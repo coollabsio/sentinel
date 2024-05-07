@@ -10,11 +10,12 @@ import (
 )
 
 type Container struct {
-	ID           string `json:"id"`
-	Image        string `json:"image"`
-	Name         string `json:"name"`
-	State        string `json:"state"`
-	HealthStatus string `json:"health_status"`
+	ID           string            `json:"id"`
+	Image        string            `json:"image"`
+	Name         string            `json:"name"`
+	State        string            `json:"state"`
+	Labels       map[string]string `json:"labels"`
+	HealthStatus string            `json:"health_status"`
 }
 
 func getAllContainers() (string, error) {
@@ -43,6 +44,7 @@ func getAllContainers() (string, error) {
 		containersData = append(containersData, Container{
 			ID:           container.ID,
 			Image:        container.Image,
+			Labels:       container.Labels,
 			Name:         container.Names[0][1:],
 			State:        container.State,
 			HealthStatus: healthStatus,

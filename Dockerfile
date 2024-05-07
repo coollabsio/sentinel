@@ -9,6 +9,7 @@ ENV GOOS=linux
 RUN go build -o /app/bin/sentinel ./cmd/sentinel
 
 FROM alpine:3.19
+RUN apk add --no-cache ca-certificates curl
 ENV GIN_MODE=release
 COPY --from=build /app/bin/sentinel /sentinel
 CMD ["/sentinel"]
