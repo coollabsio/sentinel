@@ -35,5 +35,5 @@ docker run -d -p 127.0.0.1:8888:8888 -v /var/run/docker.sock:/var/run/docker.soc
 - [ ] Able to save metrics to a database / filesystem in a time series format.
 
 ## License
-MIT
+Apache 2.0
 
