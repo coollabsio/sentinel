@@ -6,7 +6,7 @@ RUN go mod download
 COPY . .
 ENV CGO_ENABLED=0
 ENV GOOS=linux
-ENV GOARCH=amd64
+ENV GOARCH=arm64
 RUN go build -o /app/bin/sentinel ./cmd/sentinel
 
 FROM alpine:3.19

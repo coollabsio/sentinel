@@ -46,8 +46,8 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile
-          platforms: linux/amd64
+          file: Dockerfile.arm64
+          platforms: linux/aarch64
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-aarch64
   merge-manifest:
