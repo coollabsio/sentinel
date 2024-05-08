@@ -8,6 +8,7 @@ import (
 )
 
 var token string
+var version string = "0.0.2"
 
 func Token() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -31,6 +32,9 @@ func main() {
 	r := gin.Default()
 	r.GET("/api/health", func(c *gin.Context) {
 		c.String(200, "ok")
+	})
+	r.GET("/api/version", func(c *gin.Context) {
+		c.String(200, version)
 	})
 	r.Use(gin.Recovery())
 
