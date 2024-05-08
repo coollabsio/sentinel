@@ -2,7 +2,7 @@
 
 An experimental API for gathering Linux server / Docker Engine metrics.
 
-> Will be use by [coolify.io](https://coolify.io).
+> This will be used in [coolify.io](https://coolify.io).
 
 ## Features
 ### Server
