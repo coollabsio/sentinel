@@ -41,6 +41,7 @@ func getAllContainers() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	apiClient.NegotiateAPIVersion(ctx)
 	defer apiClient.Close()
 
 	containers, err := apiClient.ContainerList(ctx, container.ListOptions{All: true})
