@@ -18,7 +18,10 @@ An experimental API for gathering Linux server / Docker Engine metrics.
 ## Usage
 Start as a container:
 ```bash
-docker run -d -p 127.0.0.1:8888:8888 -v /var/run/docker.sock:/var/run/docker.sock --name sentinel ghcr.io/coollabsio/sentinel:latest
+docker run -d  -v /var/run/docker.sock:/var/run/docker.sock --pid host --name sentinel ghcr.io/coollabsio/sentinel:latest
+
+# You can expose port 8888 to access the API
+# By default, the API is only available in the container, so you need docker exec to access it.
 ```
 
 ## API
