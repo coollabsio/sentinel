@@ -8,7 +8,7 @@ import (
 )
 
 var token string
-var version string = "0.0.2"
+var version string = "0.0.1"
 
 func Token() gin.HandlerFunc {
 	return func(c *gin.Context) {
