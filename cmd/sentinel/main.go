@@ -9,10 +9,8 @@ import (
 func main() {
 	// scheduler()
 	r := gin.Default()
-	r.GET("/", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"message": "Hello, World!",
-		})
+	r.GET("/api/health", func(c *gin.Context) {
+		c.String(200, "ok")
 	})
 	r.GET("/api/containers", func(c *gin.Context) {
 		containers, err := getAllContainers()
