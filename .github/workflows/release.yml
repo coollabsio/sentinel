@@ -50,7 +50,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-aarch64
- merge-manifest:
+  merge-manifest:
     runs-on: ubuntu-latest
     permissions:
       contents: read
