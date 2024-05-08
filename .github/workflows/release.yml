@@ -1,8 +1,9 @@
 name: Sentinel Release
 
 on:
-  push:
-    branches: [ "main" ]
+  release:
+    types: [released]
+    
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: "coollabsio/sentinel"
@@ -21,14 +22,20 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN  }}
-      - name: Build image and push to registry
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+      - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest  
+          tags: ${{ steps.meta.outputs.tags }}
   aarch64:
     runs-on: [ self-hosted, arm64 ]
     permissions:
@@ -42,14 +49,21 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN  }}
-      - name: Build image and push to registry
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}-aarch64
+      - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile.arm64
           platforms: linux/aarch64
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-aarch64
+          tags: ${{ steps.meta.outputs.tags }}-aarch64
   merge-manifest:
     runs-on: ubuntu-latest
     permissions:
@@ -69,6 +83,14 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN  }}
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
       - name: Create & publish manifest
         run: |
+          docker buildx imagetools create --append ${{ fromJSON(steps.meta.outputs.json).tags[0] }}-aarch64 --tag ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
           docker buildx imagetools create --append ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-aarch64 --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
