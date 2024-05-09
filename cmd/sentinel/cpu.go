@@ -7,7 +7,10 @@ import (
 	"github.com/shirou/gopsutil/cpu"
 )
 
+var cpuCsvHeader = "time,cpu,usage,idle,system,user,percent\n"
+
 type CpuUsage struct {
+	Time    string  `json:"time"`
 	Cpu     string  `json:"cpu"`
 	Usage   float64 `json:"usage"`
 	Idle    float64 `json:"idle"`
@@ -16,7 +19,7 @@ type CpuUsage struct {
 	Percent string  `json:"percent"`
 }
 
-func getCpuUsage() (string, error) {
+func getCpuUsage(csv bool) (string, error) {
 	times, err := cpu.Times(true)
 	if err != nil {
 		fmt.Println("Failed to get CPU times:", err)
@@ -29,14 +32,16 @@ func getCpuUsage() (string, error) {
 	}
 
 	usages := make([]CpuUsage, len(times))
+	queryTimeInUnixString := getUnixTimeInNanoUTC()
 	for i, time := range times {
 		usages[i] = CpuUsage{
+			Time:    queryTimeInUnixString,
 			Cpu:     fmt.Sprintf("%d", i),
 			Usage:   time.Total(),
 			Idle:    time.Idle,
 			System:  time.System,
 			User:    time.User,
-			Percent: fmt.Sprintf("%.2f%%", percentage[i]),
+			Percent: fmt.Sprintf("%.2f", percentage[i]),
 		}
 	}
 	overallPercentage, err := cpu.Percent(0, false)
@@ -45,6 +50,7 @@ func getCpuUsage() (string, error) {
 		return "", err
 	}
 	usages = append(usages, CpuUsage{
+		Time:    queryTimeInUnixString,
 		Cpu:     "Overall",
 		Percent: fmt.Sprintf("%.2f%%", overallPercentage[0]),
 	})
@@ -54,6 +60,13 @@ func getCpuUsage() (string, error) {
 		return "", err
 	}
 
+	if csv {
+		var csvData string
+		for _, usage := range usages {
+			csvData += fmt.Sprintf("%s,%s,%f,%f,%f,%f,%s\n", usage.Time, usage.Cpu, usage.Usage, usage.Idle, usage.System, usage.User, usage.Percent)
+		}
+		return csvData, nil
+	}
 	return string(jsonData), nil
 
 }
