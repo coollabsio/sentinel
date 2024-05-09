@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 )
 
-var version string = "0.0.2"
+var version string = "0.0.3"
 var logsDir string = "/app/logs"
 var metricsDir string = "/app/metrics"
 
@@ -38,10 +39,10 @@ func main() {
 		logsDir = "./logs"
 		metricsDir = "./metrics"
 	}
-	if err := os.MkdirAll(logsDir, 0755); err != nil {
+	if err := os.MkdirAll(logsDir, 0600); err != nil {
 		log.Fatalf("Error creating metrics directory: %v", err)
 	}
-	if err := os.MkdirAll(metricsDir, 0755); err != nil {
+	if err := os.MkdirAll(metricsDir, 0600); err != nil {
 		log.Fatalf("Error creating metrics directory: %v", err)
 	}
 
@@ -54,6 +55,17 @@ func main() {
 	flag.IntVar(&refreshRateSeconds, "refresh", 5, "help message for flagname")
 	flag.BoolVar(&startScheduler, "scheduler", false, "help message for flagname")
 	flag.Parse()
+	if os.Getenv("SCHEDULER") == "true" {
+		startScheduler = true
+	}
+	if os.Getenv("REFRESHRATE") != "" {
+		refreshRate, err := strconv.Atoi(os.Getenv("REFRESHRATE"))
+		if err != nil {
+			log.Fatalf("Error converting REFRESHRATE to integer: %v", err)
+		}
+		refreshRateSeconds = refreshRate
+	}
+
 	if startScheduler {
 		fmt.Println("Starting scheduler...")
 		scheduler()
