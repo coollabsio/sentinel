@@ -40,7 +40,8 @@ func cpuMetrics() {
 		fmt.Printf("Error getting containers: %s", err)
 		return
 	}
-	filepath := fmt.Sprintf("%s/cpu.csv", metricsDir)
+	filepath := fmt.Sprintf(cpuMetricsFile)
+	fmt.Println(filepath)
 	_, err = os.Stat(filepath)
 	if err != nil {
 		err := os.WriteFile(filepath, []byte(cpuCsvHeader), 0644)

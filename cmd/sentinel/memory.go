@@ -24,7 +24,7 @@ func getMemUsage(csv bool) (string, error) {
 		fmt.Println("Failed to get memory usage:", err)
 		return "", err
 	}
-	queryTimeInUnixString := getUnixTimeInNanoUTC()
+	queryTimeInUnixString := getUnixTimeInMilliUTC()
 	usages := MemUsage{
 		Time:        queryTimeInUnixString,
 		Total:       memory.Total,

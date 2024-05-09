@@ -10,3 +10,9 @@ func getUnixTimeInNanoUTC() string {
 	queryTimeInUnixString := fmt.Sprintf("%d", queryTimeInUnix)
 	return queryTimeInUnixString
 }
+
+func getUnixTimeInMilliUTC() string {
+	queryTimeInUnix := time.Now().UTC().UnixMilli()
+	queryTimeInUnixString := fmt.Sprintf("%d", queryTimeInUnix)
+	return queryTimeInUnixString
+}

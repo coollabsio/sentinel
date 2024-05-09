@@ -14,6 +14,7 @@ import (
 var version string = "0.0.4"
 var logsDir string = "/app/logs"
 var metricsDir string = "/app/metrics"
+var cpuMetricsFile string = metricsDir + "/cpu.csv"
 
 // Arguments
 var token string
@@ -38,11 +39,12 @@ func main() {
 	if gin.Mode() == gin.DebugMode {
 		logsDir = "./logs"
 		metricsDir = "./metrics"
+		cpuMetricsFile = metricsDir + "/cpu.csv"
 	}
-	if err := os.MkdirAll(logsDir, 0600); err != nil {
+	if err := os.MkdirAll(logsDir, 0700); err != nil {
 		log.Fatalf("Error creating metrics directory: %v", err)
 	}
-	if err := os.MkdirAll(metricsDir, 0600); err != nil {
+	if err := os.MkdirAll(metricsDir, 0700); err != nil {
 		log.Fatalf("Error creating metrics directory: %v", err)
 	}
 
@@ -118,6 +120,18 @@ func main() {
 				return
 			}
 			usage = cpuCsvHeader + usage
+			c.String(200, usage)
+		})
+		authorized.GET("/cpu/history", func(c *gin.Context) {
+			from := c.Query("from")
+			to := c.Query("to")
+			usage, err := getHistoryCpuUsage(from, to)
+			if err != nil {
+				c.JSON(500, gin.H{
+					"error": err.Error(),
+				})
+				return
+			}
 			c.String(200, usage)
 		})
 		authorized.GET("/memory", func(c *gin.Context) {
