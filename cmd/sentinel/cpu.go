@@ -52,7 +52,7 @@ func getCpuUsage(csv bool) (string, error) {
 	usages = append(usages, CpuUsage{
 		Time:    queryTimeInUnixString,
 		Cpu:     "Overall",
-		Percent: fmt.Sprintf("%.2f%%", overallPercentage[0]),
+		Percent: fmt.Sprintf("%.2f", overallPercentage[0]),
 	})
 
 	jsonData, err := json.MarshalIndent(usages, "", "    ")
