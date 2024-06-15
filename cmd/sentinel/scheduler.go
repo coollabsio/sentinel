@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-co-op/gocron/v2"
@@ -22,8 +24,10 @@ func scheduler() {
 		gocron.NewTask(
 			func() {
 				cpuMetrics()
-				filesystemMetrics()
+				// filesystemMetrics()
 				memoryMetrics()
+				cleanupMetricsData()
+				// cleanupLogsData()
 			},
 		),
 	)
@@ -34,6 +38,88 @@ func scheduler() {
 	s.Start()
 }
 
+func cleanupLogsData() {
+	// If the files are too big, we can remove old logs
+
+	// currentTime := time.Now()
+	// minutesAgo := currentTime.Add(-1440 * time.Minute)
+	// files, err := os.ReadDir(logsDir)
+	// if err != nil {
+	// 	fmt.Printf("Error reading directory: %s", err)
+	// 	return
+	// }
+	// for _, file := range files {
+	// 	lines, err := os.ReadFile(fmt.Sprintf("%s/%s", logsDir, file.Name()))
+	// 	if err != nil {
+	// 		fmt.Printf("Error reading file: %s", err)
+	// 		return
+	// 	}
+	// 	for _, line := range strings.Split(string(lines), "\n") {
+	// 		stringTime := strings.Split(line, " ")[0]
+	// 		if stringTime == "" {
+	// 			continue
+	// 		}
+	// 		timeRfc, err := time.Parse(time.RFC3339, stringTime)
+	// 		if err != nil {
+	// 			fmt.Printf("Error parsing time: %s", err)
+	// 			continue
+	// 		}
+	// 		timeInt := timeRfc.UnixNano() / int64(time.Millisecond)
+	// 		if time.UnixMilli(timeInt).Before(minutesAgo) {
+	// 			lines = []byte(strings.ReplaceAll(string(lines), line, ""))
+	// 			lines = []byte(strings.ReplaceAll(string(lines), "\n\n", "\n"))
+	// 			err := os.WriteFile(fmt.Sprintf("%s/%s", logsDir, file.Name()), lines, 0644)
+	// 			if err != nil {
+	// 				fmt.Printf("Error writing file: %s", err)
+	// 				continue
+	// 			}
+	// 		}
+	// 	}
+	// }
+}
+
+func cleanupMetricsData() {
+	currentTime := time.Now()
+	minutesAgo := currentTime.Add(-1 * time.Minute)
+	files, err := os.ReadDir(metricsDir)
+	if err != nil {
+		fmt.Printf("Error reading directory: %s", err)
+		return
+	}
+	for _, file := range files {
+		lines, err := os.ReadFile(fmt.Sprintf("%s/%s", metricsDir, file.Name()))
+		if err != nil {
+			fmt.Printf("Error reading file: %s", err)
+			return
+		}
+		for _, line := range strings.Split(string(lines), "\n") {
+			if strings.Contains(line, "time") {
+				continue
+			}
+			if line == "" {
+				continue
+			}
+			timeString := strings.Split(line, ",")[0]
+			timeInt, err := strconv.ParseInt(timeString, 10, 64)
+			if err != nil {
+				fmt.Printf("Error parsing time: %s", err)
+				return
+			}
+			if time.UnixMilli(timeInt).Before(minutesAgo) {
+				// fmt.Println("removing line")
+				// fmt.Println(line)
+				lines = []byte(strings.ReplaceAll(string(lines), line, ""))
+				lines = []byte(strings.ReplaceAll(string(lines), "\n\n", "\n"))
+				err := os.WriteFile(fmt.Sprintf("%s/%s", metricsDir, file.Name()), lines, 0644)
+				if err != nil {
+					fmt.Printf("Error writing file: %s", err)
+					return
+				}
+			}
+		}
+	}
+}
+
 func cpuMetrics() {
 	out, err := getCpuUsage(true)
 	if err != nil {
@@ -41,7 +127,6 @@ func cpuMetrics() {
 		return
 	}
 	filepath := fmt.Sprintf(cpuMetricsFile)
-	fmt.Println(filepath)
 	_, err = os.Stat(filepath)
 	if err != nil {
 		err := os.WriteFile(filepath, []byte(cpuCsvHeader), 0644)

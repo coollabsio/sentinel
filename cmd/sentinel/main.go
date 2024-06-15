@@ -11,7 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-var version string = "0.0.4"
+var version string = "0.0.5"
 var logsDir string = "/app/logs"
 var metricsDir string = "/app/metrics"
 var cpuMetricsFile string = metricsDir + "/cpu.csv"
@@ -19,6 +19,7 @@ var cpuMetricsFile string = metricsDir + "/cpu.csv"
 // Arguments
 var token string
 var refreshRateSeconds int = 5
+var metricsHistoryInMinutes int = 43200
 var startScheduler bool = false
 
 func Token() gin.HandlerFunc {
@@ -54,7 +55,8 @@ func main() {
 		}
 	}()
 	flag.StringVar(&token, "token", "", "help message for flagname")
-	flag.IntVar(&refreshRateSeconds, "refresh", 5, "help message for flagname")
+	flag.IntVar(&refreshRateSeconds, "refresh", refreshRateSeconds, "help message for flagname")
+	flag.IntVar(&metricsHistoryInMinutes, "metrics-history", metricsHistoryInMinutes, "help message for flagname")
 	flag.BoolVar(&startScheduler, "scheduler", false, "help message for flagname")
 	flag.Parse()
 	if os.Getenv("SCHEDULER") == "true" {
@@ -67,9 +69,22 @@ func main() {
 		}
 		refreshRateSeconds = refreshRate
 	}
+	if os.Getenv("KEEPHISTORY") != "" {
+		history, err := strconv.Atoi(os.Getenv("KEEPHISTORY"))
+		if err != nil {
+			log.Fatalf("Error converting KEEPHISTORY to integer: %v", err)
+		}
+		metricsHistoryInMinutes = history
+	}
 
 	if startScheduler {
-		fmt.Println("Starting scheduler...")
+		if metricsHistoryInMinutes > 60 {
+			// convert to hours
+			metricsHistoryInMinutes = metricsHistoryInMinutes / 60
+			fmt.Println("Starting scheduler with refresh rate of", refreshRateSeconds, "seconds and keeping history for", metricsHistoryInMinutes, "hours.")
+		} else {
+			fmt.Println("Starting scheduler with refresh rate of", refreshRateSeconds, "seconds and keeping history for", metricsHistoryInMinutes, "minute(s).")
+		}
 		scheduler()
 	}
 
