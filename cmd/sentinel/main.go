@@ -49,11 +49,11 @@ func main() {
 		log.Fatalf("Error creating metrics directory: %v", err)
 	}
 
-	go func() {
-		if err := streamLogsToFile(); err != nil {
-			log.Fatalf("Error listening to events: %v", err)
-		}
-	}()
+	// go func() {
+	// 	if err := streamLogsToFile(); err != nil {
+	// 		log.Fatalf("Error listening to events: %v", err)
+	// 	}
+	// }()
 	flag.StringVar(&token, "token", "", "help message for flagname")
 	flag.IntVar(&refreshRateSeconds, "refresh", refreshRateSeconds, "help message for flagname")
 	flag.IntVar(&metricsHistoryInMinutes, "metrics-history", metricsHistoryInMinutes, "help message for flagname")
@@ -62,17 +62,17 @@ func main() {
 	if os.Getenv("SCHEDULER") == "true" {
 		startScheduler = true
 	}
-	if os.Getenv("REFRESHRATE") != "" {
-		refreshRate, err := strconv.Atoi(os.Getenv("REFRESHRATE"))
+	if os.Getenv("REFRESH_RATE") != "" {
+		refreshRate, err := strconv.Atoi(os.Getenv("REFRESH_RATE"))
 		if err != nil {
-			log.Fatalf("Error converting REFRESHRATE to integer: %v", err)
+			log.Fatalf("Error converting REFRESH_RATE to integer: %v", err)
 		}
 		refreshRateSeconds = refreshRate
 	}
-	if os.Getenv("KEEPHISTORY") != "" {
-		history, err := strconv.Atoi(os.Getenv("KEEPHISTORY"))
+	if os.Getenv("METRICS_HISTORY_MINUTES") != "" {
+		history, err := strconv.Atoi(os.Getenv("METRICS_HISTORY_MINUTES"))
 		if err != nil {
-			log.Fatalf("Error converting KEEPHISTORY to integer: %v", err)
+			log.Fatalf("Error converting METRICS_HISTORY_MINUTES to integer: %v", err)
 		}
 		metricsHistoryInMinutes = history
 	}
