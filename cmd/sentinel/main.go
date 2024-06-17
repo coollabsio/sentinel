@@ -54,10 +54,10 @@ func main() {
 	// 		log.Fatalf("Error listening to events: %v", err)
 	// 	}
 	// }()
-	flag.StringVar(&token, "token", "", "help message for flagname")
-	flag.IntVar(&refreshRateSeconds, "refresh", refreshRateSeconds, "help message for flagname")
-	flag.IntVar(&metricsHistoryInMinutes, "metrics-history", metricsHistoryInMinutes, "help message for flagname")
-	flag.BoolVar(&startScheduler, "scheduler", false, "help message for flagname")
+	flag.StringVar(&token, "token", "", "Token to access the API. Default is empty, which means no token is required.")
+	flag.IntVar(&refreshRateSeconds, "refresh", refreshRateSeconds, "Refresh rate in seconds. Default is 5 seconds")
+	flag.IntVar(&metricsHistoryInMinutes, "metrics-history", metricsHistoryInMinutes, "Metrics history in minutes. Default is 43200 minutes (30 days)")
+	flag.BoolVar(&startScheduler, "scheduler", false, "Start scheduler that collects metrics / data. Default is false.")
 	flag.Parse()
 	if os.Getenv("SCHEDULER") == "true" {
 		startScheduler = true
@@ -69,10 +69,10 @@ func main() {
 		}
 		refreshRateSeconds = refreshRate
 	}
-	if os.Getenv("METRICS_HISTORY_MINUTES") != "" {
-		history, err := strconv.Atoi(os.Getenv("METRICS_HISTORY_MINUTES"))
+	if os.Getenv("METRICS_HISTORY") != "" {
+		history, err := strconv.Atoi(os.Getenv("METRICS_HISTORY"))
 		if err != nil {
-			log.Fatalf("Error converting METRICS_HISTORY_MINUTES to integer: %v", err)
+			log.Fatalf("Error converting METRICS_HISTORY to integer: %v", err)
 		}
 		metricsHistoryInMinutes = history
 	}

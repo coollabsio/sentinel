@@ -80,7 +80,7 @@ func cleanupLogsData() {
 
 func cleanupMetricsData() {
 	currentTime := time.Now()
-	minutesAgo := currentTime.Add(-1 * time.Minute)
+	minutesAgo := currentTime.Add(time.Duration(-metricsHistoryInMinutes) * time.Minute)
 	files, err := os.ReadDir(metricsDir)
 	if err != nil {
 		fmt.Printf("Error reading directory: %s", err)
