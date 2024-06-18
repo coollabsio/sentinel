@@ -15,6 +15,7 @@ var version string = "0.0.5"
 var logsDir string = "/app/logs"
 var metricsDir string = "/app/metrics"
 var cpuMetricsFile string = metricsDir + "/cpu.csv"
+var memoryMetricsFile string = metricsDir + "/memory.csv"
 
 // Arguments
 var token string
@@ -41,6 +42,7 @@ func main() {
 		logsDir = "./logs"
 		metricsDir = "./metrics"
 		cpuMetricsFile = metricsDir + "/cpu.csv"
+		memoryMetricsFile = metricsDir + "/memory.csv"
 	}
 	if err := os.MkdirAll(logsDir, 0700); err != nil {
 		log.Fatalf("Error creating metrics directory: %v", err)
@@ -171,6 +173,18 @@ func main() {
 				return
 			}
 			usage = memoryCsvHeader + usage
+			c.String(200, usage)
+		})
+		authorized.GET("/memory/history", func(c *gin.Context) {
+			from := c.Query("from")
+			to := c.Query("to")
+			usage, err := getHistoryMemoryUsage(from, to)
+			if err != nil {
+				c.JSON(500, gin.H{
+					"error": err.Error(),
+				})
+				return
+			}
 			c.String(200, usage)
 		})
 		authorized.GET("/disk", func(c *gin.Context) {
