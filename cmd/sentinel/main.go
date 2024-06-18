@@ -11,7 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-var version string = "0.0.5"
+var version string = "0.0.7"
 var logsDir string = "/app/logs"
 var metricsDir string = "/app/metrics"
 var cpuMetricsFile string = metricsDir + "/cpu.csv"
@@ -61,6 +61,13 @@ func main() {
 	flag.IntVar(&metricsHistoryInMinutes, "metrics-history", metricsHistoryInMinutes, "Metrics history in minutes. Default is 43200 minutes (30 days)")
 	flag.BoolVar(&startScheduler, "scheduler", false, "Start scheduler that collects metrics / data. Default is false.")
 	flag.Parse()
+
+	if os.Getenv("TOKEN") != "" {
+		tokenFromEnv := os.Getenv("TOKEN")
+		if tokenFromEnv != "" {
+			token = tokenFromEnv
+		}
+	}
 	if os.Getenv("SCHEDULER") == "true" {
 		startScheduler = true
 	}
