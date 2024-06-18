@@ -11,7 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-var version string = "0.0.7"
+var version string = "0.0.8"
 var logsDir string = "/app/logs"
 var metricsDir string = "/app/metrics"
 var cpuMetricsFile string = metricsDir + "/cpu.csv"
@@ -20,7 +20,7 @@ var memoryMetricsFile string = metricsDir + "/memory.csv"
 // Arguments
 var token string
 var refreshRateSeconds int = 5
-var metricsHistoryInMinutes int = 43200
+var metricsHistoryInDays int = 30
 var startScheduler bool = false
 
 func Token() gin.HandlerFunc {
@@ -58,7 +58,7 @@ func main() {
 	// }()
 	flag.StringVar(&token, "token", "", "Token to access the API. Default is empty, which means no token is required.")
 	flag.IntVar(&refreshRateSeconds, "refresh", refreshRateSeconds, "Refresh rate in seconds. Default is 5 seconds")
-	flag.IntVar(&metricsHistoryInMinutes, "metrics-history", metricsHistoryInMinutes, "Metrics history in minutes. Default is 43200 minutes (30 days)")
+	flag.IntVar(&metricsHistoryInDays, "metrics-history", metricsHistoryInDays, "Metrics history in days. Default is 30 days")
 	flag.BoolVar(&startScheduler, "scheduler", false, "Start scheduler that collects metrics / data. Default is false.")
 	flag.Parse()
 
@@ -83,17 +83,11 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error converting METRICS_HISTORY to integer: %v", err)
 		}
-		metricsHistoryInMinutes = history
+		metricsHistoryInDays = history
 	}
 
 	if startScheduler {
-		if metricsHistoryInMinutes > 60 {
-			// convert to hours
-			metricsHistoryInMinutes = metricsHistoryInMinutes / 60
-			fmt.Println("Starting scheduler with refresh rate of", refreshRateSeconds, "seconds and keeping history for", metricsHistoryInMinutes, "hours.")
-		} else {
-			fmt.Println("Starting scheduler with refresh rate of", refreshRateSeconds, "seconds and keeping history for", metricsHistoryInMinutes, "minute(s).")
-		}
+		fmt.Println("Starting scheduler with refresh rate of", refreshRateSeconds, "seconds and keeping history for", metricsHistoryInDays, "days.")
 		scheduler()
 	}
 
@@ -109,6 +103,14 @@ func main() {
 	authorized := r.Group("/api")
 	authorized.Use(Token())
 	{
+		authorized.GET("/config", func(c *gin.Context) {
+			c.JSON(200, gin.H{
+				"token":                        token,
+				"metrics_refresh_rate_seconds": refreshRateSeconds,
+				"metrics_history_days":         metricsHistoryInDays,
+				"should_start_scheduler":       startScheduler,
+			})
+		})
 		authorized.GET("/containers", func(c *gin.Context) {
 			containers, err := getAllContainers()
 			if err != nil {
