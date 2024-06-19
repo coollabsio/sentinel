@@ -24,30 +24,8 @@ type CpuUsage struct {
 }
 
 func getCpuUsage(csv bool) (string, error) {
-	// times, err := cpu.Times(true)
-	// if err != nil {
-	// 	fmt.Println("Failed to get CPU times:", err)
-	// 	return "", err
-	// }
-	// percentage, err := cpu.Percent(0, true)
-	// if err != nil {
-	// 	fmt.Println("Failed to get CPU percentage:", err)
-	// 	return "", err
-	// }
-
 	usages := make([]CpuUsage, 0)
 	queryTimeInUnixString := getUnixTimeInMilliUTC()
-	// for i, time := range times {
-	// 	usages[i] = CpuUsage{
-	// 		Time:    queryTimeInUnixString,
-	// 		Cpu:     fmt.Sprintf("%d", i),
-	// 		Usage:   time.Total(),
-	// 		Idle:    time.Idle,
-	// 		System:  time.System,
-	// 		User:    time.User,
-	// 		Percent: fmt.Sprintf("%.2f", percentage[i]),
-	// 	}
-	// }
 	overallPercentage, err := cpu.Percent(0, false)
 	if err != nil {
 		fmt.Println("Failed to get overall CPU percentage:", err)

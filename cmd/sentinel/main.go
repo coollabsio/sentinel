@@ -11,11 +11,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-var version string = "0.0.8"
+var version string = "0.0.9"
 var logsDir string = "/app/logs"
 var metricsDir string = "/app/metrics"
 var cpuMetricsFile string = metricsDir + "/cpu.csv"
 var memoryMetricsFile string = metricsDir + "/memory.csv"
+var diskMetricsFile string = metricsDir + "/disk.csv"
 
 // Arguments
 var token string
@@ -43,12 +44,34 @@ func main() {
 		metricsDir = "./metrics"
 		cpuMetricsFile = metricsDir + "/cpu.csv"
 		memoryMetricsFile = metricsDir + "/memory.csv"
+		diskMetricsFile = metricsDir + "/disk.csv"
 	}
 	if err := os.MkdirAll(logsDir, 0700); err != nil {
 		log.Fatalf("Error creating metrics directory: %v", err)
 	}
 	if err := os.MkdirAll(metricsDir, 0700); err != nil {
 		log.Fatalf("Error creating metrics directory: %v", err)
+	}
+	if _, err := os.Stat(cpuMetricsFile); os.IsNotExist(err) {
+		err := os.WriteFile(cpuMetricsFile, []byte(cpuCsvHeader), 0644)
+		if err != nil {
+			fmt.Printf("Error writing file: %s", err)
+			return
+		}
+	}
+	if _, err := os.Stat(memoryMetricsFile); os.IsNotExist(err) {
+		err := os.WriteFile(memoryMetricsFile, []byte(memoryCsvHeader), 0644)
+		if err != nil {
+			fmt.Printf("Error writing file: %s", err)
+			return
+		}
+	}
+	if _, err := os.Stat(diskMetricsFile); os.IsNotExist(err) {
+		err := os.WriteFile(diskMetricsFile, []byte(diskCsvHeader), 0644)
+		if err != nil {
+			fmt.Printf("Error writing file: %s", err)
+			return
+		}
 	}
 
 	// go func() {
@@ -124,6 +147,53 @@ func main() {
 				"containers": json.RawMessage(containers),
 			})
 		})
+		authorized.GET("/container/:containerId", func(c *gin.Context) {
+			metrics, err := getOneContainer(c.Param("containerId"), false)
+			if err != nil {
+				c.JSON(500, gin.H{
+					"error": err.Error(),
+				})
+				return
+			}
+			c.JSON(200, gin.H{
+				"container": json.RawMessage(metrics),
+			})
+		})
+		authorized.GET("/container/:containerId/csv", func(c *gin.Context) {
+			data, err := getOneContainer(c.Param("containerId"), true)
+			if err != nil {
+				c.JSON(500, gin.H{
+					"error": err.Error(),
+				})
+				return
+			}
+			data = containerConfigCsvHeader + data
+			c.String(200, data)
+		})
+		authorized.GET("/container/:containerId/metrics", func(c *gin.Context) {
+			metrics, err := getOneContainerMetrics(c.Param("containerId"), false)
+			if err != nil {
+				c.JSON(500, gin.H{
+					"error": err.Error(),
+				})
+				return
+			}
+			c.JSON(200, gin.H{
+				"container": json.RawMessage(metrics),
+			})
+		})
+		authorized.GET("/container/:containerId/metrics/history", func(c *gin.Context) {
+			from := c.Query("from")
+			to := c.Query("to")
+			usage, err := getHistoryContainerUsage(from, to, c.Param("containerId"))
+			if err != nil {
+				c.JSON(500, gin.H{
+					"error": err.Error(),
+				})
+				return
+			}
+			c.String(200, usage)
+		})
 		authorized.GET("/cpu", func(c *gin.Context) {
 			usage, err := getCpuUsage(false)
 			if err != nil {
@@ -197,7 +267,7 @@ func main() {
 			c.String(200, usage)
 		})
 		authorized.GET("/disk", func(c *gin.Context) {
-			usage, err := getDiskUsage()
+			usage, err := getDiskUsage(false)
 			if err != nil {
 				c.JSON(500, gin.H{
 					"error": err.Error(),
@@ -208,6 +278,29 @@ func main() {
 			c.JSON(200, gin.H{
 				"disk_usage": json.RawMessage(usage),
 			})
+		})
+		authorized.GET("/disk/csv", func(c *gin.Context) {
+			usage, err := getDiskUsage(true)
+			if err != nil {
+				c.JSON(500, gin.H{
+					"error": err.Error(),
+				})
+				return
+			}
+			usage = memoryCsvHeader + usage
+			c.String(200, usage)
+		})
+		authorized.GET("/disk/history", func(c *gin.Context) {
+			from := c.Query("from")
+			to := c.Query("to")
+			usage, err := getHistoryDiskUsage(from, to)
+			if err != nil {
+				c.JSON(500, gin.H{
+					"error": err.Error(),
+				})
+				return
+			}
+			c.String(200, usage)
 		})
 	}
 
