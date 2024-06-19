@@ -47,7 +47,7 @@ func main() {
 		diskMetricsFile = metricsDir + "/disk.csv"
 	}
 	if err := os.MkdirAll(logsDir, 0700); err != nil {
-		log.Fatalf("Error creating metrics directory: %v", err)
+		log.Fatalf("Error creating logs directory: %v", err)
 	}
 	if err := os.MkdirAll(metricsDir, 0700); err != nil {
 		log.Fatalf("Error creating metrics directory: %v", err)
