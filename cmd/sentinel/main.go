@@ -11,7 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-var version string = "0.0.12"
+var version string = "0.0.13"
 var logsDir string = "/app/logs"
 var metricsDir string = "/app/metrics"
 var cpuMetricsFile string = metricsDir + "/cpu.csv"

@@ -16,7 +16,7 @@ import (
 	"github.com/docker/docker/client"
 )
 
-var containerMetricsCsvHeader = "time,container_id,cpu_usage_percent,memory_usage,memory_usage_percent\n"
+var containerMetricsCsvHeader = "time,cpu_usage_percent,memory_usage,memory_usage_percent\n"
 var containerConfigCsvHeader = "time,id,image,name,state,health_status\n"
 
 type Container struct {
