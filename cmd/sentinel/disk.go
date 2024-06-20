@@ -21,7 +21,7 @@ type DiskUsage struct {
 	Usage      string `json:"usage"`
 }
 
-var diskCsvHeader = "time,disk,mount_point,total,free,usagePercent\n"
+var diskCsvHeader = "time,disk,mount_point,total,free,usage_percent\n"
 
 func getDiskUsage(csv bool) (string, error) {
 	partitions, err := disk.Partitions(true)

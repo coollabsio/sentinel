@@ -11,7 +11,7 @@ import (
 	"github.com/shirou/gopsutil/mem"
 )
 
-var memoryCsvHeader = "time,used,free,usedPercent\n"
+var memoryCsvHeader = "time,used,free,used_percent\n"
 
 type MemUsage struct {
 	Time        string  `json:"time"`

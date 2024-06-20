@@ -11,7 +11,7 @@ import (
 	"github.com/shirou/gopsutil/cpu"
 )
 
-var cpuCsvHeader = "time,percent\n"
+var cpuCsvHeader = "time,usage_percent\n"
 
 type CpuUsage struct {
 	Time string `json:"time"`
