@@ -163,34 +163,44 @@ func containerMetrics() {
 			continue
 		}
 		go func(cont types.Container) {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("Recovered from panic: %v\n", r)
+				}
+			}()
+
 			metrics, err := getOneContainerMetrics(container.ID, true)
 			if err != nil {
-				fmt.Printf("Error getting container metrics: %s", err)
+				fmt.Printf("Error getting container metrics: %s\n", err)
 				return
 			}
+
 			containerNameFromLabel := container.Labels["coolify.name"]
 			if containerNameFromLabel == "" {
 				containerNameFromLabel = container.Names[0][1:]
 			}
 			containerName := "container-" + containerNameFromLabel
 			containerMetricsFile := fmt.Sprintf("%s/%s.csv", metricsDir, containerName)
+
 			_, err = os.Stat(containerMetricsFile)
-			if err != nil {
+			if err != nil && os.IsNotExist(err) {
 				err := os.WriteFile(containerMetricsFile, []byte(containerMetricsCsvHeader), 0644)
 				if err != nil {
-					fmt.Printf("Error writing file: %s", err)
+					fmt.Printf("Error writing file: %s\n", err)
 					return
 				}
 			}
+
 			f, err := os.OpenFile(containerMetricsFile, os.O_APPEND|os.O_WRONLY, 0644)
 			if err != nil {
-				fmt.Printf("Error opening file: %s", err)
+				fmt.Printf("Error opening file: %s\n", err)
 				return
 			}
 			defer f.Close()
+
 			_, err = f.WriteString(metrics)
 			if err != nil {
-				fmt.Printf("Error writing to file: %s", err)
+				fmt.Printf("Error writing to file: %s\n", err)
 				return
 			}
 		}(container)
