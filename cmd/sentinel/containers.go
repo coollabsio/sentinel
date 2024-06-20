@@ -16,7 +16,7 @@ import (
 	"github.com/docker/docker/client"
 )
 
-var containerMetricsCsvHeader = "time,container_id,cpu_usage,memory_usage\n"
+var containerMetricsCsvHeader = "time,container_id,cpu_usage_percent,memory_usage,memory_usage_percent\n"
 var containerConfigCsvHeader = "time,id,image,name,state,health_status\n"
 
 type Container struct {
@@ -125,17 +125,16 @@ func getOneContainerMetrics(containerID string, csv bool) (string, error) {
 		Time:                  getUnixTimeInMilliUTC(),
 		CPUUsagePercentage:    calculateCPUPercent(v),
 		MemoryUsagePercentage: calculateMemoryPercent(v),
-		MemoryUsed:            v.MemoryStats.Usage,
+		MemoryUsed:            calculateMemoryUsed(v),
 		MemoryAvailable:       v.MemoryStats.Limit,
 		NetworkUsage:          metrics.NetworkUsage,
 	}
-
 	jsonData, err := json.MarshalIndent(metrics, "", "    ")
 	if err != nil {
 		return "", err
 	}
 	if csv {
-		return fmt.Sprintf("%s,%f,%f\n", metrics.Time, metrics.CPUUsagePercentage, metrics.MemoryUsagePercentage), nil
+		return fmt.Sprintf("%s,%f,%d,%f\n", metrics.Time, metrics.CPUUsagePercentage, metrics.MemoryUsed, metrics.MemoryUsagePercentage), nil
 	}
 	return string(jsonData), nil
 }
@@ -253,4 +252,7 @@ func calculateMemoryPercent(stat types.StatsJSON) float64 {
 	usedMemory := float64(stat.MemoryStats.Usage) - float64(stat.MemoryStats.Stats["cache"])
 	availableMemory := float64(stat.MemoryStats.Limit)
 	return (usedMemory / availableMemory) * 100.0
+}
+func calculateMemoryUsed(stat types.StatsJSON) uint64 {
+	return (stat.MemoryStats.Usage) / 1024 / 1024
 }
