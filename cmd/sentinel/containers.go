@@ -121,12 +121,10 @@ func getOneContainerMetrics(containerID string, csv bool) (string, error) {
 		}
 	}
 
-	memoryUsagePercent := float64(v.MemoryStats.Usage) / float64(v.MemoryStats.Limit) * 100.0
-	memoryUsagePercent = float64(int(memoryUsagePercent*100)) / 100
 	metrics = ContainerMetrics{
 		Time:                  getUnixTimeInMilliUTC(),
 		CPUUsagePercentage:    calculateCPUPercent(v),
-		MemoryUsagePercentage: memoryUsagePercent,
+		MemoryUsagePercentage: calculateMemoryPercent(v),
 		MemoryUsed:            v.MemoryStats.Usage,
 		MemoryAvailable:       v.MemoryStats.Limit,
 		NetworkUsage:          metrics.NetworkUsage,
@@ -245,12 +243,14 @@ func getAllContainers() (string, error) {
 
 }
 func calculateCPUPercent(stat types.StatsJSON) float64 {
-	cpuPercent := 0.0
 	cpuDelta := float64(stat.CPUStats.CPUUsage.TotalUsage) - float64(stat.PreCPUStats.CPUUsage.TotalUsage)
 	systemDelta := float64(stat.CPUStats.SystemUsage) - float64(stat.PreCPUStats.SystemUsage)
-	if systemDelta > 0.0 {
-		cpuPercent = (cpuDelta / systemDelta) * float64(len(stat.CPUStats.CPUUsage.PercpuUsage)) * 100.0
-	}
-	cpuPercent = float64(int(cpuPercent*100)) / 100
-	return cpuPercent
+	numberOfCpus := stat.CPUStats.OnlineCPUs
+	return (cpuDelta / systemDelta) * float64(numberOfCpus) * 100.0
+}
+
+func calculateMemoryPercent(stat types.StatsJSON) float64 {
+	usedMemory := float64(stat.MemoryStats.Usage) - float64(stat.MemoryStats.Stats["cache"])
+	availableMemory := float64(stat.MemoryStats.Limit)
+	return (usedMemory / availableMemory) * 100.0
 }
