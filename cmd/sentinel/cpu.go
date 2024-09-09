@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"sentinel/pkg/db"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +23,20 @@ type CpuUsage struct {
 	// System  float64 `json:"system"`
 	// User    float64 `json:"user"`
 	Percent string `json:"percent"`
+}
+
+func CollectCpuUsage() {
+	queryTimeInUnixString := getUnixTimeInMilliUTC()
+
+	overallPercentage, err := cpu.Percent(0, false)
+	if err != nil {
+		log.Printf("%v", err)
+	}
+	cpuUsage := CpuUsage{
+		Time:    queryTimeInUnixString,
+		Percent: fmt.Sprintf("%.2f", overallPercentage[0]),
+	}
+	db.Write("cpu", int(time.Now().Unix()), cpuUsage)
 }
 
 func getCpuUsage(csv bool) (string, error) {

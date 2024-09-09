@@ -4,8 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
+	"sentinel/pkg/db"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -32,8 +31,11 @@ func scheduler() {
 		),
 		gocron.NewTask(
 			func() {
-				cpuMetrics()
-				memoryMetrics()
+				CollectCpuUsage()
+				CollectDiskUsage()
+				CollectMemoryUsage()
+				// cpuMetrics()
+				// memoryMetrics()
 				cleanupMetricsData()
 				containerMetrics()
 			},
@@ -61,86 +63,13 @@ func scheduler() {
 	disk.Start()
 }
 
-// func cleanupLogsData() {
-// If the files are too big, we can remove old logs
-
-// currentTime := time.Now()
-// minutesAgo := currentTime.Add(-1440 * time.Minute)
-// files, err := os.ReadDir(logsDir)
-// if err != nil {
-// 	fmt.Printf("Error reading directory: %s", err)
-// 	return
-// }
-// for _, file := range files {
-// 	lines, err := os.ReadFile(fmt.Sprintf("%s/%s", logsDir, file.Name()))
-// 	if err != nil {
-// 		fmt.Printf("Error reading file: %s", err)
-// 		return
-// 	}
-// 	for _, line := range strings.Split(string(lines), "\n") {
-// 		stringTime := strings.Split(line, " ")[0]
-// 		if stringTime == "" {
-// 			continue
-// 		}
-// 		timeRfc, err := time.Parse(time.RFC3339, stringTime)
-// 		if err != nil {
-// 			fmt.Printf("Error parsing time: %s", err)
-// 			continue
-// 		}
-// 		timeInt := timeRfc.UnixNano() / int64(time.Millisecond)
-// 		if time.UnixMilli(timeInt).Before(minutesAgo) {
-// 			lines = []byte(strings.ReplaceAll(string(lines), line, ""))
-// 			lines = []byte(strings.ReplaceAll(string(lines), "\n\n", "\n"))
-// 			err := os.WriteFile(fmt.Sprintf("%s/%s", logsDir, file.Name()), lines, 0644)
-// 			if err != nil {
-// 				fmt.Printf("Error writing file: %s", err)
-// 				continue
-// 			}
-// 		}
-// 	}
-// }
-// }
-
 func cleanupMetricsData() {
 	currentTime := time.Now()
-	minutesAgo := currentTime.Add(time.Duration(-metricsHistoryInDays) * time.Hour * 24)
-	files, err := os.ReadDir(metricsDir)
-	if err != nil {
-		fmt.Printf("Error reading directory: %s", err)
-		return
-	}
-	for _, file := range files {
-		lines, err := os.ReadFile(fmt.Sprintf("%s/%s", metricsDir, file.Name()))
-		if err != nil {
-			fmt.Printf("Error reading file: %s", err)
-			return
-		}
-		for _, line := range strings.Split(string(lines), "\n") {
-			if strings.Contains(line, "time") {
-				continue
-			}
-			if line == "" {
-				continue
-			}
-			timeString := strings.Split(line, ",")[0]
-			timeInt, err := strconv.ParseInt(timeString, 10, 64)
-			if err != nil {
-				fmt.Printf("Error parsing time: %s", err)
-				return
-			}
-			if time.UnixMilli(timeInt).Before(minutesAgo) {
-				// fmt.Println("removing line")
-				// fmt.Println(line)
-				lines = []byte(strings.ReplaceAll(string(lines), line, ""))
-				lines = []byte(strings.ReplaceAll(string(lines), "\n\n", "\n"))
-				err := os.WriteFile(fmt.Sprintf("%s/%s", metricsDir, file.Name()), lines, 0644)
-				if err != nil {
-					fmt.Printf("Error writing file: %s", err)
-					return
-				}
-			}
-		}
-	}
+	minutesAgo := currentTime.Add(time.Duration(-metricsHistoryInDays) * time.Hour * 24).Unix()
+
+	db.DeleteOlderThan("cpu", int(minutesAgo))
+	db.DeleteOlderThan("memory", int(minutesAgo))
+	db.DeleteOlderThan("disk", int(minutesAgo))
 }
 
 func containerMetrics() {

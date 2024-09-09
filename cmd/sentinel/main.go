@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sentinel/pkg/db"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
-var version string = "0.0.13"
+var version string = "0.0.14"
 var logsDir string = "/app/logs"
 var metricsDir string = "/app/metrics"
 var cpuMetricsFile string = metricsDir + "/cpu.csv"
@@ -39,6 +41,7 @@ func Token() gin.HandlerFunc {
 	}
 }
 func main() {
+
 	if gin.Mode() == gin.DebugMode {
 		logsDir = "./logs"
 		metricsDir = "./metrics"
@@ -46,6 +49,7 @@ func main() {
 		memoryMetricsFile = metricsDir + "/memory.csv"
 		diskMetricsFile = metricsDir + "/disk.csv"
 	}
+	db.Init("./")
 	if err := os.MkdirAll(logsDir, 0700); err != nil {
 		log.Fatalf("Error creating logs directory: %v", err)
 	}
@@ -121,6 +125,11 @@ func main() {
 	r.GET("/api/version", func(c *gin.Context) {
 		c.String(200, version)
 	})
+
+	// go WorkerCpuUsage(refreshRateSeconds)
+	// go WorkerMemoryUsage(refreshRateSeconds)
+	// go WorkerDiskUsage(refreshRateSeconds)
+
 	r.Use(gin.Recovery())
 
 	authorized := r.Group("/api")
@@ -182,6 +191,7 @@ func main() {
 				"container": json.RawMessage(metrics),
 			})
 		})
+
 		authorized.GET("/container/:containerId/metrics/history", func(c *gin.Context) {
 			from := c.Query("from")
 			to := c.Query("to")
@@ -207,28 +217,27 @@ func main() {
 				"cpu_usage": json.RawMessage(usage),
 			})
 		})
+
 		authorized.GET("/cpu/csv", func(c *gin.Context) {
-			usage, err := getCpuUsage(true)
-			if err != nil {
-				c.JSON(500, gin.H{
-					"error": err.Error(),
-				})
-				return
-			}
-			usage = cpuCsvHeader + usage
-			c.String(200, usage)
+			c.Writer.WriteHeader(200)
+			c.Writer.WriteString(cpuCsvHeader)
+			db.ReadRange("cpu", 0, int(time.Now().Unix()), func(in CpuUsage) {
+				c.Writer.WriteString(fmt.Sprintf("%s,%s\n", in.Time, in.Percent))
+			})
 		})
 		authorized.GET("/cpu/history", func(c *gin.Context) {
-			from := c.Query("from")
-			to := c.Query("to")
-			usage, err := getHistoryCpuUsage(from, to)
+			from, to, err := ParseFromTo(c.Query("from"), c.Query("to"))
 			if err != nil {
 				c.JSON(500, gin.H{
-					"error": err.Error(),
+					"error": "Invalid from or to",
 				})
-				return
 			}
-			c.String(200, usage)
+
+			c.Writer.WriteHeader(200)
+			c.Writer.WriteString(cpuCsvHeader)
+			db.ReadRange("cpu", from, to, func(in CpuUsage) {
+				c.Writer.WriteString(fmt.Sprintf("%s,%s\n", in.Time, in.Percent))
+			})
 		})
 		authorized.GET("/memory", func(c *gin.Context) {
 			usage, err := getMemUsage(false)
@@ -244,28 +253,27 @@ func main() {
 			})
 		})
 		authorized.GET("/memory/csv", func(c *gin.Context) {
-			usage, err := getMemUsage(true)
-			if err != nil {
-				c.JSON(500, gin.H{
-					"error": err.Error(),
-				})
-				return
-			}
-			usage = memoryCsvHeader + usage
-			c.String(200, usage)
+			c.Writer.WriteHeader(200)
+			c.Writer.WriteString(memoryCsvHeader)
+			db.ReadRange("memory", 0, int(time.Now().Unix()), func(in MemUsage) {
+				c.Writer.WriteString(fmt.Sprintf("%s,%d,%d,%.2f\n", in.Time, in.Used, in.Free, in.UsedPercent))
+			})
 		})
 		authorized.GET("/memory/history", func(c *gin.Context) {
-			from := c.Query("from")
-			to := c.Query("to")
-			usage, err := getHistoryMemoryUsage(from, to)
+			from, to, err := ParseFromTo(c.Query("from"), c.Query("to"))
 			if err != nil {
 				c.JSON(500, gin.H{
-					"error": err.Error(),
+					"error": "Invalid from or to",
 				})
-				return
 			}
-			c.String(200, usage)
+
+			c.Writer.WriteHeader(200)
+			c.Writer.WriteString(memoryCsvHeader)
+			db.ReadRange("memory", from, to, func(in MemUsage) {
+				c.Writer.WriteString(fmt.Sprintf("%s,%d,%d,%.2f\n", in.Time, in.Used, in.Free, in.UsedPercent))
+			})
 		})
+
 		authorized.GET("/disk", func(c *gin.Context) {
 			usage, err := getDiskUsage(false)
 			if err != nil {
@@ -280,27 +288,47 @@ func main() {
 			})
 		})
 		authorized.GET("/disk/csv", func(c *gin.Context) {
-			usage, err := getDiskUsage(true)
-			if err != nil {
-				c.JSON(500, gin.H{
-					"error": err.Error(),
-				})
-				return
-			}
-			usage = memoryCsvHeader + usage
-			c.String(200, usage)
+			c.Writer.WriteHeader(200)
+			c.Writer.WriteString(diskCsvHeader)
+			db.ReadRange("disk", 0, int(time.Now().Unix()), func(in []DiskUsage) {
+				for {
+					if len(in) == 0 {
+						break
+					}
+					c.Writer.WriteString(fmt.Sprintf("%s,%s,%s,%d,%d,%s\n", in[0].Time, in[0].Disk, in[0].MountPoint, in[0].Total, in[0].Free, in[0].Usage))
+					in = in[1:]
+				}
+			})
+
 		})
 		authorized.GET("/disk/history", func(c *gin.Context) {
-			from := c.Query("from")
-			to := c.Query("to")
-			usage, err := getHistoryDiskUsage(from, to)
-			if err != nil {
-				c.JSON(500, gin.H{
-					"error": err.Error(),
-				})
-				return
+			tmpfrom := c.Query("from")
+			tmpto := c.Query("to")
+			if tmpfrom == "" {
+				tmpfrom = "0"
 			}
-			c.String(200, usage)
+			if tmpto == "" {
+				tmpto = fmt.Sprintf("%d", time.Now().Unix())
+			}
+			from, errFrom := strconv.Atoi(tmpfrom)
+			to, errTo := strconv.Atoi(tmpto)
+			if errFrom != nil || errTo != nil {
+				c.JSON(500, gin.H{
+					"error": "Invalid from or to",
+				})
+			}
+
+			c.Writer.WriteHeader(200)
+			c.Writer.WriteString(diskCsvHeader)
+			db.ReadRange("disk", from, to, func(in []DiskUsage) {
+				for {
+					if len(in) == 0 {
+						break
+					}
+					c.Writer.WriteString(fmt.Sprintf("%s,%s,%s,%d,%d,%s\n", in[0].Time, in[0].Disk, in[0].MountPoint, in[0].Total, in[0].Free, in[0].Usage))
+					in = in[1:]
+				}
+			})
 		})
 	}
 
