@@ -6,10 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
-	"strconv"
-	"strings"
-	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -81,11 +77,12 @@ func getOneContainer(containerID string, csv bool) (string, error) {
 	return string(jsonData), nil
 
 }
-func getOneContainerMetrics(containerID string, csv bool) (string, error) {
+
+func getContainerMetrics(containerID string, csv bool) (*ContainerMetrics, error) {
 	ctx := context.Background()
 	apiClient, err := client.NewClientWithOpts()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	apiClient.NegotiateAPIVersion(ctx)
 	defer apiClient.Close()
@@ -98,11 +95,11 @@ func getOneContainerMetrics(containerID string, csv bool) (string, error) {
 	}
 	container, err := apiClient.ContainerInspect(ctx, containerID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	stats, err := apiClient.ContainerStats(ctx, container.ID, false)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	var v types.StatsJSON
 	dec := json.NewDecoder(stats.Body)
@@ -129,6 +126,17 @@ func getOneContainerMetrics(containerID string, csv bool) (string, error) {
 		MemoryAvailable:       v.MemoryStats.Limit,
 		NetworkUsage:          metrics.NetworkUsage,
 	}
+
+	return &metrics, nil
+}
+
+func getOneContainerMetrics(containerID string, csv bool) (string, error) {
+
+	metrics, err := getContainerMetrics(containerID, csv)
+	if err != nil {
+		return "", err
+	}
+
 	jsonData, err := json.MarshalIndent(metrics, "", "    ")
 	if err != nil {
 		return "", err
@@ -139,67 +147,6 @@ func getOneContainerMetrics(containerID string, csv bool) (string, error) {
 	return string(jsonData), nil
 }
 
-func getHistoryContainerUsage(from string, to string, containerId string) (string, error) {
-	fileName := "container-" + containerId + ".csv"
-	containerFile := metricsDir + "/" + fileName
-	if from == "" && to == "" {
-		// return everything
-		file, err := os.ReadFile(containerFile)
-		if err != nil {
-			fmt.Println("Failed to read file:", err)
-			return "", err
-		}
-		return string(file), nil
-	}
-	if from == "" {
-		from = "1970-01-01T00:00:00Z"
-	}
-	if to == "" {
-		to = time.Now().UTC().Format(time.RFC3339)
-	}
-	fromTime, err := time.Parse(time.RFC3339, from)
-	if err != nil {
-		fmt.Println("Failed to parse from time:", err)
-		return "", err
-	}
-	toTime, err := time.Parse(time.RFC3339, to)
-	if err != nil {
-		fmt.Println("Failed to parse to time:", err)
-		return "", err
-	}
-
-	fromTimeUnix := fromTime.UnixMilli()
-	toTimeUnix := toTime.UnixMilli()
-	file, err := os.ReadFile(containerFile)
-	if err != nil {
-		fmt.Println("Failed to read file:", err)
-		return "", err
-	}
-	lines := string(file)
-	var result string
-	lines = lines[strings.Index(lines, "\n")+1:]
-	for _, line := range strings.Split(lines, "\n") {
-		if line == "" {
-			continue
-		}
-		parts := strings.Split(line, ",")
-		if len(parts) != 4 {
-			fmt.Println("Invalid line:", line)
-			continue
-		}
-		time, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			fmt.Println("Failed to parse time:", err)
-			continue
-		}
-		if time >= fromTimeUnix && time <= toTimeUnix {
-			result += line + "\n"
-		}
-	}
-	result = containerMetricsCsvHeader + result
-	return result, nil
-
-}
 func getAllContainers() (string, error) {
 	ctx := context.Background()
 	apiClient, err := client.NewClientWithOpts()

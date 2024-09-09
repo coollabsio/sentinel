@@ -193,17 +193,20 @@ func main() {
 		})
 
 		authorized.GET("/container/:containerId/metrics/history", func(c *gin.Context) {
-			from := c.Query("from")
-			to := c.Query("to")
-			usage, err := getHistoryContainerUsage(from, to, c.Param("containerId"))
+			from, to, err := ParseFromTo(c.Query("from"), c.Query("to"))
 			if err != nil {
 				c.JSON(500, gin.H{
-					"error": err.Error(),
+					"error": "Invalid from or to",
 				})
-				return
 			}
-			c.String(200, usage)
+
+			c.Writer.WriteHeader(200)
+			c.Writer.WriteString(containerMetricsCsvHeader)
+			db.ReadRange("container-"+c.Param("containerId"), from, to, func(in ContainerMetrics) {
+				c.Writer.WriteString(fmt.Sprintf("%v,%v,%v,%v\n", in.Time, in.CPUUsagePercentage, in.MemoryUsed, in.MemoryUsagePercentage))
+			})
 		})
+
 		authorized.GET("/cpu", func(c *gin.Context) {
 			usage, err := getCpuUsage(false)
 			if err != nil {
@@ -302,17 +305,8 @@ func main() {
 
 		})
 		authorized.GET("/disk/history", func(c *gin.Context) {
-			tmpfrom := c.Query("from")
-			tmpto := c.Query("to")
-			if tmpfrom == "" {
-				tmpfrom = "0"
-			}
-			if tmpto == "" {
-				tmpto = fmt.Sprintf("%d", time.Now().Unix())
-			}
-			from, errFrom := strconv.Atoi(tmpfrom)
-			to, errTo := strconv.Atoi(tmpto)
-			if errFrom != nil || errTo != nil {
+			from, to, err := ParseFromTo(c.Query("from"), c.Query("to"))
+			if err != nil {
 				c.JSON(500, gin.H{
 					"error": "Invalid from or to",
 				})
