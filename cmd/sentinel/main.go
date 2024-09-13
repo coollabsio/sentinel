@@ -14,11 +14,7 @@ import (
 )
 
 var version string = "0.0.14"
-var logsDir string = "/app/logs"
-var metricsDir string = "/app/metrics"
-var cpuMetricsFile string = metricsDir + "/cpu.csv"
-var memoryMetricsFile string = metricsDir + "/memory.csv"
-var diskMetricsFile string = metricsDir + "/disk.csv"
+var databaseDir string = "/app/database"
 
 // Arguments
 var token string
@@ -43,46 +39,13 @@ func Token() gin.HandlerFunc {
 func main() {
 
 	if gin.Mode() == gin.DebugMode {
-		logsDir = "./logs"
-		metricsDir = "./metrics"
-		cpuMetricsFile = metricsDir + "/cpu.csv"
-		memoryMetricsFile = metricsDir + "/memory.csv"
-		diskMetricsFile = metricsDir + "/disk.csv"
-	}
-	db.Init("./")
-	if err := os.MkdirAll(logsDir, 0700); err != nil {
-		log.Fatalf("Error creating logs directory: %v", err)
-	}
-	if err := os.MkdirAll(metricsDir, 0700); err != nil {
-		log.Fatalf("Error creating metrics directory: %v", err)
-	}
-	if _, err := os.Stat(cpuMetricsFile); os.IsNotExist(err) {
-		err := os.WriteFile(cpuMetricsFile, []byte(cpuCsvHeader), 0644)
-		if err != nil {
-			fmt.Printf("Error writing file: %s", err)
-			return
-		}
-	}
-	if _, err := os.Stat(memoryMetricsFile); os.IsNotExist(err) {
-		err := os.WriteFile(memoryMetricsFile, []byte(memoryCsvHeader), 0644)
-		if err != nil {
-			fmt.Printf("Error writing file: %s", err)
-			return
-		}
-	}
-	if _, err := os.Stat(diskMetricsFile); os.IsNotExist(err) {
-		err := os.WriteFile(diskMetricsFile, []byte(diskCsvHeader), 0644)
-		if err != nil {
-			fmt.Printf("Error writing file: %s", err)
-			return
-		}
+		databaseDir = "./database"
 	}
 
-	// go func() {
-	// 	if err := streamLogsToFile(); err != nil {
-	// 		log.Fatalf("Error listening to events: %v", err)
-	// 	}
-	// }()
+	MustCreateFolderIfNotExists(databaseDir)
+
+	db.Init(databaseDir)
+
 	flag.StringVar(&token, "token", "", "Token to access the API. Default is empty, which means no token is required.")
 	flag.IntVar(&refreshRateSeconds, "refresh", refreshRateSeconds, "Refresh rate in seconds. Default is 5 seconds")
 	flag.IntVar(&metricsHistoryInDays, "metrics-history", metricsHistoryInDays, "Metrics history in days. Default is 30 days")
@@ -125,10 +88,6 @@ func main() {
 	r.GET("/api/version", func(c *gin.Context) {
 		c.String(200, version)
 	})
-
-	// go WorkerCpuUsage(refreshRateSeconds)
-	// go WorkerMemoryUsage(refreshRateSeconds)
-	// go WorkerDiskUsage(refreshRateSeconds)
 
 	r.Use(gin.Recovery())
 

@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"strconv"
 	"time"
 )
@@ -32,4 +34,15 @@ func ParseFromTo(tmpfrom, tmpto string) (int, int, error) {
 		return 0, 0, fmt.Errorf("invalid from or to")
 	}
 	return from, to, nil
+}
+
+func MustCreateFolderIfNotExists(folderPath string) error {
+	if _, err := os.Stat(folderPath); os.IsNotExist(err) {
+		err := os.Mkdir(folderPath, 0755)
+		if err != nil {
+			log.Fatalf("Error writing file: %s", err)
+			return err
+		}
+	}
+	return nil
 }
