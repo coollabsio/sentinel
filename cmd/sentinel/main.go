@@ -21,6 +21,7 @@ var token string
 var refreshRateSeconds int = 5
 var metricsHistoryInDays int = 30
 var startScheduler bool = false
+var serverPort string = ":8888"
 
 func Token() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -51,6 +52,10 @@ func main() {
 	flag.IntVar(&metricsHistoryInDays, "metrics-history", metricsHistoryInDays, "Metrics history in days. Default is 30 days")
 	flag.BoolVar(&startScheduler, "scheduler", false, "Start scheduler that collects metrics / data. Default is false.")
 	flag.Parse()
+
+	if os.Getenv("PORT") != "" {
+		serverPort = os.Getenv("PORT")
+	}
 
 	if os.Getenv("TOKEN") != "" {
 		tokenFromEnv := os.Getenv("TOKEN")
@@ -286,6 +291,6 @@ func main() {
 	}
 
 	fmt.Println("Starting API...")
-	r.Run("0.0.0.0:8888")
+	r.Run(serverPort)
 
 }
