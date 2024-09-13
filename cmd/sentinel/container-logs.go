@@ -52,12 +52,12 @@ func attachContainer(cont types.Container, ctx context.Context, apiClient *clien
 				name = fmt.Sprintf("%s-pr-%s", name, cont.Labels["coolify.pullRequestId"])
 			}
 		}
-		logFileName := fmt.Sprintf("%s/%s.txt", logsDir, name)
-		streamLogs(ctx, apiClient, cont, logFileName)
+		// logFileName := fmt.Sprintf("%s/%s.txt", logsDir, name)
+		streamLogs(ctx, apiClient, cont)
 	}(cont)
 }
 
-func streamLogs(ctx context.Context, apiClient *client.Client, cont types.Container, logFileName string) {
+func streamLogs(ctx context.Context, apiClient *client.Client, cont types.Container) {
 	out, err := apiClient.ContainerLogs(ctx, cont.ID, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
@@ -71,17 +71,17 @@ func streamLogs(ctx context.Context, apiClient *client.Client, cont types.Contai
 	}
 	defer out.Close()
 
-	logFile, err := os.OpenFile(logFileName, os.O_WRONLY|os.O_CREATE, 0666)
-	if err != nil {
-		fmt.Printf("Error opening log file %s: %s\n", logFileName, err)
-		return
-	}
-	defer logFile.Close()
+	// logFile, err := os.OpenFile(logFileName, os.O_WRONLY|os.O_CREATE, 0666)
+	// if err != nil {
+	// 	fmt.Printf("Error opening log file %s: %s\n", logFileName, err)
+	// 	return
+	// }
+	// defer logFile.Close()
 
 	seenLines := make(map[string]bool)
 	re := regexp.MustCompile(`\x1b\[[0-9;]*m`)
-	stdOutWriter := newRemovingWriter(logFile, seenLines, re)
-	stdErrWriter := newRemovingWriter(logFile, seenLines, re)
+	stdOutWriter := newRemovingWriter(os.Stdout, seenLines, re)
+	stdErrWriter := newRemovingWriter(os.Stderr, seenLines, re)
 
 	if _, err := stdcopy.StdCopy(stdOutWriter, stdErrWriter, out); err != nil {
 		fmt.Printf("Error saving logs for container %s: %s\n", cont.ID, err)
