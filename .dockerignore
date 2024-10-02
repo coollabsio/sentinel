@@ -1,2 +1,3 @@
-logs
-metrics
+tmp
+output
+db/*

@@ -1,16 +1,22 @@
-FROM golang:1.22-alpine3.19 AS build
+FROM golang:1.23 AS deps
 
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
-ENV CGO_ENABLED=0
-ENV GOOS=linux
-ENV GOARCH=amd64
-RUN go build -o /app/bin/sentinel ./cmd/sentinel
 
-FROM alpine:3.19
-RUN apk add --no-cache ca-certificates curl
+FROM golang:1.23 AS build
+
+WORKDIR /app
+COPY --from=deps /go/pkg/mod /go/pkg/mod
+COPY . .
+RUN apt-get update && apt-get install -y gcc g++
+ENV CGO_ENABLED=1 \
+    GOOS=linux \
+    GOARCH=amd64
+
+RUN go build -ldflags="-s -w" -o /app/bin/sentinel ./
+
+FROM gcr.io/distroless/cc-debian11
 ENV GIN_MODE=release
 COPY --from=build /app/bin/sentinel /app/sentinel
 CMD ["/app/sentinel"]
