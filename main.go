@@ -22,7 +22,7 @@ var pushUrl string
 var db *sql.DB
 var token string
 var endpoint string
-var metricsFile string = "db/metrics.duckdb"
+var metricsFile string = "./db/metrics.duckdb"
 var collectorEnabled bool = false
 var collectorRetentionPeriodDays int = 7
 
