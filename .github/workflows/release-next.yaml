@@ -29,7 +29,7 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}-next
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next
   aarch64:
     runs-on: [ self-hosted, arm64 ]
     permissions:
@@ -50,7 +50,7 @@ jobs:
           file: Dockerfile.arm64
           platforms: linux/aarch64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}-next-aarch64
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next-aarch64
   merge-manifest:
     runs-on: ubuntu-latest
     permissions:
