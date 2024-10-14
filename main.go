@@ -22,7 +22,7 @@ var pushUrl string
 var db *sql.DB
 var token string
 var endpoint string
-var metricsFile string = "./db/metrics.duckdb"
+var metricsFile string = "/app/db/metrics.duckdb"
 var collectorEnabled bool = false
 var collectorRetentionPeriodDays int = 7
 
@@ -46,6 +46,9 @@ func Token() gin.HandlerFunc {
 }
 
 func main() {
+	if gin.Mode() == gin.DebugMode {
+		metricsFile = "./db/metrics.duckdb"
+	}
 	tokenFromEnv := os.Getenv("TOKEN")
 	if tokenFromEnv == "" {
 		log.Fatal("TOKEN environment variable is required")
