@@ -53,18 +53,21 @@ func main() {
 	token = tokenFromEnv
 
 	endpointFromEnv := os.Getenv("ENDPOINT")
-	if endpointFromEnv == "" {
-		if gin.Mode() == gin.DebugMode {
+	if gin.Mode() == gin.DebugMode {
+		if endpointFromEnv == "" {
 			endpoint = "http://localhost:8000"
-		} else {
-			log.Fatal("ENDPOINT environment variable is required")
-		}
-	} else {
-		// Validate that the endpoint is a valid HTTPS URL
-		if !strings.HasPrefix(endpointFromEnv, "https://") {
-			log.Fatal("ENDPOINT must be a valid HTTPS URL")
 		}
 		endpoint = endpointFromEnv
+	} else {
+		if endpointFromEnv == "" {
+			log.Fatal("ENDPOINT environment variable is required")
+		} else {
+			// Validate that the endpoint is a valid HTTPS URL
+			if !strings.HasPrefix(endpointFromEnv, "https://") {
+				log.Fatal("ENDPOINT must be a valid HTTPS URL")
+			}
+			endpoint = endpointFromEnv
+		}
 	}
 	pushUrl = endpoint + pushPath
 
