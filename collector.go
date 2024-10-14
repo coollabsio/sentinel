@@ -9,12 +9,12 @@ import (
 )
 
 func collector() {
-	fmt.Printf("Starting metrics recorder with refresh rate of %d seconds\n", refreshRateSeconds)
+	fmt.Printf("[%s] Starting metrics recorder with refresh rate of %d seconds and retention period of %d days.\n", time.Now().Format("2006-01-02 15:04:05"), refreshRateSeconds, collectorRetentionPeriodDays)
 
 	go func() {
 		for {
 			time.Sleep(time.Duration(refreshRateSeconds) * time.Second)
-			fmt.Printf("[%s] Recording metrics\n", time.Now().Format("2006-01-02 15:04:05"))
+			fmt.Printf("[%s] Recording metrics data.\n", time.Now().Format("2006-01-02 15:04:05"))
 
 			queryTimeInUnixString := getUnixTimeInMilliUTC()
 			overallPercentage, err := cpu.Percent(0, false)
@@ -54,7 +54,7 @@ func collector() {
 }
 
 func cleanup() {
-	fmt.Printf("[%s] Removing old data\n", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Printf("[%s] Removing old data.\n", time.Now().Format("2006-01-02 15:04:05"))
 
 	cutoffTime := time.Now().AddDate(0, 0, -collectorRetentionPeriodDays).UnixMilli()
 
