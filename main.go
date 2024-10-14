@@ -15,7 +15,7 @@ import (
 var refreshRateSeconds int = 5
 
 var pushEnabled bool = true
-var pushIntervalSeconds int = 60
+var pushIntervalSeconds int = 10
 var pushPath string = "/api/v1/sentinel/push"
 var pushUrl string
 
@@ -161,7 +161,7 @@ func main() {
 		setupCpuRoutes(r)
 		setupContainerRoutes(r)
 		setupMemoryRoutes(r)
-		// setupPush()
+		setupPush()
 	} else {
 		setupPush()
 	}
