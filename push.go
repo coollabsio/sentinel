@@ -19,8 +19,6 @@ import (
 func setupPushRoute(r *gin.Engine) {
 	r.POST("/api/push", func(c *gin.Context) {
 		incomingToken := c.GetHeader("Authorization")
-		fmt.Printf("incoming token: [%s]\n", incomingToken)
-		fmt.Printf("expected token: [%s]\n", "Bearer "+token)
 		if incomingToken != "Bearer "+token {
 			c.JSON(401, gin.H{"error": "Unauthorized"})
 			return
