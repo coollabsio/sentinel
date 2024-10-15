@@ -1,12 +1,11 @@
 package main
 
 import (
-	"context"
-	"log"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
 )
 
@@ -21,44 +20,182 @@ type Container struct {
 }
 
 func setupContainerRoutes(r *gin.Engine) {
-	r.GET("/api/containers", func(c *gin.Context) {
-		ctx := context.Background()
-		apiClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-		if err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
-			return
-		}
-		apiClient.NegotiateAPIVersion(ctx)
-		defer apiClient.Close()
+	// r.GET("/api/containers", func(c *gin.Context) {
+	// 	ctx := context.Background()
+	// 	apiClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	// 	if err != nil {
+	// 		c.JSON(500, gin.H{"error": err.Error()})
+	// 		return
+	// 	}
+	// 	apiClient.NegotiateAPIVersion(ctx)
+	// 	defer apiClient.Close()
 
-		containers, err := apiClient.ContainerList(ctx, container.ListOptions{All: true})
+	// 	containers, err := apiClient.ContainerList(ctx, container.ListOptions{All: true})
+	// 	if err != nil {
+	// 		c.JSON(500, gin.H{"error": err.Error()})
+	// 		return
+	// 	}
+	// 	var containersData []Container
+	// 	for _, container := range containers {
+	// 		inspectData, err := apiClient.ContainerInspect(ctx, container.ID)
+	// 		if err != nil {
+	// 			log.Fatalf("Error inspecting container %s: %s", container.ID, err)
+	// 			c.JSON(500, gin.H{"error": err.Error()})
+	// 			return
+	// 		}
+	// 		healthStatus := "unhealthy"
+	// 		if inspectData.State.Health != nil {
+	// 			healthStatus = inspectData.State.Health.Status
+	// 		}
+
+	// 		containersData = append(containersData, Container{
+	// 			Time:         time.Now().Format("2006-01-02T15:04:05Z"),
+	// 			ID:           container.ID,
+	// 			Image:        container.Image,
+	// 			Labels:       container.Labels,
+	// 			Name:         container.Names[0][1:],
+	// 			State:        container.State,
+	// 			HealthStatus: healthStatus,
+	// 		})
+	// 	}
+	// 	c.JSON(200, containersData)
+	// })
+	r.GET("/api/container/:containerId/cpu/history", func(c *gin.Context) {
+		containerID := strings.ReplaceAll(c.Param("containerId"), "/", "")
+		containerID = regexp.MustCompile(`[^a-zA-Z0-9]+`).ReplaceAllString(containerID, "")
+		from := c.Query("from")
+		if from == "" {
+			from = "1970-01-01T00:00:01Z"
+		}
+		to := c.Query("to")
+		if to == "" {
+			to = time.Now().UTC().Format("2006-01-02T15:04:05Z")
+		}
+
+		// Validate date format
+		layout := "2006-01-02T15:04:05Z"
+		if from != "" {
+			if _, err := time.Parse(layout, from); err != nil {
+				c.JSON(400, gin.H{"error": "Invalid 'from' date format. Use YYYY-MM-DDTHH:MM:SSZ"})
+				return
+			}
+		}
+		if to != "" {
+			if _, err := time.Parse(layout, to); err != nil {
+				c.JSON(400, gin.H{"error": "Invalid 'to' date format. Use YYYY-MM-DDTHH:MM:SSZ"})
+				return
+			}
+		}
+
+		var params []interface{}
+		query := "SELECT time, container_id, percent FROM container_cpu_usage WHERE container_id = ?"
+		params = append(params, containerID)
+		if from != "" {
+			fromTime, _ := time.Parse(layout, from)
+			query += " AND CAST(time AS BIGINT) >= ?"
+			params = append(params, fromTime.UnixMilli())
+		}
+		if to != "" {
+			toTime, _ := time.Parse(layout, to)
+			if from != "" {
+				query += " AND"
+			} else {
+				query += " WHERE"
+			}
+			query += " CAST(time AS BIGINT) <= ?"
+			params = append(params, toTime.UnixMilli())
+		}
+		query += " ORDER BY CAST(time AS BIGINT) ASC"
+		rows, err := db.Query(query, params...)
 		if err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
-		var containersData []Container
-		for _, container := range containers {
-			inspectData, err := apiClient.ContainerInspect(ctx, container.ID)
-			if err != nil {
-				log.Fatalf("Error inspecting container %s: %s", container.ID, err)
+		defer rows.Close()
+
+		usages := []CpuUsage{}
+		for rows.Next() {
+			var usage CpuUsage
+			var containerID string
+			if err := rows.Scan(&usage.Time, &containerID, &usage.Percent); err != nil {
 				c.JSON(500, gin.H{"error": err.Error()})
 				return
 			}
-			healthStatus := "unhealthy"
-			if inspectData.State.Health != nil {
-				healthStatus = inspectData.State.Health.Status
+			timeInt, _ := strconv.ParseInt(usage.Time, 10, 64)
+			if gin.Mode() == gin.DebugMode {
+				usage.HumanFriendlyTime = time.UnixMilli(timeInt).Format(layout)
 			}
-
-			containersData = append(containersData, Container{
-				Time:         time.Now().Format("2006-01-02T15:04:05Z"),
-				ID:           container.ID,
-				Image:        container.Image,
-				Labels:       container.Labels,
-				Name:         container.Names[0][1:],
-				State:        container.State,
-				HealthStatus: healthStatus,
-			})
+			usages = append(usages, usage)
 		}
-		c.JSON(200, containersData)
+		c.JSON(200, usages)
+	})
+	r.GET("/api/container/:containerId/memory/history", func(c *gin.Context) {
+		containerID := strings.ReplaceAll(c.Param("containerId"), "/", "")
+		containerID = regexp.MustCompile(`[^a-zA-Z0-9]+`).ReplaceAllString(containerID, "")
+		from := c.Query("from")
+		if from == "" {
+			from = "1970-01-01T00:00:01Z"
+		}
+		to := c.Query("to")
+		if to == "" {
+			to = time.Now().UTC().Format("2006-01-02T15:04:05Z")
+		}
+
+		// Validate date format
+		layout := "2006-01-02T15:04:05Z"
+		if from != "" {
+			if _, err := time.Parse(layout, from); err != nil {
+				c.JSON(400, gin.H{"error": "Invalid 'from' date format. Use YYYY-MM-DDTHH:MM:SSZ"})
+				return
+			}
+		}
+		if to != "" {
+			if _, err := time.Parse(layout, to); err != nil {
+				c.JSON(400, gin.H{"error": "Invalid 'to' date format. Use YYYY-MM-DDTHH:MM:SSZ"})
+				return
+			}
+		}
+
+		var params []interface{}
+		query := "SELECT time, container_id, total, available, used, usedPercent, free FROM container_memory_usage WHERE container_id = ?"
+		params = append(params, containerID)
+		if from != "" {
+			fromTime, _ := time.Parse(layout, from)
+			query += " AND CAST(time AS BIGINT) >= ?"
+			params = append(params, fromTime.UnixMilli())
+		}
+		if to != "" {
+			toTime, _ := time.Parse(layout, to)
+			if from != "" {
+				query += " AND"
+			} else {
+				query += " WHERE"
+			}
+			query += " CAST(time AS BIGINT) <= ?"
+			params = append(params, toTime.UnixMilli())
+		}
+		query += " ORDER BY CAST(time AS BIGINT) ASC"
+		rows, err := db.Query(query, params...)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+
+		usages := []MemUsage{}
+		for rows.Next() {
+			var usage MemUsage
+			var containerID string
+			if err := rows.Scan(&usage.Time, &containerID, &usage.Total, &usage.Available, &usage.Used, &usage.UsedPercent, &usage.Free); err != nil {
+				c.JSON(500, gin.H{"error": err.Error()})
+				return
+			}
+			timeInt, _ := strconv.ParseInt(usage.Time, 10, 64)
+			if gin.Mode() == gin.DebugMode {
+				usage.HumanFriendlyTime = time.UnixMilli(timeInt).Format(layout)
+			}
+			usages = append(usages, usage)
+		}
+		c.JSON(200, usages)
 	})
 }

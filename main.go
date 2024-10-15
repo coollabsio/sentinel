@@ -157,9 +157,29 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Container CPU
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS container_cpu_usage (time VARCHAR, container_id VARCHAR, percent VARCHAR)`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Create an index on the container_cpu_usage table for better query performance
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_container_cpu_usage_time_container_id ON container_cpu_usage (container_id,time)`)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// Memory
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS memory_usage (time VARCHAR, total VARCHAR, available VARCHAR, used VARCHAR, usedPercent VARCHAR, free VARCHAR)`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Container Memory
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS container_memory_usage (time VARCHAR, container_id VARCHAR, total VARCHAR, available VARCHAR, used VARCHAR, usedPercent VARCHAR, free VARCHAR)`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Create an index on the container_memory_usage table for better query performance
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_container_memory_usage_time_container_id ON container_memory_usage (time, container_id)`)
 	if err != nil {
 		log.Fatal(err)
 	}
