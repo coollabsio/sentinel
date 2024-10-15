@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"math"
 	"strconv"
 	"time"
@@ -51,7 +50,6 @@ func setupMemoryRoutes(r *gin.Engine) {
 
 		// Validate date format
 		layout := "2006-01-02T15:04:05Z"
-		fmt.Println(from, to)
 		if from != "" {
 			if _, err := time.Parse(layout, from); err != nil {
 				c.JSON(400, gin.H{"error": "Invalid 'from' date format. Use YYYY-MM-DDTHH:MM:SSZ"})

@@ -91,7 +91,6 @@ func cleanup() {
 
 	cutoffTime := time.Now().AddDate(0, 0, -collectorRetentionPeriodDays).UnixMilli()
 
-	fmt.Println(cutoffTime)
 	_, err := db.Exec(`DELETE FROM cpu_usage WHERE CAST(time AS BIGINT) < ?`, cutoffTime)
 	if err != nil {
 		log.Printf("Error removing old data: %v", err)
