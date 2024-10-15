@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"log"
+	"net"
+	"net/http"
 	"net/http/pprof"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -28,6 +30,16 @@ var endpoint string
 var metricsFile string = "/app/db/metrics.sqlite"
 var collectorEnabled bool = false
 var collectorRetentionPeriodDays int = 7
+
+// HTTP client with connection pooling
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	},
+	Timeout: 10 * time.Second,
+}
 
 func Token() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -276,14 +288,17 @@ func main() {
 	r.Run(":8888")
 }
 
-func buildCurlCommand(url string) *exec.Cmd {
-	unixSocket := "/var/run/docker.sock"
-	baseUrl := "http://localhost"
-	baseCurl := []string{
-		"curl",
-		"-s",
-		"--unix-socket", unixSocket,
-		"-H", "Content-Type: application/json",
+func makeDockerRequest(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", "http://localhost"+url, nil)
+	if err != nil {
+		return nil, err
 	}
-	return exec.Command(baseCurl[0], append(baseCurl[1:], baseUrl+url)...)
+	req.Header.Set("Content-Type", "application/json")
+
+	// Use Unix socket transport
+	httpClient.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return net.Dial("unix", "/var/run/docker.sock")
+	}
+
+	return httpClient.Do(req)
 }

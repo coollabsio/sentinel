@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"sync"
@@ -40,7 +41,6 @@ func collector() {
 
 					queryTimeInUnixString := getUnixTimeInMilliUTC()
 
-					// fmt.Printf("[%s] Collecting metrics\n", queryTimeInUnixString)
 					// CPU usage
 					overallPercentage, err := cpu.Percent(0, false)
 					if err != nil {
@@ -90,9 +90,6 @@ func collector() {
 						}
 					}
 
-					// checkpoint()
-					// vacuum()
-
 					cleanupTable("cpu_usage")
 					cleanupTable("memory_usage")
 					cleanupTable("container_cpu_usage")
@@ -106,12 +103,17 @@ func collector() {
 
 func collectContainerMetrics(queryTimeInUnixString string) {
 	// Container usage
-	// Use curl with Unix socket to interact with Docker API (the sdk has memory leaks in json decoding + uses a lot of memory)
-	// Get list of containers
-	containersCmd := buildCurlCommand("/containers/json?all=true")
-	containersOutput, err := containersCmd.CombinedOutput()
+	// Use makeDockerRequest to interact with Docker API
+	resp, err := makeDockerRequest("/containers/json?all=true")
 	if err != nil {
 		log.Printf("Error getting containers: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	containersOutput, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading containers response: %v", err)
 		return
 	}
 
@@ -139,10 +141,16 @@ func collectContainerMetrics(queryTimeInUnixString string) {
 				containerNameFromLabel = container.Names[0][1:]
 			}
 
-			statsCmd := buildCurlCommand(fmt.Sprintf("/containers/%s/stats?stream=false", container.ID))
-			statsOutput, err := statsCmd.CombinedOutput()
+			resp, err := makeDockerRequest(fmt.Sprintf("/containers/%s/stats?stream=false", container.ID))
 			if err != nil {
 				errChannel <- fmt.Errorf("Error getting container stats for %s: %v", containerNameFromLabel, err)
+				return
+			}
+			defer resp.Body.Close()
+
+			statsOutput, err := io.ReadAll(resp.Body)
+			if err != nil {
+				errChannel <- fmt.Errorf("Error reading container stats for %s: %v", containerNameFromLabel, err)
 				return
 			}
 
@@ -224,6 +232,7 @@ func calculateMemoryPercent(stat types.StatsJSON) float64 {
 	availableMemory := float64(stat.MemoryStats.Limit)
 	return (usedMemory / availableMemory) * 100.0
 }
+
 func calculateMemoryUsed(stat types.StatsJSON) uint64 {
 	return (stat.MemoryStats.Usage) / 1024 / 1024
 }

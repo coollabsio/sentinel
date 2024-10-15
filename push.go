@@ -14,15 +14,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-var httpClient = &http.Client{
-	Timeout: time.Second * 10,
-	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     90 * time.Second,
-	},
-}
-
 func setupPushRoute(r *gin.Engine) {
 	r.POST("/api/push", func(c *gin.Context) {
 		incomingToken := c.GetHeader("Authorization")
@@ -101,10 +92,16 @@ func getPushData() (map[string]interface{}, error) {
 }
 
 func containerData() ([]Container, error) {
-	containersCmd := buildCurlCommand("/containers/json?all=true")
-	containersOutput, err := containersCmd.CombinedOutput()
+	resp, err := makeDockerRequest("/containers/json?all=true")
 	if err != nil {
 		log.Printf("Error getting containers: %v", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	containersOutput, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading containers response: %v", err)
 		return nil, err
 	}
 
@@ -116,10 +113,16 @@ func containerData() ([]Container, error) {
 
 	var containersData []Container
 	for _, container := range containers {
-		inspectCmd := buildCurlCommand(fmt.Sprintf("/containers/%s/json", container.ID))
-		inspectOutput, err := inspectCmd.CombinedOutput()
+		resp, err := makeDockerRequest(fmt.Sprintf("/containers/%s/json", container.ID))
 		if err != nil {
-			log.Printf("Error inspecting container %s: %s", container.ID, err)
+			log.Printf("Error inspecting container %s: %v", container.ID, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		inspectOutput, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("Error reading inspect response for container %s: %v", container.ID, err)
 			continue
 		}
 
