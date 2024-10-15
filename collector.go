@@ -1,17 +1,13 @@
 package main
 
 import (
-	"context"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
 	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/mem"
 )
@@ -57,7 +53,7 @@ func collector() {
 						log.Printf("Error inserting CPU usage into database: %v", err)
 					}
 
-					// collectContainerMetrics(queryTimeInUnixString)
+					collectContainerMetrics(queryTimeInUnixString)
 
 					// Memory usage
 					memory, err := mem.VirtualMemory()
@@ -110,17 +106,23 @@ func collector() {
 
 func collectContainerMetrics(queryTimeInUnixString string) {
 	// Container usage
-	ctx := context.Background()
-	apiClient, err := client.NewClientWithOpts()
-	if err != nil {
-		return
-	}
-	apiClient.NegotiateAPIVersion(ctx)
-	defer apiClient.Close()
-
-	containers, err := apiClient.ContainerList(ctx, container.ListOptions{All: true})
+	// Use curl with Unix socket to interact with Docker API (the sdk has memory leaks in json decoding + uses a lot of memory)
+	// Get list of containers
+	containersCmd := buildCurlCommand("/containers/json?all=true")
+	containersOutput, err := containersCmd.CombinedOutput()
 	if err != nil {
 		log.Printf("Error getting containers: %v", err)
+		return
+	}
+
+	if len(containersOutput) == 0 {
+		log.Println("No containers found or empty response")
+		return
+	}
+
+	var containers []types.Container
+	if err := JSON.Unmarshal(containersOutput, &containers); err != nil {
+		log.Printf("Error unmarshalling container list: %v", err)
 		return
 	}
 
@@ -137,19 +139,16 @@ func collectContainerMetrics(queryTimeInUnixString string) {
 				containerNameFromLabel = container.Names[0][1:]
 			}
 
-			stats, err := apiClient.ContainerStats(ctx, container.ID, false)
+			statsCmd := buildCurlCommand(fmt.Sprintf("/containers/%s/stats?stream=false", container.ID))
+			statsOutput, err := statsCmd.CombinedOutput()
 			if err != nil {
 				errChannel <- fmt.Errorf("Error getting container stats for %s: %v", containerNameFromLabel, err)
 				return
 			}
-			defer stats.Body.Close()
 
 			var v types.StatsJSON
-			dec := JSON.NewDecoder(stats.Body)
-			if err := dec.Decode(&v); err != nil {
-				if err != io.EOF {
-					errChannel <- fmt.Errorf("Error decoding container stats for %s: %v", containerNameFromLabel, err)
-				}
+			if err := JSON.Unmarshal(statsOutput, &v); err != nil {
+				errChannel <- fmt.Errorf("Error decoding container stats for %s: %v", containerNameFromLabel, err)
 				return
 			}
 
@@ -189,6 +188,7 @@ func collectContainerMetrics(queryTimeInUnixString string) {
 		}
 	}
 }
+
 func cleanup() {
 	fmt.Printf("[%s] Removing old data.\n", time.Now().Format("2006-01-02 15:04:05"))
 

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http/pprof"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -273,4 +274,16 @@ func main() {
 	}
 	cleanup()
 	r.Run(":8888")
+}
+
+func buildCurlCommand(url string) *exec.Cmd {
+	unixSocket := "/var/run/docker.sock"
+	baseUrl := "http://localhost"
+	baseCurl := []string{
+		"curl",
+		"-s",
+		"--unix-socket", unixSocket,
+		"-H", "Content-Type: application/json",
+	}
+	return exec.Command(baseCurl[0], append(baseCurl[1:], baseUrl+url)...)
 }

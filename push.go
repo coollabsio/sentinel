@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"log"
@@ -11,8 +10,7 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
+	"github.com/docker/docker/api/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -103,27 +101,34 @@ func getPushData() (map[string]interface{}, error) {
 }
 
 func containerData() ([]Container, error) {
-	ctx := context.Background()
-	apiClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	containersCmd := buildCurlCommand("/containers/json?all=true")
+	containersOutput, err := containersCmd.CombinedOutput()
 	if err != nil {
-		log.Printf("Error getting container data: %v", err)
+		log.Printf("Error getting containers: %v", err)
 		return nil, err
 	}
-	apiClient.NegotiateAPIVersion(ctx)
-	defer apiClient.Close()
 
-	containers, err := apiClient.ContainerList(ctx, container.ListOptions{All: true})
-	if err != nil {
-		log.Printf("Error getting container data: %v", err)
+	var containers []types.Container
+	if err := JSON.Unmarshal(containersOutput, &containers); err != nil {
+		log.Printf("Error unmarshalling container list: %v", err)
 		return nil, err
 	}
+
 	var containersData []Container
 	for _, container := range containers {
-		inspectData, err := apiClient.ContainerInspect(ctx, container.ID)
+		inspectCmd := buildCurlCommand(fmt.Sprintf("/containers/%s/json", container.ID))
+		inspectOutput, err := inspectCmd.CombinedOutput()
 		if err != nil {
 			log.Printf("Error inspecting container %s: %s", container.ID, err)
-			return nil, err
+			continue
 		}
+
+		var inspectData types.ContainerJSON
+		if err := JSON.Unmarshal(inspectOutput, &inspectData); err != nil {
+			log.Printf("Error unmarshalling inspect data for container %s: %v", container.ID, err)
+			continue
+		}
+
 		healthStatus := "unhealthy"
 		if inspectData.State.Health != nil {
 			healthStatus = inspectData.State.Health.Status
