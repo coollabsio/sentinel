@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	jsoniter "github.com/json-iterator/go"
 	_ "github.com/marcboeker/go-duckdb"
 )
 
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
 var debug bool = false
 var refreshRateSeconds int = 5
 

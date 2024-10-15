@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +15,15 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
 )
+
+var httpClient = &http.Client{
+	Timeout: time.Second * 10,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 func setupPushRoute(r *gin.Engine) {
 	r.POST("/api/push", func(c *gin.Context) {
@@ -80,17 +88,16 @@ func getPushData() (map[string]interface{}, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Printf("Error pushing to [%s]: %v", pushUrl, err)
 		return nil, err
-	} else {
-		if resp.StatusCode != 200 {
-			body, _ := io.ReadAll(resp.Body)
-			log.Printf("Error pushing to [%s]: status code %d, response: %s", pushUrl, resp.StatusCode, string(body))
-		}
-		resp.Body.Close()
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("Error pushing to [%s]: status code %d, response: %s", pushUrl, resp.StatusCode, string(body))
 	}
 	return data, nil
 }
