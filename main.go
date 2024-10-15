@@ -10,11 +10,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	jsoniter "github.com/json-iterator/go"
-	_ "github.com/marcboeker/go-duckdb"
+	_ "github.com/mattn/go-sqlite3"
 )
 
-var json = jsoniter.ConfigCompatibleWithStandardLibrary
 var debug bool = false
 var refreshRateSeconds int = 5
 
@@ -26,7 +24,7 @@ var pushUrl string
 var db *sql.DB
 var token string
 var endpoint string
-var metricsFile string = "/app/db/metrics.duckdb"
+var metricsFile string = "/app/db/metrics.sqlite"
 var collectorEnabled bool = false
 var collectorRetentionPeriodDays int = 7
 
@@ -52,7 +50,7 @@ func Token() gin.HandlerFunc {
 func main() {
 
 	if gin.Mode() == gin.DebugMode {
-		metricsFile = "./db/metrics.duckdb"
+		metricsFile = "./db/metrics.sqlite"
 	}
 	debugFromEnv := os.Getenv("DEBUG")
 	if debugFromEnv != "" {
@@ -148,7 +146,7 @@ func main() {
 	}
 
 	var err error
-	db, err = sql.Open("duckdb", metricsFile)
+	db, err = sql.Open("sqlite3", metricsFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -156,12 +154,21 @@ func main() {
 
 	// Create tables
 	// CPU
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS cpu_usage (time VARCHAR, percent VARCHAR)`)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS cpu_usage (
+		time VARCHAR,
+		percent VARCHAR,
+		PRIMARY KEY (time)
+	)`)
 	if err != nil {
 		log.Fatal(err)
 	}
 	// Container CPU
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS container_cpu_usage (time VARCHAR, container_id VARCHAR, percent VARCHAR)`)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS container_cpu_usage (
+		time VARCHAR,
+		container_id VARCHAR,
+		percent VARCHAR,
+		PRIMARY KEY (time, container_id)
+	)`)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -172,12 +179,29 @@ func main() {
 	}
 
 	// Memory
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS memory_usage (time VARCHAR, total VARCHAR, available VARCHAR, used VARCHAR, usedPercent VARCHAR, free VARCHAR)`)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS memory_usage (
+		time VARCHAR,
+		total VARCHAR,
+		available VARCHAR,
+		used VARCHAR,
+		usedPercent VARCHAR,
+		free VARCHAR,
+		PRIMARY KEY (time)
+	)`)
 	if err != nil {
 		log.Fatal(err)
 	}
 	// Container Memory
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS container_memory_usage (time VARCHAR, container_id VARCHAR, total VARCHAR, available VARCHAR, used VARCHAR, usedPercent VARCHAR, free VARCHAR)`)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS container_memory_usage (
+		time VARCHAR,
+		container_id VARCHAR,
+		total VARCHAR,
+		available VARCHAR,
+		used VARCHAR,
+		usedPercent VARCHAR,
+		free VARCHAR,
+		PRIMARY KEY (time, container_id)
+	)`)
 	if err != nil {
 		log.Fatal(err)
 	}

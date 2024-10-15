@@ -19,5 +19,6 @@ RUN go build -o /app/bin/sentinel ./
 FROM debian:bullseye-slim
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 ENV GIN_MODE=release
+COPY --from=build /app/ /app
 COPY --from=build /app/bin/sentinel /app/sentinel
 CMD ["/app/sentinel"]

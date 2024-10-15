@@ -76,7 +76,7 @@ func getPushData() (map[string]interface{}, error) {
 	data := map[string]interface{}{
 		"containers": containersData,
 	}
-	jsonData, err := json.Marshal(data)
+	jsonData, err := JSON.Marshal(data)
 	if err != nil {
 		log.Printf("Error marshalling data: %v", err)
 		return nil, err
