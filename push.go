@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -83,7 +84,12 @@ func getPushData() (map[string]interface{}, error) {
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("Error pushing to [%s]: %v", pushUrl, err)
+		return nil, err
 	} else {
+		if resp.StatusCode != 200 {
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("Error pushing to [%s]: status code %d, response: %s", pushUrl, resp.StatusCode, string(body))
+		}
 		resp.Body.Close()
 	}
 	return data, nil

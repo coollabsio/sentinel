@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/marcboeker/go-duckdb"
@@ -17,7 +16,7 @@ var debug bool = false
 var refreshRateSeconds int = 5
 
 var pushEnabled bool = true
-var pushIntervalSeconds int = 10
+var pushIntervalSeconds int = 60
 var pushPath string = "/api/v1/sentinel/push"
 var pushUrl string
 
@@ -71,25 +70,33 @@ func main() {
 	}
 	token = tokenFromEnv
 
-	endpointFromEnv := os.Getenv("ENDPOINT")
+	endpointFromEnv := os.Getenv("PUSH_ENDPOINT")
 	if gin.Mode() == gin.DebugMode {
 		if endpointFromEnv == "" {
 			endpoint = "http://localhost:8000"
+		} else {
+			endpoint = endpointFromEnv
 		}
-		endpoint = endpointFromEnv
 	} else {
 		if endpointFromEnv == "" {
-			log.Fatal("ENDPOINT environment variable is required")
+			log.Fatal("PUSH_ENDPOINT environment variable is required")
 		} else {
-			// Validate that the endpoint is a valid HTTPS URL
-			if !strings.HasPrefix(endpointFromEnv, "https://") {
-				log.Fatal("ENDPOINT must be a valid HTTPS URL")
-			}
 			endpoint = endpointFromEnv
 		}
 	}
 	pushUrl = endpoint + pushPath
 
+	if os.Getenv("PUSH_INTERVAL_SECONDS") != "" {
+		pushIntervalSecondsFromEnv := os.Getenv("PUSH_INTERVAL_SECONDS")
+		if pushIntervalSecondsFromEnv != "" {
+			pushIntervalSecondsInt, err := strconv.Atoi(pushIntervalSecondsFromEnv)
+			if err != nil {
+				log.Printf("Error converting PUSH_INTERVAL_SECONDS to int: %v", err)
+			} else {
+				pushIntervalSeconds = pushIntervalSecondsInt
+			}
+		}
+	}
 	if os.Getenv("COLLECTOR_ENABLED") != "" {
 		collectorEnabledFromEnv := os.Getenv("COLLECTOR_ENABLED")
 		if collectorEnabledFromEnv != "" {
@@ -182,6 +189,9 @@ func main() {
 		setupMemoryRoutes(r)
 		setupPush()
 	} else {
+		setupCpuRoutes(r)
+		setupContainerRoutes(r)
+		setupMemoryRoutes(r)
 		setupPush()
 	}
 	if debug {
