@@ -14,65 +14,71 @@ func collector() {
 	fmt.Printf("[%s] Starting metrics recorder with refresh rate of %d seconds and retention period of %d days.\n", time.Now().Format("2006-01-02 15:04:05"), refreshRateSeconds, collectorRetentionPeriodDays)
 
 	go func() {
+		ticker := time.NewTicker(time.Duration(refreshRateSeconds) * time.Second)
+		defer ticker.Stop()
+
 		for {
-			time.Sleep(time.Duration(refreshRateSeconds) * time.Second)
-			// fmt.Printf("[%s] Recording metrics data.\n", time.Now().Format("2006-01-02 15:04:05"))
+			select {
+			case <-ticker.C:
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("Recovered from panic in collector: %v", r)
+						}
+					}()
 
-			queryTimeInUnixString := getUnixTimeInMilliUTC()
-			overallPercentage, err := cpu.Percent(0, false)
-			if err != nil {
-				log.Printf("Error getting CPU percentage: %v", err)
-				continue
-			}
+					queryTimeInUnixString := getUnixTimeInMilliUTC()
 
-			_, err = db.Exec(`INSERT INTO cpu_usage (time, percent) VALUES (?, ?)`, queryTimeInUnixString, fmt.Sprintf("%.2f", overallPercentage[0]))
-			if err != nil {
-				log.Printf("Error inserting into database: %v", err)
-			}
+					// CPU usage
+					overallPercentage, err := cpu.Percent(0, false)
+					if err != nil {
+						log.Printf("Error getting CPU percentage: %v", err)
+						return
+					}
 
-			memory, err := mem.VirtualMemory()
-			if err != nil {
-				log.Printf("Error getting memory usage: %v", err)
-				continue
-			}
+					_, err = db.Exec(`INSERT INTO cpu_usage (time, percent) VALUES (?, ?)`, queryTimeInUnixString, fmt.Sprintf("%.2f", overallPercentage[0]))
+					if err != nil {
+						log.Printf("Error inserting CPU usage into database: %v", err)
+					}
 
-			_, err = db.Exec(`INSERT INTO memory_usage (time, total, available, used, usedPercent, free) VALUES (?, ?, ?, ?, ?, ?)`, queryTimeInUnixString, memory.Total, memory.Available, memory.Used, math.Round(memory.UsedPercent*100)/100, memory.Free)
-			if err != nil {
-				log.Printf("Error inserting into database: %v", err)
-			}
+					// Memory usage
+					memory, err := mem.VirtualMemory()
+					if err != nil {
+						log.Printf("Error getting memory usage: %v", err)
+						return
+					}
 
-			totalRowsToKeep := 10
-			currentTime := time.Now().UTC().UnixMilli()
-			cutoffTime := currentTime - int64(collectorRetentionPeriodDays*24*60*60*1000)
+					_, err = db.Exec(`INSERT INTO memory_usage (time, total, available, used, usedPercent, free) VALUES (?, ?, ?, ?, ?, ?)`,
+						queryTimeInUnixString, memory.Total, memory.Available, memory.Used, math.Round(memory.UsedPercent*100)/100, memory.Free)
+					if err != nil {
+						log.Printf("Error inserting memory usage into database: %v", err)
+					}
 
-			// Count the total number of rows
-			var totalRows int
-			err = db.QueryRow("SELECT COUNT(*) FROM cpu_usage").Scan(&totalRows)
-			if err != nil {
-				log.Printf("Error counting rows: %v", err)
-				continue
-			}
+					// Cleanup old data
+					totalRowsToKeep := 10
+					currentTime := time.Now().UTC().UnixMilli()
+					cutoffTime := currentTime - int64(collectorRetentionPeriodDays*24*60*60*1000)
 
-			if totalRows > totalRowsToKeep {
-				// Delete old data while keeping at least 10 rows
-				_, err = db.Exec(`DELETE FROM cpu_usage WHERE CAST(time AS BIGINT) < ? AND time NOT IN (SELECT time FROM cpu_usage ORDER BY time DESC LIMIT ?)`, cutoffTime, totalRowsToKeep)
-				if err != nil {
-					log.Printf("Error deleting old data: %v", err)
-				}
-			}
+					cleanupTable := func(tableName string) {
+						var totalRows int
+						err := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&totalRows)
+						if err != nil {
+							log.Printf("Error counting rows in %s: %v", tableName, err)
+							return
+						}
 
-			err = db.QueryRow("SELECT COUNT(*) FROM memory_usage").Scan(&totalRows)
-			if err != nil {
-				log.Printf("Error counting rows: %v", err)
-				continue
-			}
+						if totalRows > totalRowsToKeep {
+							_, err = db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE CAST(time AS BIGINT) < ? AND time NOT IN (SELECT time FROM %s ORDER BY time DESC LIMIT ?)`, tableName, tableName),
+								cutoffTime, totalRowsToKeep)
+							if err != nil {
+								log.Printf("Error deleting old data from %s: %v", tableName, err)
+							}
+						}
+					}
 
-			if totalRows > totalRowsToKeep {
-				// Delete old data while keeping at least 10 rows
-				_, err = db.Exec(`DELETE FROM memory_usage WHERE CAST(time AS BIGINT) < ? AND time NOT IN (SELECT time FROM memory_usage ORDER BY time DESC LIMIT ?)`, cutoffTime, totalRowsToKeep)
-				if err != nil {
-					log.Printf("Error deleting old data: %v", err)
-				}
+					cleanupTable("cpu_usage")
+					cleanupTable("memory_usage")
+				}()
 			}
 		}
 	}()

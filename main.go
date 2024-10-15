@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/marcboeker/go-duckdb"
@@ -59,9 +60,7 @@ func main() {
 		}
 	}
 	if debug {
-		log.Printf("Debug is enabled")
-	} else {
-		log.Printf("Debug is disabled")
+		log.Printf("[%s] Debug is enabled.", time.Now().Format("2006-01-02 15:04:05"))
 	}
 
 	tokenFromEnv := os.Getenv("TOKEN")
