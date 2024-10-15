@@ -78,6 +78,8 @@ func collector() {
 
 					cleanupTable("cpu_usage")
 					cleanupTable("memory_usage")
+					checkpoint()
+					vacuum()
 				}()
 			}
 		}
