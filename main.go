@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"log"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	_ "github.com/marcboeker/go-duckdb"
 )
 
+var debug bool = false
 var refreshRateSeconds int = 5
 
 var pushEnabled bool = true
@@ -49,6 +51,20 @@ func main() {
 	if gin.Mode() == gin.DebugMode {
 		metricsFile = "./db/metrics.duckdb"
 	}
+	debugFromEnv := os.Getenv("DEBUG")
+	if debugFromEnv != "" {
+		var err error
+		debug, err = strconv.ParseBool(debugFromEnv)
+		if err != nil {
+			log.Printf("Error parsing DEBUG: %v", err)
+		}
+	}
+	if debug {
+		log.Printf("Debug is enabled")
+	} else {
+		log.Printf("Debug is disabled")
+	}
+
 	tokenFromEnv := os.Getenv("TOKEN")
 	if tokenFromEnv == "" {
 		log.Fatal("TOKEN environment variable is required")
@@ -167,6 +183,32 @@ func main() {
 		setupPush()
 	} else {
 		setupPush()
+	}
+	if debug {
+		r.GET("/debug/pprof", func(c *gin.Context) {
+			pprof.Index(c.Writer, c.Request)
+		})
+		r.GET("/debug/cmdline", func(c *gin.Context) {
+			pprof.Cmdline(c.Writer, c.Request)
+		})
+		r.GET("/debug/profile", func(c *gin.Context) {
+			pprof.Profile(c.Writer, c.Request)
+		})
+		r.GET("/debug/symbol", func(c *gin.Context) {
+			pprof.Symbol(c.Writer, c.Request)
+		})
+		r.GET("/debug/trace", func(c *gin.Context) {
+			pprof.Trace(c.Writer, c.Request)
+		})
+		r.GET("/debug/heap", func(c *gin.Context) {
+			pprof.Handler("heap").ServeHTTP(c.Writer, c.Request)
+		})
+		r.GET("/debug/goroutine", func(c *gin.Context) {
+			pprof.Handler("goroutine").ServeHTTP(c.Writer, c.Request)
+		})
+		r.GET("/debug/block", func(c *gin.Context) {
+			pprof.Handler("block").ServeHTTP(c.Writer, c.Request)
+		})
 	}
 
 	// Collector
