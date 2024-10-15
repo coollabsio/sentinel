@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,11 @@ import (
 	"github.com/shirou/gopsutil/mem"
 )
 
+var (
+	stmtInsertCPU    *sql.Stmt
+	stmtInsertMemory *sql.Stmt
+)
+
 type ContainerMetrics struct {
 	Name                  string  `json:"name"`
 	Time                  string  `json:"time"`
@@ -25,9 +31,33 @@ type ContainerMetrics struct {
 	MemoryAvailable       uint64  `json:"available_memory"`
 }
 
+func prepareStatements() error {
+	var err error
+	stmtInsertCPU, err = db.Prepare(`INSERT INTO container_cpu_usage (time, container_id, percent) VALUES (?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("error preparing CPU insert statement: %v", err)
+	}
+	stmtInsertMemory, err = db.Prepare(`INSERT INTO container_memory_usage (time, container_id, total, available, used, usedPercent, free) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("error preparing memory insert statement: %v", err)
+	}
+	return nil
+}
+
 func collector() {
 	fmt.Printf("[%s] Starting metrics recorder with refresh rate of %d seconds and retention period of %d days.\n", time.Now().Format("2006-01-02 15:04:05"), refreshRateSeconds, collectorRetentionPeriodDays)
 
+	if err := prepareStatements(); err != nil {
+		log.Fatalf("Failed to prepare statements: %v", err)
+	}
+	defer func() {
+		if stmtInsertCPU != nil {
+			stmtInsertCPU.Close()
+		}
+		if stmtInsertMemory != nil {
+			stmtInsertMemory.Close()
+		}
+	}()
 	go func() {
 		ticker := time.NewTicker(time.Duration(refreshRateSeconds) * time.Second)
 		defer ticker.Stop()
@@ -123,14 +153,12 @@ func collector() {
 					}
 
 					for metrics := range metricsChannel {
-						_, err = db.Exec(`INSERT INTO container_cpu_usage (time, container_id, percent) VALUES (?, ?, ?)`,
-							queryTimeInUnixString, metrics.Name, fmt.Sprintf("%.2f", metrics.CPUUsagePercentage))
+						_, err = stmtInsertCPU.Exec(queryTimeInUnixString, metrics.Name, fmt.Sprintf("%.2f", metrics.CPUUsagePercentage))
 						if err != nil {
 							log.Printf("Error inserting container CPU usage into database: %v", err)
 						}
 
-						_, err = db.Exec(`INSERT INTO container_memory_usage (time, container_id, total, available, used, usedPercent, free) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-							queryTimeInUnixString, metrics.Name, metrics.MemoryAvailable, metrics.MemoryAvailable, metrics.MemoryUsed, metrics.MemoryUsagePercentage, metrics.MemoryAvailable-metrics.MemoryUsed)
+						_, err = stmtInsertMemory.Exec(queryTimeInUnixString, metrics.Name, metrics.MemoryAvailable, metrics.MemoryAvailable, metrics.MemoryUsed, metrics.MemoryUsagePercentage, metrics.MemoryAvailable-metrics.MemoryUsed)
 						if err != nil {
 							log.Printf("Error inserting container memory usage into database: %v", err)
 						}
