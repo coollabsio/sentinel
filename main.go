@@ -48,6 +48,7 @@ func Token() gin.HandlerFunc {
 }
 
 func main() {
+
 	if gin.Mode() == gin.DebugMode {
 		metricsFile = "./db/metrics.duckdb"
 	}

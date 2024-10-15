@@ -59,7 +59,7 @@ func setupPush() {
 }
 
 func getPushData() (map[string]interface{}, error) {
-	fmt.Printf("pushing to [%s]\n", pushUrl)
+	fmt.Printf("[%s] Pushing to [%s]\n", time.Now().Format("2006-01-02 15:04:05"), pushUrl)
 	containersData, err := containerData()
 	if err != nil {
 		log.Printf("Error getting containers data: %v", err)

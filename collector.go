@@ -45,7 +45,7 @@ func collector() {
 
 					queryTimeInUnixString := getUnixTimeInMilliUTC()
 
-					fmt.Printf("[%s] Collecting metrics\n", queryTimeInUnixString)
+					// fmt.Printf("[%s] Collecting metrics\n", queryTimeInUnixString)
 					// CPU usage
 					overallPercentage, err := cpu.Percent(0, false)
 					if err != nil {
@@ -80,7 +80,6 @@ func collector() {
 						wg.Add(1)
 						go func(container types.Container) {
 							defer wg.Done()
-							fmt.Printf("Collecting metrics for container %s\n", container.ID)
 							containerNameFromLabel := container.Labels["coolify.name"]
 							if containerNameFromLabel == "" {
 								containerNameFromLabel = container.Names[0][1:]
