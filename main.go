@@ -321,10 +321,19 @@ func main() {
 		Handler: r.Handler(),
 	}
 	group.Go(func() error {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		errorChan := make(chan error, 1)
+		go func() {
+			defer close(errorChan)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errorChan <- err
+			}
+		}()
+		select {
+		case <-gCtx.Done():
+			return nil // context cancelled
+		case err := <-errorChan:
 			return err
 		}
-		return nil
 	})
 	if err := group.Wait(); err != nil {
 		switch err.Error() {
