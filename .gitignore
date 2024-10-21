@@ -1,2 +1,4 @@
-logs
-metrics
+tmp
+output
+db/*
+.env
