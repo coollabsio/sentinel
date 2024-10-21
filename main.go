@@ -3,17 +3,21 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/sync/errgroup"
 )
 
 var debug bool = false
@@ -58,6 +62,25 @@ func Token() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func HandleSignals(ctx context.Context) error {
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGTERM, os.Interrupt)
+
+	select {
+	case s := <-signalChan:
+		switch s {
+		case syscall.SIGTERM:
+			return errors.New("received SIGTERM")
+		case os.Interrupt: // cross-platform SIGINT
+			return errors.New("received interrupt")
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	return nil
 }
 
 func main() {
@@ -246,12 +269,10 @@ func main() {
 		setupCpuRoutes(r)
 		setupContainerRoutes(r)
 		setupMemoryRoutes(r)
-		setupPush()
 	} else {
 		setupCpuRoutes(r)
 		setupContainerRoutes(r)
 		setupMemoryRoutes(r)
-		setupPush()
 	}
 	if debug {
 		r.GET("/debug/pprof", func(c *gin.Context) {
@@ -279,13 +300,60 @@ func main() {
 			pprof.Handler("block").ServeHTTP(c.Writer, c.Request)
 		})
 	}
-
+	group, gCtx := errgroup.WithContext(context.Background())
+	group.Go(func() error {
+		return HandleSignals(gCtx)
+	})
+	group.Go(func() error {
+		setupPush(gCtx)
+		return nil
+	})
 	// Collector
 	if collectorEnabled {
-		collector()
+		group.Go(func() error {
+			collector(gCtx)
+			return nil
+		})
 	}
 	cleanup()
-	r.Run(":8888")
+	srv := &http.Server{
+		Addr:    ":8888",
+		Handler: r.Handler(),
+	}
+	group.Go(func() error {
+		errorChan := make(chan error, 1)
+		go func() {
+			defer close(errorChan)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errorChan <- err
+			}
+		}()
+		select {
+		case <-gCtx.Done():
+			return nil // context cancelled
+		case err := <-errorChan:
+			return err
+		}
+	})
+	if err := group.Wait(); err != nil {
+		switch err.Error() {
+		case "received SIGTERM":
+			log.Println("received SIGTERM shutting down")
+		case "received interrupt":
+			log.Println("received interrupt shutting down")
+		default:
+			log.Fatal(err) // unexpected error
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal(err) // failure/timeout shutting down the server gracefully
+	}
+	select {
+	case <-ctx.Done():
+		log.Println("server shutdown")
+	}
 }
 
 func makeDockerRequest(url string) (*http.Response, error) {

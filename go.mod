@@ -8,6 +8,7 @@ require (
 	github.com/goccy/go-json v0.10.3
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/shirou/gopsutil v3.21.11+incompatible
+	golang.org/x/sync v0.8.0
 )
 
 require (

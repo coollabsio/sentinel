@@ -2,12 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"os"
-	"os/signal"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -30,29 +29,19 @@ func setupPushRoute(r *gin.Engine) {
 	})
 }
 
-func setupPush() {
-	go func() {
-		ticker := time.NewTicker(time.Duration(pushIntervalSeconds) * time.Second)
-		defer ticker.Stop()
+func setupPush(ctx context.Context) {
+	ticker := time.NewTicker(time.Duration(pushIntervalSeconds) * time.Second)
+	defer ticker.Stop()
 
-		done := make(chan bool)
-		go func() {
-			sigint := make(chan os.Signal, 1)
-			signal.Notify(sigint, os.Interrupt)
-			<-sigint
-			done <- true
-		}()
-
-		for {
-			select {
-			case <-done:
-				fmt.Println("Push operation stopped")
-				return
-			case <-ticker.C:
-				getPushData()
-			}
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("Push operation stopped")
+			return
+		case <-ticker.C:
+			getPushData()
 		}
-	}()
+	}
 }
 
 func getPushData() (map[string]interface{}, error) {
