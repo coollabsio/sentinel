@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	 "github.com/joho/godotenv"
 	"github.com/gin-gonic/gin"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/sync/errgroup"
@@ -84,7 +85,14 @@ func HandleSignals(ctx context.Context) error {
 }
 
 func main() {
-
+	if _, err := os.Stat(".env"); os.IsNotExist(err) {
+		log.Println("No .env file found, skipping load")
+	} else {
+		err := godotenv.Load()
+		if err != nil {
+			log.Printf("Error loading .env file: %v", err)
+		}
+	}
 	if gin.Mode() == gin.DebugMode {
 		metricsFile = "./db/metrics.sqlite"
 	}
