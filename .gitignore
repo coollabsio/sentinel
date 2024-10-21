@@ -2,4 +2,3 @@ tmp
 output
 db/*
 .env
-.env.*
