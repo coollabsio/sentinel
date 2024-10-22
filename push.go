@@ -61,7 +61,6 @@ func getPushData() (map[string]interface{}, error) {
 		"containers":            containersData,
 		"filesystem_usage_root": filesystemUsageRoot,
 	}
-	fmt.Printf("Pushing data: %v\n", data)
 	jsonData, err := JSON.Marshal(data)
 	if err != nil {
 		log.Printf("Error marshalling data: %v", err)
