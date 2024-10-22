@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"syscall"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -51,9 +52,16 @@ func getPushData() (map[string]interface{}, error) {
 		log.Printf("Error getting containers data: %v", err)
 		return nil, err
 	}
-	data := map[string]interface{}{
-		"containers": containersData,
+	filesystemUsageRoot, err := filesystemUsageRoot()
+	if err != nil {
+		log.Printf("Error getting disk usage: %v", err)
+		return nil, err
 	}
+	data := map[string]interface{}{
+		"containers":            containersData,
+		"filesystem_usage_root": filesystemUsageRoot,
+	}
+	fmt.Printf("Pushing data: %v\n", data)
 	jsonData, err := JSON.Marshal(data)
 	if err != nil {
 		log.Printf("Error marshalling data: %v", err)
@@ -78,6 +86,22 @@ func getPushData() (map[string]interface{}, error) {
 		log.Printf("Error pushing to [%s]: status code %d, response: %s", pushUrl, resp.StatusCode, string(body))
 	}
 	return data, nil
+}
+
+func filesystemUsageRoot() (map[string]interface{}, error) {
+	fs := syscall.Statfs_t{}
+	err := syscall.Statfs("/", &fs)
+	if err != nil {
+		return nil, err
+	}
+	totalSpace := fs.Blocks * uint64(fs.Bsize)
+	freeSpace := fs.Bfree * uint64(fs.Bsize)
+	usedSpace := totalSpace - freeSpace
+	usedPercentage := float64(usedSpace) / float64(totalSpace) * 100
+
+	return map[string]interface{}{
+		"used_percentage": fmt.Sprintf("%d", int(usedPercentage)),
+	}, nil
 }
 
 func containerData() ([]Container, error) {
