@@ -106,9 +106,6 @@ func main() {
 			log.Printf("Error loading .env file: %v", err)
 		}
 	}
-	if gin.Mode() == gin.DebugMode {
-		metricsFile = "./db/metrics.sqlite"
-	}
 	debugFromEnv := os.Getenv("DEBUG")
 	if debugFromEnv != "" {
 		var err error
@@ -117,8 +114,16 @@ func main() {
 			log.Printf("Error parsing DEBUG: %v", err)
 		}
 	}
+
+	debug = debug || gin.Mode() == gin.DebugMode
+	endpointFromEnv := os.Getenv("PUSH_ENDPOINT")
 	if debug {
 		log.Printf("[%s] Debug is enabled.", time.Now().Format("2006-01-02 15:04:05"))
+		metricsFile = "./db/metrics.sqlite"
+
+		if endpointFromEnv == "" {
+			endpoint = "http://localhost:8000"
+		}
 	}
 
 	tokenFromEnv := os.Getenv("TOKEN")
@@ -127,68 +132,51 @@ func main() {
 	}
 	token = tokenFromEnv
 
-	endpointFromEnv := os.Getenv("PUSH_ENDPOINT")
-	if gin.Mode() == gin.DebugMode {
-		if endpointFromEnv == "" {
-			endpoint = "http://localhost:8000"
-		} else {
-			endpoint = endpointFromEnv
-		}
-	} else {
-		if endpointFromEnv == "" {
-			log.Fatal("PUSH_ENDPOINT environment variable is required")
-		} else {
-			endpoint = endpointFromEnv
-		}
+	if endpoint == "" && endpointFromEnv == "" {
+		log.Fatal("PUSH_ENDPOINT environment variable is required")
 	}
+
+	if endpoint == "" {
+		endpoint = endpointFromEnv
+	}
+
 	pushUrl = endpoint + pushPath
 
-	if os.Getenv("PUSH_INTERVAL_SECONDS") != "" {
-		pushIntervalSecondsFromEnv := os.Getenv("PUSH_INTERVAL_SECONDS")
-		if pushIntervalSecondsFromEnv != "" {
-			pushIntervalSecondsInt, err := strconv.Atoi(pushIntervalSecondsFromEnv)
-			if err != nil {
-				log.Printf("Error converting PUSH_INTERVAL_SECONDS to int: %v", err)
-			} else {
-				pushIntervalSeconds = pushIntervalSecondsInt
-			}
+	if pushIntervalSecondsFromEnv := os.Getenv("PUSH_INTERVAL_SECONDS"); pushIntervalSecondsFromEnv != "" {
+		pushIntervalSecondsInt, err := strconv.Atoi(pushIntervalSecondsFromEnv)
+		if err != nil {
+			log.Printf("Error converting PUSH_INTERVAL_SECONDS to int: %v", err)
+		} else {
+			pushIntervalSeconds = pushIntervalSecondsInt
 		}
 	}
-	if os.Getenv("COLLECTOR_ENABLED") != "" {
-		collectorEnabledFromEnv := os.Getenv("COLLECTOR_ENABLED")
-		if collectorEnabledFromEnv != "" {
-			var err error
-			collectorEnabled, err = strconv.ParseBool(collectorEnabledFromEnv)
-			if err != nil {
-				log.Printf("Error parsing COLLECTOR_ENABLED: %v", err)
-			}
+	if collectorEnabledFromEnv := os.Getenv("COLLECTOR_ENABLED"); collectorEnabledFromEnv != "" {
+		var err error
+		collectorEnabled, err = strconv.ParseBool(collectorEnabledFromEnv)
+		if err != nil {
+			log.Printf("Error parsing COLLECTOR_ENABLED: %v", err)
 		}
 	}
-	if os.Getenv("COLLECTOR_REFRESH_RATE_SECONDS") != "" {
-		refreshRateSecondsFromEnv := os.Getenv("COLLECTOR_REFRESH_RATE_SECONDS")
-		if refreshRateSecondsFromEnv != "" {
-			refreshRateSecondsInt, err := strconv.Atoi(refreshRateSecondsFromEnv)
-			if err != nil {
-				log.Printf("Error converting REFRESH_RATE_SECONDS to int: %v", err)
+	if refreshRateSecondsFromEnv := os.Getenv("COLLECTOR_REFRESH_RATE_SECONDS"); refreshRateSecondsFromEnv != "" {
+		refreshRateSecondsInt, err := strconv.Atoi(refreshRateSecondsFromEnv)
+		if err != nil {
+			log.Printf("Error converting REFRESH_RATE_SECONDS to int: %v", err)
+		} else {
+			if refreshRateSecondsInt > 0 {
+				refreshRateSeconds = refreshRateSecondsInt
 			} else {
-				if refreshRateSecondsInt > 0 {
-					refreshRateSeconds = refreshRateSecondsInt
-				} else {
-					log.Printf("COLLECTOR_REFRESH_RATE_SECONDS must be greater than 0, using default value: %d", refreshRateSeconds)
-				}
+				log.Printf("COLLECTOR_REFRESH_RATE_SECONDS must be greater than 0, using default value: %d", refreshRateSeconds)
 			}
 		}
 	}
 
-	if os.Getenv("COLLECTOR_RETENTION_PERIOD_DAYS") != "" {
-		collectorRetentionPeriodDaysFromEnv := os.Getenv("COLLECTOR_RETENTION_PERIOD_DAYS")
-		if collectorRetentionPeriodDaysFromEnv != "" {
-			collectorRetentionPeriodDaysInt, err := strconv.Atoi(collectorRetentionPeriodDaysFromEnv)
-			if err != nil {
-				log.Printf("Error converting COLLECTOR_RETENTION_PERIOD_DAYS to int: %v", err)
-			} else {
-				collectorRetentionPeriodDays = collectorRetentionPeriodDaysInt
-			}
+	if collectorRetentionPeriodDaysFromEnv := os.Getenv("COLLECTOR_RETENTION_PERIOD_DAYS"); collectorRetentionPeriodDaysFromEnv != "" {
+		collectorRetentionPeriodDaysInt, err := strconv.Atoi(collectorRetentionPeriodDaysFromEnv)
+		if err != nil {
+			log.Printf("Error converting COLLECTOR_RETENTION_PERIOD_DAYS to int: %v", err)
+		} else {
+			collectorRetentionPeriodDays = collectorRetentionPeriodDaysInt
+
 		}
 	}
 
@@ -284,18 +272,9 @@ func main() {
 		c.String(200, "ok")
 	})
 
-	if gin.Mode() == gin.DebugMode {
+	if debug {
 		setupPushRoute(r)
 		setupDebugRoutes(r)
-		setupCpuRoutes(r)
-		setupContainerRoutes(r)
-		setupMemoryRoutes(r)
-	} else {
-		setupCpuRoutes(r)
-		setupContainerRoutes(r)
-		setupMemoryRoutes(r)
-	}
-	if debug {
 		r.GET("/debug/pprof", func(c *gin.Context) {
 			pprof.Index(c.Writer, c.Request)
 		})
@@ -321,6 +300,11 @@ func main() {
 			pprof.Handler("block").ServeHTTP(c.Writer, c.Request)
 		})
 	}
+
+	setupCpuRoutes(r)
+	setupContainerRoutes(r)
+	setupMemoryRoutes(r)
+
 	group, gCtx := errgroup.WithContext(context.Background())
 	group.Go(func() error {
 		return HandleSignals(gCtx)
