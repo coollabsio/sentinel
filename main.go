@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	 "github.com/joho/godotenv"
 	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/sync/errgroup"
 )
@@ -36,7 +36,17 @@ var metricsFile string = "/app/db/metrics.sqlite"
 var collectorEnabled bool = false
 var collectorRetentionPeriodDays int = 7
 
-// HTTP client with connection pooling
+// HTTP client (Docker) with connection pooling
+var dockerHttpClient = &http.Client{
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	},
+	Timeout: 10 * time.Second,
+}
+
+// HTTP client (other) with connection pooling
 var httpClient = &http.Client{
 	Transport: &http.Transport{
 		MaxIdleConns:        100,
@@ -266,6 +276,11 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Use Unix socket transport
+	dockerHttpClient.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return net.Dial("unix", "/var/run/docker.sock")
+	}
+
 	r := gin.Default()
 	r.GET("/api/health", func(c *gin.Context) {
 		c.String(200, "ok")
@@ -371,10 +386,5 @@ func makeDockerRequest(url string) (*http.Response, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// Use Unix socket transport
-	httpClient.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return net.Dial("unix", "/var/run/docker.sock")
-	}
-
-	return httpClient.Do(req)
+	return dockerHttpClient.Do(req)
 }
