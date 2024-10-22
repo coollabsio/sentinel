@@ -84,7 +84,7 @@ func setupContainerRoutes(r *gin.Engine) {
 				return
 			}
 			timeInt, _ := strconv.ParseInt(usage.Time, 10, 64)
-			if gin.Mode() == gin.DebugMode {
+			if debug {
 				usage.HumanFriendlyTime = time.UnixMilli(timeInt).Format(layout)
 			}
 			usages = append(usages, usage)
@@ -153,7 +153,7 @@ func setupContainerRoutes(r *gin.Engine) {
 				return
 			}
 			timeInt, _ := strconv.ParseInt(usage.Time, 10, 64)
-			if gin.Mode() == gin.DebugMode {
+			if debug {
 				usage.HumanFriendlyTime = time.UnixMilli(timeInt).Format(layout)
 			}
 			usages = append(usages, usage)
