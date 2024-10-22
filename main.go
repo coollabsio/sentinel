@@ -42,6 +42,9 @@ var dockerHttpClient = &http.Client{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
 		IdleConnTimeout:     90 * time.Second,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return net.Dial("unix", "/var/run/docker.sock")
+		},
 	},
 	Timeout: 10 * time.Second,
 }
@@ -274,11 +277,6 @@ func main() {
 	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_container_logs_time_container_id ON container_logs (time, container_id)`)
 	if err != nil {
 		log.Fatal(err)
-	}
-
-	// Use Unix socket transport
-	dockerHttpClient.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return net.Dial("unix", "/var/run/docker.sock")
 	}
 
 	r := gin.Default()
