@@ -17,7 +17,7 @@ import (
 	"github.com/coollabsio/sentinel/pkg/config"
 	"github.com/coollabsio/sentinel/pkg/db"
 	"github.com/coollabsio/sentinel/pkg/dockerClient"
-	push "github.com/coollabsio/sentinel/pkg/pusher"
+	"github.com/coollabsio/sentinel/pkg/push"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
