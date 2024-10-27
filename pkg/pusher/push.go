@@ -1,4 +1,4 @@
-package main
+package push
 
 import (
 	"bytes"
@@ -10,28 +10,36 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/gin-gonic/gin"
+	"github.com/coollabsio/sentinel/pkg/config"
+	"github.com/coollabsio/sentinel/pkg/dockerClient"
+	"github.com/coollabsio/sentinel/pkg/json"
+	"github.com/coollabsio/sentinel/pkg/types"
+	dockerTypes "github.com/docker/docker/api/types"
 )
 
-func setupPushRoute(r *gin.Engine) {
-	r.POST("/api/push", func(c *gin.Context) {
-		incomingToken := c.GetHeader("Authorization")
-		if incomingToken != "Bearer "+token {
-			c.JSON(401, gin.H{"error": "Unauthorized"})
-			return
-		}
-		data, err := getPushData()
-		if err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(200, data)
-	})
+type Pusher struct {
+	config       *config.Config
+	client       *http.Client
+	dockerClient *dockerClient.DockerClient
 }
 
-func setupPush(ctx context.Context) {
-	ticker := time.NewTicker(time.Duration(pushIntervalSeconds) * time.Second)
+func New(config *config.Config, dockerClient *dockerClient.DockerClient) *Pusher {
+	return &Pusher{
+		config: config,
+		client: &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     90 * time.Second,
+			},
+			Timeout: 10 * time.Second,
+		},
+		dockerClient: dockerClient,
+	}
+}
+
+func (p *Pusher) Run(ctx context.Context) {
+	ticker := time.NewTicker(time.Duration(p.config.PushIntervalSeconds) * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -40,14 +48,14 @@ func setupPush(ctx context.Context) {
 			fmt.Println("Push operation stopped")
 			return
 		case <-ticker.C:
-			getPushData()
+			p.GetPushData()
 		}
 	}
 }
 
-func getPushData() (map[string]interface{}, error) {
-	fmt.Printf("[%s] Pushing to [%s]\n", time.Now().Format("2006-01-02 15:04:05"), pushUrl)
-	containersData, err := containerData()
+func (p *Pusher) GetPushData() (map[string]interface{}, error) {
+	fmt.Printf("[%s] Pushing to [%s]\n", time.Now().Format("2006-01-02 15:04:05"), p.config.PushUrl)
+	containersData, err := p.containerData()
 	if err != nil {
 		log.Printf("Error getting containers data: %v", err)
 		return nil, err
@@ -61,28 +69,27 @@ func getPushData() (map[string]interface{}, error) {
 		"containers":            containersData,
 		"filesystem_usage_root": filesystemUsageRoot,
 	}
-	jsonData, err := JSON.Marshal(data)
+	jsonData, err := json.Marshal(data)
 	if err != nil {
 		log.Printf("Error marshalling data: %v", err)
 		return nil, err
 	}
-	req, err := http.NewRequest("POST", pushUrl, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequest("POST", p.config.PushUrl, bytes.NewBuffer(jsonData))
 	if err != nil {
 		log.Printf("Error creating request: %v", err)
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := httpClient.Do(req)
+	req.Header.Set("Authorization", "Bearer "+p.config.Token)
+	resp, err := p.client.Do(req)
 	if err != nil {
-		log.Printf("Error pushing to [%s]: %v", pushUrl, err)
+		log.Printf("Error pushing to [%s]: %v", p.config.PushUrl, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		log.Printf("Error pushing to [%s]: status code %d, response: %s", pushUrl, resp.StatusCode, string(body))
+		log.Printf("Error pushing to [%s]: status code %d", p.config.PushUrl, resp.StatusCode)
 	}
 	return data, nil
 }
@@ -103,8 +110,8 @@ func filesystemUsageRoot() (map[string]interface{}, error) {
 	}, nil
 }
 
-func containerData() ([]Container, error) {
-	resp, err := makeDockerRequest("/containers/json?all=true")
+func (p *Pusher) containerData() ([]types.Container, error) {
+	resp, err := p.dockerClient.MakeRequest("/containers/json?all=true")
 	if err != nil {
 		log.Printf("Error getting containers: %v", err)
 		return nil, err
@@ -117,15 +124,15 @@ func containerData() ([]Container, error) {
 		return nil, err
 	}
 
-	var containers []types.Container
-	if err := JSON.Unmarshal(containersOutput, &containers); err != nil {
+	var containers []dockerTypes.Container
+	if err := json.Unmarshal(containersOutput, &containers); err != nil {
 		log.Printf("Error unmarshalling container list: %v", err)
 		return nil, err
 	}
 
-	var containersData []Container
+	var containersData []types.Container
 	for _, container := range containers {
-		resp, err := makeDockerRequest(fmt.Sprintf("/containers/%s/json", container.ID))
+		resp, err := p.dockerClient.MakeRequest(fmt.Sprintf("/containers/%s/json", container.ID))
 		if err != nil {
 			log.Printf("Error inspecting container %s: %v", container.ID, err)
 			continue
@@ -138,8 +145,8 @@ func containerData() ([]Container, error) {
 			continue
 		}
 
-		var inspectData types.ContainerJSON
-		if err := JSON.Unmarshal(inspectOutput, &inspectData); err != nil {
+		var inspectData dockerTypes.ContainerJSON
+		if err := json.Unmarshal(inspectOutput, &inspectData); err != nil {
 			log.Printf("Error unmarshalling inspect data for container %s: %v", container.ID, err)
 			continue
 		}
@@ -149,7 +156,7 @@ func containerData() ([]Container, error) {
 			healthStatus = inspectData.State.Health.Status
 		}
 
-		containersData = append(containersData, Container{
+		containersData = append(containersData, types.Container{
 			Time:         time.Now().Format("2006-01-02T15:04:05Z"),
 			ID:           container.ID,
 			Image:        container.Image,

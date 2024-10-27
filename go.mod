@@ -1,4 +1,4 @@
-module sentinel
+module github.com/coollabsio/sentinel
 
 go 1.23.1
 

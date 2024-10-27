@@ -1,10 +1,11 @@
-package main
+package controller
 
 import (
 	"math"
 	"strconv"
 	"time"
 
+	"github.com/coollabsio/sentinel/pkg/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/shirou/gopsutil/mem"
 )
@@ -19,12 +20,12 @@ type MemUsage struct {
 	HumanFriendlyTime string  `json:"human_friendly_time,omitempty"`
 }
 
-func setupMemoryRoutes(r *gin.Engine) {
-	r.GET("/api/memory/current", func(c *gin.Context) {
-		queryTimeInUnixString := getUnixTimeInMilliUTC()
+func (c *Controller) setupMemoryRoutes() {
+	c.ginE.GET("/api/memory/current", func(ctx *gin.Context) {
+		queryTimeInUnixString := utils.GetUnixTimeInMilliUTC()
 		memory, err := mem.VirtualMemory()
 		if err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
+			ctx.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
 
@@ -36,14 +37,14 @@ func setupMemoryRoutes(r *gin.Engine) {
 			UsedPercent: math.Round(memory.UsedPercent*100) / 100,
 			Free:        memory.Free,
 		}
-		c.JSON(200, usage)
+		ctx.JSON(200, usage)
 	})
-	r.GET("/api/memory/history", func(c *gin.Context) {
-		from := c.Query("from")
+	c.ginE.GET("/api/memory/history", func(ctx *gin.Context) {
+		from := ctx.Query("from")
 		if from == "" {
 			from = "1970-01-01T00:00:00Z"
 		}
-		to := c.Query("to")
+		to := ctx.Query("to")
 		if to == "" {
 			to = time.Now().UTC().Format("2006-01-02T15:04:05Z")
 		}
@@ -52,13 +53,13 @@ func setupMemoryRoutes(r *gin.Engine) {
 		layout := "2006-01-02T15:04:05Z"
 		if from != "" {
 			if _, err := time.Parse(layout, from); err != nil {
-				c.JSON(400, gin.H{"error": "Invalid 'from' date format. Use YYYY-MM-DDTHH:MM:SSZ"})
+				ctx.JSON(400, gin.H{"error": "Invalid 'from' date format. Use YYYY-MM-DDTHH:MM:SSZ"})
 				return
 			}
 		}
 		if to != "" {
 			if _, err := time.Parse(layout, to); err != nil {
-				c.JSON(400, gin.H{"error": "Invalid 'to' date format. Use YYYY-MM-DDTHH:MM:SSZ"})
+				ctx.JSON(400, gin.H{"error": "Invalid 'to' date format. Use YYYY-MM-DDTHH:MM:SSZ"})
 				return
 			}
 		}
@@ -81,9 +82,9 @@ func setupMemoryRoutes(r *gin.Engine) {
 			params = append(params, toTime.UnixMilli())
 		}
 		query += " ORDER BY CAST(time AS BIGINT) ASC"
-		rows, err := db.Query(query, params...)
+		rows, err := c.database.Query(query, params...)
 		if err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
+			ctx.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
 		defer rows.Close()
@@ -92,15 +93,15 @@ func setupMemoryRoutes(r *gin.Engine) {
 		for rows.Next() {
 			var usage MemUsage
 			if err := rows.Scan(&usage.Time, &usage.Total, &usage.Available, &usage.Used, &usage.UsedPercent, &usage.Free); err != nil {
-				c.JSON(500, gin.H{"error": err.Error()})
+				ctx.JSON(500, gin.H{"error": err.Error()})
 				return
 			}
 			timeInt, _ := strconv.ParseInt(usage.Time, 10, 64)
-			if debug {
+			if gin.Mode() == gin.DebugMode {
 				usage.HumanFriendlyTime = time.UnixMilli(timeInt).Format(layout)
 			}
 			usages = append(usages, usage)
 		}
-		c.JSON(200, usages)
+		ctx.JSON(200, usages)
 	})
 }
