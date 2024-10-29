@@ -27,9 +27,16 @@ func (c *Controller) GetEngine() *gin.Engine {
 }
 
 func (c *Controller) SetupRoutes() {
+	c.setupHealthRoutes()
 	c.setupContainerRoutes()
 	c.setupMemoryRoutes()
 	c.setupCpuRoutes()
+}
+
+func (c *Controller) setupHealthRoutes() {
+	c.ginE.GET("/health", func(c *gin.Context) {
+		c.String(200, "ok")
+	})
 }
 
 // TODO: Implement c.setupPushRoutes()
