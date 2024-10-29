@@ -1,11 +1,12 @@
-name: Sentinel Release
+name: Sentinel Release Development
 
 on:
   release:
     types: [released]
 
 env:
-  REGISTRY: ghcr.io
+  GITHUB_REGISTRY: ghcr.io
+  DOCKER_REGISTRY: docker.io
   IMAGE_NAME: "coollabsio/sentinel"
 
 jobs:
@@ -16,27 +17,33 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - name: Login to ghcr.io
+
+      - name: Login to ${{ env.GITHUB_REGISTRY }}
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ${{ env.GITHUB_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN  }}
-      - name: Extract metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
+
+      - name: Login to ${{ env.DOCKER_REGISTRY }}
+        uses: docker/login-action@v3
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-      - name: Build and push
-        uses: docker/build-push-action@v5
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Build and Push Image
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}-amd64
+            ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}-amd64
+          labels: |
+            coolify.managed=true
   aarch64:
     runs-on: [ self-hosted, arm64 ]
     permissions:
@@ -44,27 +51,33 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - name: Login to ghcr.io
+
+      - name: Login to ${{ env.GITHUB_REGISTRY }}
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ${{ env.GITHUB_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN  }}
-      - name: Extract metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
+
+      - name: Login to ${{ env.DOCKER_REGISTRY }}
+        uses: docker/login-action@v3
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}-aarch64
-      - name: Build and push
-        uses: docker/build-push-action@v5
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Build and Push Image
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.arm64
           platforms: linux/aarch64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}-aarch64
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}-aarch64
+            ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}-aarch64
+          labels: |
+            coolify.managed=true
   merge-manifest:
     runs-on: ubuntu-latest
     permissions:
@@ -72,26 +85,33 @@ jobs:
       packages: write
     needs: [ amd64, aarch64 ]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Login to ghcr.io
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to ${{ env.GITHUB_REGISTRY }}
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ${{ env.GITHUB_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN  }}
-      - name: Extract metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
+
+      - name: Login to ${{ env.DOCKER_REGISTRY }}
+        uses: docker/login-action@v3
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-      - name: Create & publish manifest
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Create & publish manifest on ${{ env.DOCKER_REGISTRY }}
         run: |
-          docker buildx imagetools create --append ${{ fromJSON(steps.meta.outputs.json).tags[0] }}-aarch64 --tag ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
-          docker buildx imagetools create --append ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-aarch64 --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker buildx imagetools create \
+          --append ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}-aarch64 \
+          --tag ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}-amd64 \
+          --tag ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}
+
+      - name: Create & publish manifest on ${{ env.GITHUB_REGISTRY }}
+        run: |
+          docker buildx imagetools create \
+          --append ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}-aarch64 \
+          --tag ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}-amd64 \
+          --tag ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}

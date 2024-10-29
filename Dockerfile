@@ -1,24 +1,20 @@
-FROM golang:1.23-bullseye AS deps
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
-FROM golang:1.23-bullseye AS build
-
-WORKDIR /app
-COPY --from=deps /go/pkg/mod /go/pkg/mod
 COPY . .
-RUN apt-get update && apt-get install -y gcc g++
-ENV CGO_ENABLED=1 \
-    GOOS=linux \
-    GOARCH=amd64
+RUN --mount=type=cache,target=/var/cache/apk \
+    apk update && \
+    apk add gcc g++ && \
+    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o /app/sentinel ./
 
-RUN go build -o /app/bin/sentinel ./
+FROM alpine:latest
+RUN --mount=type=cache,target=/var/cache/apk \
+    apk update && \
+    apk add ca-certificates curl
 
-FROM debian:bullseye-slim
-RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 ENV GIN_MODE=release
-COPY --from=build /app/ /app
-COPY --from=build /app/bin/sentinel /app/sentinel
+COPY --from=builder /app/sentinel /app/sentinel
 CMD ["/app/sentinel"]
