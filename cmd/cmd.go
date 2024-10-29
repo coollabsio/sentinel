@@ -65,6 +65,7 @@ func Execute() error {
 		}
 	}
 
+	endpointFromEnv := os.Getenv("PUSH_ENDPOINT")
 	if gin.Mode() == gin.DebugMode {
 		config.MetricsFile = "./db/metrics.sqlite"
 
@@ -75,10 +76,6 @@ func Execute() error {
 
 	if config.Debug && gin.Mode() != gin.DebugMode {
 		gin.SetMode(gin.DebugMode)
-	}
-
-	endpointFromEnv := os.Getenv("PUSH_ENDPOINT")
-	if config.Debug {
 		log.Printf("[%s] Debug is enabled.", time.Now().Format("2006-01-02 15:04:05"))
 	}
 
