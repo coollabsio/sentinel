@@ -1,4 +1,4 @@
-name: Sentinel Release Development
+name: Sentinel Release
 
 on:
   release:
