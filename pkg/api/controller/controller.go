@@ -34,7 +34,7 @@ func (c *Controller) SetupRoutes() {
 }
 
 func (c *Controller) setupHealthRoutes() {
-	c.ginE.GET("/health", func(c *gin.Context) {
+	c.ginE.GET("/api/health", func(c *gin.Context) {
 		c.String(200, "ok")
 	})
 }
