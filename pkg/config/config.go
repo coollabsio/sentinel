@@ -1,6 +1,9 @@
 package config
 
+const Version = "0.0.14"
+
 type Config struct {
+	Version                      string
 	Debug                        bool
 	RefreshRateSeconds           int
 	PushEnabled                  bool
@@ -17,6 +20,7 @@ type Config struct {
 
 func NewDefaultConfig() *Config {
 	return &Config{
+		Version:                      Version,
 		Debug:                        false,
 		RefreshRateSeconds:           5,
 		PushEnabled:                  true,
