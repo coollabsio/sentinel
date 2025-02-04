@@ -144,6 +144,13 @@ func Execute() error {
 		return err
 	}
 
+	log.Printf("[%s] Starting database schema migration...", time.Now().Format("2006-01-02 15:04:05"))
+	if err := database.MigrateDatabase(); err != nil {
+		log.Printf("[%s] Database migration failed: %v", time.Now().Format("2006-01-02 15:04:05"), err)
+		return err
+	}
+	log.Printf("[%s] Database schema migration completed", time.Now().Format("2006-01-02 15:04:05"))
+
 	server := api.New(config, database)
 	pusherService := push.New(config, dockerHttpClient)
 	collectorService := collector.New(config, database, dockerHttpClient)
