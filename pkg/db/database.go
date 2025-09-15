@@ -33,6 +33,24 @@ func New(config *config.Config) (*Database, error) {
 		return nil, err
 	}
 
+	// Enable WAL mode for better concurrent read/write performance
+	_, err = db.Exec("PRAGMA journal_mode=WAL")
+	if err != nil {
+		return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
+	}
+
+	// Set synchronous mode to NORMAL for better performance while maintaining durability
+	_, err = db.Exec("PRAGMA synchronous=NORMAL")
+	if err != nil {
+		return nil, fmt.Errorf("failed to set synchronous mode: %w", err)
+	}
+
+	// Increase cache size for better performance (default is 2000 pages)
+	_, err = db.Exec("PRAGMA cache_size=-64000") // 64MB cache
+	if err != nil {
+		return nil, fmt.Errorf("failed to set cache size: %w", err)
+	}
+
 	return &Database{
 		db:     db,
 		config: config,
@@ -84,8 +102,14 @@ func (d *Database) Query(query string, args ...interface{}) (*sql.Rows, error) {
 	return d.db.Query(query, args...)
 }
 
+
+
 func (d *Database) QueryRow(query string, args ...interface{}) *sql.Row {
 	return d.db.QueryRow(query, args...)
+}
+
+func (d *Database) Begin() (*sql.Tx, error) {
+	return d.db.Begin()
 }
 
 func (d *Database) Vacuum() error {
