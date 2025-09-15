@@ -152,8 +152,23 @@ func (p *Pusher) containerData() ([]types.Container, error) {
 		}
 
 		healthStatus := "unhealthy"
-		if inspectData.State.Health != nil {
+		// Check if State exists and is not nil before accessing Health
+		if inspectData.State != nil && inspectData.State.Health != nil {
 			healthStatus = inspectData.State.Health.Status
+		} else if inspectData.State == nil {
+			log.Printf("Warning: Container %s has nil State (possibly corrupted/dead)", container.ID)
+			healthStatus = "unknown"
+		}
+
+		// Safe name extraction with bounds checking
+		containerName := ""
+		if len(container.Names) > 0 && len(container.Names[0]) > 1 {
+			containerName = container.Names[0][1:] // Remove leading '/'
+		} else if len(container.Names) > 0 {
+			containerName = container.Names[0]
+		} else {
+			containerName = container.ID[:12] // Use short ID as fallback
+			log.Printf("Warning: Container %s has no names, using ID as name", container.ID)
 		}
 
 		containersData = append(containersData, types.Container{
@@ -161,7 +176,7 @@ func (p *Pusher) containerData() ([]types.Container, error) {
 			ID:           container.ID,
 			Image:        container.Image,
 			Labels:       container.Labels,
-			Name:         container.Names[0][1:],
+			Name:         containerName,
 			State:        container.State,
 			HealthStatus: healthStatus,
 		})

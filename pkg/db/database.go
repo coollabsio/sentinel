@@ -57,7 +57,7 @@ func (d *Database) Run(ctx context.Context) {
 }
 
 func (d *Database) Cleanup() {
-	fmt.Printf("[%s] Removing old data.\n", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Printf("[%s] Removing old data (Retention period: %d days).\n", time.Now().Format("2006-01-02 15:04:05"), d.config.CollectorRetentionPeriodDays)
 
 	cutoffTime := time.Now().AddDate(0, 0, -d.config.CollectorRetentionPeriodDays).UnixMilli()
 
