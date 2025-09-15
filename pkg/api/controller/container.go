@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -93,6 +94,10 @@ func (c *Controller) setupContainerRoutes() {
 			to = time.Now().UTC().Format("2006-01-02T15:04:05Z")
 		}
 
+		if c.config.Debug {
+			log.Printf("[DEBUG] Container memory history request - containerID: %s, from: %s, to: %s", containerID, from, to)
+		}
+
 		// Validate date format
 		layout := "2006-01-02T15:04:05Z"
 		if from != "" {
@@ -127,6 +132,11 @@ func (c *Controller) setupContainerRoutes() {
 			params = append(params, toTime.UnixMilli())
 		}
 		query += " ORDER BY CAST(time AS BIGINT) ASC"
+
+		if c.config.Debug {
+			log.Printf("[DEBUG] Container memory query: %s with params: %v", query, params)
+		}
+
 		rows, err := c.database.Query(query, params...)
 		if err != nil {
 			ctx.JSON(500, gin.H{"error": err.Error()})
@@ -135,18 +145,34 @@ func (c *Controller) setupContainerRoutes() {
 		defer rows.Close()
 
 		usages := []MemUsage{}
+		rowCount := 0
 		for rows.Next() {
 			var usage MemUsage
 			var containerID string
-			if err := rows.Scan(&usage.Time, &containerID, &usage.Total, &usage.Available, &usage.Used, &usage.UsedPercent, &usage.Free); err != nil {
+			var totalStr, availableStr, usedStr, usedPercentStr, freeStr string
+			if err := rows.Scan(&usage.Time, &containerID, &totalStr, &availableStr, &usedStr, &usedPercentStr, &freeStr); err != nil {
+				log.Printf("[ERROR] Container scan failed: %v", err)
 				ctx.JSON(500, gin.H{"error": err.Error()})
 				return
 			}
+			rowCount++
+			if c.config.Debug {
+				log.Printf("[DEBUG] Container row %d - time: %s, id: %s, total: %s, available: %s, used: %s, usedPercent: %s, free: %s",
+					rowCount, usage.Time, containerID, totalStr, availableStr, usedStr, usedPercentStr, freeStr)
+			}
+			usage.Total, _ = strconv.ParseUint(totalStr, 10, 64)
+			usage.Available, _ = strconv.ParseUint(availableStr, 10, 64)
+			usage.Used, _ = strconv.ParseUint(usedStr, 10, 64)
+			usage.UsedPercent, _ = strconv.ParseFloat(usedPercentStr, 64)
+			usage.Free, _ = strconv.ParseUint(freeStr, 10, 64)
 			timeInt, _ := strconv.ParseInt(usage.Time, 10, 64)
 			if gin.Mode() == gin.DebugMode {
 				usage.HumanFriendlyTime = time.UnixMilli(timeInt).Format(layout)
 			}
 			usages = append(usages, usage)
+		}
+		if c.config.Debug {
+			log.Printf("[DEBUG] Returning %d container memory records", len(usages))
 		}
 		ctx.JSON(200, usages)
 	})

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"log"
 	"strconv"
 	"time"
 
@@ -33,6 +34,10 @@ func (c *Controller) setupCpuRoutes() {
 		to := ctx.Query("to")
 		if to == "" {
 			to = time.Now().UTC().Format("2006-01-02T15:04:05Z")
+		}
+
+		if c.config.Debug {
+			log.Printf("[DEBUG] CPU history request - from: %s, to: %s", from, to)
 		}
 
 		// Validate date format
@@ -68,25 +73,40 @@ func (c *Controller) setupCpuRoutes() {
 			params = append(params, toTime.UnixMilli())
 		}
 		query += " ORDER BY CAST(time AS BIGINT) ASC"
+
+		if c.config.Debug {
+			log.Printf("[DEBUG] CPU query: %s with params: %v", query, params)
+		}
+
 		rows, err := c.database.Query(query, params...)
 		if err != nil {
+			log.Printf("[ERROR] CPU query failed: %v", err)
 			ctx.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
 		defer rows.Close()
 
 		usages := []CpuUsage{}
+		rowCount := 0
 		for rows.Next() {
 			var usage CpuUsage
 			if err := rows.Scan(&usage.Time, &usage.Percent); err != nil {
+				log.Printf("[ERROR] CPU scan failed: %v", err)
 				ctx.JSON(500, gin.H{"error": err.Error()})
 				return
+			}
+			rowCount++
+			if c.config.Debug {
+				log.Printf("[DEBUG] CPU row %d - time: %s, percent: %s", rowCount, usage.Time, usage.Percent)
 			}
 			timeInt, _ := strconv.ParseInt(usage.Time, 10, 64)
 			if gin.Mode() == gin.DebugMode {
 				usage.HumanFriendlyTime = time.UnixMilli(timeInt).Format(layout)
 			}
 			usages = append(usages, usage)
+		}
+		if c.config.Debug {
+			log.Printf("[DEBUG] Returning %d CPU usage records", len(usages))
 		}
 		ctx.JSON(200, usages)
 	})

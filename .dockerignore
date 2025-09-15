@@ -1,4 +1,35 @@
+# Temporary files and build artifacts
 tmp
 output
 db/*
 .env
+*.log
+*.tmp
+*.swp
+.DS_Store
+
+# Git and version control
+.git
+.gitignore
+.github
+
+# Documentation
+*.md
+LICENSE
+docs/
+
+# Test files
+*_test.go
+testdata/
+
+# Development files
+.air.toml
+air
+.vscode/
+.idea/
+
+# Binary
+sentinel
+
+# Go build cache
+vendor/
