@@ -48,6 +48,7 @@ func HandleSignals(ctx context.Context) error {
 
 func Execute() error {
 	config := config.NewDefaultConfig()
+	log.Printf("Sentinel v%s is starting...", config.Version)
 	if _, err := os.Stat(".env"); os.IsNotExist(err) {
 		log.Println("No .env file found, skipping load")
 	} else {

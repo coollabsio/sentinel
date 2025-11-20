@@ -1,6 +1,6 @@
 package config
 
-const Version = "0.0.15"
+const Version = "0.0.17"
 
 type Config struct {
 	Version                      string
