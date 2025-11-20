@@ -19,7 +19,7 @@ COPY . .
 # Build with cache mounts and optimizations
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 GOOS=linux \
+    CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} \
     go build -ldflags="-s -w" \
     -o /app/sentinel ./
 
