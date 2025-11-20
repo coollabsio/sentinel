@@ -297,11 +297,23 @@ func calculateCPUPercent(stat dockerContainer.StatsResponse) float64 {
 }
 
 func calculateMemoryPercent(stat dockerContainer.StatsResponse) float64 {
-	usedMemory := float64(stat.MemoryStats.Usage) - float64(stat.MemoryStats.Stats["cache"])
+	// Try total_inactive_file first (cgroup v1), fall back to inactive_file (cgroup v2)
+	// This matches Docker CLI calculation behavior
+	cacheUsage := stat.MemoryStats.Stats["total_inactive_file"]
+	if cacheUsage == 0 {
+		cacheUsage = stat.MemoryStats.Stats["inactive_file"]
+	}
+	usedMemory := float64(stat.MemoryStats.Usage) - float64(cacheUsage)
 	availableMemory := float64(stat.MemoryStats.Limit)
 	return (usedMemory / availableMemory) * 100.0
 }
 
 func calculateMemoryUsed(stat dockerContainer.StatsResponse) uint64 {
-	return (stat.MemoryStats.Usage) / 1024 / 1024
+	// Try total_inactive_file first (cgroup v1), fall back to inactive_file (cgroup v2)
+	// This matches Docker CLI calculation behavior
+	cacheUsage := stat.MemoryStats.Stats["total_inactive_file"]
+	if cacheUsage == 0 {
+		cacheUsage = stat.MemoryStats.Stats["inactive_file"]
+	}
+	return (stat.MemoryStats.Usage - cacheUsage) / 1024 / 1024
 }
