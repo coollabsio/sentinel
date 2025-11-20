@@ -151,7 +151,7 @@ func (p *Pusher) containerData() ([]types.Container, error) {
 			continue
 		}
 
-		healthStatus := "unhealthy"
+		healthStatus := "unknown"
 		// Check if State exists and is not nil before accessing Health
 		if inspectData.State != nil && inspectData.State.Health != nil {
 			healthStatus = inspectData.State.Health.Status
