@@ -1,0 +1,518 @@
+openapi: 3.0.3
+info:
+  title: Sentinel API
+  description: |
+    REST API for gathering Linux server and Docker Engine metrics.
+
+    Sentinel collects system metrics (CPU, memory) and Docker container statistics,
+    storing them in SQLite and providing both current and historical data through
+    REST endpoints.
+
+    This service is designed for integration with [Coolify.io](https://coolify.io).
+  version: 0.0.17
+  contact:
+    name: Coolify
+    url: https://coolify.io
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+  - url: https://sentinel.example.com
+    description: Production server
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Core
+    description: Health check and version endpoints
+  - name: System Metrics
+    description: CPU and memory metrics for the host system
+  - name: Container Metrics
+    description: Metrics for Docker containers
+  - name: Debug
+    description: Debug and profiling endpoints (only available when DEBUG=true)
+
+paths:
+  /api/health:
+    get:
+      summary: Health check
+      description: Check if the service is running
+      tags:
+        - Core
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
+
+  /api/version:
+    get:
+      summary: Get version
+      description: Get the current version of Sentinel
+      tags:
+        - Core
+      security: []
+      responses:
+        '200':
+          description: Current version
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: 0.0.17
+
+  /api/cpu/current:
+    get:
+      summary: Get current CPU usage
+      description: Retrieve the current CPU usage percentage
+      tags:
+        - System Metrics
+      responses:
+        '200':
+          description: Current CPU usage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentCPUUsage'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/cpu/history:
+    get:
+      summary: Get CPU usage history
+      description: Retrieve historical CPU usage data with optional date range filtering
+      tags:
+        - System Metrics
+      parameters:
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Historical CPU usage data
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/HistoricalCPUUsage'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/memory/current:
+    get:
+      summary: Get current memory usage
+      description: Retrieve the current memory usage statistics
+      tags:
+        - System Metrics
+      responses:
+        '200':
+          description: Current memory usage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentMemoryUsage'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/memory/history:
+    get:
+      summary: Get memory usage history
+      description: Retrieve historical memory usage data with optional date range filtering
+      tags:
+        - System Metrics
+      parameters:
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Historical memory usage data
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/HistoricalMemoryUsage'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/container/{containerId}/cpu/history:
+    get:
+      summary: Get container CPU usage history
+      description: Retrieve CPU usage history for a specific Docker container
+      tags:
+        - Container Metrics
+      parameters:
+        - name: containerId
+          in: path
+          required: true
+          description: Docker container ID (alphanumeric characters only)
+          schema:
+            type: string
+            pattern: '^[a-zA-Z0-9]+$'
+          example: abc123def456
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Container CPU usage history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ContainerCPUUsage'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/container/{containerId}/memory/history:
+    get:
+      summary: Get container memory usage history
+      description: Retrieve memory usage history for a specific Docker container
+      tags:
+        - Container Metrics
+      parameters:
+        - name: containerId
+          in: path
+          required: true
+          description: Docker container ID (alphanumeric characters only)
+          schema:
+            type: string
+            pattern: '^[a-zA-Z0-9]+$'
+          example: abc123def456
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Container memory usage history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ContainerMemoryUsage'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/stats:
+    get:
+      summary: Get database statistics
+      description: |
+        Retrieve database storage statistics and table sizes.
+        Only available when DEBUG environment variable is set to true.
+      tags:
+        - Debug
+      responses:
+        '200':
+          description: Database statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatabaseStats'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Bearer token authentication. Set the TOKEN environment variable when
+        running Sentinel and include it in the Authorization header.
+
+  parameters:
+    FromDate:
+      name: from
+      in: query
+      description: |
+        Start date in ISO 8601 format (UTC timezone).
+        If not provided, defaults to 1970-01-01T00:00:00Z.
+      required: false
+      schema:
+        type: string
+        format: date-time
+      example: 2024-01-15T00:00:00Z
+
+    ToDate:
+      name: to
+      in: query
+      description: |
+        End date in ISO 8601 format (UTC timezone).
+        If not provided, defaults to current time.
+      required: false
+      schema:
+        type: string
+        format: date-time
+      example: 2024-01-15T23:59:59Z
+
+  schemas:
+    CurrentCPUUsage:
+      type: object
+      properties:
+        time:
+          type: string
+          description: Unix timestamp in milliseconds
+          example: "1700000000000"
+        percent:
+          type: number
+          format: float
+          description: CPU usage percentage (0-100)
+          example: 25.5
+
+    HistoricalCPUUsage:
+      type: object
+      properties:
+        time:
+          type: string
+          description: Unix timestamp in milliseconds
+          example: "1700000000000"
+        percent:
+          type: string
+          description: CPU usage percentage
+          example: "25.5"
+        human_friendly_time:
+          type: string
+          format: date-time
+          description: ISO 8601 formatted timestamp (only in debug mode)
+          example: "2024-01-15T10:00:00Z"
+
+    CurrentMemoryUsage:
+      type: object
+      properties:
+        time:
+          type: string
+          description: Unix timestamp in milliseconds
+          example: "1700000000000"
+        total:
+          type: integer
+          format: int64
+          description: Total memory in bytes
+          example: 16000000000
+        available:
+          type: integer
+          format: int64
+          description: Available memory in bytes
+          example: 8000000000
+        used:
+          type: integer
+          format: int64
+          description: Used memory in bytes
+          example: 8000000000
+        usedPercent:
+          type: number
+          format: float
+          description: Memory usage percentage (0-100)
+          example: 50.00
+        free:
+          type: integer
+          format: int64
+          description: Free memory in bytes
+          example: 8000000000
+
+    HistoricalMemoryUsage:
+      type: object
+      properties:
+        time:
+          type: string
+          description: Unix timestamp in milliseconds
+          example: "1700000000000"
+        total:
+          type: integer
+          format: int64
+          description: Total memory in bytes
+          example: 16000000000
+        available:
+          type: integer
+          format: int64
+          description: Available memory in bytes
+          example: 8000000000
+        used:
+          type: integer
+          format: int64
+          description: Used memory in bytes
+          example: 8000000000
+        usedPercent:
+          type: number
+          format: float
+          description: Memory usage percentage
+          example: 50.00
+        free:
+          type: integer
+          format: int64
+          description: Free memory in bytes
+          example: 8000000000
+        human_friendly_time:
+          type: string
+          format: date-time
+          description: ISO 8601 formatted timestamp (only in debug mode)
+          example: "2024-01-15T10:00:00Z"
+
+    ContainerCPUUsage:
+      type: object
+      properties:
+        time:
+          type: string
+          description: Unix timestamp in milliseconds
+          example: "1700000000000"
+        percent:
+          type: string
+          description: CPU usage percentage for the container
+          example: "12.5"
+        human_friendly_time:
+          type: string
+          format: date-time
+          description: ISO 8601 formatted timestamp (only in debug mode)
+          example: "2024-01-15T10:00:00Z"
+
+    ContainerMemoryUsage:
+      type: object
+      properties:
+        time:
+          type: string
+          description: Unix timestamp in milliseconds
+          example: "1700000000000"
+        total:
+          type: integer
+          format: int64
+          description: Total container memory limit in bytes
+          example: 4000000000
+        available:
+          type: integer
+          format: int64
+          description: Available memory in bytes
+          example: 2000000000
+        used:
+          type: integer
+          format: int64
+          description: Used memory in bytes
+          example: 2000000000
+        usedPercent:
+          type: number
+          format: float
+          description: Memory usage percentage
+          example: 50.00
+        free:
+          type: integer
+          format: int64
+          description: Free memory in bytes
+          example: 2000000000
+        human_friendly_time:
+          type: string
+          format: date-time
+          description: ISO 8601 formatted timestamp (only in debug mode)
+          example: "2024-01-15T10:00:00Z"
+
+    DatabaseStats:
+      type: object
+      properties:
+        row_count:
+          type: integer
+          description: Total number of rows in the database
+          example: 10000
+        storage_usage_kb:
+          type: string
+          description: Storage usage in kilobytes
+          example: "1024.50"
+        storage_usage_mb:
+          type: string
+          description: Storage usage in megabytes
+          example: "1.00"
+        memory_usage:
+          $ref: '#/components/schemas/CurrentMemoryUsage'
+        table_sizes:
+          type: array
+          items:
+            type: object
+            properties:
+              table_name:
+                type: string
+                description: Name of the database table
+                example: cpu_usage
+              size_mb:
+                type: string
+                description: Table size in megabytes
+                example: "0.50"
+              size_kb:
+                type: string
+                description: Table size in kilobytes
+                example: "512.00"
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error message
+          example: Invalid date format
+
+  responses:
+    BadRequestError:
+      description: Bad request - invalid parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Invalid date format for 'from' parameter
+
+    UnauthorizedError:
+      description: Unauthorized - missing or invalid authentication token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Unauthorized
+
+    NotFoundError:
+      description: Not found - resource does not exist
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Container not found
+
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Internal server error
