@@ -9,7 +9,7 @@ info:
     REST endpoints.
 
     This service is designed for integration with [Coolify.io](https://coolify.io).
-  version: 0.0.17
+  version: 0.0.18
   contact:
     name: Coolify
     url: https://coolify.io
@@ -66,7 +66,7 @@ paths:
             text/plain:
               schema:
                 type: string
-                example: 0.0.17
+                example: 0.0.18
 
   /api/cpu/current:
     get:
