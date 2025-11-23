@@ -14,7 +14,7 @@ import (
 	"github.com/coollabsio/sentinel/pkg/dockerClient"
 	"github.com/coollabsio/sentinel/pkg/json"
 	"github.com/coollabsio/sentinel/pkg/types"
-	dockerTypes "github.com/docker/docker/api/types"
+	dockerContainer "github.com/docker/docker/api/types/container"
 )
 
 type Pusher struct {
@@ -124,7 +124,7 @@ func (p *Pusher) containerData() ([]types.Container, error) {
 		return nil, err
 	}
 
-	var containers []dockerTypes.Container
+	var containers []dockerContainer.Summary
 	if err := json.Unmarshal(containersOutput, &containers); err != nil {
 		log.Printf("Error unmarshalling container list: %v", err)
 		return nil, err
@@ -137,6 +137,14 @@ func (p *Pusher) containerData() ([]types.Container, error) {
 			log.Printf("Error inspecting container %s: %v", container.ID, err)
 			continue
 		}
+		if resp == nil {
+			log.Printf("Error: nil response when inspecting container %s", container.ID)
+			continue
+		}
+		if resp.Body == nil {
+			log.Printf("Error: nil response body when inspecting container %s", container.ID)
+			continue
+		}
 		defer resp.Body.Close()
 
 		inspectOutput, err := io.ReadAll(resp.Body)
@@ -144,20 +152,24 @@ func (p *Pusher) containerData() ([]types.Container, error) {
 			log.Printf("Error reading inspect response for container %s: %v", container.ID, err)
 			continue
 		}
+		if len(inspectOutput) == 0 {
+			log.Printf("Warning: Empty inspect response for container %s", container.ID)
+			continue
+		}
 
-		var inspectData dockerTypes.ContainerJSON
+		var inspectData dockerContainer.InspectResponse
 		if err := json.Unmarshal(inspectOutput, &inspectData); err != nil {
 			log.Printf("Error unmarshalling inspect data for container %s: %v", container.ID, err)
 			continue
 		}
 
 		healthStatus := "unknown"
-		// Check if State exists and is not nil before accessing Health
-		if inspectData.State != nil && inspectData.State.Health != nil {
+		if inspectData.ContainerJSONBase != nil && inspectData.State != nil && inspectData.State.Health != nil {
 			healthStatus = inspectData.State.Health.Status
+		} else if inspectData.ContainerJSONBase == nil {
+			log.Printf("Warning: Container %s has nil ContainerJSONBase (possibly corrupted/dead)", container.ID)
 		} else if inspectData.State == nil {
 			log.Printf("Warning: Container %s has nil State (possibly corrupted/dead)", container.ID)
-			healthStatus = "unknown"
 		}
 
 		// Safe name extraction with bounds checking
