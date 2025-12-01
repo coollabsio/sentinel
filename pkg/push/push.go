@@ -14,7 +14,7 @@ import (
 	"github.com/coollabsio/sentinel/pkg/dockerClient"
 	"github.com/coollabsio/sentinel/pkg/json"
 	"github.com/coollabsio/sentinel/pkg/types"
-	dockerTypes "github.com/docker/docker/api/types"
+	dockerContainer "github.com/docker/docker/api/types/container"
 )
 
 type Pusher struct {
@@ -124,7 +124,7 @@ func (p *Pusher) containerData() ([]types.Container, error) {
 		return nil, err
 	}
 
-	var containers []dockerTypes.Container
+	var containers []dockerContainer.Summary
 	if err := json.Unmarshal(containersOutput, &containers); err != nil {
 		log.Printf("Error unmarshalling container list: %v", err)
 		return nil, err
@@ -132,54 +132,68 @@ func (p *Pusher) containerData() ([]types.Container, error) {
 
 	var containersData []types.Container
 	for _, container := range containers {
-		resp, err := p.dockerClient.MakeRequest(fmt.Sprintf("/containers/%s/json", container.ID))
-		if err != nil {
-			log.Printf("Error inspecting container %s: %v", container.ID, err)
-			continue
-		}
-		defer resp.Body.Close()
+		func() {
+			resp, err := p.dockerClient.MakeRequest(fmt.Sprintf("/containers/%s/json", container.ID))
+			if err != nil {
+				log.Printf("Error inspecting container %s: %v", container.ID, err)
+				return
+			}
+			if resp == nil {
+				log.Printf("Error: nil response when inspecting container %s", container.ID)
+				return
+			}
+			if resp.Body == nil {
+				log.Printf("Error: nil response body when inspecting container %s", container.ID)
+				return
+			}
+			defer resp.Body.Close()
 
-		inspectOutput, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("Error reading inspect response for container %s: %v", container.ID, err)
-			continue
-		}
+			inspectOutput, err := io.ReadAll(resp.Body)
+			if err != nil {
+				log.Printf("Error reading inspect response for container %s: %v", container.ID, err)
+				return
+			}
+			if len(inspectOutput) == 0 {
+				log.Printf("Warning: Empty inspect response for container %s", container.ID)
+				return
+			}
 
-		var inspectData dockerTypes.ContainerJSON
-		if err := json.Unmarshal(inspectOutput, &inspectData); err != nil {
-			log.Printf("Error unmarshalling inspect data for container %s: %v", container.ID, err)
-			continue
-		}
+			var inspectData dockerContainer.InspectResponse
+			if err := json.Unmarshal(inspectOutput, &inspectData); err != nil {
+				log.Printf("Error unmarshalling inspect data for container %s: %v", container.ID, err)
+				return
+			}
 
-		healthStatus := "unknown"
-		// Check if State exists and is not nil before accessing Health
-		if inspectData.State != nil && inspectData.State.Health != nil {
-			healthStatus = inspectData.State.Health.Status
-		} else if inspectData.State == nil {
-			log.Printf("Warning: Container %s has nil State (possibly corrupted/dead)", container.ID)
-			healthStatus = "unknown"
-		}
+			healthStatus := "unknown"
+			if inspectData.ContainerJSONBase != nil && inspectData.State != nil && inspectData.State.Health != nil {
+				healthStatus = inspectData.State.Health.Status
+			} else if inspectData.ContainerJSONBase == nil {
+				log.Printf("Warning: Container %s has nil ContainerJSONBase (possibly corrupted/dead)", container.ID)
+			} else if inspectData.State == nil {
+				log.Printf("Warning: Container %s has nil State (possibly corrupted/dead)", container.ID)
+			}
 
-		// Safe name extraction with bounds checking
-		containerName := ""
-		if len(container.Names) > 0 && len(container.Names[0]) > 1 {
-			containerName = container.Names[0][1:] // Remove leading '/'
-		} else if len(container.Names) > 0 {
-			containerName = container.Names[0]
-		} else {
-			containerName = container.ID[:12] // Use short ID as fallback
-			log.Printf("Warning: Container %s has no names, using ID as name", container.ID)
-		}
+			// Safe name extraction with bounds checking
+			containerName := ""
+			if len(container.Names) > 0 && len(container.Names[0]) > 1 {
+				containerName = container.Names[0][1:] // Remove leading '/'
+			} else if len(container.Names) > 0 {
+				containerName = container.Names[0]
+			} else {
+				containerName = container.ID[:12] // Use short ID as fallback
+				log.Printf("Warning: Container %s has no names, using ID as name", container.ID)
+			}
 
-		containersData = append(containersData, types.Container{
-			Time:         time.Now().Format("2006-01-02T15:04:05Z"),
-			ID:           container.ID,
-			Image:        container.Image,
-			Labels:       container.Labels,
-			Name:         containerName,
-			State:        container.State,
-			HealthStatus: healthStatus,
-		})
+			containersData = append(containersData, types.Container{
+				Time:         time.Now().Format("2006-01-02T15:04:05Z"),
+				ID:           container.ID,
+				Image:        container.Image,
+				Labels:       container.Labels,
+				Name:         containerName,
+				State:        container.State,
+				HealthStatus: healthStatus,
+			})
+		}()
 	}
 	return containersData, nil
 }
