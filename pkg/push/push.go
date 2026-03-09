@@ -116,6 +116,14 @@ func (p *Pusher) containerData() ([]types.Container, error) {
 		log.Printf("Error getting containers: %v", err)
 		return nil, err
 	}
+	if resp == nil {
+		log.Printf("Error: nil response when getting containers")
+		return nil, fmt.Errorf("nil response when getting containers")
+	}
+	if resp.Body == nil {
+		log.Printf("Error: nil response body when getting containers")
+		return nil, fmt.Errorf("nil response body when getting containers")
+	}
 	defer resp.Body.Close()
 
 	containersOutput, err := io.ReadAll(resp.Body)
@@ -180,7 +188,11 @@ func (p *Pusher) containerData() ([]types.Container, error) {
 			} else if len(container.Names) > 0 {
 				containerName = container.Names[0]
 			} else {
-				containerName = container.ID[:12] // Use short ID as fallback
+				if len(container.ID) >= 12 {
+					containerName = container.ID[:12] // Use short ID as fallback
+				} else {
+					containerName = container.ID
+				}
 				log.Printf("Warning: Container %s has no names, using ID as name", container.ID)
 			}
 
@@ -194,6 +206,9 @@ func (p *Pusher) containerData() ([]types.Container, error) {
 				HealthStatus: healthStatus,
 			})
 		}()
+	}
+	if skipped := len(containers) - len(containersData); skipped > 0 {
+		log.Printf("Warning: Skipped %d out of %d containers due to inspection errors", skipped, len(containers))
 	}
 	return containersData, nil
 }
