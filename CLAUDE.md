@@ -85,3 +85,26 @@ Optional configuration:
 
 ## Docker Integration
 The application connects to Docker daemon via Unix socket to collect container statistics. It uses a custom HTTP client with connection pooling for efficient Docker API communication.
+
+## Release Process
+
+### Version Locations (all must be updated together)
+1. `pkg/config/config.go:3` — `const Version = "X.Y.Z"`
+2. `openapi.yaml:12` — `version: X.Y.Z` (info block)
+3. `openapi.yaml:69` — `example: X.Y.Z` (version endpoint response)
+4. `API.md:74` — `X.Y.Z` (version endpoint example response)
+
+### Steps
+1. **Bump version** in all 4 locations above, then verify:
+   - `grep -r "OLD_VERSION" .` returns nothing
+   - `grep -r "NEW_VERSION" .` shows all 4 locations
+   - `go build -o sentinel .` passes
+2. **Commit & push to `next`** — triggers `release-next.yaml` workflow
+   - Builds multi-arch Docker images (amd64 + aarch64)
+   - Pushes to Docker Hub & GHCR with `next` tag
+   - Sends Discord notification (dev channel)
+3. **PR `next` → `main`** and merge
+4. **Create GitHub Release** with tag `vX.Y.Z` — triggers `release.yaml` workflow
+   - Builds multi-arch Docker images tagged with version
+   - Pushes to Docker Hub (`coollabsio/sentinel`) and GHCR
+   - Sends Discord notification (production channel)
