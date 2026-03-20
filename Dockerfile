@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.24-alpine3.20 AS builder
+FROM golang:1.24.13-alpine3.20 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache gcc musl-dev
