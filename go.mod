@@ -2,7 +2,7 @@ module github.com/coollabsio/sentinel
 
 go 1.24.0
 
-toolchain go1.24.4
+toolchain go1.24.13
 
 require (
 	github.com/docker/docker v28.4.0+incompatible

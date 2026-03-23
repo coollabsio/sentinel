@@ -1,6 +1,6 @@
 # Sentinel
 
-An experimental API for gathering Linux server / Docker Engine metrics.
+An API for gathering Linux server / Docker Engine metrics.
 
 > This will be used in [coolify.io](https://coolify.io).
 
