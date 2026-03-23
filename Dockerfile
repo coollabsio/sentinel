@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.24.13-alpine3.20 AS builder
+FROM golang:1.24.13-alpine3.22 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache gcc musl-dev
@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     -o /app/sentinel ./
 
 # Final stage
-FROM alpine:3.20
+FROM alpine:3.22
 
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates tzdata curl
