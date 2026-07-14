@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/coollabsio/sentinel/pkg/config"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Database struct {
@@ -61,7 +63,9 @@ func (d *Database) Run(ctx context.Context) {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 
-	d.Cleanup()
+	if err := d.Cleanup(); err != nil {
+		log.Printf("Error removing old data: %v", err)
+	}
 
 	for {
 		select {
@@ -69,25 +73,29 @@ func (d *Database) Run(ctx context.Context) {
 			fmt.Println("Database cleanup stopped")
 			return
 		case <-ticker.C:
-			d.Cleanup()
+			if err := d.Cleanup(); err != nil {
+				log.Printf("Error removing old data: %v", err)
+			}
 		}
 	}
 }
 
-func (d *Database) Cleanup() {
+func (d *Database) Cleanup() error {
 	fmt.Printf("[%s] Removing old data (Retention period: %d days).\n", time.Now().Format("2006-01-02 15:04:05"), d.config.CollectorRetentionPeriodDays)
 
 	cutoffTime := time.Now().AddDate(0, 0, -d.config.CollectorRetentionPeriodDays).UnixMilli()
-
-	_, err := d.db.Exec(`DELETE FROM cpu_usage WHERE CAST(time AS BIGINT) < ?`, cutoffTime)
-	if err != nil {
-		log.Printf("Error removing old data: %v", err)
+	var cleanupErrors []error
+	for _, table := range []string{"cpu_usage", "memory_usage", "container_cpu_usage", "container_memory_usage", "container_logs"} {
+		query := fmt.Sprintf(`DELETE FROM %s
+			WHERE CAST(time AS INTEGER) < ?
+			AND time NOT IN (
+				SELECT DISTINCT time FROM %s ORDER BY CAST(time AS INTEGER) DESC LIMIT 10
+			)`, table, table)
+		if _, err := d.db.Exec(query, cutoffTime); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("clean %s: %w", table, err))
+		}
 	}
-
-	_, err = d.db.Exec(`DELETE FROM memory_usage WHERE CAST(time AS BIGINT) < ?`, cutoffTime)
-	if err != nil {
-		log.Printf("Error removing old memory data: %v", err)
-	}
+	return errors.Join(cleanupErrors...)
 }
 
 func (d *Database) Close() error {
@@ -101,9 +109,6 @@ func (d *Database) Exec(query string, args ...interface{}) (sql.Result, error) {
 func (d *Database) Query(query string, args ...interface{}) (*sql.Rows, error) {
 	return d.db.Query(query, args...)
 }
-
-
-
 func (d *Database) QueryRow(query string, args ...interface{}) *sql.Row {
 	return d.db.QueryRow(query, args...)
 }
@@ -132,6 +137,10 @@ func (d *Database) CreateDefaultTables() error {
 	if err != nil {
 		return err
 	}
+	_, err = d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_cpu_usage_time_integer ON cpu_usage (CAST(time AS INTEGER))`)
+	if err != nil {
+		return err
+	}
 	// Container CPU
 	_, err = d.db.Exec(`CREATE TABLE IF NOT EXISTS container_cpu_usage (
 		time VARCHAR,
@@ -139,6 +148,10 @@ func (d *Database) CreateDefaultTables() error {
 		percent VARCHAR,
 		PRIMARY KEY (time, container_id)
 	)`)
+	if err != nil {
+		return err
+	}
+	_, err = d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_container_cpu_usage_container_time_integer ON container_cpu_usage (container_id, CAST(time AS INTEGER))`)
 	if err != nil {
 		return err
 	}
@@ -161,6 +174,10 @@ func (d *Database) CreateDefaultTables() error {
 	if err != nil {
 		return err
 	}
+	_, err = d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_memory_usage_time_integer ON memory_usage (CAST(time AS INTEGER))`)
+	if err != nil {
+		return err
+	}
 	// Container Memory
 	_, err = d.db.Exec(`CREATE TABLE IF NOT EXISTS container_memory_usage (
 		time VARCHAR,
@@ -172,6 +189,10 @@ func (d *Database) CreateDefaultTables() error {
 		free VARCHAR,
 		PRIMARY KEY (time, container_id)
 	)`)
+	if err != nil {
+		return err
+	}
+	_, err = d.db.Exec(`CREATE INDEX IF NOT EXISTS idx_container_memory_usage_container_time_integer ON container_memory_usage (container_id, CAST(time AS INTEGER))`)
 	if err != nil {
 		return err
 	}

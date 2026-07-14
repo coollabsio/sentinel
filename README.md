@@ -18,7 +18,7 @@ An API for gathering Linux server / Docker Engine metrics.
 
 ### Prerequisites
 
-- Go 1.21 or higher (for development)
+- Go 1.24 or higher (for development)
 - Docker (for container metrics)
 - Linux environment (production deployment)
 
@@ -28,10 +28,10 @@ An API for gathering Linux server / Docker Engine metrics.
 
 ```bash
 docker run -d \
-  -p 8080:8080 \
+  -p 8888:8888 \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e TOKEN=your-secret-token \
-  -e PUSH_ENDPOINT=https://your-endpoint.com/metrics \
+  -e PUSH_ENDPOINT=https://coolify.example.com \
   ghcr.io/coollabsio/sentinel:latest
 ```
 
@@ -68,24 +68,26 @@ Sentinel is configured using environment variables:
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `TOKEN` | Authentication token for API access | `your-secret-token` |
+| `PUSH_ENDPOINT` | Coolify base URL that receives Sentinel pushes | `https://coolify.example.com` |
 
 ### Optional Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PUSH_ENDPOINT` | - | URL to push metrics to |
 | `PUSH_INTERVAL_SECONDS` | 60 | Interval for pushing metrics |
-| `COLLECTOR_ENABLED` | `true` | Enable/disable metrics collection |
-| `COLLECTOR_REFRESH_RATE_SECONDS` | 10 | Metrics collection interval |
+| `COLLECTOR_ENABLED` | `false` | Enable/disable metrics collection |
+| `COLLECTOR_REFRESH_RATE_SECONDS` | 5 | Metrics collection interval |
 | `COLLECTOR_RETENTION_PERIOD_DAYS` | 7 | How long to keep metrics in database |
 | `DEBUG` | `false` | Enable debug mode and profiling endpoints |
-| `PORT` | `8080` | HTTP server port |
+| `PORT` | `8888` | HTTP server port |
+
+When running directly in Gin development mode, `PUSH_ENDPOINT` defaults to `http://localhost:8000`.
 
 ### Example Configuration
 
 ```bash
 export TOKEN=your-secret-token
-export PUSH_ENDPOINT=https://coolify.io/api/metrics
+export PUSH_ENDPOINT=https://coolify.example.com
 export COLLECTOR_REFRESH_RATE_SECONDS=30
 export COLLECTOR_RETENTION_PERIOD_DAYS=14
 export DEBUG=false
@@ -110,11 +112,11 @@ Sentinel provides a comprehensive REST API for retrieving system and Docker cont
 
 ### Authentication
 
-All API requests require a Bearer token:
+Metrics and debug API requests require a Bearer token. Health and version endpoints remain public for probes:
 
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  http://localhost:8080/api/cpu/current
+  http://localhost:8888/api/cpu/current
 ```
 
 ### Complete API Documentation
@@ -184,6 +186,37 @@ go fmt ./...
 golangci-lint run
 ```
 
+### Test with Coolify development
+
+Coolify's development testing host uses the same Docker daemon, and its Sentinel page already accepts a custom development image.
+
+```bash
+# Start Coolify development first from the Coolify repository.
+spin up
+
+# Build Sentinel in this repository.
+./scripts/coolify-dev.sh build
+```
+
+The image receives a build-time version such as `0.0.22-dev+9b1cd1a.dirty`, so startup logs and `/api/version` clearly distinguish it from a release build. Set `SENTINEL_DEV_VERSION` to override this value.
+
+In Coolify, open **Servers → localhost → Sentinel**, set **Custom Sentinel Docker Image (Dev Only)** to `sentinel:dev`, then enable or restart Sentinel. Verify the running container afterwards:
+
+```bash
+./scripts/coolify-dev.sh smoke
+docker logs coolify-sentinel
+```
+
+The smoke command checks Docker health plus authenticated history access from inside the Sentinel container. The Coolify UI heartbeat confirms that push delivery to `/api/v1/sentinel/push` succeeds.
+
+For an isolated end-to-end check, keep the Coolify-managed `coolify-sentinel` container running and execute:
+
+```bash
+./scripts/coolify-dev.sh integration
+```
+
+This starts a temporary candidate container using the development server's existing token and endpoint, then checks a custom listener port, health, authentication, collection, and a real push to Coolify before removing the container.
+
 ### Dependencies
 
 Key dependencies used in the project:
@@ -205,13 +238,14 @@ services:
   sentinel:
     image: ghcr.io/coollabsio/sentinel:latest
     ports:
-      - "8080:8080"
+      - "8888:8888"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - sentinel-data:/data
+      - sentinel-data:/app/db
     environment:
       TOKEN: ${SENTINEL_TOKEN}
       PUSH_ENDPOINT: ${PUSH_ENDPOINT}
+      COLLECTOR_ENABLED: "true"
       COLLECTOR_REFRESH_RATE_SECONDS: 30
       COLLECTOR_RETENTION_PERIOD_DAYS: 14
     restart: unless-stopped
@@ -232,7 +266,7 @@ Requires=docker.service
 Type=simple
 User=sentinel
 Environment="TOKEN=your-secret-token"
-Environment="PUSH_ENDPOINT=https://your-endpoint.com/metrics"
+Environment="PUSH_ENDPOINT=https://coolify.example.com"
 ExecStart=/usr/local/bin/sentinel
 Restart=always
 RestartSec=10
@@ -246,7 +280,7 @@ WantedBy=multi-user.target
 ### Health Check
 
 ```bash
-curl http://localhost:8080/api/health
+curl http://localhost:8888/api/health
 ```
 
 ### Database Statistics (Debug Mode)
@@ -255,7 +289,7 @@ When `DEBUG=true`, access database statistics:
 
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  http://localhost:8080/api/stats
+  http://localhost:8888/api/stats
 ```
 
 ### Profiling Endpoints (Debug Mode)

@@ -9,15 +9,16 @@ info:
     REST endpoints.
 
     This service is designed for integration with [Coolify.io](https://coolify.io).
-  version: 0.0.21
+  version: 0.0.22
   contact:
     name: Coolify
     url: https://coolify.io
   license:
-    name: MIT
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
 
 servers:
-  - url: http://localhost:8080
+  - url: http://localhost:8888
     description: Local development server
   - url: https://sentinel.example.com
     description: Production server
@@ -66,7 +67,7 @@ paths:
             text/plain:
               schema:
                 type: string
-                example: 0.0.21
+                example: 0.0.22
 
   /api/cpu/current:
     get:
@@ -228,7 +229,7 @@ paths:
     get:
       summary: Get database statistics
       description: |
-        Retrieve database storage statistics and table sizes.
+        Retrieve database storage statistics and estimated logical table sizes.
         Only available when DEBUG environment variable is set to true.
       tags:
         - Debug
@@ -463,13 +464,17 @@ components:
                 type: string
                 description: Name of the database table
                 example: cpu_usage
+              row_count:
+                type: integer
+                description: Number of rows in the table
+                example: 600
               size_mb:
                 type: string
-                description: Table size in megabytes
+                description: Estimated logical table size in megabytes
                 example: "0.50"
               size_kb:
                 type: string
-                description: Table size in kilobytes
+                description: Estimated logical table size in kilobytes
                 example: "512.00"
 
     Error:

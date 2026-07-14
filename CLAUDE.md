@@ -89,7 +89,7 @@ The application connects to Docker daemon via Unix socket to collect container s
 ## Release Process
 
 ### Version Locations (all must be updated together)
-1. `pkg/config/config.go:3` — `const Version = "X.Y.Z"`
+1. `pkg/config/config.go` — `var Version = "X.Y.Z"`
 2. `openapi.yaml:12` — `version: X.Y.Z` (info block)
 3. `openapi.yaml:69` — `example: X.Y.Z` (version endpoint response)
 4. `API.md:74` — `X.Y.Z` (version endpoint example response)

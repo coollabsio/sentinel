@@ -8,7 +8,7 @@ type ContainerMetrics struct {
 	CPUUsagePercentage    float64 `json:"cpu_usage_percentage"`
 	MemoryUsagePercentage float64 `json:"memory_usage_percentage"`
 	MemoryUsed            uint64  `json:"memory_used"`
-	MemoryAvailable       uint64  `json:"available_memory"`
+	MemoryLimit           uint64  `json:"memory_limit"`
 }
 
 type Container struct {

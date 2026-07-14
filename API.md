@@ -17,7 +17,7 @@ Sentinel provides a REST API for retrieving system and Docker container metrics.
 
 ## Authentication
 
-All API endpoints require authentication using a Bearer token. Set the `TOKEN` environment variable when running Sentinel, and include it in your requests:
+Metrics and debug endpoints require authentication using a Bearer token. The health and version endpoints are public so container and orchestration probes can use them. Set the `TOKEN` environment variable when running Sentinel, and include it in protected requests:
 
 ```bash
 Authorization: Bearer YOUR_TOKEN_HERE
@@ -27,7 +27,7 @@ Authorization: Bearer YOUR_TOKEN_HERE
 
 The default base URL is:
 ```
-http://localhost:8080/api
+http://localhost:8888/api
 ```
 
 ## Date/Time Format
@@ -58,7 +58,7 @@ ok
 
 **Example:**
 ```bash
-curl http://localhost:8080/api/health
+curl http://localhost:8888/api/health
 ```
 
 ---
@@ -71,12 +71,12 @@ Get the current version of Sentinel.
 
 **Response:**
 ```
-0.0.21
+0.0.22
 ```
 
 **Example:**
 ```bash
-curl http://localhost:8080/api/version
+curl http://localhost:8888/api/version
 ```
 
 ---
@@ -106,7 +106,7 @@ Retrieve the current CPU usage percentage.
 **Example:**
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  http://localhost:8080/api/cpu/current
+  http://localhost:8888/api/cpu/current
 ```
 
 ---
@@ -148,7 +148,7 @@ Retrieve historical CPU usage data.
 ```bash
 # Get CPU history for the last 24 hours
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "http://localhost:8080/api/cpu/history?from=2024-01-14T10:00:00Z&to=2024-01-15T10:00:00Z"
+  "http://localhost:8888/api/cpu/history?from=2024-01-14T10:00:00Z&to=2024-01-15T10:00:00Z"
 ```
 
 ---
@@ -184,7 +184,7 @@ Retrieve the current memory usage statistics.
 **Example:**
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  http://localhost:8080/api/memory/current
+  http://localhost:8888/api/memory/current
 ```
 
 ---
@@ -229,7 +229,7 @@ Retrieve historical memory usage data.
 ```bash
 # Get memory history for a specific time range
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "http://localhost:8080/api/memory/history?from=2024-01-15T00:00:00Z&to=2024-01-15T12:00:00Z"
+  "http://localhost:8888/api/memory/history?from=2024-01-15T00:00:00Z&to=2024-01-15T12:00:00Z"
 ```
 
 ---
@@ -272,7 +272,7 @@ Retrieve CPU usage history for a specific Docker container.
 **Example:**
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "http://localhost:8080/api/container/abc123def456/cpu/history?from=2024-01-15T09:00:00Z"
+  "http://localhost:8888/api/container/abc123def456/cpu/history?from=2024-01-15T09:00:00Z"
 ```
 
 ---
@@ -321,7 +321,7 @@ Retrieve memory usage history for a specific Docker container.
 **Example:**
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "http://localhost:8080/api/container/abc123def456/memory/history?from=2024-01-15T00:00:00Z&to=2024-01-15T12:00:00Z"
+  "http://localhost:8888/api/container/abc123def456/memory/history?from=2024-01-15T00:00:00Z&to=2024-01-15T12:00:00Z"
 ```
 
 ---
@@ -332,7 +332,7 @@ Debug endpoints are only available when the `DEBUG` environment variable is set 
 
 ### Get Database Statistics
 
-Retrieve database storage statistics and table sizes.
+Retrieve database storage statistics and estimated logical table sizes.
 
 **Endpoint:** `GET /api/stats`
 
@@ -352,11 +352,13 @@ Retrieve database storage statistics and table sizes.
   "table_sizes": [
     {
       "table_name": "cpu_usage",
+      "row_count": 600,
       "size_mb": "0.50",
       "size_kb": "512.00"
     },
     {
       "table_name": "memory_usage",
+      "row_count": 600,
       "size_mb": "0.30",
       "size_kb": "307.20"
     }
@@ -367,7 +369,7 @@ Retrieve database storage statistics and table sizes.
 **Example:**
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  http://localhost:8080/api/stats
+  http://localhost:8888/api/stats
 ```
 
 ### Profiling Endpoints

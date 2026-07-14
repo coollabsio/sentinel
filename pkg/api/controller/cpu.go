@@ -84,7 +84,7 @@ func (c *Controller) setupCpuRoutes() {
 			ctx.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		usages := []CpuUsage{}
 		rowCount := 0

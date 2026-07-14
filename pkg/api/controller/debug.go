@@ -2,7 +2,6 @@ package controller
 
 import (
 	"fmt"
-	"log"
 
 	"github.com/gin-gonic/gin"
 	"github.com/shirou/gopsutil/mem"
@@ -10,66 +9,60 @@ import (
 
 func (c *Controller) setupDebugRoutes() {
 	c.ginE.GET("/api/stats", func(ctx *gin.Context) {
-		var count int
-		var storageUsage int64
-		err := c.database.QueryRow("SELECT COUNT(*), SUM(LENGTH(time) + LENGTH(percent)) FROM cpu_usage").Scan(&count, &storageUsage)
-		if err != nil {
-			ctx.JSON(500, gin.H{"error": err.Error()})
-			return
-		}
-
-		// Convert storage usage to KB
-		storageKB := float64(storageUsage) / 1024
-		// add memory stats
 		memory, err := mem.VirtualMemory()
 		if err != nil {
 			ctx.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
 
-		// Query to get table names and their sizes
-		rows, err := c.database.Query(`
-			SELECT
-				table_name,
-				SUM(estimated_size) AS total_size
-			FROM duckdb_tables()
-			GROUP BY table_name
-			ORDER BY total_size DESC
-		`)
-		if err != nil {
+		var pageCount, pageSize int64
+		if err := c.database.QueryRow("PRAGMA page_count").Scan(&pageCount); err != nil {
 			ctx.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
-		defer rows.Close()
+		if err := c.database.QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
+			ctx.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
 
-		var tables []gin.H
-		for rows.Next() {
-			var tableName string
-			var sizeBytes int64
-			if err := rows.Scan(&tableName, &sizeBytes); err != nil {
-				log.Printf("Error scanning row: %v", err)
-				continue
+		tableStats := []struct {
+			name      string
+			sizeQuery string
+		}{
+			{"cpu_usage", "SELECT COALESCE(SUM(LENGTH(time) + LENGTH(percent)), 0) FROM cpu_usage"},
+			{"memory_usage", "SELECT COALESCE(SUM(LENGTH(time) + LENGTH(total) + LENGTH(available) + LENGTH(used) + LENGTH(usedPercent) + LENGTH(free)), 0) FROM memory_usage"},
+			{"container_cpu_usage", "SELECT COALESCE(SUM(LENGTH(time) + LENGTH(container_id) + LENGTH(percent)), 0) FROM container_cpu_usage"},
+			{"container_memory_usage", "SELECT COALESCE(SUM(LENGTH(time) + LENGTH(container_id) + LENGTH(total) + LENGTH(available) + LENGTH(used) + LENGTH(usedPercent) + LENGTH(free)), 0) FROM container_memory_usage"},
+			{"container_logs", "SELECT COALESCE(SUM(LENGTH(time) + LENGTH(container_id) + LENGTH(log)), 0) FROM container_logs"},
+		}
+		tables := make([]gin.H, 0, len(tableStats))
+		totalRows := 0
+		for _, table := range tableStats {
+			var rowCount int
+			if err := c.database.QueryRow("SELECT COUNT(*) FROM " + table.name).Scan(&rowCount); err != nil {
+				ctx.JSON(500, gin.H{"error": err.Error()})
+				return
 			}
+			totalRows += rowCount
 
-			// Convert bytes to MB for readability
-			sizeMB := float64(sizeBytes) / (1024 * 1024)
-
+			var sizeBytes int64
+			if err := c.database.QueryRow(table.sizeQuery).Scan(&sizeBytes); err != nil {
+				ctx.JSON(500, gin.H{"error": err.Error()})
+				return
+			}
 			tables = append(tables, gin.H{
-				"table_name": tableName,
-				"size_mb":    fmt.Sprintf("%.2f", sizeMB),
-				"size_kb":    fmt.Sprintf("%.2f", sizeMB*1024),
+				"table_name": table.name,
+				"row_count":  rowCount,
+				"size_mb":    fmt.Sprintf("%.2f", float64(sizeBytes)/(1024*1024)),
+				"size_kb":    fmt.Sprintf("%.2f", float64(sizeBytes)/1024),
 			})
 		}
 
-		if err := rows.Err(); err != nil {
-			ctx.JSON(500, gin.H{"error": err.Error()})
-			return
-		}
-
+		storageBytes := pageCount * pageSize
 		ctx.JSON(200, gin.H{
-			"row_count":        count,
-			"storage_usage_kb": fmt.Sprintf("%.2f", storageKB),
-			"storage_usage_mb": fmt.Sprintf("%.2f", storageKB/1024),
+			"row_count":        totalRows,
+			"storage_usage_kb": fmt.Sprintf("%.2f", float64(storageBytes)/1024),
+			"storage_usage_mb": fmt.Sprintf("%.2f", float64(storageBytes)/(1024*1024)),
 			"memory_usage":     memory,
 			"table_sizes":      tables,
 		})

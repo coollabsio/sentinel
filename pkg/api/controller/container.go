@@ -64,7 +64,7 @@ func (c *Controller) setupContainerRoutes() {
 			ctx.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		usages := []CpuUsage{}
 		for rows.Next() {
@@ -142,7 +142,7 @@ func (c *Controller) setupContainerRoutes() {
 			ctx.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		usages := []MemUsage{}
 		rowCount := 0

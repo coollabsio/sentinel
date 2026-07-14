@@ -6,16 +6,15 @@ import (
 	"io"
 	"log"
 	"math"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/coollabsio/sentinel/pkg/config"
 	"github.com/coollabsio/sentinel/pkg/db"
-	"github.com/coollabsio/sentinel/pkg/dockerClient"
 	"github.com/coollabsio/sentinel/pkg/json"
 	"github.com/coollabsio/sentinel/pkg/types"
 	"github.com/coollabsio/sentinel/pkg/utils"
-	dockerTypes "github.com/docker/docker/api/types"
 	dockerContainer "github.com/docker/docker/api/types/container"
 	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/mem"
@@ -23,11 +22,15 @@ import (
 
 type Collector struct {
 	config   *config.Config
-	client   *dockerClient.DockerClient
+	client   dockerAPI
 	database *db.Database
 }
 
-func New(config *config.Config, database *db.Database, dockerClient *dockerClient.DockerClient) *Collector {
+type dockerAPI interface {
+	MakeRequest(context.Context, string) (*http.Response, error)
+}
+
+func New(config *config.Config, database *db.Database, dockerClient dockerAPI) *Collector {
 	return &Collector{
 		config:   config,
 		client:   dockerClient,
@@ -70,7 +73,7 @@ func (c *Collector) Run(ctx context.Context) {
 					log.Printf("[DEBUG] Inserted CPU usage - time: %s, percent: %.2f", queryTimeInUnixString, overallPercentage[0])
 				}
 
-				c.collectContainerMetrics(queryTimeInUnixString)
+				c.collectContainerMetrics(ctx, queryTimeInUnixString)
 
 				// Memory usage
 				memory, err := mem.VirtualMemory()
@@ -88,47 +91,24 @@ func (c *Collector) Run(ctx context.Context) {
 						queryTimeInUnixString, memory.Total, memory.Used, math.Round(memory.UsedPercent*100)/100)
 				}
 
-				// Cleanup old data
-				totalRowsToKeep := 10
-				currentTime := time.Now().UTC().UnixMilli()
-				cutoffTime := currentTime - int64(c.config.CollectorRetentionPeriodDays*24*60*60*1000)
-
-				cleanupTable := func(tableName string) {
-					var totalRows int
-					err := c.database.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&totalRows)
-					if err != nil {
-						log.Printf("Error counting rows in %s: %v", tableName, err)
-						return
-					}
-
-					if totalRows > totalRowsToKeep {
-						_, err = c.database.Exec(fmt.Sprintf(`DELETE FROM %s WHERE CAST(time AS BIGINT) < ? AND time NOT IN (SELECT time FROM %s ORDER BY time DESC LIMIT ?)`, tableName, tableName),
-							cutoffTime, totalRowsToKeep)
-						if err != nil {
-							log.Printf("Error deleting old data from %s: %v", tableName, err)
-						}
-					}
-				}
-
-				cleanupTable("cpu_usage")
-				cleanupTable("memory_usage")
-				cleanupTable("container_cpu_usage")
-				cleanupTable("container_memory_usage")
-
 			}()
 		}
 	}
 }
 
-func (c *Collector) collectContainerMetrics(queryTimeInUnixString string) {
+func (c *Collector) collectContainerMetrics(ctx context.Context, queryTimeInUnixString string) {
 	// Container usage
 	// Use makeDockerRequest to interact with Docker API
-	resp, err := c.client.MakeRequest("/containers/json?all=true")
+	resp, err := c.client.MakeRequest(ctx, "/containers/json?all=true")
 	if err != nil {
 		log.Printf("Error getting containers: %v", err)
 		return
 	}
-	defer resp.Body.Close()
+	if resp == nil || resp.Body == nil {
+		log.Printf("Error getting containers: empty Docker response")
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
 
 	containersOutput, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -141,7 +121,7 @@ func (c *Collector) collectContainerMetrics(queryTimeInUnixString string) {
 		return
 	}
 
-	var containers []dockerTypes.Container
+	var containers []dockerContainer.Summary
 	if err := json.Unmarshal(containersOutput, &containers); err != nil {
 		log.Printf("Error unmarshalling container list: %v", err)
 		return
@@ -159,7 +139,7 @@ func (c *Collector) collectContainerMetrics(queryTimeInUnixString string) {
 		workerCount = len(containers)
 	}
 
-	containersChan := make(chan dockerTypes.Container, len(containers))
+	containersChan := make(chan dockerContainer.Summary, len(containers))
 
 	// Start worker goroutines
 	for i := 0; i < workerCount; i++ {
@@ -175,27 +155,34 @@ func (c *Collector) collectContainerMetrics(queryTimeInUnixString string) {
 					} else if len(container.Names) > 0 {
 						containerNameFromLabel = container.Names[0]
 					} else {
-						containerNameFromLabel = container.ID[:12] // Use short ID as fallback
+						containerNameFromLabel = container.ID
+						if len(containerNameFromLabel) > 12 {
+							containerNameFromLabel = containerNameFromLabel[:12]
+						}
 						log.Printf("Warning: Container %s has no names, using ID as name", container.ID)
 					}
 				}
 
-				resp, err := c.client.MakeRequest(fmt.Sprintf("/containers/%s/stats?stream=false", container.ID))
+				resp, err := c.client.MakeRequest(ctx, fmt.Sprintf("/containers/%s/stats?stream=false", container.ID))
 				if err != nil {
-					errChannel <- fmt.Errorf("Error getting container stats for %s: %v", containerNameFromLabel, err)
+					errChannel <- fmt.Errorf("get container stats for %s: %w", containerNameFromLabel, err)
+					continue
+				}
+				if resp == nil || resp.Body == nil {
+					errChannel <- fmt.Errorf("get container stats for %s: empty Docker response", containerNameFromLabel)
 					continue
 				}
 
 				statsOutput, err := io.ReadAll(resp.Body)
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				if err != nil {
-					errChannel <- fmt.Errorf("Error reading container stats for %s: %v", containerNameFromLabel, err)
+					errChannel <- fmt.Errorf("read container stats for %s: %w", containerNameFromLabel, err)
 					continue
 				}
 
 				var v dockerContainer.StatsResponse
 				if err := json.Unmarshal(statsOutput, &v); err != nil {
-					errChannel <- fmt.Errorf("Error decoding container stats for %s: %v", containerNameFromLabel, err)
+					errChannel <- fmt.Errorf("decode container stats for %s: %w", containerNameFromLabel, err)
 					continue
 				}
 
@@ -204,7 +191,7 @@ func (c *Collector) collectContainerMetrics(queryTimeInUnixString string) {
 					CPUUsagePercentage:    calculateCPUPercent(v),
 					MemoryUsagePercentage: calculateMemoryPercent(v),
 					MemoryUsed:            calculateMemoryUsed(v),
-					MemoryAvailable:       v.MemoryStats.Limit,
+					MemoryLimit:           v.MemoryStats.Limit,
 				}
 
 				metricsChannel <- metrics
@@ -245,7 +232,7 @@ func (c *Collector) collectContainerMetrics(queryTimeInUnixString string) {
 			log.Printf("Error starting transaction: %v", err)
 			return
 		}
-		defer tx.Rollback()
+		defer func() { _ = tx.Rollback() }()
 
 		// Prepare statements for batch inserts
 		cpuStmt, err := tx.Prepare(`INSERT OR REPLACE INTO container_cpu_usage (time, container_id, percent) VALUES (?, ?, ?)`)
@@ -253,14 +240,14 @@ func (c *Collector) collectContainerMetrics(queryTimeInUnixString string) {
 			log.Printf("Error preparing CPU statement: %v", err)
 			return
 		}
-		defer cpuStmt.Close()
+		defer func() { _ = cpuStmt.Close() }()
 
 		memStmt, err := tx.Prepare(`INSERT OR REPLACE INTO container_memory_usage (time, container_id, total, available, used, usedPercent, free) VALUES (?, ?, ?, ?, ?, ?, ?)`)
 		if err != nil {
 			log.Printf("Error preparing memory statement: %v", err)
 			return
 		}
-		defer memStmt.Close()
+		defer func() { _ = memStmt.Close() }()
 
 		// Execute batch inserts
 		for _, metrics := range allMetrics {
@@ -272,13 +259,17 @@ func (c *Collector) collectContainerMetrics(queryTimeInUnixString string) {
 					queryTimeInUnixString, metrics.Name, metrics.CPUUsagePercentage)
 			}
 
-			_, err = memStmt.Exec(queryTimeInUnixString, metrics.Name, metrics.MemoryAvailable, metrics.MemoryAvailable,
-				metrics.MemoryUsed, fmt.Sprintf("%.2f", metrics.MemoryUsagePercentage), metrics.MemoryAvailable-metrics.MemoryUsed)
+			freeMemory := uint64(0)
+			if metrics.MemoryLimit > metrics.MemoryUsed {
+				freeMemory = metrics.MemoryLimit - metrics.MemoryUsed
+			}
+			_, err = memStmt.Exec(queryTimeInUnixString, metrics.Name, metrics.MemoryLimit, freeMemory,
+				metrics.MemoryUsed, fmt.Sprintf("%.2f", metrics.MemoryUsagePercentage), freeMemory)
 			if err != nil {
 				log.Printf("Error inserting container memory usage into database: %v", err)
 			} else if c.config.Debug {
 				log.Printf("[DEBUG] Inserted container memory - time: %s, id: %s, total: %d, used: %d, usedPercent: %.2f",
-					queryTimeInUnixString, metrics.Name, metrics.MemoryAvailable, metrics.MemoryUsed, metrics.MemoryUsagePercentage)
+					queryTimeInUnixString, metrics.Name, metrics.MemoryLimit, metrics.MemoryUsed, metrics.MemoryUsagePercentage)
 			}
 		}
 
@@ -292,19 +283,27 @@ func (c *Collector) collectContainerMetrics(queryTimeInUnixString string) {
 func calculateCPUPercent(stat dockerContainer.StatsResponse) float64 {
 	cpuDelta := float64(stat.CPUStats.CPUUsage.TotalUsage) - float64(stat.PreCPUStats.CPUUsage.TotalUsage)
 	systemDelta := float64(stat.CPUStats.SystemUsage) - float64(stat.PreCPUStats.SystemUsage)
-	numberOfCpus := stat.CPUStats.OnlineCPUs
-	return (cpuDelta / systemDelta) * float64(numberOfCpus) * 100.0
+	if cpuDelta <= 0 || systemDelta <= 0 {
+		return 0
+	}
+
+	numberOfCPUs := stat.CPUStats.OnlineCPUs
+	if numberOfCPUs == 0 {
+		numberOfCPUs = uint32(len(stat.CPUStats.CPUUsage.PercpuUsage))
+	}
+	if numberOfCPUs == 0 {
+		return 0
+	}
+
+	return (cpuDelta / systemDelta) * float64(numberOfCPUs) * 100.0
 }
 
 func calculateMemoryPercent(stat dockerContainer.StatsResponse) float64 {
-	// Try total_inactive_file first (cgroup v1), fall back to inactive_file (cgroup v2)
-	// This matches Docker CLI calculation behavior
-	cacheUsage := stat.MemoryStats.Stats["total_inactive_file"]
-	if cacheUsage == 0 {
-		cacheUsage = stat.MemoryStats.Stats["inactive_file"]
-	}
-	usedMemory := float64(stat.MemoryStats.Usage) - float64(cacheUsage)
+	usedMemory := float64(calculateMemoryUsed(stat))
 	availableMemory := float64(stat.MemoryStats.Limit)
+	if availableMemory <= 0 {
+		return 0
+	}
 	return (usedMemory / availableMemory) * 100.0
 }
 
@@ -315,5 +314,8 @@ func calculateMemoryUsed(stat dockerContainer.StatsResponse) uint64 {
 	if cacheUsage == 0 {
 		cacheUsage = stat.MemoryStats.Stats["inactive_file"]
 	}
-	return (stat.MemoryStats.Usage - cacheUsage) / 1024 / 1024
+	if cacheUsage >= stat.MemoryStats.Usage {
+		return 0
+	}
+	return stat.MemoryStats.Usage - cacheUsage
 }

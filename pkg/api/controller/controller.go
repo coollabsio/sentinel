@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"crypto/subtle"
+	"net/http"
 	"net/http/pprof"
 
 	"github.com/coollabsio/sentinel/pkg/config"
@@ -27,10 +29,28 @@ func (c *Controller) GetEngine() *gin.Engine {
 }
 
 func (c *Controller) SetupRoutes() {
+	c.ginE.Use(c.authenticate())
 	c.setupCoreRoutes()
 	c.setupContainerRoutes()
 	c.setupMemoryRoutes()
 	c.setupCpuRoutes()
+}
+
+func (c *Controller) authenticate() gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		if ctx.Request.URL.Path == "/api/health" || ctx.Request.URL.Path == "/api/version" {
+			ctx.Next()
+			return
+		}
+
+		expected := "Bearer " + c.config.Token
+		provided := ctx.GetHeader("Authorization")
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+			ctx.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			return
+		}
+		ctx.Next()
+	}
 }
 
 func (c *Controller) setupCoreRoutes() {
