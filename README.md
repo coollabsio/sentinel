@@ -18,7 +18,7 @@ An API for gathering Linux server / Docker Engine metrics.
 
 ### Prerequisites
 
-- Go 1.24 or higher (for development)
+- Go 1.25 or higher (for development)
 - Docker (for container metrics)
 - Linux environment (production deployment)
 
