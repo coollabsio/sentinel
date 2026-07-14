@@ -15,7 +15,7 @@ import (
 	"github.com/coollabsio/sentinel/pkg/json"
 	"github.com/coollabsio/sentinel/pkg/types"
 	"github.com/coollabsio/sentinel/pkg/utils"
-	dockerContainer "github.com/docker/docker/api/types/container"
+	dockerContainer "github.com/moby/moby/api/types/container"
 	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/mem"
 )

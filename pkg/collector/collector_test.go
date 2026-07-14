@@ -11,7 +11,7 @@ import (
 
 	"github.com/coollabsio/sentinel/pkg/config"
 	"github.com/coollabsio/sentinel/pkg/db"
-	dockerContainer "github.com/docker/docker/api/types/container"
+	dockerContainer "github.com/moby/moby/api/types/container"
 )
 
 type collectorDockerClient struct {

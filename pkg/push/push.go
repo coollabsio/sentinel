@@ -15,7 +15,7 @@ import (
 	"github.com/coollabsio/sentinel/pkg/config"
 	"github.com/coollabsio/sentinel/pkg/json"
 	"github.com/coollabsio/sentinel/pkg/types"
-	dockerContainer "github.com/docker/docker/api/types/container"
+	dockerContainer "github.com/moby/moby/api/types/container"
 )
 
 type Pusher struct {
@@ -216,8 +216,8 @@ func (p *Pusher) inspectContainer(ctx context.Context, container dockerContainer
 	}
 
 	healthStatus := "unknown"
-	if inspectData.ContainerJSONBase != nil && inspectData.State != nil && inspectData.State.Health != nil {
-		healthStatus = inspectData.State.Health.Status
+	if inspectData.State != nil && inspectData.State.Health != nil {
+		healthStatus = string(inspectData.State.Health.Status)
 	}
 
 	containerName := container.ID
@@ -234,7 +234,7 @@ func (p *Pusher) inspectContainer(ctx context.Context, container dockerContainer
 		Image:        container.Image,
 		Labels:       container.Labels,
 		Name:         containerName,
-		State:        container.State,
+		State:        string(container.State),
 		HealthStatus: healthStatus,
 	}, nil
 }
