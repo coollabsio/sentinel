@@ -161,6 +161,140 @@ fn skips_rows_with_a_genuine_sql_null_not_just_unparseable_text() {
 }
 
 #[test]
+fn migrates_a_large_legacy_database_row_for_row() {
+    // The migration streams rows instead of collecting the whole legacy table
+    // into a Vec first (which would materialize millions of rows in RAM on a
+    // busy host). This is the correctness guard on that rewrite: every row
+    // must still land, with its exact values, when there are far more rows
+    // than a single `Rows::next()` step.
+    const N: i64 = 2_000;
+    let dir = tmpdir("bulk");
+    let path = dir.join("m.sqlite");
+    let _ = std::fs::remove_file(&path);
+    legacy_db(&path);
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let tx = c.unchecked_transaction().unwrap();
+        for i in 0..N {
+            // offset past the rows legacy_db() already seeded
+            let t = 1_700_000_100_000 + i * 1_000;
+            tx.execute(
+                "INSERT INTO cpu_usage VALUES (?1, ?2)",
+                (t.to_string(), format!("{:.2}", i as f64 / 100.0)),
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO memory_usage VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    t.to_string(),
+                    "16000000000",
+                    (8_000_000_000i64 + i).to_string(),
+                    (7_000_000_000i64 + i).to_string(),
+                    format!("{:.2}", i as f64 / 100.0),
+                    "1000000000",
+                ),
+            )
+            .unwrap();
+            for name in ["web", "db"] {
+                tx.execute(
+                    "INSERT INTO container_cpu_usage VALUES (?1, ?2, ?3)",
+                    (t.to_string(), name, format!("{:.2}", i as f64 / 100.0)),
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO container_memory_usage VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (
+                        t.to_string(),
+                        name,
+                        "100",
+                        (40 + i).to_string(),
+                        (60 + i).to_string(),
+                        format!("{:.2}", i as f64 / 100.0),
+                        (40 + i).to_string(),
+                    ),
+                )
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    let s = Store::open(&path).unwrap();
+
+    let cpu = s.cpu_history(0, i64::MAX).unwrap();
+    assert_eq!(cpu.len() as i64, N + 2, "2 seeded + {N} bulk cpu rows");
+    let mem = s.memory_history(0, i64::MAX).unwrap();
+    assert_eq!(mem.len() as i64, N + 1);
+    for name in ["web", "db"] {
+        let ccpu = s.container_cpu_history(name, 0, i64::MAX).unwrap();
+        let cmem = s.container_memory_history(name, 0, i64::MAX).unwrap();
+        // "web" also has the single row legacy_db() seeded
+        let seeded = i64::from(name == "web");
+        assert_eq!(ccpu.len() as i64, N + seeded, "{name} cpu");
+        assert_eq!(cmem.len() as i64, N + seeded, "{name} mem");
+    }
+
+    // spot-check exact values at the start, middle and end of the stream
+    for i in [0i64, N / 2, N - 1] {
+        let t = 1_700_000_100_000 + i * 1_000;
+        let expected = i as f64 / 100.0;
+        let cpu = s.cpu_history(t, t).unwrap();
+        assert_eq!(cpu.len(), 1, "cpu row at {t}");
+        assert!((cpu[0].percent - expected).abs() < 1e-9, "cpu at {t}");
+
+        let mem = s.memory_history(t, t).unwrap();
+        assert_eq!(mem.len(), 1);
+        assert_eq!(mem[0].used, 7_000_000_000 + i as u64);
+        assert!((mem[0].used_percent - expected).abs() < 1e-9);
+
+        let ccpu = s.container_cpu_history("db", t, t).unwrap();
+        assert_eq!(ccpu.len(), 1);
+        assert!((ccpu[0].percent - expected).abs() < 1e-9);
+
+        let cmem = s.container_memory_history("db", t, t).unwrap();
+        assert_eq!(cmem.len(), 1);
+        assert_eq!(cmem[0].used, 60 + i as u64);
+        assert_eq!(cmem[0].free, 40 + i as u64);
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unreadable_database_is_moved_aside_instead_of_failing_startup() {
+    // A corrupt/unmigratable file must not be fatal: history is regenerable
+    // and retention-bounded, but a hard error here crash-loops the whole
+    // agent (API, push, collection) forever on the same file.
+    let dir = tmpdir("garbage");
+    let path = dir.join("m.sqlite");
+    let backup = path.with_extension("legacy-backup.sqlite");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&backup);
+
+    let garbage = b"this is definitely not a sqlite database\n";
+    std::fs::write(&path, garbage).unwrap();
+
+    let s = Store::open(&path).expect("open must recover, not error");
+
+    // fresh, empty, typed database usable immediately
+    assert!(s.cpu_history(0, i64::MAX).unwrap().is_empty());
+    s.insert_cpu(1_000, 1.0).unwrap();
+    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 1);
+
+    assert!(
+        backup.exists(),
+        "original file must be preserved at {backup:?}"
+    );
+    assert_eq!(
+        std::fs::read(&backup).unwrap(),
+        garbage,
+        "backup must hold the original bytes verbatim"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn fresh_database_needs_no_migration() {
     let dir = tmpdir("fresh");
     let path = dir.join("m.sqlite");

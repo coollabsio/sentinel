@@ -40,8 +40,35 @@ impl Store {
                 std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))?;
             }
         }
-        let conn = rusqlite::Connection::open(path)?;
-        Self::init(conn)
+        match rusqlite::Connection::open(path)
+            .map_err(StoreError::from)
+            .and_then(Self::init)
+        {
+            Ok(store) => Ok(store),
+            Err(e) => {
+                // Migration failure must never be fatal to startup: metrics
+                // history is regenerable and retention-bounded, while the
+                // agent itself (API, push, collection) is not optional. Move
+                // the unreadable/unmigratable file aside and start fresh
+                // rather than crash-looping on the same failure forever.
+                tracing::error!(
+                    error = %e,
+                    path = %path.display(),
+                    "failed to open or migrate metrics database, starting fresh"
+                );
+                if path.exists() {
+                    let backup = path.with_extension("legacy-backup.sqlite");
+                    let _ = std::fs::remove_file(&backup);
+                    std::fs::rename(path, &backup)?;
+                    for ext in ["-wal", "-shm"] {
+                        let sidecar = path.with_extension(format!("sqlite{ext}"));
+                        let _ = std::fs::remove_file(&sidecar);
+                    }
+                }
+                let conn = rusqlite::Connection::open(path)?;
+                Self::init(conn)
+            }
+        }
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {

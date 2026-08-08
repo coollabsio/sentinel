@@ -111,15 +111,25 @@ fn parse_opt<T: std::str::FromStr>(s: Option<String>) -> Option<T> {
 /// Reads every row as raw (possibly-NULL) text first, so a value that is
 /// missing or fails to parse skips only that row rather than the whole
 /// migration.
+///
+/// Streams row-by-row (`Statement::query` + `Rows::next`) rather than
+/// collecting into a `Vec` first: a `.collect::<Vec<_>>()` materializes the
+/// ENTIRE legacy table in memory before inserting anything. At 7 days of
+/// retention, 5s sampling, and a few dozen containers, the container tables
+/// can hold millions of rows — collecting first can burn well over a
+/// gigabyte of RAM on an agent whose whole design goal is a single-digit-MB
+/// footprint, on exactly the busiest hosts. A `select`/`insert` pair of
+/// independent prepared statements on the same transaction is safe here:
+/// they operate on different tables (the `_old` table being read, the typed
+/// table being written), so there's no self-referential cursor conflict.
 fn migrate_cpu_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
-    let rows: Vec<(Option<String>, Option<String>)> = tx
-        .prepare("SELECT time, percent FROM cpu_usage_old")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-
+    let mut select = tx.prepare("SELECT time, percent FROM cpu_usage_old")?;
     let mut insert =
         tx.prepare("INSERT OR REPLACE INTO cpu_usage (time, percent) VALUES (?1, ?2)")?;
-    for (time_s, percent_s) in rows {
+    let mut rows = select.query([])?;
+    while let Some(row) = rows.next()? {
+        let time_s: Option<String> = row.get(0)?;
+        let percent_s: Option<String> = row.get(1)?;
         let Some(time) = parse_opt::<i64>(time_s) else {
             continue;
         };
@@ -132,33 +142,20 @@ fn migrate_cpu_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
 }
 
 fn migrate_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
-    type Row = (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    );
-    let rows: Vec<Row> = tx
-        .prepare("SELECT time, total, available, used, usedPercent, free FROM memory_usage_old")?
-        .query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-
+    let mut select =
+        tx.prepare("SELECT time, total, available, used, usedPercent, free FROM memory_usage_old")?;
     let mut insert = tx.prepare(
         "INSERT OR REPLACE INTO memory_usage (time, total, available, used, used_percent, free)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
-    for (time_s, total_s, available_s, used_s, used_percent_s, free_s) in rows {
+    let mut rows = select.query([])?;
+    while let Some(row) = rows.next()? {
+        let time_s: Option<String> = row.get(0)?;
+        let total_s: Option<String> = row.get(1)?;
+        let available_s: Option<String> = row.get(2)?;
+        let used_s: Option<String> = row.get(3)?;
+        let used_percent_s: Option<String> = row.get(4)?;
+        let free_s: Option<String> = row.get(5)?;
         let Some(time) = parse_opt::<i64>(time_s) else {
             continue;
         };
@@ -183,16 +180,17 @@ fn migrate_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> 
 }
 
 fn migrate_container_cpu_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
-    let rows: Vec<(Option<String>, Option<String>, Option<String>)> = tx
-        .prepare("SELECT time, container_id, percent FROM container_cpu_usage_old")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-
+    let mut select =
+        tx.prepare("SELECT time, container_id, percent FROM container_cpu_usage_old")?;
     let mut insert = tx.prepare(
         "INSERT OR REPLACE INTO container_cpu_usage (time, container_id, percent)
          VALUES (?1, ?2, ?3)",
     )?;
-    for (time_s, container_id, percent_s) in rows {
+    let mut rows = select.query([])?;
+    while let Some(row) = rows.next()? {
+        let time_s: Option<String> = row.get(0)?;
+        let container_id: Option<String> = row.get(1)?;
+        let percent_s: Option<String> = row.get(2)?;
         let Some(time) = parse_opt::<i64>(time_s) else {
             continue;
         };
@@ -208,39 +206,24 @@ fn migrate_container_cpu_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Resu
 }
 
 fn migrate_container_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
-    type Row = (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    );
-    let rows: Vec<Row> = tx
-        .prepare(
-            "SELECT time, container_id, total, available, used, usedPercent, free
-             FROM container_memory_usage_old",
-        )?
-        .query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-
+    let mut select = tx.prepare(
+        "SELECT time, container_id, total, available, used, usedPercent, free
+         FROM container_memory_usage_old",
+    )?;
     let mut insert = tx.prepare(
         "INSERT OR REPLACE INTO container_memory_usage
             (time, container_id, total, available, used, used_percent, free)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
-    for (time_s, container_id, total_s, available_s, used_s, used_percent_s, free_s) in rows {
+    let mut rows = select.query([])?;
+    while let Some(row) = rows.next()? {
+        let time_s: Option<String> = row.get(0)?;
+        let container_id: Option<String> = row.get(1)?;
+        let total_s: Option<String> = row.get(2)?;
+        let available_s: Option<String> = row.get(3)?;
+        let used_s: Option<String> = row.get(4)?;
+        let used_percent_s: Option<String> = row.get(5)?;
+        let free_s: Option<String> = row.get(6)?;
         let Some(time) = parse_opt::<i64>(time_s) else {
             continue;
         };
