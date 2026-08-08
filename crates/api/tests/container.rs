@@ -92,8 +92,116 @@ async fn container_history_rejects_bad_dates() {
 }
 
 #[tokio::test]
+async fn container_history_default_from_is_one_second_not_zero() {
+    // "1970-01-01T00:00:00Z" (the HOST endpoints' default, Task 8) = 0ms.
+    // "1970-01-01T00:00:01Z" (this endpoint's default) = 1000ms. A row at
+    // 500ms falls strictly between the two: excluded under this endpoint's
+    // real default, but would be wrongly included if DEFAULT_FROM ever
+    // regressed to ":00Z". A row at exactly 1000ms must survive (inclusive
+    // bound). This pins the asymmetry down; every other test in this file
+    // uses timestamps far past both defaults and would not catch a regression.
+    let store = store::Store::open_in_memory().unwrap();
+    for (time, id) in [(500i64, "before"), (1_000i64, "atboundary")] {
+        store
+            .insert_container_batch(
+                time,
+                &[store::ContainerSample {
+                    container_id: id.into(),
+                    cpu_percent: 1.0,
+                    mem_total: 1, mem_available: 1, mem_used: 1,
+                    mem_used_percent: 1.0, mem_free: 1,
+                }],
+            )
+            .unwrap();
+    }
+    let mut config = config::Config::load_for_test();
+    config.token = "secret".into();
+    let st = Arc::new(AppState {
+        config: Arc::new(config),
+        store,
+        sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
+    });
+
+    let get_st = |uri: &'static str, st: Arc<AppState>| async move {
+        let res = router(st)
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+
+    let before = get_st("/api/container/before/cpu/history", st.clone()).await;
+    assert_eq!(
+        before.as_array().unwrap().len(), 0,
+        "a row at 500ms must be excluded by the :01Z default (1000ms)"
+    );
+
+    let at_boundary = get_st("/api/container/atboundary/cpu/history", st).await;
+    assert_eq!(
+        at_boundary.as_array().unwrap().len(), 1,
+        "a row at exactly 1000ms must be included (inclusive lower bound)"
+    );
+}
+
+#[tokio::test]
 async fn stats_route_is_absent_unless_debug() {
     // state() builds a non-debug config
     let (s, _) = get("/api/stats").await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn stats_route_reports_row_counts_and_live_memory_when_debug() {
+    // state()'s Config::load_for_test() hardcodes debug: false, so this
+    // builds its own debug-enabled state directly rather than going through
+    // the shared get()/state() helpers.
+    let store = store::Store::open_in_memory().unwrap();
+    store.insert_cpu(1_000, 1.0).unwrap();
+    store.insert_cpu(2_000, 2.0).unwrap();
+
+    let mut config = config::Config::load_for_test();
+    config.token = "secret".into();
+    config.debug = true;
+    let st = Arc::new(AppState {
+        config: Arc::new(config),
+        store,
+        sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
+    });
+
+    let res = router(st)
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats")
+                .header("Authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(j["row_count"], 2, "the two inserted cpu_usage rows must be counted");
+    assert!(j["storage_usage_kb"].is_string());
+    assert!(j["storage_usage_mb"].is_string());
+    // memory_usage must come from the live sampler, not a hardcoded stub --
+    // total is always > 0 on any real machine.
+    assert!(j["memory_usage"]["total"].as_u64().unwrap() > 0);
+    assert!(j["memory_usage"]["usedPercent"].is_number());
+    let cpu_table = j["table_sizes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["table_name"] == "cpu_usage")
+        .expect("cpu_usage must appear in table_sizes");
+    assert_eq!(cpu_table["row_count"], 2);
 }
