@@ -10,7 +10,12 @@ use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions, 
 use futures_util::StreamExt;
 
 const SOCKET: &str = "/var/run/docker.sock";
-const TIMEOUT_SECS: u64 = 120;
+// Matches the Go client's `http.Client{Timeout: 10s}` (pkg/dockerClient). A
+// single unresponsive container or a hung Docker daemon must not stall a whole
+// collection/push cycle for two minutes — the collector drops missed ticks
+// (MissedTickBehavior::Skip), so a long per-request timeout turns into large
+// gaps in the recorded metrics.
+const TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DockerError {
@@ -43,10 +48,13 @@ impl DockerClient {
                 id: c.id.unwrap_or_default(),
                 names: c.names.unwrap_or_default(),
                 image: c.image.unwrap_or_default(),
-                state: c
-                    .state
-                    .map(|s| format!("{s:?}").to_lowercase())
-                    .unwrap_or_default(),
+                // bollard's ContainerSummaryStateEnum Display emits the exact
+                // Docker wire strings ("running", "exited", ... and "" for the
+                // empty state), matching Go's `string(container.State)`. Debug
+                // + to_lowercase() would instead emit "empty" for the empty
+                // variant and silently drift if a future bollard release
+                // renamed a variant. See the wire-string test below.
+                state: c.state.map(|s| s.to_string()).unwrap_or_default(),
                 labels: c.labels.unwrap_or_default(),
             })
             .collect())
@@ -115,7 +123,44 @@ impl DockerClient {
             .as_ref()
             .and_then(|st| st.health.as_ref())
             .and_then(|h| h.status.as_ref())
-            .map(|s| format!("{s:?}").to_lowercase())
+            // Display emits the Docker wire values ("healthy", "unhealthy",
+            // "starting", "none", "") — matching Go's raw status string. See
+            // the state field in list_containers for the rationale.
+            .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bollard::models::{ContainerSummaryStateEnum, HealthStatusEnum};
+
+    // Coolify's PushServerUpdateJob keys container status on these exact
+    // lowercase strings (running / restarting / exited / paused / dead ...),
+    // and the push/list wire values come from these enums' Display impl. Pin
+    // the mapping so a bollard upgrade that renames a variant or changes its
+    // Display can't silently break status reporting to Coolify.
+    #[test]
+    fn container_state_wire_strings_match_docker() {
+        use ContainerSummaryStateEnum::*;
+        assert_eq!(CREATED.to_string(), "created");
+        assert_eq!(RUNNING.to_string(), "running");
+        assert_eq!(PAUSED.to_string(), "paused");
+        assert_eq!(RESTARTING.to_string(), "restarting");
+        assert_eq!(EXITED.to_string(), "exited");
+        assert_eq!(REMOVING.to_string(), "removing");
+        assert_eq!(DEAD.to_string(), "dead");
+        // The empty state must serialize to "" (Go's empty string), NOT "empty".
+        assert_eq!(EMPTY.to_string(), "");
+    }
+
+    #[test]
+    fn health_status_wire_strings_match_docker() {
+        use HealthStatusEnum::*;
+        assert_eq!(NONE.to_string(), "none");
+        assert_eq!(STARTING.to_string(), "starting");
+        assert_eq!(HEALTHY.to_string(), "healthy");
+        assert_eq!(UNHEALTHY.to_string(), "unhealthy");
+        assert_eq!(EMPTY.to_string(), "");
     }
 }

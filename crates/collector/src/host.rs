@@ -42,6 +42,21 @@ impl HostSampler {
 
     /// `time` is left at 0; the caller stamps it so every metric in a cycle
     /// shares one timestamp, matching the Go collector.
+    ///
+    /// `used`/`usedPercent` come from sysinfo's `used_memory()`, which is
+    /// `MemTotal - MemAvailable`. This is a **deliberate, more-accurate
+    /// divergence** from the Go agent, which used gopsutil's classic
+    /// `Total - Free - Buffers - Cached`. gopsutil treats *all* page cache as
+    /// reclaimable — including tmpfs/shmem and other non-reclaimable pages — so
+    /// it under-reports real memory pressure. `MemTotal - MemAvailable` uses the
+    /// kernel's own estimate of memory obtainable without swapping, and is what
+    /// modern `free`/`htop`/node_exporter report as used.
+    ///
+    /// NOTE: on cache-heavy hosts this reads HIGHER than the Go agent did — that
+    /// is intentional and correct. Do NOT "restore Go parity" by switching back
+    /// to the gopsutil formula; the higher number is the honest one. If this
+    /// value ever needs to change, treat it as a versioned metric change and
+    /// re-check any Coolify memory alert thresholds calibrated on the old agent.
     pub fn sample_memory(&mut self) -> MemRow {
         self.system.refresh_memory();
         let total = self.system.total_memory();

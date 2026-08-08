@@ -1,10 +1,28 @@
 #![forbid(unsafe_code)]
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, watch};
 
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bind the API listener. `addr` is the dual-stack `[::]` address from config;
+/// on hosts where IPv6 is disabled that bind fails (EAFNOSUPPORT /
+/// EADDRNOTAVAIL), so fall back to the equivalent IPv4 `0.0.0.0` address. This
+/// mirrors Go's `net.Listen("tcp", ":PORT")`, which is dual-stack when IPv6 is
+/// available and IPv4-only when it isn't.
+async fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => Ok(listener),
+        Err(e) if addr.is_ipv6() => {
+            let v4 = SocketAddr::from(([0, 0, 0, 0], addr.port()));
+            tracing::warn!(error = %e, %v4, "IPv6 bind failed, falling back to IPv4");
+            tokio::net::TcpListener::bind(v4).await
+        }
+        Err(e) => Err(e),
+    }
+}
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -88,8 +106,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // so orchestration healthchecks (Coolify, Docker HEALTHCHECK) succeed as
     // soon as the process can answer /api/health.
     {
-        let addr = config.bind_addr;
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let listener = bind_listener(config.bind_addr).await?;
+        let addr = listener.local_addr().unwrap_or(config.bind_addr);
         tracing::info!(%addr, "api listening");
 
         let state = Arc::new(api::AppState {

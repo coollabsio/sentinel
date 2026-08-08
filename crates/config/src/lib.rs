@@ -3,7 +3,7 @@
 // scoped #[allow(unsafe_code)] instead (see Global Constraints).
 #![deny(unsafe_code)]
 
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 // Mirrors the Go implementation's build-time `-ldflags -X ...Version=...`
@@ -74,7 +74,12 @@ impl Config {
         if port == 0 {
             return Err(ConfigError::InvalidPort);
         }
-        let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
+        // Bind the unspecified IPv6 address so the listener is dual-stack on
+        // Linux (net.ipv6.bindv6only=0 by default), matching Go's
+        // net.Listen("tcp", ":PORT"), which accepts both IPv4 and IPv6. On
+        // hosts with IPv6 disabled this bind fails, and main.rs falls back to
+        // 0.0.0.0 — again mirroring Go's transparent IPv4 fallback.
+        let bind_addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
 
         let token = non_empty("TOKEN").ok_or(ConfigError::MissingToken)?;
 

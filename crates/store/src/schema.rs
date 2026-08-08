@@ -91,8 +91,15 @@ pub fn migrate_legacy(conn: &Connection) -> rusqlite::Result<bool> {
     )?;
 
     tx.commit()?;
-    // VACUUM cannot run inside a transaction.
-    conn.execute_batch("VACUUM")?;
+    // VACUUM cannot run inside a transaction. It only reclaims disk space left
+    // by the dropped legacy tables — the migration is already durably committed
+    // above. A VACUUM failure (e.g. transient disk-full) must NOT propagate:
+    // the caller (Store::open) treats a migration error as an unopenable DB and
+    // renames the file aside, which would hide the freshly-migrated history.
+    // Log and continue with the successfully migrated data instead.
+    if let Err(e) = conn.execute_batch("VACUUM") {
+        tracing::warn!(error = %e, "post-migration VACUUM failed; continuing with migrated data");
+    }
     tracing::info!("legacy schema migration complete");
     Ok(true)
 }

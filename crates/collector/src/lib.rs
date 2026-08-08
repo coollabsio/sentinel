@@ -17,6 +17,12 @@ use tokio::task::JoinSet;
 /// 10-worker pool. Making it explicit replaces an unbounded goroutine fan-out.
 const MAX_CONCURRENT_STATS: usize = 10;
 
+/// Round a percentage to two decimals, matching Go's
+/// `math.Round(x*100)/100` / `fmt.Sprintf("%.2f", x)` used when storing metrics.
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
 pub fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -75,7 +81,11 @@ impl Collector {
     async fn cycle(&self, sampler: &mut HostSampler) {
         let time = now_millis();
 
-        let cpu = sampler.sample_cpu();
+        // Go stored host CPU with fmt.Sprintf("%.2f", ...) (collector.go), so
+        // round to 2 decimals here to keep stored values at wire parity — the
+        // same treatment sample_memory already applies to memory. The raw value
+        // is only used unrounded by /api/cpu/current, which Go also returned raw.
+        let cpu = round2(sampler.sample_cpu());
         if let Err(e) = self.store.insert_cpu(time, cpu) {
             tracing::warn!(error = %e, "failed to record host cpu");
         }
@@ -150,16 +160,17 @@ async fn fetch(
     // Matches the Go collector: `free` is derived, and `available` is set to the
     // same derived value. Preserved deliberately for wire compatibility.
     let free = mem_limit.saturating_sub(mem_used);
-    // Go stored this with fmt.Sprintf("%.2f", ...) and re-parsed it on read,
-    // effectively rounding to 2 decimals — same rounding HostSampler applies
-    // to host memory. Without this, the raw f64 (e.g. 12.345678901234568)
-    // still serializes as a JSON number and passes a type-only check, but
-    // it's a real departure from the frozen wire value Go actually emitted.
-    let mem_used_percent = (calc::memory_percent(&stats) * 100.0).round() / 100.0;
+    // Go stored both percentages with fmt.Sprintf("%.2f", ...) (collector.go)
+    // and re-parsed them on read, effectively rounding to 2 decimals. Round
+    // both here so the stored (and downsampled) values stay at wire parity with
+    // the Go agent; without it the raw f64 (e.g. 12.345678901234568) persists
+    // to storage even though a type-only check would pass.
+    let mem_used_percent = round2(calc::memory_percent(&stats));
+    let cpu_percent = round2(calc::cpu_percent(&stats));
 
     Some(ContainerSample {
         container_id: name,
-        cpu_percent: calc::cpu_percent(&stats),
+        cpu_percent,
         mem_total: mem_limit,
         mem_available: free,
         mem_used,
