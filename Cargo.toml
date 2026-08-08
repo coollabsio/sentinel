@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.22"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+axum = "0.8.9"
+bollard = "0.21"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.39.6"
+thiserror = "2"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+
+[package]
+name = "sentinel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+config = { path = "crates/config" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
