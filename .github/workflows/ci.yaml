@@ -16,31 +16,29 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@v6
+      # dtolnay/rust-toolchain's docs are explicit: when passing an explicit
+      # `toolchain` input, the action ref must be @master, not @stable --
+      # @stable pulls in whatever is CURRENTLY stable at CI run time
+      # (drifting over time) rather than respecting the pinned toolchain
+      # input, defeating the whole point of pinning 1.96.0 here.
+      - uses: dtolnay/rust-toolchain@master
         with:
-          go-version-file: go.mod
-          cache: true
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
 
-      - name: Check formatting
-        run: test -z "$(gofmt -l .)"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: go test -race ./...
-
-      - name: Test build version injection
-        env:
-          SENTINEL_EXPECT_VERSION: ci-dev
-        run: go test -ldflags "-X github.com/coollabsio/sentinel/pkg/config.Version=ci-dev" ./pkg/config
-
-      - name: Vet
-        run: go vet ./...
-
-      - uses: golangci/golangci-lint-action@v9
-        with:
-          version: v2.7.2
+        run: cargo test --workspace
 
       - name: Build
-        run: go build ./...
+        run: cargo build --release --locked
 
   docker:
     runs-on: ubuntu-24.04

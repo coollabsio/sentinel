@@ -18,7 +18,7 @@ An API for gathering Linux server / Docker Engine metrics.
 
 ### Prerequisites
 
-- Go 1.25 or higher (for development)
+- Rust 1.96 or higher (for development)
 - Docker (for container metrics)
 - Linux environment (production deployment)
 
@@ -35,28 +35,25 @@ docker run -d \
   ghcr.io/coollabsio/sentinel:latest
 ```
 
-#### Using Go
+#### Using Cargo
 
 ```bash
 # Clone the repository
 git clone https://github.com/coollabsio/sentinel.git
 cd sentinel
 
-# Install dependencies
-go mod download
-
 # Run the application
-TOKEN=your-secret-token go run main.go
+TOKEN=your-secret-token cargo run
 ```
 
-#### Using Air (Development with hot reload)
+#### Using cargo-watch (Development with hot reload)
 
 ```bash
-# Install Air if not already installed
-go install github.com/cosmtrek/air@latest
+# Install cargo-watch if not already installed
+cargo install cargo-watch
 
 # Run with hot reload
-air
+cargo watch -x run
 ```
 
 ## Configuration
@@ -81,7 +78,7 @@ Sentinel is configured using environment variables:
 | `DEBUG` | `false` | Enable debug mode and profiling endpoints |
 | `PORT` | `8888` | HTTP server port |
 
-When running directly in Gin development mode, `PUSH_ENDPOINT` defaults to `http://localhost:8000`.
+In development mode (`cargo run`/`cargo build` debug profile, or `SENTINEL_DEVELOPMENT=1`), `PUSH_ENDPOINT` defaults to `http://localhost:8000`.
 
 ### Example Configuration
 
@@ -133,10 +130,10 @@ Sentinel follows a service-oriented architecture with these components:
 
 ### Core Services
 
-1. **API Server** (`pkg/api/`) - Gin-based HTTP server exposing metrics endpoints
-2. **Collector Service** (`pkg/collector/`) - Periodically collects system and Docker metrics
-3. **Push Service** (`pkg/push/`) - Sends metrics to external endpoints
-4. **Database Layer** (`pkg/db/`) - SQLite storage with automatic cleanup
+1. **API Server** (`crates/api/`) - Axum-based HTTP server exposing metrics endpoints
+2. **Collector Service** (`crates/collector/`) - Periodically collects system and Docker metrics
+3. **Push Service** (`crates/push/`) - Sends metrics to external endpoints
+4. **Database Layer** (`crates/store/`) - SQLite storage (rusqlite, bundled) with automatic cleanup
 
 ### Data Flow
 
@@ -153,37 +150,37 @@ System Stats ───┘                              │
 
 ```
 sentinel/
-├── cmd/              # Application entry points
-├── pkg/
-│   ├── api/         # HTTP API and controllers
-│   ├── collector/   # Metrics collection service
-│   ├── push/        # Push service
-│   ├── db/          # Database layer
-│   └── config/      # Configuration management
-├── main.go          # Application main
-├── go.mod           # Go dependencies
-├── Dockerfile       # Docker build configuration
-├── API.md           # API documentation
-└── openapi.yaml     # OpenAPI specification
+├── src/               # Application entry point (main.rs)
+├── crates/
+│   ├── api/          # HTTP API and routes (axum)
+│   ├── collector/    # Metrics collection service
+│   ├── push/         # Push service
+│   ├── store/        # Database layer (rusqlite)
+│   ├── config/       # Configuration management
+│   └── docker/       # Docker Engine client (bollard)
+├── Cargo.toml         # Workspace manifest
+├── Dockerfile          # Docker build configuration
+├── API.md              # API documentation
+└── openapi.yaml        # OpenAPI specification
 ```
 
 ### Building
 
 ```bash
 # Build binary
-go build -o sentinel .
+cargo build --release
 
 # Build Docker image
 docker build -t sentinel .
 
 # Run tests
-go test ./...
+cargo test --workspace
 
 # Format code
-go fmt ./...
+cargo fmt --all
 
 # Run linter
-golangci-lint run
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ### Test with Coolify development
@@ -221,11 +218,11 @@ This starts a temporary candidate container using the development server's exist
 
 Key dependencies used in the project:
 
-- **gin-gonic/gin**: HTTP web framework
-- **docker/docker**: Docker API client
-- **shirou/gopsutil**: System metrics collection
-- **mattn/go-sqlite3**: SQLite database driver
-- **golang.org/x/sync/errgroup**: Concurrent service management
+- **axum**: HTTP web framework
+- **bollard**: Docker API client
+- **sysinfo**: System metrics collection
+- **rusqlite** (bundled): SQLite database driver
+- **tokio**: Async runtime and concurrent service management
 
 ## Deployment
 
@@ -291,10 +288,6 @@ When `DEBUG=true`, access database statistics:
 curl -H "Authorization: Bearer YOUR_TOKEN" \
   http://localhost:8888/api/stats
 ```
-
-### Profiling Endpoints (Debug Mode)
-
-Go profiling endpoints are available at `/debug/pprof/*` when debug mode is enabled.
 
 ## Contributing
 

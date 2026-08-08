@@ -51,5 +51,8 @@ fn exits_nonzero_when_port_already_in_use() {
         .unwrap();
 
     drop(holder);
-    assert!(!out.status.success(), "binary must exit non-zero on a bind failure");
+    assert!(
+        !out.status.success(),
+        "binary must exit non-zero on a bind failure"
+    );
 }

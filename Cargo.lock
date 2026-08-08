@@ -1153,9 +1153,12 @@ dependencies = [
  "config",
  "docker",
  "dotenvy",
+ "http-body-util",
  "push",
+ "serde_json",
  "store",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
