@@ -43,9 +43,12 @@ impl Collector {
         );
 
         let mut sampler = HostSampler::new();
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-            self.config.refresh_rate_seconds,
-        ));
+        // tokio::time::interval's first tick fires immediately, unlike Go's
+        // time.NewTicker (which waits a full period before the first tick).
+        // interval_at with an explicit first-tick deadline restores that
+        // behavior, matching the Go collector's actual startup timing.
+        let period = std::time::Duration::from_secs(self.config.refresh_rate_seconds);
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
