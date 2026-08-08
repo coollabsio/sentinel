@@ -97,10 +97,22 @@ pub fn migrate_legacy(conn: &Connection) -> rusqlite::Result<bool> {
     Ok(true)
 }
 
-/// Reads every row as raw text first, so a value that fails to parse skips
-/// only that row rather than the whole migration.
+/// The legacy schema declares every column VARCHAR with no NOT NULL, and a
+/// non-INTEGER PRIMARY KEY does not imply NOT NULL in SQLite — so a legacy
+/// row's `time` (or any other column) can be a genuine SQL NULL, not just
+/// unparseable text. Reading straight into `String` would error on NULL
+/// (`InvalidColumnType`) and abort the whole migration; reading into
+/// `Option<String>` and treating None the same as a parse failure is what
+/// "skip this row" actually requires.
+fn parse_opt<T: std::str::FromStr>(s: Option<String>) -> Option<T> {
+    s?.trim().parse().ok()
+}
+
+/// Reads every row as raw (possibly-NULL) text first, so a value that is
+/// missing or fails to parse skips only that row rather than the whole
+/// migration.
 fn migrate_cpu_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
-    let rows: Vec<(String, String)> = tx
+    let rows: Vec<(Option<String>, Option<String>)> = tx
         .prepare("SELECT time, percent FROM cpu_usage_old")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -108,15 +120,23 @@ fn migrate_cpu_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     let mut insert =
         tx.prepare("INSERT OR REPLACE INTO cpu_usage (time, percent) VALUES (?1, ?2)")?;
     for (time_s, percent_s) in rows {
-        let Ok(time) = time_s.trim().parse::<i64>() else { continue };
-        let Ok(percent) = percent_s.trim().parse::<f64>() else { continue };
+        let Some(time) = parse_opt::<i64>(time_s) else { continue };
+        let Some(percent) = parse_opt::<f64>(percent_s) else { continue };
         insert.execute((time, percent))?;
     }
     Ok(())
 }
 
 fn migrate_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
-    let rows: Vec<(String, String, String, String, String, String)> = tx
+    type Row = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = tx
         .prepare("SELECT time, total, available, used, usedPercent, free FROM memory_usage_old")?
         .query_map([], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
@@ -128,19 +148,19 @@ fn migrate_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> 
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     for (time_s, total_s, available_s, used_s, used_percent_s, free_s) in rows {
-        let Ok(time) = time_s.trim().parse::<i64>() else { continue };
-        let Ok(total) = total_s.trim().parse::<i64>() else { continue };
-        let Ok(available) = available_s.trim().parse::<i64>() else { continue };
-        let Ok(used) = used_s.trim().parse::<i64>() else { continue };
-        let Ok(used_percent) = used_percent_s.trim().parse::<f64>() else { continue };
-        let Ok(free) = free_s.trim().parse::<i64>() else { continue };
+        let Some(time) = parse_opt::<i64>(time_s) else { continue };
+        let Some(total) = parse_opt::<i64>(total_s) else { continue };
+        let Some(available) = parse_opt::<i64>(available_s) else { continue };
+        let Some(used) = parse_opt::<i64>(used_s) else { continue };
+        let Some(used_percent) = parse_opt::<f64>(used_percent_s) else { continue };
+        let Some(free) = parse_opt::<i64>(free_s) else { continue };
         insert.execute((time, total, available, used, used_percent, free))?;
     }
     Ok(())
 }
 
 fn migrate_container_cpu_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
-    let rows: Vec<(String, Option<String>, String)> = tx
+    let rows: Vec<(Option<String>, Option<String>, Option<String>)> = tx
         .prepare("SELECT time, container_id, percent FROM container_cpu_usage_old")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -150,17 +170,25 @@ fn migrate_container_cpu_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Resu
          VALUES (?1, ?2, ?3)",
     )?;
     for (time_s, container_id, percent_s) in rows {
-        let Ok(time) = time_s.trim().parse::<i64>() else { continue };
+        let Some(time) = parse_opt::<i64>(time_s) else { continue };
         let Some(container_id) = container_id.filter(|s| !s.is_empty()) else { continue };
-        let Ok(percent) = percent_s.trim().parse::<f64>() else { continue };
+        let Some(percent) = parse_opt::<f64>(percent_s) else { continue };
         insert.execute((time, container_id, percent))?;
     }
     Ok(())
 }
 
 fn migrate_container_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
-    type MemRow = (String, Option<String>, String, String, String, String, String);
-    let rows: Vec<MemRow> = tx
+    type Row = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = tx
         .prepare(
             "SELECT time, container_id, total, available, used, usedPercent, free
              FROM container_memory_usage_old",
@@ -176,13 +204,13 @@ fn migrate_container_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::R
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     for (time_s, container_id, total_s, available_s, used_s, used_percent_s, free_s) in rows {
-        let Ok(time) = time_s.trim().parse::<i64>() else { continue };
+        let Some(time) = parse_opt::<i64>(time_s) else { continue };
         let Some(container_id) = container_id.filter(|s| !s.is_empty()) else { continue };
-        let Ok(total) = total_s.trim().parse::<i64>() else { continue };
-        let Ok(available) = available_s.trim().parse::<i64>() else { continue };
-        let Ok(used) = used_s.trim().parse::<i64>() else { continue };
-        let Ok(used_percent) = used_percent_s.trim().parse::<f64>() else { continue };
-        let Ok(free) = free_s.trim().parse::<i64>() else { continue };
+        let Some(total) = parse_opt::<i64>(total_s) else { continue };
+        let Some(available) = parse_opt::<i64>(available_s) else { continue };
+        let Some(used) = parse_opt::<i64>(used_s) else { continue };
+        let Some(used_percent) = parse_opt::<f64>(used_percent_s) else { continue };
+        let Some(free) = parse_opt::<i64>(free_s) else { continue };
         insert.execute((time, container_id, total, available, used, used_percent, free))?;
     }
     Ok(())

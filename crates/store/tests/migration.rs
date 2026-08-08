@@ -114,6 +114,37 @@ fn skips_unparseable_rows_instead_of_failing() {
 }
 
 #[test]
+fn skips_rows_with_a_genuine_sql_null_not_just_unparseable_text() {
+    // The legacy schema declares every column VARCHAR with no NOT NULL, and
+    // SQLite does not imply NOT NULL from a non-INTEGER PRIMARY KEY, so a
+    // real SQL NULL is a legal legacy value distinct from garbage text.
+    // Reading straight into `String` would error (and abort the whole
+    // migration) instead of skipping; reading into `Option<String>` must
+    // treat NULL the same as a parse failure.
+    let dir = tmpdir("null");
+    let path = dir.join("m.sqlite");
+    let _ = std::fs::remove_file(&path);
+    legacy_db(&path);
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute("INSERT INTO cpu_usage VALUES (NULL, '10.00')", []).unwrap();
+        c.execute("INSERT INTO cpu_usage VALUES ('1700000099999', NULL)", [])
+            .unwrap();
+        c.execute(
+            "INSERT INTO container_cpu_usage VALUES ('1700000099999', NULL, '5.00')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let s = Store::open(&path).unwrap();
+    let rows = s.cpu_history(0, i64::MAX).unwrap();
+    assert_eq!(rows.len(), 2, "NULL rows must be skipped, not error the migration: got {rows:?}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn fresh_database_needs_no_migration() {
     let dir = tmpdir("fresh");
     let path = dir.join("m.sqlite");
