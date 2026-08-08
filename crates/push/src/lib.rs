@@ -62,9 +62,13 @@ impl Pusher {
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-            self.config.push_interval_seconds,
-        ));
+        // See the collector's identical fix: tokio::time::interval's first
+        // tick fires immediately, unlike Go's time.NewTicker. interval_at
+        // restores the Go behavior of waiting a full period before the first
+        // push, avoiding a push attempt (and possible failure/log noise) at
+        // the moment the process starts, before Docker/network may be ready.
+        let period = std::time::Duration::from_secs(self.config.push_interval_seconds);
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
