@@ -9,10 +9,11 @@ fn now_millis_is_a_plausible_unix_timestamp() {
 }
 
 #[test]
-fn cpu_sample_is_in_range_after_warmup() {
+fn cpu_sample_is_in_range() {
     let mut s = HostSampler::new();
-    // First read is meaningless because sysinfo is differential; the sampler
-    // must warm up internally so callers never see a bogus first value.
+    // First read is often ~0.0 because sysinfo is differential and we no
+    // longer block-sleep a warm-up in the constructor (cold-start path).
+    // Range is still always valid; subsequent samples gain a real delta.
     let p = s.sample_cpu();
     assert!((0.0..=100.0).contains(&p), "cpu percent out of range: {p}");
 }

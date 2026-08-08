@@ -65,8 +65,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(version = %config.version, "Sentinel is starting");
 
+    // Store + sampler are required by the API. Docker is only needed by the
+    // collector and pusher, so it is opened *after* the listener binds —
+    // keeping the path to `/api/health` as short as possible.
     let store = store::Store::open(&config.metrics_file)?;
-    let docker = docker::DockerClient::new()?;
     let sampler = Arc::new(Mutex::new(collector::HostSampler::new()));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -81,6 +83,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // bind failure surfaces via `?` immediately, before any other service is
     // even started, rather than needing extra coordination to cascade a
     // failure out of a spawned task after the fact.
+    //
+    // Also bind before DockerClient::new and before any collector/push work
+    // so orchestration healthchecks (Coolify, Docker HEALTHCHECK) succeed as
+    // soon as the process can answer /api/health.
     {
         let addr = config.bind_addr;
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -101,6 +107,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await;
         });
     }
+
+    let docker = docker::DockerClient::new()?;
 
     // Collector
     if config.collector_enabled {

@@ -2,8 +2,14 @@ use store::MemRow;
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
 /// Owns a long-lived `System`. sysinfo derives CPU usage from the delta between
-/// two refreshes, so a fresh instance reports 0.0; the constructor warms up
-/// once and every `sample_cpu` refreshes before reading.
+/// two refreshes, so a brand-new instance's first `sample_cpu` is typically
+/// ~0.0 — matching Go's gopsutil `cpu.Percent(0, false)` first-call behavior.
+///
+/// Deliberately does **not** sleep `MINIMUM_CPU_UPDATE_INTERVAL` (200 ms on
+/// Linux) in the constructor: that warm-up used to run on the critical path
+/// before the HTTP listener bound, adding ~200 ms to cold start. Callers that
+/// need a non-zero first reading should call `sample_cpu` twice with their
+/// own delay; the collector's 5 s tick already provides that naturally.
 pub struct HostSampler {
     system: System,
 }
@@ -21,8 +27,9 @@ impl HostSampler {
                 .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
                 .with_memory(MemoryRefreshKind::nothing().with_ram()),
         );
-        system.refresh_cpu_usage();
-        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        // Seed the differential baseline and load memory counters without
+        // blocking. First sample_cpu will refresh again and return the delta
+        // since this baseline (usually ~0 if called immediately).
         system.refresh_cpu_usage();
         system.refresh_memory();
         Self { system }

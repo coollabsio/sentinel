@@ -20,9 +20,11 @@ ARG VERSION
 # shows up in logs and /api/version — matching the Go implementation's
 # equivalent -ldflags override.
 ENV SENTINEL_BUILD_VERSION=$VERSION
+# Build only the agent binary. Workspace also contains `sentinel-bench` (a
+# host-side harness from BENCHMARK.md) which must not ship in the image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --locked && \
+    cargo build --release --locked -p sentinel && \
     cp /app/target/release/sentinel /app/sentinel
 
 # Final stage
