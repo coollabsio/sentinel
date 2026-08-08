@@ -18,6 +18,22 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Mirrors the Go implementation's Execute(): load a ".env" file from the
+    // exact current working directory if present. Uses dotenvy::from_path
+    // rather than dotenvy::dotenv() deliberately — the latter walks up
+    // parent directories looking for ".env", which Go's plain
+    // os.Stat(".env") + godotenv.Load() never did. tracing isn't initialized
+    // yet at this point (config.debug, read a few lines below, decides the
+    // log level), so this uses eprintln!/println! directly, matching Go's
+    // use of the always-available standard `log` package here.
+    if std::path::Path::new(".env").exists() {
+        if let Err(e) = dotenvy::from_path(".env") {
+            eprintln!("sentinel: error loading .env file: {e}");
+        }
+    } else {
+        println!("sentinel: no .env file found, skipping load");
+    }
+
     // Mirrors the Go implementation's `gin.Mode() == gin.DebugMode` check,
     // which is a RUNTIME env-var signal (GIN_MODE, defaulting to DebugMode
     // unless explicitly set to "release" — the Dockerfile does exactly
@@ -57,24 +73,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut services = tokio::task::JoinSet::new();
 
     // HTTP API
+    //
+    // Bind eagerly, before spawning: Go's implementation ran ListenAndServe
+    // in a goroutine and propagated a bind failure through errgroup, tearing
+    // down every other service and exiting the process non-zero. Binding
+    // here, in run()'s own body, gets the same outcome more directly — a
+    // bind failure surfaces via `?` immediately, before any other service is
+    // even started, rather than needing extra coordination to cascade a
+    // failure out of a spawned task after the fact.
     {
+        let addr = config.bind_addr;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!(%addr, "api listening");
+
         let state = Arc::new(api::AppState {
             config: config.clone(),
             store: store.clone(),
             sampler: sampler.clone(),
         });
         let app = api::router(state);
-        let addr = config.bind_addr;
         let mut rx = shutdown_rx.clone();
         services.spawn(async move {
-            let listener = match tokio::net::TcpListener::bind(addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!(error = %e, %addr, "failed to bind");
-                    return;
-                }
-            };
-            tracing::info!(%addr, "api listening");
             let _ = axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     let _ = rx.changed().await;
