@@ -3,11 +3,13 @@
 pub mod metrics;
 pub mod retention;
 pub mod schema;
+pub mod stats;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub use metrics::{ContainerSample, CpuRow, MemRow};
+pub use stats::{DbStats, TableStat};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
