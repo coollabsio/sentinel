@@ -1,0 +1,20 @@
+[package]
+name = "api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum.workspace = true
+collector = { path = "../collector" }
+config = { path = "../config" }
+serde.workspace = true
+serde_json = "1"
+store = { path = "../store" }
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

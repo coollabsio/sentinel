@@ -1,0 +1,65 @@
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use std::sync::Arc;
+
+use crate::{types::ErrorBody, AppState};
+
+/// Endpoints exempt from authentication, matching the Go implementation.
+const PUBLIC_PATHS: [&str; 2] = ["/api/health", "/api/version"];
+
+pub async fn require_token(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if PUBLIC_PATHS.contains(&path) {
+        return next.run(request).await;
+    }
+
+    let expected = format!("Bearer {}", state.config.token);
+    let provided = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody { error: "Unauthorized".into() }),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Length-independent comparison, mirroring Go's subtle.ConstantTimeCompare
+/// (which returns 0 for unequal lengths without leaking content).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn compares_equal_and_unequal_inputs() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
+    }
+}
