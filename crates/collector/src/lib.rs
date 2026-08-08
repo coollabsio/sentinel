@@ -62,17 +62,17 @@ impl Collector {
                     return;
                 }
                 _ = ticker.tick() => {
-                    if let Err(e) = self.cycle(&mut sampler).await {
-                        // A failed cycle must never kill the loop. This replaces
-                        // the Go implementation's panic/recover block.
-                        tracing::warn!(error = %e, "collection cycle failed");
-                    }
+                    // A failed cycle must never kill the loop: every fallible
+                    // step inside `cycle` logs and continues, so there is no
+                    // error to surface here. This replaces the Go
+                    // implementation's panic/recover block.
+                    self.cycle(&mut sampler).await;
                 }
             }
         }
     }
 
-    async fn cycle(&self, sampler: &mut HostSampler) -> Result<(), String> {
+    async fn cycle(&self, sampler: &mut HostSampler) {
         let time = now_millis();
 
         let cpu = sampler.sample_cpu();
@@ -87,7 +87,6 @@ impl Collector {
         }
 
         self.collect_containers(time).await;
-        Ok(())
     }
 
     async fn collect_containers(&self, time: i64) {
@@ -151,6 +150,12 @@ async fn fetch(
     // Matches the Go collector: `free` is derived, and `available` is set to the
     // same derived value. Preserved deliberately for wire compatibility.
     let free = mem_limit.saturating_sub(mem_used);
+    // Go stored this with fmt.Sprintf("%.2f", ...) and re-parsed it on read,
+    // effectively rounding to 2 decimals — same rounding HostSampler applies
+    // to host memory. Without this, the raw f64 (e.g. 12.345678901234568)
+    // still serializes as a JSON number and passes a type-only check, but
+    // it's a real departure from the frozen wire value Go actually emitted.
+    let mem_used_percent = (calc::memory_percent(&stats) * 100.0).round() / 100.0;
 
     Some(ContainerSample {
         container_id: name,
@@ -158,7 +163,7 @@ async fn fetch(
         mem_total: mem_limit,
         mem_available: free,
         mem_used,
-        mem_used_percent: calc::memory_percent(&stats),
+        mem_used_percent,
         mem_free: free,
     })
 }

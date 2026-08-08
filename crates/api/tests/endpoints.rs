@@ -107,6 +107,28 @@ async fn cpu_history_honours_from_and_to() {
 }
 
 #[tokio::test]
+async fn empty_from_and_to_fall_back_to_the_defaults() {
+    // `?from=&to=` deserializes to Some("") through axum's Query extractor,
+    // not None. Go's ctx.Query returned "" for both absent and empty and
+    // applied the defaults either way, so an empty value must return full
+    // history, not 400.
+    for (uri, expected) in [
+        ("/api/cpu/history?from=&to=", 2),
+        ("/api/cpu/history?from=", 2),
+        ("/api/cpu/history?to=", 2),
+        ("/api/memory/history?from=&to=", 1),
+    ] {
+        let (s, j) = get(router(state(false)), uri, Some("secret")).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        assert_eq!(
+            j.as_array().unwrap().len(),
+            expected,
+            "{uri} must return full history"
+        );
+    }
+}
+
+#[tokio::test]
 async fn cpu_history_rejects_bad_dates() {
     for uri in [
         "/api/cpu/history?from=nonsense",

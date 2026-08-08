@@ -20,10 +20,25 @@ pub struct HistoryQuery {
 /// Resolves `from`/`to` into a millisecond range, applying the Go defaults.
 /// The Response error type is necessary here for axum's flexibility in returning
 /// different response types (bad_request or other errors).
+///
+/// `?from=&to=` deserializes to `Some("")`, not `None` — axum's `Query`
+/// extractor only produces `None` when the key is absent entirely, not when
+/// its value is empty (verified directly against `serde_urlencoded`). Go's
+/// `ctx.Query("from")` returns `""` for both cases and its `if from != ""`
+/// guard applied the default either way. Without the `.filter`, a caller
+/// that builds a query string from an optional value (`?from=${from ?? ''}`)
+/// gets a 400 on an endpoint that used to return full history.
 #[allow(clippy::result_large_err)]
 pub fn resolve_range(q: &HistoryQuery, default_from: &str) -> Result<(i64, i64), Response> {
-    let from = q.from.clone().unwrap_or_else(|| default_from.to_string());
-    let to = q.to.clone().unwrap_or_else(now_layout);
+    let from = q
+        .from
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_from.to_string());
+    let to =
+        q.to.clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(now_layout);
 
     let from_ms = parse_bound(&from).map_err(|_| bad_request("from"))?;
     let to_ms = parse_bound(&to).map_err(|_| bad_request("to"))?;
