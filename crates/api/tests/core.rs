@@ -4,7 +4,10 @@ use api::time::parse_bound;
 fn parses_the_go_layout() {
     // layout "2006-01-02T15:04:05Z"
     assert_eq!(parse_bound("1970-01-01T00:00:00Z").unwrap(), 0);
-    assert_eq!(parse_bound("2023-11-14T22:13:20Z").unwrap(), 1_700_000_000_000);
+    assert_eq!(
+        parse_bound("2023-11-14T22:13:20Z").unwrap(),
+        1_700_000_000_000
+    );
 }
 
 #[test]
@@ -29,7 +32,10 @@ fn cpu_usage_serializes_percent_as_string() {
     };
     let j: serde_json::Value = serde_json::to_value(&v).unwrap();
     assert!(j["time"].is_string());
-    assert!(j["percent"].is_string(), "percent MUST be a string in /history");
+    assert!(
+        j["percent"].is_string(),
+        "percent MUST be a string in /history"
+    );
     assert!(
         j.get("human_friendly_time").is_none(),
         "human_friendly_time must be omitted when absent"
@@ -56,7 +62,10 @@ fn mem_usage_serializes_numbers_and_camel_case_percent() {
         j["usedPercent"].is_number(),
         "usedPercent must be camelCase and numeric"
     );
-    assert!(j.get("used_percent").is_none(), "snake_case key must not appear");
+    assert!(
+        j.get("used_percent").is_none(),
+        "snake_case key must not appear"
+    );
 }
 
 #[test]
@@ -96,11 +105,7 @@ fn test_state() -> std::sync::Arc<api::AppState> {
     })
 }
 
-async fn status_for(
-    app: axum::Router,
-    uri: &str,
-    token: Option<&str>,
-) -> axum::http::StatusCode {
+async fn status_for(app: axum::Router, uri: &str, token: Option<&str>) -> axum::http::StatusCode {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -117,8 +122,14 @@ async fn status_for(
 async fn health_and_version_need_no_token() {
     use axum::http::StatusCode;
     let state = test_state();
-    assert_eq!(status_for(api::router(state.clone()), "/api/health", None).await, StatusCode::OK);
-    assert_eq!(status_for(api::router(state), "/api/version", None).await, StatusCode::OK);
+    assert_eq!(
+        status_for(api::router(state.clone()), "/api/health", None).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_for(api::router(state), "/api/version", None).await,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]

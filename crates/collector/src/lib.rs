@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use config::Config;
-use docker::{calc, DockerClient};
+use docker::{DockerClient, calc};
 use store::{ContainerSample, Store};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -32,7 +32,11 @@ pub struct Collector {
 
 impl Collector {
     pub fn new(config: Arc<Config>, store: Store, docker: DockerClient) -> Self {
-        Self { config, store, docker }
+        Self {
+            config,
+            store,
+            docker,
+        }
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
@@ -106,7 +110,9 @@ impl Collector {
         // Bounded fan-out: keep at most MAX_CONCURRENT_STATS requests in flight.
         for _ in 0..MAX_CONCURRENT_STATS {
             match queue.next() {
-                Some(c) => { tasks.spawn(fetch(self.docker.clone(), c)); }
+                Some(c) => {
+                    tasks.spawn(fetch(self.docker.clone(), c));
+                }
                 None => break,
             }
         }

@@ -50,7 +50,10 @@ mod tests {
     use super::*;
 
     fn summary() -> ContainerSummary {
-        ContainerSummary { id: "abcdef0123456789".into(), ..Default::default() }
+        ContainerSummary {
+            id: "abcdef0123456789".into(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -81,4 +84,3 @@ mod tests {
         assert_eq!(c.display_name(), "abcdef012345");
     }
 }
-

@@ -16,7 +16,10 @@ pub struct DbStats {
 
 /// (table, expression summing the byte length of every column in a row)
 const TABLE_SIZES: [(&str, &str); 4] = [
-    ("cpu_usage", "LENGTH(CAST(time AS TEXT)) + LENGTH(CAST(percent AS TEXT))"),
+    (
+        "cpu_usage",
+        "LENGTH(CAST(time AS TEXT)) + LENGTH(CAST(percent AS TEXT))",
+    ),
     (
         "memory_usage",
         "LENGTH(CAST(time AS TEXT)) + LENGTH(CAST(total AS TEXT)) + \
@@ -59,7 +62,11 @@ impl Store {
                 });
             }
 
-            Ok(DbStats { row_count, storage_bytes: page_count * page_size, tables })
+            Ok(DbStats {
+                row_count,
+                storage_bytes: page_count * page_size,
+                tables,
+            })
         })
     }
 }

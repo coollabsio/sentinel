@@ -108,7 +108,10 @@ impl Store {
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
                 .query_map((from, to), |r| {
-                    Ok(CpuRow { time: r.get(0)?, percent: r.get(1)? })
+                    Ok(CpuRow {
+                        time: r.get(0)?,
+                        percent: r.get(1)?,
+                    })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
@@ -142,7 +145,10 @@ impl Store {
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
                 .query_map((id, from, to), |r| {
-                    Ok(CpuRow { time: r.get(0)?, percent: r.get(1)? })
+                    Ok(CpuRow {
+                        time: r.get(0)?,
+                        percent: r.get(1)?,
+                    })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)

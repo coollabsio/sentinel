@@ -29,7 +29,13 @@ fn container_entry_serializes_expected_keys() {
     };
     let j = serde_json::to_value(&c).unwrap();
     for key in [
-        "time", "id", "image", "name", "state", "labels", "health_status",
+        "time",
+        "id",
+        "image",
+        "name",
+        "state",
+        "labels",
+        "health_status",
     ] {
         assert!(j.get(key).is_some(), "missing key {key}");
     }

@@ -47,6 +47,13 @@ impl HostSampler {
         } else {
             0.0
         };
-        MemRow { time: 0, total, available, used, used_percent, free }
+        MemRow {
+            time: 0,
+            total,
+            available,
+            used,
+            used_percent,
+            free,
+        }
     }
 }

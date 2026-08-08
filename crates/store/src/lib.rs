@@ -57,7 +57,9 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         schema::migrate_legacy(&conn)?;
         schema::apply(&conn)?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     pub(crate) fn with_conn<T>(

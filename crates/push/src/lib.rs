@@ -23,7 +23,11 @@ pub enum PushError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("push to {url} returned {status}: {body}")]
-    Status { url: String, status: u16, body: String },
+    Status {
+        url: String,
+        status: u16,
+        body: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,7 +62,11 @@ impl Pusher {
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
-        Ok(Self { config, docker, client })
+        Ok(Self {
+            config,
+            docker,
+            client,
+        })
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
@@ -105,7 +113,12 @@ impl Pusher {
             return Err(PushError::Status {
                 url: self.config.push_url.clone(),
                 status: status.as_u16(),
-                body: body.chars().take(4096).collect::<String>().trim().to_string(),
+                body: body
+                    .chars()
+                    .take(4096)
+                    .collect::<String>()
+                    .trim()
+                    .to_string(),
             });
         }
         Ok(())
@@ -138,7 +151,9 @@ impl Pusher {
 
         for _ in 0..MAX_CONCURRENT_INSPECTS {
             match queue.next() {
-                Some(c) => { tasks.spawn(inspect(self.docker.clone(), c)); }
+                Some(c) => {
+                    tasks.spawn(inspect(self.docker.clone(), c));
+                }
                 None => break,
             }
         }
@@ -153,16 +168,17 @@ impl Pusher {
 
         let skipped = total - out.len();
         if skipped > 0 {
-            tracing::warn!(skipped, total, "skipped containers due to inspection errors");
+            tracing::warn!(
+                skipped,
+                total,
+                "skipped containers due to inspection errors"
+            );
         }
         Ok((out, skipped))
     }
 }
 
-async fn inspect(
-    docker: DockerClient,
-    summary: docker::ContainerSummary,
-) -> Option<Container> {
+async fn inspect(docker: DockerClient, summary: docker::ContainerSummary) -> Option<Container> {
     let health = match docker.inspect_health(&summary.id).await {
         Ok(h) => h,
         Err(e) => {

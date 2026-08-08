@@ -1,4 +1,4 @@
-use store::{retention, Store};
+use store::{Store, retention};
 
 const DAY: i64 = 86_400_000;
 
@@ -15,10 +15,16 @@ fn deletes_rows_older_than_retention() {
     s.cleanup(7, now).unwrap();
     let after = s.cpu_history(0, i64::MAX).unwrap();
     assert_eq!(before, 20, "should have 20 rows before cleanup");
-    assert_eq!(after.len(), 10, "should have 10 rows after cleanup (top 10 preserved)");
+    assert_eq!(
+        after.len(),
+        10,
+        "should have 10 rows after cleanup (top 10 preserved)"
+    );
     // Rows 11-20 (times now - 10*DAY through now - 19*DAY) are deleted
-    assert!(after.iter().all(|r| r.time >= now - 10 * DAY),
-            "oldest remaining row should be within top 10");
+    assert!(
+        after.iter().all(|r| r.time >= now - 10 * DAY),
+        "oldest remaining row should be within top 10"
+    );
 }
 
 #[test]
@@ -42,7 +48,12 @@ fn cleanup_covers_every_table() {
     for i in 0..15i64 {
         s.insert_cpu(old + i, 1.0).unwrap();
         s.insert_memory(&store::MemRow {
-            time: old + i, total: 1, available: 1, used: 1, used_percent: 1.0, free: 1,
+            time: old + i,
+            total: 1,
+            available: 1,
+            used: 1,
+            used_percent: 1.0,
+            free: 1,
         })
         .unwrap();
         s.insert_container_batch(
@@ -50,8 +61,11 @@ fn cleanup_covers_every_table() {
             &[store::ContainerSample {
                 container_id: "web".into(),
                 cpu_percent: 1.0,
-                mem_total: 1, mem_available: 1, mem_used: 1,
-                mem_used_percent: 1.0, mem_free: 1,
+                mem_total: 1,
+                mem_available: 1,
+                mem_used: 1,
+                mem_used_percent: 1.0,
+                mem_free: 1,
             }],
         )
         .unwrap();
@@ -59,8 +73,16 @@ fn cleanup_covers_every_table() {
     s.cleanup(7, now).unwrap();
     assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 10);
     assert_eq!(s.memory_history(0, i64::MAX).unwrap().len(), 10);
-    assert_eq!(s.container_cpu_history("web", 0, i64::MAX).unwrap().len(), 10);
-    assert_eq!(s.container_memory_history("web", 0, i64::MAX).unwrap().len(), 10);
+    assert_eq!(
+        s.container_cpu_history("web", 0, i64::MAX).unwrap().len(),
+        10
+    );
+    assert_eq!(
+        s.container_memory_history("web", 0, i64::MAX)
+            .unwrap()
+            .len(),
+        10
+    );
 }
 
 #[test]
@@ -79,11 +101,20 @@ fn downsample_collapses_old_samples_into_one_minute_averages() {
     // report the latter.
     assert_eq!(collapsed, 12);
 
-    let rows = s.cpu_history(bucket, bucket + retention::BUCKET_MS - 1).unwrap();
-    assert_eq!(rows.len(), 1, "one minute of old samples collapses to one row");
+    let rows = s
+        .cpu_history(bucket, bucket + retention::BUCKET_MS - 1)
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one minute of old samples collapses to one row"
+    );
     assert_eq!(rows[0].time, bucket);
     let expected = (10..22).map(|v| v as f64).sum::<f64>() / 12.0;
-    assert!((rows[0].percent - expected).abs() < 1e-9, "value is the bucket mean");
+    assert!(
+        (rows[0].percent - expected).abs() < 1e-9,
+        "value is the bucket mean"
+    );
 }
 
 #[test]
@@ -124,14 +155,22 @@ fn downsample_keeps_container_series_separate() {
             bucket + i * 5_000,
             &[
                 store::ContainerSample {
-                    container_id: "web".into(), cpu_percent: 10.0,
-                    mem_total: 1, mem_available: 1, mem_used: 1,
-                    mem_used_percent: 1.0, mem_free: 1,
+                    container_id: "web".into(),
+                    cpu_percent: 10.0,
+                    mem_total: 1,
+                    mem_available: 1,
+                    mem_used: 1,
+                    mem_used_percent: 1.0,
+                    mem_free: 1,
                 },
                 store::ContainerSample {
-                    container_id: "db".into(), cpu_percent: 20.0,
-                    mem_total: 1, mem_available: 1, mem_used: 1,
-                    mem_used_percent: 1.0, mem_free: 1,
+                    container_id: "db".into(),
+                    cpu_percent: 20.0,
+                    mem_total: 1,
+                    mem_available: 1,
+                    mem_used: 1,
+                    mem_used_percent: 1.0,
+                    mem_free: 1,
                 },
             ],
         )

@@ -6,7 +6,12 @@ fn reports_row_counts_and_storage_for_every_table() {
     s.insert_cpu(1_000, 1.0).unwrap();
     s.insert_cpu(2_000, 2.0).unwrap();
     s.insert_memory(&store::MemRow {
-        time: 1_000, total: 1, available: 1, used: 1, used_percent: 1.0, free: 1,
+        time: 1_000,
+        total: 1,
+        available: 1,
+        used: 1,
+        used_percent: 1.0,
+        free: 1,
     })
     .unwrap();
 
@@ -24,7 +29,11 @@ fn reports_row_counts_and_storage_for_every_table() {
             "container_memory_usage"
         ]
     );
-    let cpu = stats.tables.iter().find(|t| t.table_name == "cpu_usage").unwrap();
+    let cpu = stats
+        .tables
+        .iter()
+        .find(|t| t.table_name == "cpu_usage")
+        .unwrap();
     assert_eq!(cpu.row_count, 2);
 }
 

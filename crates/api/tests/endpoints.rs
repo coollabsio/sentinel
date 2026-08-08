@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use api::{router, AppState};
+use api::{AppState, router};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -99,7 +99,11 @@ async fn cpu_history_honours_from_and_to() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(j.as_array().unwrap().len(), 1, "only the later sample matches");
+    assert_eq!(
+        j.as_array().unwrap().len(),
+        1,
+        "only the later sample matches"
+    );
 }
 
 #[tokio::test]

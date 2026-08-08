@@ -7,9 +7,9 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 
+use crate::AppState;
 use crate::time::{format_millis, now_layout, parse_bound};
 use crate::types::{CpuUsage, ErrorBody};
-use crate::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct HistoryQuery {
@@ -21,10 +21,7 @@ pub struct HistoryQuery {
 /// The Response error type is necessary here for axum's flexibility in returning
 /// different response types (bad_request or other errors).
 #[allow(clippy::result_large_err)]
-pub fn resolve_range(
-    q: &HistoryQuery,
-    default_from: &str,
-) -> Result<(i64, i64), Response> {
+pub fn resolve_range(q: &HistoryQuery, default_from: &str) -> Result<(i64, i64), Response> {
     let from = q.from.clone().unwrap_or_else(|| default_from.to_string());
     let to = q.to.clone().unwrap_or_else(now_layout);
 
@@ -46,7 +43,9 @@ fn bad_request(field: &str) -> Response {
 pub fn internal_error(e: impl std::fmt::Display) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorBody { error: e.to_string() }),
+        Json(ErrorBody {
+            error: e.to_string(),
+        }),
     )
         .into_response()
 }
@@ -67,10 +66,7 @@ async fn current(State(state): State<Arc<AppState>>) -> Response {
     Json(serde_json::json!({ "time": time, "percent": percent })).into_response()
 }
 
-async fn history(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<HistoryQuery>,
-) -> Response {
+async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuery>) -> Response {
     let (from, to) = match resolve_range(&q, "1970-01-01T00:00:00Z") {
         Ok(r) => r,
         Err(resp) => return resp,

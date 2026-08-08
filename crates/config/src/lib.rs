@@ -222,14 +222,20 @@ mod tests {
     fn requires_token() {
         let _l = env_lock().lock().unwrap();
         let _g = EnvGuard::set(&[("TOKEN", ""), ("PUSH_ENDPOINT", "https://example.com")]);
-        assert!(matches!(Config::load(false), Err(ConfigError::MissingToken)));
+        assert!(matches!(
+            Config::load(false),
+            Err(ConfigError::MissingToken)
+        ));
     }
 
     #[test]
     fn requires_push_endpoint() {
         let _l = env_lock().lock().unwrap();
         let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", "")]);
-        assert!(matches!(Config::load(false), Err(ConfigError::MissingEndpoint)));
+        assert!(matches!(
+            Config::load(false),
+            Err(ConfigError::MissingEndpoint)
+        ));
     }
 
     #[test]
@@ -245,7 +251,10 @@ mod tests {
     fn rejects_non_http_endpoint() {
         let _l = env_lock().lock().unwrap();
         let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", "ftp://example.com")]);
-        assert!(matches!(Config::load(false), Err(ConfigError::InvalidEndpoint)));
+        assert!(matches!(
+            Config::load(false),
+            Err(ConfigError::InvalidEndpoint)
+        ));
     }
 
     #[test]
@@ -291,7 +300,10 @@ mod tests {
                 ("PUSH_ENDPOINT", "https://example.com"),
                 (var, "0"),
             ]);
-            assert!(matches!(Config::load(false), Err(ConfigError::NotPositive(_))));
+            assert!(matches!(
+                Config::load(false),
+                Err(ConfigError::NotPositive(_))
+            ));
         }
     }
 

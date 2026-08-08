@@ -73,7 +73,9 @@ fn migration_is_idempotent() {
     let _ = std::fs::remove_file(&path);
     legacy_db(&path);
 
-    { Store::open(&path).unwrap(); }
+    {
+        Store::open(&path).unwrap();
+    }
     let s = Store::open(&path).unwrap();
     assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 2);
 
@@ -92,15 +94,21 @@ fn skips_unparseable_rows_instead_of_failing() {
     {
         let c = rusqlite::Connection::open(&path).unwrap();
         // time is fully non-numeric
-        c.execute("INSERT INTO cpu_usage VALUES ('not-a-number', 'garbage')", [])
-            .unwrap();
+        c.execute(
+            "INSERT INTO cpu_usage VALUES ('not-a-number', 'garbage')",
+            [],
+        )
+        .unwrap();
         // time has a digit prefix but trailing garbage — CAST(... AS INTEGER)
         // would truncate this to 123, not skip it
         c.execute("INSERT INTO cpu_usage VALUES ('123abc', '10.00')", [])
             .unwrap();
         // time is valid, but percent is garbage
-        c.execute("INSERT INTO cpu_usage VALUES ('1700000099999', 'garbage')", [])
-            .unwrap();
+        c.execute(
+            "INSERT INTO cpu_usage VALUES ('1700000099999', 'garbage')",
+            [],
+        )
+        .unwrap();
     }
 
     let s = Store::open(&path).unwrap();
@@ -108,7 +116,10 @@ fn skips_unparseable_rows_instead_of_failing() {
     // rows above are dropped, none silently coerced to a fabricated 0/0.0
     let rows = s.cpu_history(0, i64::MAX).unwrap();
     assert_eq!(rows.len(), 2, "got {rows:?}");
-    assert!(rows.iter().all(|r| r.time == 1_700_000_000_000 || r.time == 1_700_000_005_000));
+    assert!(
+        rows.iter()
+            .all(|r| r.time == 1_700_000_000_000 || r.time == 1_700_000_005_000)
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -127,7 +138,8 @@ fn skips_rows_with_a_genuine_sql_null_not_just_unparseable_text() {
     legacy_db(&path);
     {
         let c = rusqlite::Connection::open(&path).unwrap();
-        c.execute("INSERT INTO cpu_usage VALUES (NULL, '10.00')", []).unwrap();
+        c.execute("INSERT INTO cpu_usage VALUES (NULL, '10.00')", [])
+            .unwrap();
         c.execute("INSERT INTO cpu_usage VALUES ('1700000099999', NULL)", [])
             .unwrap();
         c.execute(
@@ -139,7 +151,11 @@ fn skips_rows_with_a_genuine_sql_null_not_just_unparseable_text() {
 
     let s = Store::open(&path).unwrap();
     let rows = s.cpu_history(0, i64::MAX).unwrap();
-    assert_eq!(rows.len(), 2, "NULL rows must be skipped, not error the migration: got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "NULL rows must be skipped, not error the migration: got {rows:?}"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -174,7 +190,10 @@ fn drops_unused_container_logs_table() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(n, 0, "container_logs should be dropped: never read or written");
+    assert_eq!(
+        n, 0,
+        "container_logs should be dropped: never read or written"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

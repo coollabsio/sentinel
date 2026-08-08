@@ -5,10 +5,8 @@ pub mod model;
 
 pub use model::{ContainerStats, ContainerSummary};
 
-use bollard::query_parameters::{
-    InspectContainerOptions, ListContainersOptions, StatsOptions,
-};
 use bollard::Docker;
+use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions, StatsOptions};
 use futures_util::StreamExt;
 
 const SOCKET: &str = "/var/run/docker.sock";
@@ -29,13 +27,15 @@ pub struct DockerClient {
 
 impl DockerClient {
     pub fn new() -> Result<Self, DockerError> {
-        let inner =
-            Docker::connect_with_unix(SOCKET, TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)?;
+        let inner = Docker::connect_with_unix(SOCKET, TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)?;
         Ok(Self { inner })
     }
 
     pub async fn list_containers(&self) -> Result<Vec<ContainerSummary>, DockerError> {
-        let opts = ListContainersOptions { all: true, ..Default::default() };
+        let opts = ListContainersOptions {
+            all: true,
+            ..Default::default()
+        };
         let raw = self.inner.list_containers(Some(opts)).await?;
         Ok(raw
             .into_iter()
@@ -55,7 +55,10 @@ impl DockerClient {
     pub async fn stats(&self, id: &str) -> Result<ContainerStats, DockerError> {
         // stream=false yields exactly one datapoint, matching the Go client's
         // /containers/{id}/stats?stream=false request.
-        let opts = StatsOptions { stream: false, one_shot: false };
+        let opts = StatsOptions {
+            stream: false,
+            one_shot: false,
+        };
         let mut stream = self.inner.stats(id, Some(opts));
         let s = stream
             .next()

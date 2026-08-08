@@ -120,8 +120,12 @@ fn migrate_cpu_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     let mut insert =
         tx.prepare("INSERT OR REPLACE INTO cpu_usage (time, percent) VALUES (?1, ?2)")?;
     for (time_s, percent_s) in rows {
-        let Some(time) = parse_opt::<i64>(time_s) else { continue };
-        let Some(percent) = parse_opt::<f64>(percent_s) else { continue };
+        let Some(time) = parse_opt::<i64>(time_s) else {
+            continue;
+        };
+        let Some(percent) = parse_opt::<f64>(percent_s) else {
+            continue;
+        };
         insert.execute((time, percent))?;
     }
     Ok(())
@@ -139,7 +143,14 @@ fn migrate_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> 
     let rows: Vec<Row> = tx
         .prepare("SELECT time, total, available, used, usedPercent, free FROM memory_usage_old")?
         .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })?
         .collect::<rusqlite::Result<_>>()?;
 
@@ -148,12 +159,24 @@ fn migrate_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> 
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     for (time_s, total_s, available_s, used_s, used_percent_s, free_s) in rows {
-        let Some(time) = parse_opt::<i64>(time_s) else { continue };
-        let Some(total) = parse_opt::<i64>(total_s) else { continue };
-        let Some(available) = parse_opt::<i64>(available_s) else { continue };
-        let Some(used) = parse_opt::<i64>(used_s) else { continue };
-        let Some(used_percent) = parse_opt::<f64>(used_percent_s) else { continue };
-        let Some(free) = parse_opt::<i64>(free_s) else { continue };
+        let Some(time) = parse_opt::<i64>(time_s) else {
+            continue;
+        };
+        let Some(total) = parse_opt::<i64>(total_s) else {
+            continue;
+        };
+        let Some(available) = parse_opt::<i64>(available_s) else {
+            continue;
+        };
+        let Some(used) = parse_opt::<i64>(used_s) else {
+            continue;
+        };
+        let Some(used_percent) = parse_opt::<f64>(used_percent_s) else {
+            continue;
+        };
+        let Some(free) = parse_opt::<i64>(free_s) else {
+            continue;
+        };
         insert.execute((time, total, available, used, used_percent, free))?;
     }
     Ok(())
@@ -170,9 +193,15 @@ fn migrate_container_cpu_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Resu
          VALUES (?1, ?2, ?3)",
     )?;
     for (time_s, container_id, percent_s) in rows {
-        let Some(time) = parse_opt::<i64>(time_s) else { continue };
-        let Some(container_id) = container_id.filter(|s| !s.is_empty()) else { continue };
-        let Some(percent) = parse_opt::<f64>(percent_s) else { continue };
+        let Some(time) = parse_opt::<i64>(time_s) else {
+            continue;
+        };
+        let Some(container_id) = container_id.filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(percent) = parse_opt::<f64>(percent_s) else {
+            continue;
+        };
         insert.execute((time, container_id, percent))?;
     }
     Ok(())
@@ -194,7 +223,15 @@ fn migrate_container_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::R
              FROM container_memory_usage_old",
         )?
         .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
         })?
         .collect::<rusqlite::Result<_>>()?;
 
@@ -204,14 +241,36 @@ fn migrate_container_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::R
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     for (time_s, container_id, total_s, available_s, used_s, used_percent_s, free_s) in rows {
-        let Some(time) = parse_opt::<i64>(time_s) else { continue };
-        let Some(container_id) = container_id.filter(|s| !s.is_empty()) else { continue };
-        let Some(total) = parse_opt::<i64>(total_s) else { continue };
-        let Some(available) = parse_opt::<i64>(available_s) else { continue };
-        let Some(used) = parse_opt::<i64>(used_s) else { continue };
-        let Some(used_percent) = parse_opt::<f64>(used_percent_s) else { continue };
-        let Some(free) = parse_opt::<i64>(free_s) else { continue };
-        insert.execute((time, container_id, total, available, used, used_percent, free))?;
+        let Some(time) = parse_opt::<i64>(time_s) else {
+            continue;
+        };
+        let Some(container_id) = container_id.filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(total) = parse_opt::<i64>(total_s) else {
+            continue;
+        };
+        let Some(available) = parse_opt::<i64>(available_s) else {
+            continue;
+        };
+        let Some(used) = parse_opt::<i64>(used_s) else {
+            continue;
+        };
+        let Some(used_percent) = parse_opt::<f64>(used_percent_s) else {
+            continue;
+        };
+        let Some(free) = parse_opt::<i64>(free_s) else {
+            continue;
+        };
+        insert.execute((
+            time,
+            container_id,
+            total,
+            available,
+            used,
+            used_percent,
+            free,
+        ))?;
     }
     Ok(())
 }

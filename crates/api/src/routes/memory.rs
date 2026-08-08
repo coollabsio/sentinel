@@ -5,10 +5,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 
-use crate::routes::cpu::{internal_error, resolve_range, HistoryQuery};
+use crate::AppState;
+use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
 use crate::time::format_millis;
 use crate::types::MemUsage;
-use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -36,10 +36,7 @@ async fn current(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
-async fn history(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<HistoryQuery>,
-) -> Response {
+async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuery>) -> Response {
     let (from, to) = match resolve_range(&q, "1970-01-01T00:00:00Z") {
         Ok(r) => r,
         Err(resp) => return resp,

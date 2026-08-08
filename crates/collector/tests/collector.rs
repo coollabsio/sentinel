@@ -1,4 +1,4 @@
-use collector::{now_millis, HostSampler};
+use collector::{HostSampler, now_millis};
 
 #[test]
 fn now_millis_is_a_plausible_unix_timestamp() {

@@ -1,11 +1,11 @@
+use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use std::sync::Arc;
 
-use crate::{types::ErrorBody, AppState};
+use crate::{AppState, types::ErrorBody};
 
 /// Endpoints exempt from authentication, matching the Go implementation.
 const PUBLIC_PATHS: [&str; 2] = ["/api/health", "/api/version"];
@@ -30,7 +30,9 @@ pub async fn require_token(
     if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
         return (
             StatusCode::UNAUTHORIZED,
-            Json(ErrorBody { error: "Unauthorized".into() }),
+            Json(ErrorBody {
+                error: "Unauthorized".into(),
+            }),
         )
             .into_response();
     }

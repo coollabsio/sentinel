@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use api::{router, AppState};
+use api::{AppState, router};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -45,7 +45,10 @@ async fn get(uri: &str) -> (StatusCode, serde_json::Value) {
         .unwrap();
     let status = res.status();
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 #[tokio::test]
@@ -108,8 +111,11 @@ async fn container_history_default_from_is_one_second_not_zero() {
                 &[store::ContainerSample {
                     container_id: id.into(),
                     cpu_percent: 1.0,
-                    mem_total: 1, mem_available: 1, mem_used: 1,
-                    mem_used_percent: 1.0, mem_free: 1,
+                    mem_total: 1,
+                    mem_available: 1,
+                    mem_used: 1,
+                    mem_used_percent: 1.0,
+                    mem_free: 1,
                 }],
             )
             .unwrap();
@@ -139,13 +145,15 @@ async fn container_history_default_from_is_one_second_not_zero() {
 
     let before = get_st("/api/container/before/cpu/history", st.clone()).await;
     assert_eq!(
-        before.as_array().unwrap().len(), 0,
+        before.as_array().unwrap().len(),
+        0,
         "a row at 500ms must be excluded by the :01Z default (1000ms)"
     );
 
     let at_boundary = get_st("/api/container/atboundary/cpu/history", st).await;
     assert_eq!(
-        at_boundary.as_array().unwrap().len(), 1,
+        at_boundary.as_array().unwrap().len(),
+        1,
         "a row at exactly 1000ms must be included (inclusive lower bound)"
     );
 }
@@ -190,7 +198,10 @@ async fn stats_route_reports_row_counts_and_live_memory_when_debug() {
     let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(j["row_count"], 2, "the two inserted cpu_usage rows must be counted");
+    assert_eq!(
+        j["row_count"], 2,
+        "the two inserted cpu_usage rows must be counted"
+    );
     assert!(j["storage_usage_kb"].is_string());
     assert!(j["storage_usage_mb"].is_string());
     // memory_usage must come from the live sampler, not a hardcoded stub --

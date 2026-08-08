@@ -5,8 +5,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 
-use crate::routes::cpu::internal_error;
 use crate::AppState;
+use crate::routes::cpu::internal_error;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/api/stats", get(stats))

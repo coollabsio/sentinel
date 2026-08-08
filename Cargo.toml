@@ -28,7 +28,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+api = { path = "crates/api" }
+collector = { path = "crates/collector" }
 config = { path = "crates/config" }
+docker = { path = "crates/docker" }
+push = { path = "crates/push" }
+store = { path = "crates/store" }
+axum.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

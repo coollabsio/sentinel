@@ -89,14 +89,22 @@ fn container_batch_writes_cpu_and_memory() {
     assert_eq!(db[0].used, 100);
 
     // container scoping must not leak across ids
-    assert!(s.container_cpu_history("nope", 0, i64::MAX).unwrap().is_empty());
+    assert!(
+        s.container_cpu_history("nope", 0, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
 fn empty_batch_is_a_noop() {
     let s = Store::open_in_memory().unwrap();
     s.insert_container_batch(1_000, &[]).unwrap();
-    assert!(s.container_cpu_history("x", 0, i64::MAX).unwrap().is_empty());
+    assert!(
+        s.container_cpu_history("x", 0, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -131,5 +139,9 @@ fn opens_a_bare_filename_with_no_directory_component() {
     let ok = result.is_ok();
     std::fs::remove_file(&path).ok();
 
-    assert!(ok, "Store::open must accept a bare filename: {:?}", result.err());
+    assert!(
+        ok,
+        "Store::open must accept a bare filename: {:?}",
+        result.err()
+    );
 }

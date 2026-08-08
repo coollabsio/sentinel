@@ -7,8 +7,8 @@ pub mod types;
 
 use std::sync::Arc;
 
-use axum::routing::get;
 use axum::Router;
+use axum::routing::get;
 use collector::HostSampler;
 use config::Config;
 use store::Store;
