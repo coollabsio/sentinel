@@ -6,7 +6,18 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+// Mirrors the Go implementation's build-time `-ldflags -X ...Version=...`
+// override (used by scripts/coolify-dev.sh and the Dockerfile's ARG VERSION
+// to tag dev builds as e.g. "0.0.22-dev+9b1cd1a.dirty", distinguishing them
+// from release builds in logs and /api/version). SENTINEL_BUILD_VERSION is
+// set via the Dockerfile's `ENV SENTINEL_BUILD_VERSION=$VERSION` in the
+// builder stage, so it's visible to option_env! at compile time; unset, this
+// falls back to the crate's own Cargo.toml version, matching a plain
+// `cargo build`.
+pub const VERSION: &str = match option_env!("SENTINEL_BUILD_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {

@@ -15,6 +15,11 @@ COPY crates ./crates
 COPY src ./src
 
 ARG VERSION
+# Visible to option_env!("SENTINEL_BUILD_VERSION") at compile time, so a dev
+# build tagged via `--build-arg VERSION=...` (see scripts/coolify-dev.sh)
+# shows up in logs and /api/version — matching the Go implementation's
+# equivalent -ldflags override.
+ENV SENTINEL_BUILD_VERSION=$VERSION
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo build --release --locked && \

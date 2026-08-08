@@ -6,7 +6,7 @@ command="${1:-build}"
 image="${SENTINEL_DEV_IMAGE:-sentinel:dev}"
 container="${SENTINEL_CONTAINER:-coolify-sentinel}"
 
-release_version="$(sed -n 's/^var Version = "\([^"]*\)"/\1/p' pkg/config/config.go)"
+release_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
 revision="$(git rev-parse --short HEAD)"
 dirty=""
 if [[ -n "$(git status --porcelain)" ]]; then

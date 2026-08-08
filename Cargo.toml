@@ -45,9 +45,15 @@ serde_json.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
+# `panic` is deliberately left at its default (`unwind`), not set to "abort":
+# a collection cycle failure, a single container's stats call failing, or a
+# panicking task must never take down the whole agent. The collector's and
+# retention's "task panicked" log branches, and StoreError::Poisoned, exist
+# specifically to handle a panic inside a spawned task without crashing the
+# process — `panic = "abort"` would convert any panic anywhere into an
+# immediate process abort and make those branches unreachable dead code.
 [profile.release]
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = true
 opt-level = 3
