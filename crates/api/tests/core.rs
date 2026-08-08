@@ -69,3 +69,75 @@ fn human_friendly_time_is_included_when_present() {
     let j: serde_json::Value = serde_json::to_value(&v).unwrap();
     assert_eq!(j["human_friendly_time"], "1970-01-01T00:00:00Z");
 }
+
+fn test_state() -> std::sync::Arc<api::AppState> {
+    // Constructed directly rather than via a load_for_test() helper (that
+    // helper isn't introduced until Task 8) — Config's fields are all public,
+    // so this has no forward dependency on later tasks.
+    let config = config::Config {
+        version: "0.0.0-test".into(),
+        debug: false,
+        refresh_rate_seconds: 5,
+        push_enabled: false,
+        push_interval_seconds: 60,
+        push_path: "/api/v1/sentinel/push".into(),
+        push_url: "http://localhost/api/v1/sentinel/push".into(),
+        token: "secret".into(),
+        endpoint: "http://localhost".into(),
+        metrics_file: std::path::PathBuf::from(":memory:"),
+        collector_enabled: false,
+        collector_retention_period_days: 7,
+        bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+    };
+    std::sync::Arc::new(api::AppState {
+        config: std::sync::Arc::new(config),
+        store: store::Store::open_in_memory().unwrap(),
+        sampler: std::sync::Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
+    })
+}
+
+async fn status_for(
+    app: axum::Router,
+    uri: &str,
+    token: Option<&str>,
+) -> axum::http::StatusCode {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let mut req = Request::builder().uri(uri);
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+    res.status()
+}
+
+#[tokio::test]
+async fn health_and_version_need_no_token() {
+    use axum::http::StatusCode;
+    let state = test_state();
+    assert_eq!(status_for(api::router(state.clone()), "/api/health", None).await, StatusCode::OK);
+    assert_eq!(status_for(api::router(state), "/api/version", None).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn require_token_middleware_runs_before_routing() {
+    // The auth layer must reject an unauthenticated request even for a path
+    // whose route isn't registered yet (this task's route modules are still
+    // empty stubs) -- confirmed empirically that axum's .layer() runs before
+    // route matching, so a missing/wrong token never falls through to a 404.
+    use axum::http::StatusCode;
+    let state = test_state();
+
+    assert_eq!(
+        status_for(api::router(state.clone()), "/api/cpu/history", None).await,
+        StatusCode::UNAUTHORIZED,
+        "missing token must be rejected before routing"
+    );
+    assert_eq!(
+        status_for(api::router(state), "/api/cpu/history", Some("wrong-token")).await,
+        StatusCode::UNAUTHORIZED,
+        "incorrect token must be rejected"
+    );
+}
