@@ -7,8 +7,15 @@ RUN apk add --no-cache musl-dev gcc
 
 WORKDIR /app
 
-# Cache dependencies ahead of the source copy.
+# Cache dependencies ahead of the source copy. .cargo/config.toml must be
+# copied too — cargo discovers it by walking up from the working directory,
+# so without this copy its crt-static rustflags never apply inside the
+# builder image. (musl targets default to crt-static on this toolchain
+# regardless, so omitting this doesn't currently break the build — but the
+# static link then happens by target-default accident, not because of the
+# config this repo actually ships to control it.)
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo ./.cargo
 COPY crates ./crates
 COPY src ./src
 
