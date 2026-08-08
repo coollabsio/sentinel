@@ -97,6 +97,25 @@ impl Config {
             bind_addr,
         })
     }
+
+    /// Minimal valid config for tests in downstream crates.
+    pub fn load_for_test() -> Self {
+        Config {
+            version: VERSION.to_string(),
+            debug: false,
+            refresh_rate_seconds: 5,
+            push_enabled: false,
+            push_interval_seconds: 60,
+            push_path: "/api/v1/sentinel/push".to_string(),
+            push_url: "http://localhost:8000/api/v1/sentinel/push".to_string(),
+            token: "test-token".to_string(),
+            endpoint: "http://localhost:8000".to_string(),
+            metrics_file: PathBuf::from(":memory:"),
+            collector_enabled: false,
+            collector_retention_period_days: 7,
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 8888)),
+        }
+    }
 }
 
 fn non_empty(key: &str) -> Option<String> {
