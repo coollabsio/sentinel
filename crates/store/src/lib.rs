@@ -52,6 +52,7 @@ impl Store {
         // small and a large page cache works against the footprint goal.
         conn.pragma_update(None, "cache_size", -8000)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        schema::migrate_legacy(&conn)?;
         schema::apply(&conn)?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
