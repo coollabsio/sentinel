@@ -91,7 +91,12 @@ impl DockerClient {
                 .unwrap_or(0),
             system_usage: cpu.and_then(|c| c.system_cpu_usage).unwrap_or(0),
             pre_system_usage: pre.and_then(|c| c.system_cpu_usage).unwrap_or(0),
-            online_cpus: cpu.and_then(|c| c.online_cpus).unwrap_or(0) as u32,
+            online_cpus: cpu.and_then(|c| c.online_cpus).unwrap_or(0),
+            percpu_usage_len: cpu
+                .and_then(|c| c.cpu_usage.as_ref())
+                .and_then(|u| u.percpu_usage.as_ref())
+                .map(|v| v.len() as u32)
+                .unwrap_or(0),
             mem_usage: mem.and_then(|m| m.usage).unwrap_or(0),
             mem_limit: mem.and_then(|m| m.limit).unwrap_or(0),
             inactive_file,

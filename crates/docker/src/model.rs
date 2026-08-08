@@ -35,6 +35,11 @@ pub struct ContainerStats {
     pub system_usage: u64,
     pub pre_system_usage: u64,
     pub online_cpus: u32,
+    /// Length of `cpu_stats.cpu_usage.percpu_usage`. Go's calculateCPUPercent
+    /// falls back to this when `online_cpus` is 0 (cgroup v1 hosts and some
+    /// Docker Engine builds don't populate `online_cpus`) — without this
+    /// fallback, cpu_percent would silently report 0% on those hosts.
+    pub percpu_usage_len: u32,
     pub mem_usage: u64,
     pub mem_limit: u64,
     pub inactive_file: u64,
