@@ -48,71 +48,144 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Returns true if a legacy (all-VARCHAR) schema was detected and migrated.
+///
+/// Row values are parsed in Rust, not filtered via SQL CAST: SQLite's
+/// `CAST(text AS INTEGER/REAL)` never yields NULL for non-NULL text — it
+/// extracts a leading numeric prefix and otherwise falls back to 0. A
+/// `WHERE CAST(...) IS NOT NULL` guard therefore does not skip garbage, it
+/// silently coerces it to a fabricated 0/0.0 value indistinguishable from a
+/// real reading. Real `str::parse` failure is what "skip, don't corrupt"
+/// requires.
 pub fn migrate_legacy(conn: &Connection) -> rusqlite::Result<bool> {
     if !is_legacy(conn)? {
         return Ok(false);
     }
     tracing::info!("legacy metrics schema detected, migrating to typed schema");
 
-    conn.execute_batch(
-        r#"
-        BEGIN;
+    let tx = conn.unchecked_transaction()?;
 
+    tx.execute_batch(
+        r#"
         ALTER TABLE cpu_usage              RENAME TO cpu_usage_old;
         ALTER TABLE memory_usage           RENAME TO memory_usage_old;
         ALTER TABLE container_cpu_usage    RENAME TO container_cpu_usage_old;
         ALTER TABLE container_memory_usage RENAME TO container_memory_usage_old;
         "#,
     )?;
-    apply(conn)?;
+    apply(&tx)?;
 
-    // CAST yields NULL for unparseable text; WHERE ... IS NOT NULL drops those
-    // rows rather than aborting. Metrics are regenerable and retention-bounded.
-    conn.execute_batch(
+    migrate_cpu_usage(&tx)?;
+    migrate_memory_usage(&tx)?;
+    migrate_container_cpu_usage(&tx)?;
+    migrate_container_memory_usage(&tx)?;
+
+    tx.execute_batch(
         r#"
-        INSERT OR REPLACE INTO cpu_usage (time, percent)
-        SELECT CAST(time AS INTEGER), CAST(percent AS REAL)
-        FROM cpu_usage_old
-        WHERE CAST(time AS INTEGER) IS NOT NULL
-          AND CAST(percent AS REAL) IS NOT NULL
-          AND time GLOB '[0-9]*';
-
-        INSERT OR REPLACE INTO memory_usage
-            (time, total, available, used, used_percent, free)
-        SELECT CAST(time AS INTEGER), CAST(total AS INTEGER),
-               CAST(available AS INTEGER), CAST(used AS INTEGER),
-               CAST(usedPercent AS REAL), CAST(free AS INTEGER)
-        FROM memory_usage_old
-        WHERE time GLOB '[0-9]*';
-
-        INSERT OR REPLACE INTO container_cpu_usage (time, container_id, percent)
-        SELECT CAST(time AS INTEGER), container_id, CAST(percent AS REAL)
-        FROM container_cpu_usage_old
-        WHERE time GLOB '[0-9]*' AND container_id IS NOT NULL;
-
-        INSERT OR REPLACE INTO container_memory_usage
-            (time, container_id, total, available, used, used_percent, free)
-        SELECT CAST(time AS INTEGER), container_id, CAST(total AS INTEGER),
-               CAST(available AS INTEGER), CAST(used AS INTEGER),
-               CAST(usedPercent AS REAL), CAST(free AS INTEGER)
-        FROM container_memory_usage_old
-        WHERE time GLOB '[0-9]*' AND container_id IS NOT NULL;
-
         DROP TABLE cpu_usage_old;
         DROP TABLE memory_usage_old;
         DROP TABLE container_cpu_usage_old;
         DROP TABLE container_memory_usage_old;
         -- created and indexed by the Go implementation but never read or written
         DROP TABLE IF EXISTS container_logs;
-
-        COMMIT;
         "#,
     )?;
 
+    tx.commit()?;
     // VACUUM cannot run inside a transaction.
     conn.execute_batch("VACUUM")?;
     tracing::info!("legacy schema migration complete");
     Ok(true)
+}
+
+/// Reads every row as raw text first, so a value that fails to parse skips
+/// only that row rather than the whole migration.
+fn migrate_cpu_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let rows: Vec<(String, String)> = tx
+        .prepare("SELECT time, percent FROM cpu_usage_old")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut insert =
+        tx.prepare("INSERT OR REPLACE INTO cpu_usage (time, percent) VALUES (?1, ?2)")?;
+    for (time_s, percent_s) in rows {
+        let Ok(time) = time_s.trim().parse::<i64>() else { continue };
+        let Ok(percent) = percent_s.trim().parse::<f64>() else { continue };
+        insert.execute((time, percent))?;
+    }
+    Ok(())
+}
+
+fn migrate_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let rows: Vec<(String, String, String, String, String, String)> = tx
+        .prepare("SELECT time, total, available, used, usedPercent, free FROM memory_usage_old")?
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut insert = tx.prepare(
+        "INSERT OR REPLACE INTO memory_usage (time, total, available, used, used_percent, free)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for (time_s, total_s, available_s, used_s, used_percent_s, free_s) in rows {
+        let Ok(time) = time_s.trim().parse::<i64>() else { continue };
+        let Ok(total) = total_s.trim().parse::<i64>() else { continue };
+        let Ok(available) = available_s.trim().parse::<i64>() else { continue };
+        let Ok(used) = used_s.trim().parse::<i64>() else { continue };
+        let Ok(used_percent) = used_percent_s.trim().parse::<f64>() else { continue };
+        let Ok(free) = free_s.trim().parse::<i64>() else { continue };
+        insert.execute((time, total, available, used, used_percent, free))?;
+    }
+    Ok(())
+}
+
+fn migrate_container_cpu_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let rows: Vec<(String, Option<String>, String)> = tx
+        .prepare("SELECT time, container_id, percent FROM container_cpu_usage_old")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut insert = tx.prepare(
+        "INSERT OR REPLACE INTO container_cpu_usage (time, container_id, percent)
+         VALUES (?1, ?2, ?3)",
+    )?;
+    for (time_s, container_id, percent_s) in rows {
+        let Ok(time) = time_s.trim().parse::<i64>() else { continue };
+        let Some(container_id) = container_id.filter(|s| !s.is_empty()) else { continue };
+        let Ok(percent) = percent_s.trim().parse::<f64>() else { continue };
+        insert.execute((time, container_id, percent))?;
+    }
+    Ok(())
+}
+
+fn migrate_container_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    type MemRow = (String, Option<String>, String, String, String, String, String);
+    let rows: Vec<MemRow> = tx
+        .prepare(
+            "SELECT time, container_id, total, available, used, usedPercent, free
+             FROM container_memory_usage_old",
+        )?
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut insert = tx.prepare(
+        "INSERT OR REPLACE INTO container_memory_usage
+            (time, container_id, total, available, used, used_percent, free)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for (time_s, container_id, total_s, available_s, used_s, used_percent_s, free_s) in rows {
+        let Ok(time) = time_s.trim().parse::<i64>() else { continue };
+        let Some(container_id) = container_id.filter(|s| !s.is_empty()) else { continue };
+        let Ok(total) = total_s.trim().parse::<i64>() else { continue };
+        let Ok(available) = available_s.trim().parse::<i64>() else { continue };
+        let Ok(used) = used_s.trim().parse::<i64>() else { continue };
+        let Ok(used_percent) = used_percent_s.trim().parse::<f64>() else { continue };
+        let Ok(free) = free_s.trim().parse::<i64>() else { continue };
+        insert.execute((time, container_id, total, available, used, used_percent, free))?;
+    }
+    Ok(())
 }
 
 fn is_legacy(conn: &Connection) -> rusqlite::Result<bool> {

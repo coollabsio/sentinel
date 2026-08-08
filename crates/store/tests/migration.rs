@@ -82,19 +82,33 @@ fn migration_is_idempotent() {
 
 #[test]
 fn skips_unparseable_rows_instead_of_failing() {
+    // Three distinct corruption shapes. SQL `CAST` would silently coerce all
+    // of these to 0/0.0 rather than skip them — this test only passes if
+    // migration actually parses in Rust (str::parse failure), not CAST.
     let dir = tmpdir("bad");
     let path = dir.join("m.sqlite");
     let _ = std::fs::remove_file(&path);
     legacy_db(&path);
     {
         let c = rusqlite::Connection::open(&path).unwrap();
+        // time is fully non-numeric
         c.execute("INSERT INTO cpu_usage VALUES ('not-a-number', 'garbage')", [])
+            .unwrap();
+        // time has a digit prefix but trailing garbage — CAST(... AS INTEGER)
+        // would truncate this to 123, not skip it
+        c.execute("INSERT INTO cpu_usage VALUES ('123abc', '10.00')", [])
+            .unwrap();
+        // time is valid, but percent is garbage
+        c.execute("INSERT INTO cpu_usage VALUES ('1700000099999', 'garbage')", [])
             .unwrap();
     }
 
     let s = Store::open(&path).unwrap();
-    // the two good rows survive; the malformed one is dropped
-    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 2);
+    // only the two originally-seeded good rows survive; all three malformed
+    // rows above are dropped, none silently coerced to a fabricated 0/0.0
+    let rows = s.cpu_history(0, i64::MAX).unwrap();
+    assert_eq!(rows.len(), 2, "got {rows:?}");
+    assert!(rows.iter().all(|r| r.time == 1_700_000_000_000 || r.time == 1_700_000_005_000));
 
     std::fs::remove_dir_all(&dir).ok();
 }
