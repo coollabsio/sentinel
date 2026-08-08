@@ -1,8 +1,8 @@
 # Build stage
-FROM rust:1.96-alpine3.22 AS builder
+FROM rust:1.97.1-alpine3.24 AS builder
 
 # rusqlite's bundled SQLite compiles from C source, so the build stage needs a
-# C toolchain. The runtime image is alpine:3.22, which ships musl's shared
+# C toolchain. The runtime image is alpine:3.24, which ships musl's shared
 # libraries natively — the binary is dynamically linked against musl, not
 # static, and needs nothing beyond that to run in the runtime stage below.
 RUN apk add --no-cache musl-dev gcc
@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp /app/target/release/sentinel /app/sentinel
 
 # Final stage
-FROM alpine:3.22
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates tzdata curl
 

@@ -12,7 +12,7 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -20,10 +20,10 @@ jobs:
       # `toolchain` input, the action ref must be @master, not @stable --
       # @stable pulls in whatever is CURRENTLY stable at CI run time
       # (drifting over time) rather than respecting the pinned toolchain
-      # input, defeating the whole point of pinning 1.96.0 here.
+      # input, defeating the whole point of pinning 1.97.1 here.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.97.1"
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -40,10 +40,20 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      # Prebuilt-binary install (not `cargo install`) so this doesn't compile
+      # cargo-audit from source on every run. Checks Cargo.lock against the
+      # RustSec Advisory Database; fails the job on any known vulnerability.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit
+        run: cargo audit
+
   docker:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 

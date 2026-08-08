@@ -18,7 +18,7 @@ An API for gathering Linux server / Docker Engine metrics.
 
 ### Prerequisites
 
-- Rust 1.96 or higher (for development)
+- Rust 1.97 or higher (for development)
 - Docker (for container metrics)
 - Linux environment (production deployment)
 
