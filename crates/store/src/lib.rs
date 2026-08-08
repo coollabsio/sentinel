@@ -25,7 +25,11 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        if let Some(dir) = path.parent() {
+        // Path::parent() returns Some("") for a bare filename with no
+        // directory component (e.g. "db.sqlite"), not None — create_dir_all("")
+        // silently no-ops, but set_permissions("") fails with NotFound. Skip
+        // the whole block when there's no real directory to create.
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
             #[cfg(unix)]
             {

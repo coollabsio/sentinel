@@ -115,3 +115,21 @@ fn opening_twice_is_idempotent() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn opens_a_bare_filename_with_no_directory_component() {
+    // Path::parent() on a single-component relative path returns Some(""),
+    // not None. Store::open must not choke on that when trying to create /
+    // chmod the (nonexistent) parent directory. Uses a unique name directly
+    // in the test binary's cwd rather than changing it, so this stays safe
+    // under parallel test execution.
+    let name = format!("sentinel-test-bare-{}.sqlite", std::process::id());
+    let path = std::path::PathBuf::from(&name);
+    let _ = std::fs::remove_file(&path);
+
+    let result = Store::open(&path);
+    let ok = result.is_ok();
+    std::fs::remove_file(&path).ok();
+
+    assert!(ok, "Store::open must accept a bare filename: {:?}", result.err());
+}
