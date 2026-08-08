@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod metrics;
+pub mod retention;
 pub mod schema;
 
 use std::path::Path;
