@@ -17,8 +17,17 @@ use tokio::sync::Mutex;
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Store,
-    /// Shared with the collector's sampling cadence: sysinfo CPU readings are
-    /// differential, so /api/cpu/current must read through a warm instance.
+    /// Shared between the API's own `/api/cpu/current`, `/api/memory/current`
+    /// and `/api/stats` handlers — *not* with the collector, which constructs
+    /// its own independent `HostSampler` so its fixed-cadence loop never
+    /// contends on this lock with inbound requests. sysinfo CPU readings are
+    /// differential, so those three handlers must read through one warm,
+    /// consistently-refreshed instance rather than a fresh one per request.
+    ///
+    /// Consequence: `/api/cpu/current` reports usage *since the last call to
+    /// any of those three routes* (whichever last refreshed this sampler),
+    /// not usage over a fixed 5-second window the way the collector's own
+    /// independently sampled history rows are.
     pub sampler: Arc<Mutex<HostSampler>>,
 }
 

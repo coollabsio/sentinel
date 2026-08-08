@@ -3,9 +3,13 @@
 #[allow(unsafe_code)]
 pub fn root_used_percentage() -> std::io::Result<u64> {
     let path = std::ffi::CString::new("/")?;
+    // SAFETY (both unsafe blocks below): `libc::statfs` is a plain-old-data
+    // struct of integer fields, so an all-zero bit pattern is a valid value
+    // to initialize it with; the kernel then fills it in via the `statfs`
+    // call, whose arguments are a valid NUL-terminated C string and a
+    // correctly sized, exclusively borrowed statfs, and whose return value is
+    // checked below before any field is read.
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `path` is a valid NUL-terminated C string and `stat` is a
-    // correctly sized, zeroed statfs the kernel fills in. Checked return value.
     let rc = unsafe { libc::statfs(path.as_ptr(), &mut stat) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());

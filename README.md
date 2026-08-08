@@ -12,7 +12,7 @@ An API for gathering Linux server / Docker Engine metrics.
 - REST API for querying metrics
 - Configurable data retention
 - Push metrics to external endpoints
-- Debug and profiling endpoints
+- Debug mode with verbose logging and a database statistics endpoint
 
 ## Quick Start
 
@@ -75,7 +75,7 @@ Sentinel is configured using environment variables:
 | `COLLECTOR_ENABLED` | `false` | Enable/disable metrics collection |
 | `COLLECTOR_REFRESH_RATE_SECONDS` | 5 | Metrics collection interval |
 | `COLLECTOR_RETENTION_PERIOD_DAYS` | 7 | How long to keep metrics in database |
-| `DEBUG` | `false` | Enable debug mode and profiling endpoints |
+| `DEBUG` | `false` | Enable verbose logging, `human_friendly_time` fields, and the `/api/stats` route |
 | `PORT` | `8888` | HTTP server port |
 
 In development mode (`cargo run`/`cargo build` debug profile, or `SENTINEL_DEVELOPMENT=1`), `PUSH_ENDPOINT` defaults to `http://localhost:8000`.

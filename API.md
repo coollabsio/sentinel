@@ -372,19 +372,6 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
   http://localhost:8888/api/stats
 ```
 
-### Profiling Endpoints
-
-Additional debug endpoints for Go profiling (requires `DEBUG=true`):
-
-- `GET /debug/pprof` - pprof index
-- `GET /debug/cmdline` - Command line invocation
-- `GET /debug/profile` - CPU profile
-- `GET /debug/symbol` - Symbol lookup
-- `GET /debug/trace` - Execution trace
-- `GET /debug/heap` - Heap profile
-- `GET /debug/goroutine` - Goroutine profile
-- `GET /debug/block` - Block profile
-
 ---
 
 ## Error Responses

@@ -34,7 +34,7 @@ tags:
   - name: Container Metrics
     description: Metrics for Docker containers
   - name: Debug
-    description: Debug and profiling endpoints (only available when DEBUG=true)
+    description: Debug-only endpoints (available when DEBUG=true)
 
 paths:
   /api/health:
