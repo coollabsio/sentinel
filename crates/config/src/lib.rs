@@ -130,20 +130,29 @@ fn positive_from_env(key: &'static str, fallback: u64) -> Result<u64, ConfigErro
 
 // Mirrors validateEndpoint in pkg/config/config.go: scheme must be http/https,
 // host must be present, and userinfo/query/fragment are all rejected.
+//
+// Go's check is `parsed.User != nil`, which only looks at the authority
+// component (before the host) — a literal '@' later in the path, like
+// "https://example.com/path/@handle", is valid there. Scanning the whole
+// remainder for '@' would reject that URL incorrectly, so the userinfo
+// check is scoped to the authority: everything up to the first '/', '?',
+// or '#'. Query and fragment are rejected anywhere after the authority,
+// since neither can legitimately appear in a bare path segment.
 fn validate_endpoint(endpoint: &str) -> Result<(), ConfigError> {
     let rest = match endpoint.split_once("://") {
         Some(("http", rest)) | Some(("https", rest)) => rest,
         _ => return Err(ConfigError::InvalidEndpoint),
     };
-    if rest.is_empty()
-        || rest.contains('@')
-        || rest.contains('?')
-        || rest.contains('#')
-    {
+    if rest.is_empty() {
         return Err(ConfigError::InvalidEndpoint);
     }
-    let host = rest.split('/').next().unwrap_or_default();
-    if host.is_empty() {
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() || authority.contains('@') {
+        return Err(ConfigError::InvalidEndpoint);
+    }
+    let remainder = &rest[authority_end..];
+    if remainder.contains('?') || remainder.contains('#') {
         return Err(ConfigError::InvalidEndpoint);
     }
     Ok(())
@@ -226,6 +235,7 @@ mod tests {
             "https://u:p@example.com",
             "https://example.com?a=1",
             "https://example.com#f",
+            "https://u:p@example.com/some/path",
         ] {
             let _l = env_lock().lock().unwrap();
             let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", bad)]);
@@ -234,6 +244,19 @@ mod tests {
                 "expected {bad} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn accepts_at_sign_in_path_query_or_fragment_free_urls() {
+        // '@' here is not userinfo (it's not before the host), so this must
+        // NOT be rejected. Matches Go's `parsed.User != nil`, which only
+        // looks at the authority component.
+        let _l = env_lock().lock().unwrap();
+        let _g = EnvGuard::set(&[
+            ("TOKEN", "t"),
+            ("PUSH_ENDPOINT", "https://example.com/path/@handle"),
+        ]);
+        assert!(Config::load(false).is_ok());
     }
 
     #[test]
