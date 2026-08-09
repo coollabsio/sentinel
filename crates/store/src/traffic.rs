@@ -305,6 +305,17 @@ impl AnalyticsStore {
         // per commit than the metrics collector's per-5s scalar inserts.
         conn.pragma_update(None, "cache_size", -16000)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // A brief checkpoint (or, later, the timed wal_checkpoint(TRUNCATE))
+        // can hold the writer lock; wait rather than error immediately,
+        // matching the reader connection below.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Disable SQLite's automatic checkpoint: a later task adds an
+        // explicit timed `wal_checkpoint(TRUNCATE)` that owns checkpointing
+        // instead, so it isn't racing an implicit one here (design spec §9).
+        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+        // Must be set before any table exists (below, via `apply`) to take
+        // effect without a full VACUUM later (design spec §9).
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         Ok(())
     }
 
@@ -562,6 +573,35 @@ mod tests {
             latency_tdigest: tdigest,
             uniques_hll: hll,
         }
+    }
+
+    /// Design spec §9: `wal_autocheckpoint=0` (a later task's timed
+    /// `wal_checkpoint(TRUNCATE)` owns checkpointing instead) and
+    /// `auto_vacuum=INCREMENTAL` (reported back as `2`) must both actually
+    /// take effect on the writer connection, not just be sent and ignored.
+    #[test]
+    fn writer_pragmas_take_effect() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        let (autocheckpoint, auto_vacuum) = s
+            .with_conn(|conn| {
+                let autocheckpoint: i64 =
+                    conn.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))?;
+                let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+                Ok((autocheckpoint, auto_vacuum))
+            })
+            .unwrap();
+        assert_eq!(
+            autocheckpoint, 0,
+            "automatic checkpointing must be disabled; a later task's timed \
+             wal_checkpoint(TRUNCATE) owns it instead"
+        );
+        assert_eq!(
+            auto_vacuum, 2,
+            "auto_vacuum must be INCREMENTAL (SQLite reports this mode as 2)"
+        );
+        // busy_timeout has no readback pragma in rusqlite; init_conn sets it
+        // via `conn.busy_timeout(Duration::from_secs(5))`, mirroring the
+        // reader connection's setting above.
     }
 
     #[test]
