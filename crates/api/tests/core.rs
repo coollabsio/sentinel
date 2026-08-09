@@ -97,6 +97,7 @@ fn test_state() -> std::sync::Arc<api::AppState> {
         history_queries: std::sync::Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics: None,
     })
 }
 

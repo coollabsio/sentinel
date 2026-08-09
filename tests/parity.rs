@@ -50,6 +50,7 @@ async fn fetch(uri: &str) -> serde_json::Value {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics: None,
     });
 
     let res = api::router(state)

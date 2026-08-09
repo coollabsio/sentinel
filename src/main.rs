@@ -98,6 +98,37 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // collector and pusher, so it is opened *after* the listener binds —
     // keeping the path to `/api/health` as short as possible.
     let store = store::Store::open(&config.metrics_file)?;
+
+    // Traffic analytics database. Opened here, next to the metrics store and
+    // ahead of the listener, for the same reason that one is: `AppState`
+    // carries it, so it has to exist before the router is built. This is only
+    // a local SQLite open — everything actually expensive about the traffic
+    // subsystem (the GeoIP download, the access-log tail) is deferred to the
+    // bottom of this function, well after the API is answering.
+    //
+    // A failure here degrades traffic analytics to "off" rather than taking
+    // the agent down. `AnalyticsStore::open` already moves an unreadable
+    // database aside and starts fresh, so reaching this arm means something
+    // like a permissions or disk problem — which CPU/memory collection has no
+    // stake in and must not be killed by.
+    #[cfg(feature = "traffic")]
+    let analytics: Option<store::traffic::AnalyticsStore> = if config.traffic.enabled {
+        match store::traffic::AnalyticsStore::open(&config.traffic.analytics_file) {
+            Ok(analytics) => Some(analytics),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    path = %config.traffic.analytics_file.display(),
+                    "failed to open analytics database, traffic analytics disabled"
+                );
+                None
+            }
+        }
+    } else {
+        tracing::info!("traffic analytics disabled");
+        None
+    };
+
     let mut host_sampler = collector::HostSampler::new();
     let memory = Arc::new(api::CachedMemory::new(host_sampler.sample_memory()));
     let sampler = Arc::new(Mutex::new(host_sampler));
@@ -130,6 +161,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             sampler: sampler.clone(),
             memory: memory.clone(),
             history_queries: Arc::new(Semaphore::new(api::MAX_CONCURRENT_HISTORY_QUERIES)),
+            #[cfg(feature = "traffic")]
+            analytics: analytics.clone(),
+            #[cfg(not(feature = "traffic"))]
+            analytics: None,
         });
         let app = api::router(state);
         let mut rx = shutdown_rx.clone();
@@ -230,6 +265,181 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+    }
+
+    // Traffic analytics: access-log ingest, tier compaction, retention, and
+    // periodic GeoIP refresh. `analytics` is `Some` only when the subsystem is
+    // both enabled and its database opened, so this one binding gates the whole
+    // section.
+    //
+    // Deliberately last in the startup sequence: `GeoIp::bootstrap` downloads a
+    // database, and nothing above — API, collectors, pusher — should wait on
+    // that. (A signal arriving during the download still terminates the process
+    // at its default disposition, exactly as one arriving during any other part
+    // of startup does; `wait_for_signal` has not installed a handler yet.)
+    #[cfg(feature = "traffic")]
+    if let Some(analytics) = analytics {
+        // GeoIP databases live next to analytics.sqlite (spec §6). `parent()`
+        // is `Some("")` for a bare filename and `None` only for a root path;
+        // neither is a directory to write into, so both degrade to the current
+        // directory rather than panicking.
+        let db_dir = config
+            .traffic
+            .analytics_file
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        // Country enrichment is optional: if every candidate source is
+        // unreachable the country breakdown is simply empty, which is not a
+        // reason to run without traffic analytics altogether.
+        let geoip = if config.traffic.geoip_enabled {
+            match traffic::geoip::GeoIp::bootstrap(&config.traffic, &db_dir).await {
+                Ok(geoip) => Some(geoip),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "geoip bootstrap failed, continuing without country enrichment"
+                    );
+                    None
+                }
+            }
+        } else {
+            tracing::info!("geoip disabled");
+            None
+        };
+        let lookup: Arc<dyn traffic::enrich::CountryLookup> = match &geoip {
+            Some(geoip) => geoip.clone(),
+            None => Arc::new(traffic::enrich::NoGeo),
+        };
+
+        // Ingest. A build failure here is nearly always "the access log isn't
+        // there": the proxy's log directory isn't mounted into this container,
+        // or the proxy hasn't been switched to JSON access logging yet. That is
+        // a real misconfiguration worth surfacing loudly, but not a crash — and
+        // not a reason to stop maintaining a database that may already hold
+        // history, so the tasks below are spawned either way.
+        match traffic::service::TrafficService::build(&config, analytics.clone(), lookup).await {
+            Ok(service) => {
+                let rx = shutdown_rx.clone();
+                services.spawn(async move {
+                    service.run(rx).await;
+                    Ok::<(), String>(())
+                });
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                path = %config.traffic.access_log_path.display(),
+                "traffic ingest unavailable; compaction and retention still run"
+            ),
+        }
+
+        // 1m -> 1h compaction, hourly, with one pass at startup. Compaction
+        // only ever touches *closed* coarse buckets, so an off-boundary cadence
+        // (and this immediate first pass) is safe by construction.
+        {
+            let analytics = analytics.clone();
+            let topn = config.traffic.topn as usize;
+            let mut rx = shutdown_rx.clone();
+            services.spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+                loop {
+                    tokio::select! {
+                        _ = rx.changed() => return Ok::<(), String>(()),
+                        _ = ticker.tick() => {
+                            let s = analytics.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                traffic::compaction::compact_1m_to_1h(&s, collector::now_millis(), topn)
+                            })
+                            .await;
+                            match result {
+                                Ok(Ok(written)) => tracing::info!(
+                                    written, "traffic 1m->1h compaction complete"
+                                ),
+                                Ok(Err(e)) => tracing::warn!(error = %e, "traffic 1m->1h compaction failed"),
+                                Err(e) => tracing::warn!(error = %e, "traffic compaction task panicked"),
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // 1h -> 1d compaction plus per-tier retention, daily, with one pass at
+        // startup. Both are cheap SQLite work on the same connection, so they
+        // share one blocking task rather than racing for the writer mutex.
+        {
+            let analytics = analytics.clone();
+            let topn = config.traffic.topn as usize;
+            let m1_hours = config.traffic.retention_1m_hours;
+            let h1_days = config.traffic.retention_1h_days;
+            let d1_days = config.traffic.retention_1d_days;
+            let mut rx = shutdown_rx.clone();
+            services.spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+                loop {
+                    tokio::select! {
+                        _ = rx.changed() => return Ok::<(), String>(()),
+                        _ = ticker.tick() => {
+                            let s = analytics.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                let now = collector::now_millis();
+                                let written = traffic::compaction::compact_1h_to_1d(&s, now, topn)?;
+                                let deleted = s.retention(now, m1_hours, h1_days, d1_days)?;
+                                Ok::<_, traffic::TrafficError>((written, deleted))
+                            })
+                            .await;
+                            match result {
+                                Ok(Ok((written, deleted))) => tracing::info!(
+                                    written, deleted, "traffic 1h->1d compaction and retention complete"
+                                ),
+                                Ok(Err(e)) => tracing::warn!(error = %e, "traffic daily compaction/retention failed"),
+                                Err(e) => tracing::warn!(error = %e, "traffic daily task panicked"),
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // GeoIP refresh, every GEOIP_REFRESH_DAYS. Unlike the tickers above,
+        // the interval's immediate first tick is consumed rather than acted on:
+        // `bootstrap` fetched a fresh database moments ago, so refreshing now
+        // would be a redundant round-trip.
+        if let Some(geoip) = geoip {
+            let settings = config.traffic.clone();
+            let period = std::time::Duration::from_secs(
+                config.traffic.geoip_refresh_days as u64 * 24 * 60 * 60,
+            );
+            let mut rx = shutdown_rx.clone();
+            services.spawn(async move {
+                let mut ticker = tokio::time::interval(period);
+                ticker.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = rx.changed() => return Ok::<(), String>(()),
+                        _ = ticker.tick() => {
+                            // `Err` means every candidate source failed, which
+                            // `refresh` documents as leaving the currently
+                            // mapped database untouched and still serving
+                            // lookups. Log it and wait for the next tick —
+                            // returning would trip `unexpected_service_exit`
+                            // and take the whole agent down over a failed
+                            // background download.
+                            match geoip.refresh(&settings, &db_dir).await {
+                                Ok(true) => tracing::info!("geoip database refreshed"),
+                                Ok(false) => tracing::debug!("geoip database already current"),
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    "geoip refresh failed, keeping the current database"
+                                ),
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
 
     tokio::select! {

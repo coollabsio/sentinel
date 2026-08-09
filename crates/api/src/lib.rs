@@ -52,6 +52,16 @@ pub struct AppState {
     /// Bounds admission to SQLite's blocking history path. The store has one
     /// reader, so more blocking tasks only consume threads while waiting.
     pub history_queries: Arc<Semaphore>,
+    /// Traffic-analytics database, when the subsystem is both compiled in
+    /// (the binary's `traffic` feature) and enabled (`TRAFFIC_ENABLED`) and
+    /// its database opened successfully. `None` in every other case,
+    /// including a build without the feature.
+    ///
+    /// Deliberately *not* `#[cfg]`-gated: `store::traffic` is always
+    /// compiled (`store` is a required dependency here), so gating the field
+    /// would only fracture this struct's shape across builds for no saving.
+    /// `main.rs` owns the decision of what to put in it.
+    pub analytics: Option<store::traffic::AnalyticsStore>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {

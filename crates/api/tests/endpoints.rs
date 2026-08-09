@@ -36,6 +36,7 @@ fn state(debug: bool) -> Arc<AppState> {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics: None,
     })
 }
 
@@ -173,6 +174,7 @@ async fn cpu_history_returns_empty_array_not_null() {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics: None,
     });
     let (s, j) = get(router(st), "/api/cpu/history", Some("secret")).await;
     assert_eq!(s, StatusCode::OK);
