@@ -23,12 +23,12 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 woothee = { workspace = true }
 lru = { workspace = true }
-# Deferred: tdigest 1.0.0's manifest hard-pins `syn = "=2.0.81"`, which conflicts
-# with thiserror-impl 2.x's `syn ^2.0.87` requirement (already used by store/config).
-# No newer tdigest release fixes this; the archived `tdigests` crate is not a safe
-# alternative either. Task 5 (Sketches) owns resolving this — a patched fork, a
-# different crate, or an in-house t-digest — before it needs real percentile logic.
-# tdigest = { workspace = true }
+# Uses `tdigests` (andylokandy), not `tdigest` (MnO2): the latter's manifest
+# hard-pins `syn = "=2.0.81"`, which conflicts with thiserror-impl 2.x's
+# `syn ^2.0.87` requirement (already used by store/config). `tdigests` has no
+# such conflict and no `serde` feature — sketches.rs defines its own small
+# serializable CentroidData mirror for the postcard codec.
+tdigests = { workspace = true }
 hyperloglogplus = { workspace = true }
 siphasher = { workspace = true }
 

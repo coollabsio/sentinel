@@ -33,7 +33,7 @@ flate2 = "1.1"
 tar = "0.4"
 woothee = "0.13"
 lru = "0.18"
-tdigest = { version = "1.0", features = ["serde"] }
+tdigests = "1"
 hyperloglogplus = "0.4"
 siphasher = "1"
 traffic = { path = "crates/traffic" }

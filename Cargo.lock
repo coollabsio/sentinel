@@ -2038,6 +2038,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tdigests"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8cc794f115de9eb67bb1bf4e8de08ac1b3d2f43bfdbec083636450da72a0986"
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2311,6 +2317,7 @@ dependencies = [
  "siphasher",
  "store",
  "tar",
+ "tdigests",
  "tempfile",
  "thiserror",
  "time",

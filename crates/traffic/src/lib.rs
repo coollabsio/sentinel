@@ -21,4 +21,6 @@ pub enum TrafficError {
     Decompress(String),
     #[error("geoip: {0}")]
     GeoIp(String),
+    #[error("codec: {0}")]
+    Codec(String),
 }
