@@ -299,7 +299,7 @@ Runs **latency → load → stress** with the shared target.
 
 ### 4.9 Storage collection micro-bench (`sentinel-bench storage`)
 
-The HTTP modes cover the storage **read** endpoints (`/api/disk/*`, `/api/container/{id}/disk/*`),
+The HTTP modes cover the host storage **read** endpoints (`/api/disk/current`, `/api/disk/history`),
 but the storage feature's real cost is **collector-side** and has no HTTP surface: the recursive
 volume `du`-walk, `sysinfo` disk enumeration, and store batch writes/downsample. This mode measures
 those directly by driving the **real** production functions (`collector::storage::dir_size` /

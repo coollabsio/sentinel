@@ -427,6 +427,11 @@ Retrieve historical writable-layer and volume sizes for a container.
 
 **Endpoint:** `GET /api/container/:containerId/disk/history`
 
+**Path Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `containerId` | string | Yes | Exact container display name recorded by Sentinel |
+
 **Query Parameters:**
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|

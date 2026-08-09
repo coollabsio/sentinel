@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -103,13 +103,26 @@ impl StorageCollector {
         let prefix = self.config.host_mount_prefix.clone();
 
         match tokio::task::spawn_blocking(move || {
+            // Cache measured sizes for the whole collection cycle: a host source
+            // shared across containers (or mounted at several targets within one
+            // container) is `du`-walked only once.
+            let mut measured: HashMap<PathBuf, u64> = HashMap::new();
             let samples: Vec<ContainerDiskSample> = containers
                 .into_iter()
                 .map(|c| {
                     let volumes_total = if volumes_enabled {
                         c.mount_sources
                             .iter()
-                            .map(|src| dir_size(&resolve_host_path(&prefix, src)))
+                            .map(|src| resolve_host_path(&prefix, src))
+                            // Dedupe per container so one source mounted at
+                            // multiple targets is counted once, not summed twice.
+                            .collect::<HashSet<_>>()
+                            .into_iter()
+                            .map(|path| {
+                                *measured
+                                    .entry(path.clone())
+                                    .or_insert_with(|| dir_size(&path))
+                            })
                             .sum()
                     } else {
                         0

@@ -194,9 +194,9 @@ pub fn run(opts: &StorageOpts) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n[C] store batch inserts (in-memory SQLite)");
     let store = Store::open_in_memory()?;
 
-    // Disk: 8 mounts/cycle is a realistic server; push `rows` total.
+    // Disk: 8 mounts/cycle is a realistic server; insert exactly `rows` total,
+    // with a partial final batch so the executed workload matches `--rows`.
     let mounts_per_cycle = 8usize;
-    let disk_cycles = (opts.rows / mounts_per_cycle).max(1);
     let disk_batch: Vec<DiskSample> = (0..mounts_per_cycle)
         .map(|m| DiskSample {
             mount: format!("/mnt/d{m}"),
@@ -207,11 +207,16 @@ pub fn run(opts: &StorageOpts) -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     let t = Instant::now();
-    for cycle in 0..disk_cycles {
-        store.insert_disk_batch(cycle as i64 * 1000, &disk_batch)?;
+    let mut disk_rows = 0usize;
+    let mut cycle = 0i64;
+    while disk_rows < opts.rows {
+        let n = (opts.rows - disk_rows).min(mounts_per_cycle);
+        store.insert_disk_batch(cycle * 1000, &disk_batch[..n])?;
+        disk_rows += n;
+        cycle += 1;
     }
     let disk_elapsed = t.elapsed();
-    let disk_rows = (disk_cycles * mounts_per_cycle) as f64;
+    let disk_rows = disk_rows as f64;
     println!(
         "    disk_usage: {} rows in {:.2}s → {:.0} rows/s",
         disk_rows as u64,
@@ -219,9 +224,9 @@ pub fn run(opts: &StorageOpts) -> Result<(), Box<dyn std::error::Error>> {
         disk_rows / disk_elapsed.as_secs_f64().max(1e-9),
     );
 
-    // Container: 100 containers/cycle.
+    // Container: 100 containers/cycle; insert exactly `rows` total, with a
+    // partial final batch so the executed workload matches `--rows`.
     let cont_per_cycle = 100usize;
-    let cont_cycles = (opts.rows / cont_per_cycle).max(1);
     let cont_batch: Vec<ContainerDiskSample> = (0..cont_per_cycle)
         .map(|c| ContainerDiskSample {
             container_id: format!("container-{c:04}"),
@@ -230,11 +235,16 @@ pub fn run(opts: &StorageOpts) -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     let t = Instant::now();
-    for cycle in 0..cont_cycles {
-        store.insert_container_disk_batch(cycle as i64 * 1000, &cont_batch)?;
+    let mut cont_rows = 0usize;
+    let mut cycle = 0i64;
+    while cont_rows < opts.rows {
+        let n = (opts.rows - cont_rows).min(cont_per_cycle);
+        store.insert_container_disk_batch(cycle * 1000, &cont_batch[..n])?;
+        cont_rows += n;
+        cycle += 1;
     }
     let cont_elapsed = t.elapsed();
-    let cont_rows = (cont_cycles * cont_per_cycle) as f64;
+    let cont_rows = cont_rows as f64;
     println!(
         "    container_disk_usage: {} rows in {:.2}s → {:.0} rows/s",
         cont_rows as u64,
@@ -257,11 +267,17 @@ pub fn run(opts: &StorageOpts) -> Result<(), Box<dyn std::error::Error>> {
         collapsed as f64 / ds_elapsed.as_secs_f64().max(1e-9),
     );
 
-    // Cleanup
+    // Cleanup. Propagate removal failures so a leftover tree never reports OK.
+    // (A tree left behind by an earlier `?` failure is intentional: it aids
+    // debugging of a crashed run and is cleared by the next run's pre-clean.)
     if opts.keep {
         println!("\ntree kept at {}", root.display());
     } else {
-        let _ = std::fs::remove_dir_all(&root);
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
 
     println!("\nstorage_bench=OK");

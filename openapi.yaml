@@ -291,7 +291,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ContainerDiskUsage'
+                nullable: true
+                allOf:
+                  - $ref: '#/components/schemas/ContainerDiskUsage'
         '401':
           $ref: '#/components/responses/UnauthorizedError'
         '500':
