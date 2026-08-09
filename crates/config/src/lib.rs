@@ -35,6 +35,30 @@ pub enum ConfigError {
     InvalidBool(&'static str),
 }
 
+/// Traffic-analytics subsystem configuration (spec §5). Inert unless
+/// `enabled` (TRAFFIC_ENABLED) is set and the binary is built with the
+/// `traffic` feature. All fields have safe defaults so the zero-config path
+/// is opt-out-clean.
+#[derive(Debug, Clone)]
+pub struct TrafficSettings {
+    pub enabled: bool,
+    pub access_log_path: PathBuf,
+    pub proxy_type: String,
+    pub topn: u32,
+    pub sample_threshold: u32,
+    pub retention_1m_hours: u32,
+    pub retention_1h_days: u32,
+    pub retention_1d_days: u32,
+    pub analytics_file: PathBuf,
+    pub geoip_enabled: bool,
+    /// Explicit source URL override. When `None`, the default resolution chain
+    /// (mirror → DB-IP fallback, or MaxMind if a key is set) applies. See §6.
+    pub geoip_db_url: Option<String>,
+    pub geoip_maxmind_key: Option<String>,
+    pub geoip_maxmind_edition: String,
+    pub geoip_refresh_days: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub version: String,
@@ -55,6 +79,7 @@ pub struct Config {
     pub storage_volumes_enabled: bool,
     pub storage_volumes_refresh_rate_seconds: u64,
     pub host_mount_prefix: String,
+    pub traffic: TrafficSettings,
 }
 
 impl Config {
@@ -79,6 +104,34 @@ impl Config {
         let storage_volumes_refresh_rate_seconds =
             positive_from_env("STORAGE_VOLUMES_REFRESH_RATE_SECONDS", 900)?;
         let host_mount_prefix = non_empty("HOST_MOUNT_PREFIX").unwrap_or_default();
+
+        let analytics_file = if development {
+            PathBuf::from("./db/analytics.sqlite")
+        } else {
+            PathBuf::from("/app/db/analytics.sqlite")
+        };
+        let traffic = TrafficSettings {
+            enabled: bool_from_env("TRAFFIC_ENABLED", false)?,
+            access_log_path: PathBuf::from(
+                non_empty("TRAFFIC_ACCESS_LOG_PATH")
+                    .unwrap_or_else(|| "/data/coolify/proxy/access.log".to_string()),
+            ),
+            proxy_type: non_empty("TRAFFIC_PROXY_TYPE").unwrap_or_else(|| "auto".to_string()),
+            topn: u32_from_env("TRAFFIC_TOPN", 50)?,
+            // Sampling is off by default; 0 is a valid "disabled" sentinel, so it
+            // uses a non-positive-tolerant parse rather than positive_from_env.
+            sample_threshold: u32_nonneg_from_env("TRAFFIC_SAMPLE_THRESHOLD", 0)?,
+            retention_1m_hours: u32_from_env("TRAFFIC_RETENTION_1M_HOURS", 48)?,
+            retention_1h_days: u32_from_env("TRAFFIC_RETENTION_1H_DAYS", 30)?,
+            retention_1d_days: u32_from_env("TRAFFIC_RETENTION_1D_DAYS", 395)?,
+            analytics_file,
+            geoip_enabled: bool_from_env("GEOIP_ENABLED", true)?,
+            geoip_db_url: non_empty("GEOIP_DB_URL"),
+            geoip_maxmind_key: non_empty("GEOIP_MAXMIND_LICENSE_KEY"),
+            geoip_maxmind_edition: non_empty("GEOIP_MAXMIND_EDITION")
+                .unwrap_or_else(|| "GeoLite2-Country".to_string()),
+            geoip_refresh_days: u32_from_env("GEOIP_REFRESH_DAYS", 30)?,
+        };
 
         let port: u16 = match non_empty("PORT") {
             None => 8888,
@@ -129,6 +182,7 @@ impl Config {
             storage_volumes_enabled,
             storage_volumes_refresh_rate_seconds,
             host_mount_prefix,
+            traffic,
         })
     }
 
@@ -153,6 +207,22 @@ impl Config {
             storage_volumes_enabled: false,
             storage_volumes_refresh_rate_seconds: 900,
             host_mount_prefix: String::new(),
+            traffic: TrafficSettings {
+                enabled: false,
+                access_log_path: PathBuf::from("/data/coolify/proxy/access.log"),
+                proxy_type: "auto".to_string(),
+                topn: 50,
+                sample_threshold: 0,
+                retention_1m_hours: 48,
+                retention_1h_days: 30,
+                retention_1d_days: 395,
+                analytics_file: PathBuf::from(":memory:"),
+                geoip_enabled: true,
+                geoip_db_url: None,
+                geoip_maxmind_key: None,
+                geoip_maxmind_edition: "GeoLite2-Country".to_string(),
+                geoip_refresh_days: 30,
+            },
         }
     }
 }
@@ -181,6 +251,24 @@ fn positive_from_env(key: &'static str, fallback: u64) -> Result<u64, ConfigErro
         None => Ok(fallback),
         Some(v) => match v.parse::<i64>() {
             Ok(n) if n > 0 => Ok(n as u64),
+            _ => Err(ConfigError::NotPositive(key)),
+        },
+    }
+}
+
+/// A strictly-positive `u32` env var (rejects 0, negatives, and overflow).
+fn u32_from_env(key: &'static str, fallback: u32) -> Result<u32, ConfigError> {
+    let n = positive_from_env(key, fallback as u64)?;
+    u32::try_from(n).map_err(|_| ConfigError::NotPositive(key))
+}
+
+/// A non-negative `u32` env var: 0 is accepted (it is a valid "disabled"
+/// sentinel, e.g. TRAFFIC_SAMPLE_THRESHOLD=0 means "never sample").
+fn u32_nonneg_from_env(key: &'static str, fallback: u32) -> Result<u32, ConfigError> {
+    match non_empty(key) {
+        None => Ok(fallback),
+        Some(v) => match v.parse::<i64>() {
+            Ok(n) if n >= 0 => u32::try_from(n).map_err(|_| ConfigError::NotPositive(key)),
             _ => Err(ConfigError::NotPositive(key)),
         },
     }
@@ -430,5 +518,93 @@ mod tests {
         // development supplies a default endpoint
         assert_eq!(c.endpoint, "http://localhost:8000");
         assert_eq!(c.metrics_file.to_str().unwrap(), "./db/metrics.sqlite");
+        // analytics DB mirrors the metrics_file dev/prod split
+        assert_eq!(c.traffic.analytics_file.to_str().unwrap(), "./db/analytics.sqlite");
+    }
+
+    #[test]
+    fn traffic_defaults() {
+        let _l = env_lock().lock().unwrap();
+        let _g = EnvGuard::set(&[
+            ("TOKEN", "t"),
+            ("PUSH_ENDPOINT", "https://example.com"),
+            ("TRAFFIC_ENABLED", ""),
+            ("TRAFFIC_PROXY_TYPE", ""),
+            ("TRAFFIC_TOPN", ""),
+            ("TRAFFIC_SAMPLE_THRESHOLD", ""),
+            ("GEOIP_ENABLED", ""),
+            ("GEOIP_DB_URL", ""),
+            ("GEOIP_REFRESH_DAYS", ""),
+            ("GEOIP_MAXMIND_LICENSE_KEY", ""),
+            ("GEOIP_MAXMIND_EDITION", ""),
+        ]);
+        let c = Config::load(false).unwrap();
+        assert!(!c.traffic.enabled);
+        assert_eq!(c.traffic.proxy_type, "auto");
+        assert_eq!(c.traffic.topn, 50);
+        assert_eq!(c.traffic.sample_threshold, 0);
+        assert_eq!(c.traffic.retention_1m_hours, 48);
+        assert_eq!(c.traffic.retention_1h_days, 30);
+        assert_eq!(c.traffic.retention_1d_days, 395);
+        assert_eq!(c.traffic.geoip_refresh_days, 30);
+        assert!(c.traffic.geoip_enabled);
+        assert!(c.traffic.geoip_db_url.is_none());
+        assert!(c.traffic.geoip_maxmind_key.is_none());
+        assert_eq!(c.traffic.geoip_maxmind_edition, "GeoLite2-Country");
+        assert_eq!(
+            c.traffic.analytics_file.to_str().unwrap(),
+            "/app/db/analytics.sqlite"
+        );
+        assert_eq!(
+            c.traffic.access_log_path.to_str().unwrap(),
+            "/data/coolify/proxy/access.log"
+        );
+    }
+
+    #[test]
+    fn traffic_reads_env() {
+        let _l = env_lock().lock().unwrap();
+        let _g = EnvGuard::set(&[
+            ("TOKEN", "t"),
+            ("PUSH_ENDPOINT", "https://example.com"),
+            ("TRAFFIC_ENABLED", "true"),
+            ("TRAFFIC_TOPN", "200"),
+            ("TRAFFIC_SAMPLE_THRESHOLD", "1000"),
+            ("GEOIP_MAXMIND_LICENSE_KEY", "abc123"),
+            ("GEOIP_DB_URL", "https://cdn.example/geo.mmdb.gz"),
+            ("GEOIP_REFRESH_DAYS", "3"),
+        ]);
+        let c = Config::load(false).unwrap();
+        assert!(c.traffic.enabled);
+        assert_eq!(c.traffic.topn, 200);
+        assert_eq!(c.traffic.sample_threshold, 1000);
+        assert_eq!(c.traffic.geoip_maxmind_key.as_deref(), Some("abc123"));
+        assert_eq!(
+            c.traffic.geoip_db_url.as_deref(),
+            Some("https://cdn.example/geo.mmdb.gz")
+        );
+        assert_eq!(c.traffic.geoip_refresh_days, 3);
+    }
+
+    #[test]
+    fn traffic_rejects_zero_topn_and_retention() {
+        for var in [
+            "TRAFFIC_TOPN",
+            "TRAFFIC_RETENTION_1M_HOURS",
+            "TRAFFIC_RETENTION_1H_DAYS",
+            "TRAFFIC_RETENTION_1D_DAYS",
+            "GEOIP_REFRESH_DAYS",
+        ] {
+            let _l = env_lock().lock().unwrap();
+            let _g = EnvGuard::set(&[
+                ("TOKEN", "t"),
+                ("PUSH_ENDPOINT", "https://example.com"),
+                (var, "0"),
+            ]);
+            assert!(
+                matches!(Config::load(false), Err(ConfigError::NotPositive(_))),
+                "expected {var}=0 to be rejected"
+            );
+        }
     }
 }

@@ -22,6 +22,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# Traffic analytics subsystem (feature-gated). Versions verified 2026-08 against
+# crates.io; all build on rust 1.97 / edition 2024. See
+# docs/superpowers/specs/2026-08-09-traffic-analytics-design.md §8.
+maxminddb = { version = "0.30", features = ["mmap"] }
+arc-swap = "1.9"
+foldhash = "0.2"
+postcard = { version = "1.1", features = ["use-std"] }
+flate2 = "1.1"
+tar = "0.4"
+woothee = "0.13"
+lru = "0.18"
+tdigest = { version = "1.0", features = ["serde"] }
+hyperloglogplus = "0.4"
+siphasher = "1"
 
 [package]
 name = "sentinel"
