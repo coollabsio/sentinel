@@ -23,8 +23,11 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 woothee = { workspace = true }
 lru = { workspace = true }
-# tdigest has a conflicting syn requirement (2.0.81) incompatible with the
-# current ecosystem; deferred to later when Task 1 dependencies are fixed
+# Deferred: tdigest 1.0.0's manifest hard-pins `syn = "=2.0.81"`, which conflicts
+# with thiserror-impl 2.x's `syn ^2.0.87` requirement (already used by store/config).
+# No newer tdigest release fixes this; the archived `tdigests` crate is not a safe
+# alternative either. Task 5 (Sketches) owns resolving this — a patched fork, a
+# different crate, or an in-house t-digest — before it needs real percentile logic.
 # tdigest = { workspace = true }
 hyperloglogplus = { workspace = true }
 siphasher = { workspace = true }

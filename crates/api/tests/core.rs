@@ -80,29 +80,12 @@ fn human_friendly_time_is_included_when_present() {
 }
 
 fn test_state() -> std::sync::Arc<api::AppState> {
-    // Constructed directly rather than via a load_for_test() helper (that
-    // helper isn't introduced until Task 8) — Config's fields are all public,
-    // so this has no forward dependency on later tasks.
-    let config = config::Config {
-        version: "0.0.0-test".into(),
-        debug: false,
-        refresh_rate_seconds: 5,
-        push_enabled: false,
-        push_interval_seconds: 60,
-        push_path: "/api/v1/sentinel/push".into(),
-        push_url: "http://localhost/api/v1/sentinel/push".into(),
-        token: "secret".into(),
-        endpoint: "http://localhost".into(),
-        metrics_file: std::path::PathBuf::from(":memory:"),
-        collector_enabled: false,
-        collector_retention_period_days: 7,
-        bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        storage_enabled: false,
-        storage_refresh_rate_seconds: 300,
-        storage_volumes_enabled: false,
-        storage_volumes_refresh_rate_seconds: 900,
-        host_mount_prefix: String::new(),
-    };
+    let mut config = config::Config::load_for_test();
+    // Override minimal fields for this test
+    config.token = "secret".to_string();
+    config.endpoint = "http://localhost".to_string();
+    config.push_url = "http://localhost/api/v1/sentinel/push".to_string();
+    config.bind_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
     std::sync::Arc::new(api::AppState {
         auth_header: format!("Bearer {}", config.token),
         config: std::sync::Arc::new(config),
