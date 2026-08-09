@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "api"
-version = "0.0.22"
+version = "1.0.0"
 dependencies = [
  "axum",
  "collector",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "collector"
-version = "0.0.22"
+version = "1.0.0"
 dependencies = [
  "config",
  "docker",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "0.0.22"
+version = "1.0.0"
 dependencies = [
  "thiserror",
 ]
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "docker"
-version = "0.0.22"
+version = "1.0.0"
 dependencies = [
  "bollard",
  "futures-util",
@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "push"
-version = "0.0.22"
+version = "1.0.0"
 dependencies = [
  "config",
  "docker",
@@ -1531,7 +1531,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sentinel"
-version = "0.0.22"
+version = "1.0.0"
 dependencies = [
  "api",
  "axum",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-bench"
-version = "0.0.22"
+version = "1.0.0"
 dependencies = [
  "clap",
  "futures-util",
@@ -1721,7 +1721,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "store"
-version = "0.0.22"
+version = "1.0.0"
 dependencies = [
  "rusqlite",
  "thiserror",

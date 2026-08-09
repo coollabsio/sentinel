@@ -195,7 +195,7 @@ spin up
 ./scripts/coolify-dev.sh build
 ```
 
-The image receives a build-time version such as `0.0.22-dev+9b1cd1a.dirty`, so startup logs and `/api/version` clearly distinguish it from a release build. Set `SENTINEL_DEV_VERSION` to override this value.
+The image receives a build-time version such as `1.0.0-dev+9b1cd1a.dirty`, so startup logs and `/api/version` clearly distinguish it from a release build. Set `SENTINEL_DEV_VERSION` to override this value.
 
 In Coolify, open **Servers → localhost → Sentinel**, set **Custom Sentinel Docker Image (Dev Only)** to `sentinel:dev`, then enable or restart Sentinel. Verify the running container afterwards:
 
@@ -291,7 +291,7 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ## Contributing
 
-This is an experimental project for Coolify.io. Contributions are welcome!
+This project is built for Coolify.io. Contributions are welcome!
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)

@@ -3,7 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
-Sentinel is an experimental API for gathering Linux server and Docker Engine metrics, built for integration with Coolify.io. It's a Rust-based service that collects system metrics (CPU, memory) and Docker container stats, storing them in SQLite and pushing them to a configured endpoint.
+Sentinel is an API for gathering Linux server and Docker Engine metrics, built for integration with Coolify.io. It's a Rust-based service that collects system metrics (CPU, memory) and Docker container stats, storing them in SQLite and pushing them to a configured endpoint.
 
 ## Development Commands
 

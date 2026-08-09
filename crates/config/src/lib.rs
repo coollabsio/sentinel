@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 // Mirrors the Go implementation's build-time `-ldflags -X ...Version=...`
 // override (used by scripts/coolify-dev.sh and the Dockerfile's ARG VERSION
-// to tag dev builds as e.g. "0.0.22-dev+9b1cd1a.dirty", distinguishing them
+// to tag dev builds as e.g. "1.0.0-dev+9b1cd1a.dirty", distinguishing them
 // from release builds in logs and /api/version). SENTINEL_BUILD_VERSION is
 // set via the Dockerfile's `ENV SENTINEL_BUILD_VERSION=$VERSION` in the
 // builder stage, so it's visible to option_env! at compile time; unset, this

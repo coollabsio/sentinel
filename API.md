@@ -71,7 +71,7 @@ Get the current version of Sentinel.
 
 **Response:**
 ```
-0.0.22
+1.0.0
 ```
 
 **Example:**
