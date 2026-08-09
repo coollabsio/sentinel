@@ -117,14 +117,14 @@ impl Aggregator {
 
         // Breakdown dimensions.
         let status_str = ev.status.to_string();
-        add_breakdown(
+        record_breakdown(
             &mut self.breakdown,
             &app,
             "status",
             &status_str,
             ev.bytes_out,
         );
-        add_breakdown(&mut self.breakdown, &app, "method", ev.method, ev.bytes_out);
+        record_breakdown(&mut self.breakdown, &app, "method", ev.method, ev.bytes_out);
         if let Some(country) = &en.country {
             add_breakdown(&mut self.breakdown, &app, "country", country, ev.bytes_out);
         }
@@ -146,21 +146,21 @@ impl Aggregator {
             &en.ua.device,
             ev.bytes_out,
         );
-        add_breakdown(
+        record_breakdown(
             &mut self.breakdown,
             &app,
             "protocol",
             ev.protocol,
             ev.bytes_out,
         );
-        add_breakdown(&mut self.breakdown, &app, "scheme", ev.scheme, ev.bytes_out);
+        record_breakdown(&mut self.breakdown, &app, "scheme", ev.scheme, ev.bytes_out);
         if let Some(tls) = &ev.tls_version {
             add_breakdown(&mut self.breakdown, &app, "tls", tls, ev.bytes_out);
         }
         if let Some(cache) = &en.cache {
             add_breakdown(&mut self.breakdown, &app, "cache", cache, ev.bytes_out);
         }
-        add_breakdown(
+        record_breakdown(
             &mut self.breakdown,
             &app,
             "bot",
@@ -260,7 +260,9 @@ impl Aggregator {
 
 /// Adds one `(app, dimension)` top-N entry, skipping empty values (a
 /// woothee UA-parse fallback, or an event field that was simply absent)
-/// rather than inventing a placeholder.
+/// rather than inventing a placeholder. Used by the seven dimensions that
+/// are legitimately optional: `country`, `referer`, `browser`, `os`,
+/// `device`, `tls`, `cache`.
 fn add_breakdown(
     map: &mut HashMap<(String, String), TopN, RandomState>,
     app: &str,
@@ -271,6 +273,22 @@ fn add_breakdown(
     if value.is_empty() {
         return;
     }
+    record_breakdown(map, app, dim, value, bytes_out);
+}
+
+/// Adds one `(app, dimension)` top-N entry unconditionally, even if
+/// `value` happens to be empty. Used by the five dimensions documented as
+/// "always recorded": `status`, `method`, `protocol`, `scheme`, `bot`.
+/// These are drawn from required `RequestEvent` fields (or computed, like
+/// `bot`), so they must never be silently dropped the way an optional
+/// enrichment field would be.
+fn record_breakdown(
+    map: &mut HashMap<(String, String), TopN, RandomState>,
+    app: &str,
+    dim: &str,
+    value: &str,
+    bytes_out: u64,
+) {
     map.entry((app.to_string(), dim.to_string()))
         .or_default()
         .add(value, 1, bytes_out);
@@ -475,5 +493,30 @@ mod tests {
         let third = a.take_rollup(180_000);
         assert_eq!(third.stats.len(), 1);
         assert_eq!(third.stats[0].requests, 1);
+    }
+
+    #[test]
+    fn always_recorded_dimensions_bypass_empty_skip() {
+        // method is an "always recorded" dimension (status, method,
+        // protocol, scheme, bot): it must be recorded even for an
+        // edge-case empty value, unlike the skippable dimensions (e.g.
+        // country) which drop empty values silently. A real Traefik/Caddy
+        // parse would never produce an empty method, but the contract is
+        // "always recorded", not "recorded unless empty".
+        let mut a = Aggregator::new(50);
+        let en = base_enriched();
+        let mut ev = base_event();
+        ev.method = "";
+
+        a.record(&ev, &en);
+
+        let rollup = a.take_rollup(60_000);
+        let method_row = rollup
+            .breakdown
+            .iter()
+            .find(|r| r.dimension == "method")
+            .expect("method dimension must always produce a row, even for an empty value");
+        assert_eq!(method_row.value, "");
+        assert_eq!(method_row.requests, 1);
     }
 }
