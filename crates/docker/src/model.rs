@@ -28,6 +28,17 @@ impl ContainerSummary {
     }
 }
 
+/// Per-container storage inputs from a `size: true` container list.
+#[derive(Debug, Clone, Default)]
+pub struct ContainerDisk {
+    pub id: String,
+    /// Docker `SizeRw` — writable-layer bytes.
+    pub writable_layer: u64,
+    /// Host source paths of the container's volume/bind mounts. tmpfs mounts
+    /// (empty source) are excluded, so these are the paths worth `du`-walking.
+    pub mount_sources: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ContainerStats {
     pub cpu_total: u64,

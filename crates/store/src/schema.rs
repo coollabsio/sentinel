@@ -37,10 +37,32 @@ CREATE TABLE IF NOT EXISTS container_memory_usage (
     PRIMARY KEY (time, container_id)
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS disk_usage (
+    time         INTEGER NOT NULL,
+    mount        TEXT    NOT NULL,
+    total        INTEGER NOT NULL,
+    used         INTEGER NOT NULL,
+    available    INTEGER NOT NULL,
+    used_percent REAL    NOT NULL,
+    PRIMARY KEY (time, mount)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS container_disk_usage (
+    time           INTEGER NOT NULL,
+    container_id   TEXT    NOT NULL,
+    writable_layer INTEGER NOT NULL,
+    volumes_total  INTEGER NOT NULL,
+    PRIMARY KEY (time, container_id)
+) STRICT;
+
 CREATE INDEX IF NOT EXISTS idx_ccu_container_time
     ON container_cpu_usage (container_id, time);
 CREATE INDEX IF NOT EXISTS idx_cmu_container_time
     ON container_memory_usage (container_id, time);
+CREATE INDEX IF NOT EXISTS idx_du_mount_time
+    ON disk_usage (mount, time);
+CREATE INDEX IF NOT EXISTS idx_cdu_container_time
+    ON container_disk_usage (container_id, time);
 
 CREATE TABLE IF NOT EXISTS sentinel_meta (
     key   TEXT PRIMARY KEY,

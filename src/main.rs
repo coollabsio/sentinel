@@ -178,9 +178,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("collector disabled");
     }
 
+    // Storage collector (disk usage + per-container storage)
+    if config.storage_enabled {
+        let c = collector::StorageCollector::new(config.clone(), store.clone(), docker.clone());
+        let rx = shutdown_rx.clone();
+        services.spawn(async move {
+            c.run(rx).await;
+            Ok::<(), String>(())
+        });
+    } else {
+        tracing::info!("storage collector disabled");
+    }
+
     // Pusher
     {
-        let pusher = push::Pusher::new(config.clone(), docker.clone())?;
+        let pusher = push::Pusher::new(config.clone(), docker.clone(), store.clone())?;
         let rx = shutdown_rx.clone();
         services.spawn(async move {
             pusher.run(rx).await;

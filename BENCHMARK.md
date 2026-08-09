@@ -199,6 +199,8 @@ Default samples (HTTP 200 only for latency stats):
 | `/api/memory/current` | 80 |
 | `/api/cpu/history` | 40 |
 | `/api/memory/history` | 40 |
+| `/api/disk/current` | 80 |
+| `/api/disk/history` | 40 |
 
 Report: ok, fail, avg, p50, p95, p99, min, max (ms).
 
@@ -221,6 +223,7 @@ Fixed grid: each path × each concurrency for a timed window.
 | `/api/cpu/current` | 1, 10, 32 | 8 s each |
 | `/api/memory/current` | 1, 10, 32 | 8 s each |
 | `/api/cpu/history` | 1, 10, 32 | 8 s each |
+| `/api/disk/current` | 1, 10, 32 | 8 s each |
 
 Report: ok, fail, **RPS**, avg / p50 / p95 / p99 / max (ms), **error %**.
 
@@ -258,7 +261,7 @@ Stress answers: *“Under a nasty concurrent read mix, does the agent stay corre
 | `--max-p99-ms` | `0` (off) | Optional p99 ceiling |
 | `--health-every-secs` | `2` | Mid-run `/api/health` probes (0 = off) |
 
-**Traffic mix (weighted):** health 4, version 1, cpu/current 3, memory/current 3, cpu/history 2, memory/history 2.
+**Traffic mix (weighted):** health 4, version 1, cpu/current 3, memory/current 3, cpu/history 2, memory/history 2, disk/current 3, disk/history 2.
 
 **Pass criteria (default):**
 
@@ -289,10 +292,48 @@ Runs **latency → load → stress** with the shared target.
 | Item | Status |
 |------|--------|
 | Push payload success rate against a real Coolify mock | Not in default suite |
-| Container history endpoints | Optional; need a long-lived container ID |
+| Container history endpoints (cpu/memory/disk) | Optional; need a long-lived container ID |
 | Multi-host / noisy neighbor | Not required |
 | Absolute production capacity | Not claimed |
-| Writing load (mutating DB beyond collector) | Not in suite |
+| Writing load (mutating DB beyond collector) | Covered for storage by §4.9; not otherwise |
+
+### 4.9 Storage collection micro-bench (`sentinel-bench storage`)
+
+The HTTP modes cover the storage **read** endpoints (`/api/disk/*`, `/api/container/{id}/disk/*`),
+but the storage feature's real cost is **collector-side** and has no HTTP surface: the recursive
+volume `du`-walk, `sysinfo` disk enumeration, and store batch writes/downsample. This mode measures
+those directly by driving the **real** production functions (`collector::storage::dir_size` /
+`sample_disks`, `store::insert_disk_batch` / `insert_container_disk_batch` / `downsample`).
+
+```bash
+# Default: modest synthetic tree + 100k-row store phases
+./target/release/sentinel-bench storage
+
+# Stress: ~78k-file / ~305 MiB tree + 1M-row store/downsample burst
+./target/release/sentinel-bench storage --stress
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--tree-dir` | `/tmp` | Where the synthetic tree is built (a unique subdir is created + removed) |
+| `--breadth` | `4` | Child dirs per level |
+| `--depth` | `4` | Tree nesting depth |
+| `--files-per-dir` | `8` | Files per directory |
+| `--file-bytes` | `4096` | Bytes per synthetic file |
+| `--rows` | `100000` | Total rows for the store-write / downsample phases |
+| `--keep` | off | Keep the synthetic tree after the run |
+| `--stress` | off | Larger worst-case preset (breadth 5, depth 5, 20 files/dir, 1M rows) |
+
+Reports four phases: **[A]** du-walk (files/s, bytes/s, min/avg/max ms), **[B]** `sample_disks`
+(ms, mount count), **[C]** disk + container batch insert throughput (rows/s), **[D]** downsample
+(rows collapsed, rows/s).
+
+**Interpreting it against the "system usage" concern:** the volume walk runs sequentially (one
+container at a time) on a blocking thread, once per `STORAGE_VOLUMES_REFRESH_RATE_SECONDS` (default
+900 s). Even a worst-case walk that takes a few hundred ms is a fraction of a percent duty cycle.
+**Caveat:** `--tree-dir` defaults to `/tmp`, which is often **tmpfs** (RAM) — that understates walk
+time on spinning/network disks where the walk is seek-bound. For a realistic figure, point
+`--tree-dir` at the same backing store as `/var/lib/docker/volumes`.
 
 ---
 
@@ -310,8 +351,9 @@ Runs **latency → load → stress** with the shared target.
 10. **Post-load memory** (§4.3).
 11. **`sentinel-bench stress`** (§4.6) — at least `mixed` 256×30s; add `ramp` / `burst` for release candidates.
 12. **Post-stress memory** (§4.3).
-13. `docker rm -f` bench containers; paste numbers into the results template.
-14. Note log noise (Docker stats errors, push failures — expected for blackhole push).
+13. **`sentinel-bench storage`** (§4.9) — default + `--stress`; runs on the host, no container needed.
+14. `docker rm -f` bench containers; paste numbers into the results template.
+15. Note log noise (Docker stats errors, push failures — expected for blackhole push).
 
 Quick path when you only care about “is this build sane under load?”:
 
@@ -440,7 +482,8 @@ Copy into `docs/benchmark-results/YYYY-MM-DD-<label>.md`:
 | File | Role |
 |------|------|
 | `BENCHMARK.md` (this file) | Spec — how to measure |
-| `crates/sentinel-bench/` | Rust harness (`sys` / `latency` / `load` / `stress` / `suite`) |
+| `crates/sentinel-bench/` | Rust harness (`sys` / `latency` / `load` / `stress` / `suite` / `storage`) |
+| `crates/sentinel-bench/src/storage_bench.rs` | Storage-feature micro-bench (§4.9) |
 | `docs/benchmark-results/` | Dated run reports (canonical history) |
 | `crates/collector/tests/startup_timing.rs` | Guards against reintroducing constructor sleep |
 | `Dockerfile` | Builds `-p sentinel` only (bench stays on the host) |

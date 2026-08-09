@@ -7,3 +7,4 @@ sentinel
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+.ai/

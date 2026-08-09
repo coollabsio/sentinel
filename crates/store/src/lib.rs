@@ -8,7 +8,9 @@ pub mod stats;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-pub use metrics::{ContainerSample, CpuRow, MemRow};
+pub use metrics::{
+    ContainerDiskRow, ContainerDiskSample, ContainerSample, CpuRow, DiskRow, DiskSample, MemRow,
+};
 pub use stats::{DbStats, TableStat};
 
 #[derive(Debug, thiserror::Error)]

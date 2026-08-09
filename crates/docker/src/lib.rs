@@ -3,7 +3,7 @@
 pub mod calc;
 pub mod model;
 
-pub use model::{ContainerStats, ContainerSummary};
+pub use model::{ContainerDisk, ContainerStats, ContainerSummary};
 
 use bollard::Docker;
 use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions, StatsOptions};
@@ -56,6 +56,37 @@ impl DockerClient {
                 // renamed a variant. See the wire-string test below.
                 state: c.state.map(|s| s.to_string()).unwrap_or_default(),
                 labels: c.labels.unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// Lists all containers with `size: true`, yielding each container's
+    /// writable-layer size (`SizeRw`) and mount source paths in one API call.
+    /// `size: true` makes the daemon compute per-container sizes, so this is
+    /// heavier than `list_containers` and runs on the slower storage ticker.
+    pub async fn list_container_sizes(&self) -> Result<Vec<ContainerDisk>, DockerError> {
+        let opts = ListContainersOptions {
+            all: true,
+            size: true,
+            ..Default::default()
+        };
+        let raw = self.inner.list_containers(Some(opts)).await?;
+        Ok(raw
+            .into_iter()
+            .map(|c| {
+                let mount_sources = c
+                    .mounts
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|m| m.source.filter(|s| !s.is_empty()))
+                    .collect();
+                ContainerDisk {
+                    id: c.id.unwrap_or_default(),
+                    // SizeRw is Option<i64>; a missing or negative value means
+                    // "unknown", recorded as 0.
+                    writable_layer: c.size_rw.filter(|v| *v >= 0).unwrap_or(0) as u64,
+                    mount_sources,
+                }
             })
             .collect())
     }

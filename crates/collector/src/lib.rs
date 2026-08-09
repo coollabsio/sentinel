@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 pub mod host;
+pub mod storage;
 
 pub use host::HostSampler;
+pub use storage::StorageCollector;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

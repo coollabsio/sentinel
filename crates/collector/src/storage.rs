@@ -1,0 +1,310 @@
+use std::collections::HashSet;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use config::Config;
+use docker::DockerClient;
+use store::{ContainerDiskSample, DiskSample, Store};
+use sysinfo::Disks;
+use tokio::sync::watch;
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
+
+use crate::now_millis;
+
+/// Collects storage metrics on two independent cadences: cheap per-mount
+/// filesystem stats on `storage_refresh_rate_seconds`, and the more expensive
+/// per-container writable-layer + volume `du`-walk on
+/// `storage_volumes_refresh_rate_seconds`. Splitting the tickers keeps the
+/// heavy walk from being forced onto the fast disk-stat interval.
+pub struct StorageCollector {
+    config: Arc<Config>,
+    store: Store,
+    docker: DockerClient,
+}
+
+impl StorageCollector {
+    pub fn new(config: Arc<Config>, store: Store, docker: DockerClient) -> Self {
+        Self {
+            config,
+            store,
+            docker,
+        }
+    }
+
+    pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
+        tracing::info!(
+            disk_refresh_seconds = self.config.storage_refresh_rate_seconds,
+            volumes_refresh_seconds = self.config.storage_volumes_refresh_rate_seconds,
+            volumes_enabled = self.config.storage_volumes_enabled,
+            "starting storage collector"
+        );
+
+        // interval_at defers the first tick by a full period, matching the
+        // Collector/Pusher startup timing (no immediate burst at boot).
+        let disk_period = Duration::from_secs(self.config.storage_refresh_rate_seconds);
+        let mut disk_ticker = interval_at(Instant::now() + disk_period, disk_period);
+        disk_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        let vol_period = Duration::from_secs(self.config.storage_volumes_refresh_rate_seconds);
+        let mut vol_ticker = interval_at(Instant::now() + vol_period, vol_period);
+        vol_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    tracing::info!("stopping storage collector");
+                    return;
+                }
+                _ = disk_ticker.tick() => {
+                    self.collect_disk(now_millis()).await;
+                }
+                _ = vol_ticker.tick() => {
+                    self.collect_container_storage(now_millis()).await;
+                }
+            }
+        }
+    }
+
+    /// Enumerate real filesystems via sysinfo and record one row per mount.
+    /// A failed cycle logs and continues; it never propagates out of `run`.
+    async fn collect_disk(&self, time: i64) {
+        let store = self.store.clone();
+        match tokio::task::spawn_blocking(move || {
+            let samples = sample_disks();
+            store.insert_disk_batch(time, &samples)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "failed to record disk usage"),
+            Err(e) => tracing::warn!(error = %e, "disk usage insert task panicked"),
+        }
+    }
+
+    /// One `size: true` container list gives every container's writable-layer
+    /// size and mount sources; when volume walking is enabled, each mount's
+    /// host path is `du`-walked (sequentially, to bound I/O) and summed.
+    async fn collect_container_storage(&self, time: i64) {
+        let containers = match self.docker.list_container_sizes().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to list container sizes");
+                return;
+            }
+        };
+        if containers.is_empty() {
+            return;
+        }
+
+        let store = self.store.clone();
+        let volumes_enabled = self.config.storage_volumes_enabled;
+        let prefix = self.config.host_mount_prefix.clone();
+
+        match tokio::task::spawn_blocking(move || {
+            let samples: Vec<ContainerDiskSample> = containers
+                .into_iter()
+                .map(|c| {
+                    let volumes_total = if volumes_enabled {
+                        c.mount_sources
+                            .iter()
+                            .map(|src| dir_size(&resolve_host_path(&prefix, src)))
+                            .sum()
+                    } else {
+                        0
+                    };
+                    ContainerDiskSample {
+                        container_id: c.id,
+                        writable_layer: c.writable_layer,
+                        volumes_total,
+                    }
+                })
+                .collect();
+            store.insert_container_disk_batch(time, &samples)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "failed to record container storage"),
+            Err(e) => tracing::warn!(error = %e, "container storage insert task panicked"),
+        }
+    }
+}
+
+/// Prefixes a container mount source with `HOST_MOUNT_PREFIX` so Sentinel can
+/// reach host paths mounted into its own container. Mount sources are absolute,
+/// so an empty prefix leaves the path unchanged.
+fn resolve_host_path(prefix: &str, source: &str) -> PathBuf {
+    if prefix.is_empty() {
+        PathBuf::from(source)
+    } else {
+        PathBuf::from(format!("{prefix}{source}"))
+    }
+}
+
+/// Recursively sums on-disk block usage (like `du`) under `path`. Symlinks are
+/// never followed and any I/O error degrades to 0 with a warning — the walk
+/// must never crash a collection cycle.
+///
+/// `pub` so the host-only `sentinel-bench storage` harness can measure the real
+/// walk (see BENCHMARK.md §4.9); not part of any runtime API surface.
+pub fn dir_size(path: &Path) -> u64 {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "storage: cannot stat mount source");
+            return 0;
+        }
+    };
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return 0;
+    }
+    if ft.is_file() {
+        return meta.blocks() * 512;
+    }
+    if !ft.is_dir() {
+        return 0;
+    }
+
+    let mut total = meta.blocks() * 512;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(path = %dir.display(), error = %e, "storage: cannot read directory");
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            // DirEntry::metadata does not traverse symlinks, so symlinked
+            // entries report their own (tiny) size and are not recursed into.
+            let md = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let ft = md.file_type();
+            if ft.is_dir() {
+                total += md.blocks() * 512;
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                total += md.blocks() * 512;
+            }
+        }
+    }
+    total
+}
+
+/// Snapshot every real filesystem, one `DiskSample` per unique mountpoint.
+/// Pseudo/virtual filesystems and zero-capacity devices are skipped.
+///
+/// `pub` for the host-only `sentinel-bench storage` harness (BENCHMARK.md §4.9).
+pub fn sample_disks() -> Vec<DiskSample> {
+    let disks = Disks::new_with_refreshed_list();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for d in disks.list() {
+        let fs = d.file_system().to_string_lossy();
+        if is_pseudo_fs(&fs) {
+            continue;
+        }
+        let total = d.total_space();
+        if total == 0 {
+            continue;
+        }
+        let mount = d.mount_point().to_string_lossy().to_string();
+        if !seen.insert(mount.clone()) {
+            continue;
+        }
+        let available = d.available_space();
+        let used = total.saturating_sub(available);
+        let used_percent = used as f64 / total as f64 * 100.0;
+        out.push(DiskSample {
+            mount,
+            total,
+            used,
+            available,
+            used_percent,
+        });
+    }
+    out
+}
+
+/// Kernel/pseudo filesystems that carry no meaningful capacity for a server
+/// storage view (tmpfs, overlay, cgroup mounts, …).
+fn is_pseudo_fs(fs: &str) -> bool {
+    matches!(
+        fs,
+        "" | "tmpfs"
+            | "devtmpfs"
+            | "overlay"
+            | "overlayfs"
+            | "squashfs"
+            | "proc"
+            | "sysfs"
+            | "cgroup"
+            | "cgroup2"
+            | "mqueue"
+            | "devpts"
+            | "ramfs"
+            | "nsfs"
+            | "tracefs"
+            | "debugfs"
+            | "autofs"
+            | "binfmt_misc"
+            | "fusectl"
+            | "configfs"
+            | "securityfs"
+            | "pstore"
+            | "bpf"
+            | "hugetlbfs"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_host_path_with_and_without_prefix() {
+        assert_eq!(
+            resolve_host_path("", "/var/lib/docker/volumes/x/_data"),
+            PathBuf::from("/var/lib/docker/volumes/x/_data")
+        );
+        assert_eq!(
+            resolve_host_path("/host", "/var/lib/docker/volumes/x/_data"),
+            PathBuf::from("/host/var/lib/docker/volumes/x/_data")
+        );
+    }
+
+    #[test]
+    fn pseudo_filesystems_are_skipped() {
+        assert!(is_pseudo_fs("tmpfs"));
+        assert!(is_pseudo_fs("overlay"));
+        assert!(is_pseudo_fs("cgroup2"));
+        assert!(is_pseudo_fs(""));
+        assert!(!is_pseudo_fs("ext4"));
+        assert!(!is_pseudo_fs("xfs"));
+        assert!(!is_pseudo_fs("btrfs"));
+    }
+
+    #[test]
+    fn dir_size_missing_path_is_zero() {
+        assert_eq!(dir_size(Path::new("/nonexistent/sentinel/storage/path")), 0);
+    }
+
+    #[test]
+    fn dir_size_sums_file_blocks() {
+        let dir =
+            std::env::temp_dir().join(format!("sentinel-storage-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 8192]).unwrap();
+        std::fs::write(dir.join("sub/b.bin"), vec![0u8; 4096]).unwrap();
+        // At least the two files' worth of blocks (12 KiB) must be counted.
+        assert!(dir_size(&dir) >= 12 * 1024);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

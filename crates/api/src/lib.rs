@@ -68,6 +68,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .merge(routes::cpu::routes())
         .merge(routes::memory::routes())
+        .merge(routes::disk::routes())
         .merge(routes::container::routes());
 
     if debug {

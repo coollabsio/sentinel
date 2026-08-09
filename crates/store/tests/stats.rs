@@ -26,7 +26,9 @@ fn reports_row_counts_and_storage_for_every_table() {
             "cpu_usage",
             "memory_usage",
             "container_cpu_usage",
-            "container_memory_usage"
+            "container_memory_usage",
+            "disk_usage",
+            "container_disk_usage"
         ]
     );
     let cpu = stats
@@ -42,6 +44,6 @@ fn reports_zeroes_for_an_empty_database() {
     let s = Store::open_in_memory().unwrap();
     let stats = s.db_stats().unwrap();
     assert_eq!(stats.row_count, 0);
-    assert_eq!(stats.tables.len(), 4);
+    assert_eq!(stats.tables.len(), 6);
     assert!(stats.tables.iter().all(|t| t.row_count == 0));
 }
