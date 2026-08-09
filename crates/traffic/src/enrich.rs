@@ -81,15 +81,16 @@ impl Enricher {
 
     /// Enrich `ev`, applying client-IP, country, UA, and bot precedence rules.
     pub fn enrich(&self, ev: &RequestEvent) -> Enriched {
-        let client_ip_str = ev.cf_connecting_ip.or_else(|| {
-            ev.xff
-                .and_then(|xff| xff.split(',').next().map(str::trim))
-        }).or(ev.client_ip);
+        let client_ip_str = ev
+            .cf_connecting_ip
+            .or_else(|| ev.xff.and_then(|xff| xff.split(',').next().map(str::trim)))
+            .or(ev.client_ip);
         let client_ip: Option<IpAddr> = client_ip_str.and_then(|s| s.parse().ok());
 
-        let country = ev.cf_country.map(String::from).or_else(|| {
-            client_ip.and_then(|ip| self.geo.country(ip))
-        });
+        let country = ev
+            .cf_country
+            .map(String::from)
+            .or_else(|| client_ip.and_then(|ip| self.geo.country(ip)));
 
         let ua = match ev.user_agent {
             Some(ua_str) => self.parse_ua_cached(ua_str),
@@ -200,29 +201,37 @@ mod tests {
         ev.xff = Some("10.0.0.2, 10.0.0.3");
         ev.client_ip = Some("10.0.0.4");
         let result = enricher.enrich(&ev);
-        assert_eq!(result.client_ip, Some("10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            result.client_ip,
+            Some("10.0.0.1".parse::<IpAddr>().unwrap())
+        );
 
         // xff beats client_ip when cf_connecting_ip is absent.
         let mut ev = base_event();
         ev.xff = Some("10.0.0.2, 10.0.0.3");
         ev.client_ip = Some("10.0.0.4");
         let result = enricher.enrich(&ev);
-        assert_eq!(result.client_ip, Some("10.0.0.2".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            result.client_ip,
+            Some("10.0.0.2".parse::<IpAddr>().unwrap())
+        );
 
         // client_ip used when neither cf_connecting_ip nor xff present.
         let mut ev = base_event();
         ev.client_ip = Some("10.0.0.4");
         let result = enricher.enrich(&ev);
-        assert_eq!(result.client_ip, Some("10.0.0.4".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            result.client_ip,
+            Some("10.0.0.4".parse::<IpAddr>().unwrap())
+        );
     }
 
     #[test]
     fn detects_bot_via_woothee() {
         let enricher = Enricher::new(Arc::new(NoGeo), 8);
         let mut ev = base_event();
-        ev.user_agent = Some(
-            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-        );
+        ev.user_agent =
+            Some("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)");
 
         let result = enricher.enrich(&ev);
 

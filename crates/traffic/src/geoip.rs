@@ -323,23 +323,24 @@ impl GeoIp {
                 (None, None)
             };
 
-            let (bytes, new_etag, new_lm) =
-                match Self::fetch(&client, &source, cond_etag, cond_lm).await {
-                    Ok(Fetched::Body {
-                        bytes,
-                        etag,
-                        last_modified,
-                    }) => (bytes, etag, last_modified),
-                    Ok(Fetched::NotModified) => {
-                        tracing::debug!(url = %source.url, "geoip database unchanged");
-                        return Ok(false);
-                    }
-                    Err(e) => {
-                        tracing::debug!(url = %source.url, error = %e, "geoip refresh source failed");
-                        last_err = Some(e);
-                        continue;
-                    }
-                };
+            let (bytes, new_etag, new_lm) = match Self::fetch(&client, &source, cond_etag, cond_lm)
+                .await
+            {
+                Ok(Fetched::Body {
+                    bytes,
+                    etag,
+                    last_modified,
+                }) => (bytes, etag, last_modified),
+                Ok(Fetched::NotModified) => {
+                    tracing::debug!(url = %source.url, "geoip database unchanged");
+                    return Ok(false);
+                }
+                Err(e) => {
+                    tracing::debug!(url = %source.url, error = %e, "geoip refresh source failed");
+                    last_err = Some(e);
+                    continue;
+                }
+            };
 
             let (reader, path) = match Self::install(&bytes, &source, db_dir) {
                 Ok(v) => v,
@@ -597,12 +598,18 @@ mod tests {
         let cfg = default_settings(); // no key, no db_url
         let s = resolve_sources(&cfg);
         assert_eq!(s[0].url, MIRROR_URL);
-        assert!(s[1].url.starts_with("https://download.db-ip.com/free/dbip-country-lite-"));
+        assert!(
+            s[1].url
+                .starts_with("https://download.db-ip.com/free/dbip-country-lite-")
+        );
         assert!(matches!(s[0].archive, Archive::Gz));
         // Third candidate is the previous month's DB-IP file: the current
         // month's build may not be published yet at the start of a month.
         assert_eq!(s.len(), 3);
-        assert!(s[2].url.starts_with("https://download.db-ip.com/free/dbip-country-lite-"));
+        assert!(
+            s[2].url
+                .starts_with("https://download.db-ip.com/free/dbip-country-lite-")
+        );
         assert_ne!(s[1].url, s[2].url);
     }
 
@@ -651,7 +658,11 @@ mod tests {
         header.set_mode(0o644);
         header.set_cksum();
         builder
-            .append_data(&mut header, "GeoLite2-Country_20260801/README", &b"hello"[..])
+            .append_data(
+                &mut header,
+                "GeoLite2-Country_20260801/README",
+                &b"hello"[..],
+            )
             .unwrap();
 
         let mut header = tar::Header::new_gnu();
@@ -680,10 +691,16 @@ mod tests {
     #[test]
     fn magic_reconciles_mismatched_suffix() {
         // A server that hands back a bare .mmdb from a .gz URL still works.
-        assert_eq!(extract_mmdb(b"raw bytes", &Archive::Gz).unwrap(), b"raw bytes");
+        assert_eq!(
+            extract_mmdb(b"raw bytes", &Archive::Gz).unwrap(),
+            b"raw bytes"
+        );
         // ...and vice versa.
         let compressed = gz(b"payload");
-        assert_eq!(extract_mmdb(&compressed, &Archive::Raw).unwrap(), b"payload");
+        assert_eq!(
+            extract_mmdb(&compressed, &Archive::Raw).unwrap(),
+            b"payload"
+        );
     }
 
     #[test]
@@ -720,7 +737,10 @@ mod tests {
 
         let geo = GeoIp::bootstrap(&cfg, dir.path()).await.unwrap();
         let country = geo.country("89.160.20.128".parse().unwrap());
-        assert!(country.is_some(), "expected a country for a known public IP");
+        assert!(
+            country.is_some(),
+            "expected a country for a known public IP"
+        );
 
         // A second pass either 304s (Ok(false)) or re-downloads (Ok(true));
         // either way the database stays usable and only one file remains.

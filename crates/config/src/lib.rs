@@ -519,7 +519,10 @@ mod tests {
         assert_eq!(c.endpoint, "http://localhost:8000");
         assert_eq!(c.metrics_file.to_str().unwrap(), "./db/metrics.sqlite");
         // analytics DB mirrors the metrics_file dev/prod split
-        assert_eq!(c.traffic.analytics_file.to_str().unwrap(), "./db/analytics.sqlite");
+        assert_eq!(
+            c.traffic.analytics_file.to_str().unwrap(),
+            "./db/analytics.sqlite"
+        );
     }
 
     #[test]
