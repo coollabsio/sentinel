@@ -21,8 +21,9 @@
 //! drives: [`AnalyticsStore::distinct_buckets_before`] to enumerate the
 //! coarse buckets that have finer-tier data waiting, and
 //! [`AnalyticsStore::compact_window`] to move one such bucket up a tier
-//! atomically — it reads the finer rows, calls back into the `traffic` crate
-//! to merge them (the one step that needs the sketch types), writes the
+//! atomically — it reads the finer rows *and* whatever the coarse bucket
+//! already holds, calls back into the `traffic` crate to merge them (the one
+//! step that needs the sketch types), replaces the coarse bucket with the
 //! result, and deletes what it consumed, all inside one transaction on the
 //! writer connection. [`AnalyticsStore::stats_rows_between`] and friends
 //! remain for read-only inspection (and tests).
@@ -394,10 +395,9 @@ impl AnalyticsStore {
     /// `ON CONFLICT` sums the count/byte columns but *replaces* the sketch
     /// blobs (`latency_tdigest`, `uniques_hll`) with the incoming value:
     /// callers already hand over fully-merged sketches for the window, so
-    /// summing raw bytes would be meaningless. Summing (rather than
-    /// replacing) the counters is what makes a late-arriving row for an
-    /// already-written bucket additive instead of destructive — see
-    /// [`Self::compact_window`].
+    /// summing raw bytes would be meaningless. Compaction never relies on
+    /// either rule — it clears the destination window first, so its rows
+    /// cannot conflict with a previous pass's; see [`Self::compact_window`].
     pub fn write_rows(
         &self,
         tier: Tier,
@@ -421,18 +421,39 @@ impl AnalyticsStore {
     ///
     /// 1. reads every `from_tier` row whose bucket is in `[from_bucket,
     ///    to_bucket)`, across all three tables and all apps;
-    /// 2. hands them to `merge`, which is the `traffic` crate's sketch-aware
-    ///    roll-up (the one step that cannot live in this crate without a
-    ///    dependency cycle);
-    /// 3. upserts the merged rows into `to_tier`;
-    /// 4. deletes the consumed `from_tier` rows in the same window;
-    /// 5. commits.
+    /// 2. reads the `to_tier` rows in the *same* window — whatever an earlier
+    ///    pass already left in the destination bucket;
+    /// 3. hands both to `merge(finer, coarse)`, which is the `traffic`
+    ///    crate's sketch-aware roll-up (the one step that cannot live in this
+    ///    crate without a dependency cycle) and which returns the *complete*
+    ///    new content of the destination window;
+    /// 4. deletes the destination window and writes the merged rows in its
+    ///    place;
+    /// 5. deletes the consumed `from_tier` rows in the same window;
+    /// 6. commits.
     ///
     /// Returns the number of coarser rows written (0 if the window held no
-    /// finer rows at all, in which case nothing is written or deleted).
+    /// finer rows at all, in which case the destination is not even read and
+    /// nothing is written or deleted).
+    ///
+    /// **The merge is a recompute, not an increment.** Step 2 is what makes a
+    /// second pass over an already-compacted bucket safe. A finer row can
+    /// legitimately arrive after its coarse bucket was rolled up — the last
+    /// minute of hour `H` is flushed at `H+1h`, exactly when the hourly sweep
+    /// becomes eligible — and the next sweep then compacts bucket `H` a
+    /// second time. Handing `merge` only the one late row would produce a
+    /// coarse row describing only that row; because the sketch columns
+    /// *replace* on conflict (see [`insert_rows`]), that fragment would
+    /// silently overwrite the hour's real latency distribution and HLL while
+    /// the summed counters stayed plausible. Feeding the destination's
+    /// current state back in instead makes the callback's output the full
+    /// picture, so replacing the window wholesale is correct — and it is a
+    /// wholesale replace, not an upsert, so the counters are not added on top
+    /// of themselves and a value the re-cap demotes into `__other__` does not
+    /// linger as a stale row.
     ///
     /// The atomicity is the point: a crash, or a failure on any one of the
-    /// six statements, leaves *both* the write and the delete undone, so the
+    /// statements, leaves *both* the write and the delete undone, so the
     /// next sweep re-reads exactly the same finer rows and redoes the same
     /// roll-up. Without it, a crash between the write and the delete would
     /// leave the finer rows in place for the next sweep to add a second time
@@ -444,8 +465,9 @@ impl AnalyticsStore {
     /// the `1h → 1d` pass, and those two run off independent tickers.
     ///
     /// Callers are expected to pass a window that is aligned to (and no
-    /// wider than) one `to_tier` bucket, and to only pass windows that are
-    /// already closed — see `traffic::compaction`.
+    /// wider than) one `to_tier` bucket, to only pass windows that are
+    /// already closed, and to pass two *distinct* tiers — see
+    /// `traffic::compaction`.
     pub fn compact_window<F>(
         &self,
         from_tier: Tier,
@@ -455,23 +477,39 @@ impl AnalyticsStore {
         merge: F,
     ) -> Result<usize, StoreError>
     where
-        F: FnOnce(TierRows) -> TierRows,
+        F: FnOnce(TierRows, TierRows) -> TierRows,
     {
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
 
-            let src = TierRows {
+            let finer = TierRows {
                 stats: select_stats(&tx, from_tier, from_bucket, to_bucket)?,
                 paths: select_paths(&tx, from_tier, from_bucket, to_bucket)?,
                 breakdown: select_breakdown(&tx, from_tier, from_bucket, to_bucket)?,
             };
-            if src.is_empty() {
+            if finer.is_empty() {
                 // Nothing was written, so there is nothing to commit;
-                // dropping the transaction rolls back an empty read.
+                // dropping the transaction rolls back an empty read. The
+                // destination is deliberately left unread and untouched.
                 return Ok(0);
             }
 
-            let merged = merge(src);
+            // Whatever a previous pass already wrote for this coarse bucket.
+            // Empty on the common first-compaction path.
+            let coarse = TierRows {
+                stats: select_stats(&tx, to_tier, from_bucket, to_bucket)?,
+                paths: select_paths(&tx, to_tier, from_bucket, to_bucket)?,
+                breakdown: select_breakdown(&tx, to_tier, from_bucket, to_bucket)?,
+            };
+
+            let merged = merge(finer, coarse);
+
+            // Clear the destination window before writing: `merged` already
+            // subsumes everything that was in it, so an upsert would sum the
+            // counters into themselves.
+            for table in ["traffic_stats", "traffic_paths", "traffic_breakdown"] {
+                delete_range(&tx, table, to_tier, from_bucket, to_bucket)?;
+            }
             insert_rows(
                 &tx,
                 to_tier,
@@ -752,15 +790,21 @@ impl AnalyticsStore {
 /// the minute flush and compaction cannot drift apart on conflict
 /// resolution.
 ///
-/// Counters sum on conflict; sketch blobs are replaced. Summing is the
-/// correct choice for *both* callers because every row that reaches this
-/// function contributes exactly once: the flush owns a minute window that is
-/// closed before it writes, and compaction deletes the finer rows it
-/// consumed in the same transaction as the write. A row that turns up later
-/// for an already-written bucket (a delayed flush landing in an hour that has
-/// already been rolled up) is therefore genuinely new information, and adding
-/// it keeps the counters right — replacing would throw the bucket's existing
-/// counters away.
+/// Counters sum on conflict; sketch blobs are replaced. Both are safe here
+/// because every row that reaches this function contributes exactly once:
+/// the flush owns a minute window that is closed before it writes, and
+/// compaction clears the destination window and deletes the finer rows it
+/// consumed in the same transaction as the write, so its rows never collide
+/// with a previous pass's at all (see
+/// [`AnalyticsStore::compact_window`] — the merge it drives is a recompute
+/// of the whole coarse bucket, not an increment on top of it).
+///
+/// Summing is still the right conflict rule for the flush: a delayed flush
+/// landing on a `1m` bucket that was already written is genuinely new
+/// information, and adding it keeps the counters right, where replacing
+/// would throw the bucket's existing counters away. Replacing is the right
+/// rule for the sketches, since summing raw sketch bytes is meaningless —
+/// callers hand over an already-merged sketch for the whole key.
 fn insert_rows(
     conn: &Connection,
     tier: Tier,
@@ -1442,11 +1486,12 @@ mod tests {
         .unwrap();
 
         let written = s
-            .compact_window(Tier::M1, Tier::H1, HOUR_MS, 2 * HOUR_MS, |src| {
+            .compact_window(Tier::M1, Tier::H1, HOUR_MS, 2 * HOUR_MS, |src, dst| {
                 assert_eq!(src.stats.len(), 2, "callback sees the finer rows");
                 assert_eq!(src.paths.len(), 1);
                 assert_eq!(src.breakdown.len(), 1);
                 assert_eq!(src.len(), 4);
+                assert!(dst.is_empty(), "nothing in the coarse bucket yet");
                 // Trivial "merge": one summed stats row for the window.
                 TierRows {
                     stats: vec![stats_row(HOUR_MS, "a", "h", 5, vec![9], vec![9])],
@@ -1495,9 +1540,11 @@ mod tests {
         )
         .unwrap();
 
-        s.compact_window(Tier::M1, Tier::H1, HOUR_MS, 2 * HOUR_MS, |src| TierRows {
-            stats: src.stats,
-            ..Default::default()
+        s.compact_window(Tier::M1, Tier::H1, HOUR_MS, 2 * HOUR_MS, |src, _| {
+            TierRows {
+                stats: src.stats,
+                ..Default::default()
+            }
         })
         .unwrap();
 
@@ -1514,7 +1561,7 @@ mod tests {
     fn compact_window_on_an_empty_window_is_a_noop() {
         let s = AnalyticsStore::open_in_memory().unwrap();
         let written = s
-            .compact_window(Tier::M1, Tier::H1, 0, HOUR_MS, |_| {
+            .compact_window(Tier::M1, Tier::H1, 0, HOUR_MS, |_, _| {
                 panic!("merge must not run for an empty window")
             })
             .unwrap();
@@ -1548,10 +1595,12 @@ mod tests {
         .unwrap();
 
         let err = s
-            .compact_window(Tier::M1, Tier::H1, HOUR_MS, 2 * HOUR_MS, |src| TierRows {
-                stats: src.stats,
-                paths: src.paths,
-                breakdown: src.breakdown,
+            .compact_window(Tier::M1, Tier::H1, HOUR_MS, 2 * HOUR_MS, |src, _| {
+                TierRows {
+                    stats: src.stats,
+                    paths: src.paths,
+                    breakdown: src.breakdown,
+                }
             })
             .unwrap_err();
         assert!(
@@ -1586,10 +1635,12 @@ mod tests {
 
         // With the fault removed, the retry produces exactly one coarse row.
         s.execute_batch_for_test("DROP TRIGGER boom").unwrap();
-        s.compact_window(Tier::M1, Tier::H1, HOUR_MS, 2 * HOUR_MS, |src| TierRows {
-            stats: src.stats,
-            paths: src.paths,
-            breakdown: src.breakdown,
+        s.compact_window(Tier::M1, Tier::H1, HOUR_MS, 2 * HOUR_MS, |src, _| {
+            TierRows {
+                stats: src.stats,
+                paths: src.paths,
+                breakdown: src.breakdown,
+            }
         })
         .unwrap();
         let h1 = s.stats_rows_between(Tier::H1, i64::MIN, i64::MAX).unwrap();

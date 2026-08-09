@@ -8,8 +8,8 @@
 //! store side owns the transaction and calls back in here to merge, via
 //! [`AnalyticsStore::compact_window`].
 //!
-//! Two rules make a sweep safe to run on any cadence, and they are the whole
-//! design:
+//! Three rules make a sweep safe to run on any cadence, and they are the
+//! whole design:
 //!
 //! 1. **Only closed coarse buckets are touched.** The window bound is
 //!    `floor(now)`, never the raw `now`. An hourly caller that fires at
@@ -23,13 +23,27 @@
 //!    single coarse bucket rather than by the whole backlog, and there is no
 //!    window in which the coarse row exists while its finer sources also
 //!    still do.
+//! 3. **A coarse bucket is recomputed, never appended to.** The merge is fed
+//!    both the finer rows and the coarse bucket's *current* contents, and
+//!    returns the complete new contents, which
+//!    [`AnalyticsStore::compact_window`] writes in place of the old.
 //!
-//! There is still no watermark — the delete *is* the watermark. A finer row
-//! that arrives late, after its coarse bucket has already been rolled up,
-//! is picked up by the next sweep and *added* to the existing coarse row
-//! (the store's upsert sums counters); its sketch contribution is the one
-//! thing that cannot be recovered, because merging blobs would need this
-//! crate's types on the store side.
+//! There is still no watermark — the delete *is* the watermark, and rule 3 is
+//! what makes that sufficient. A finer row can arrive after its coarse bucket
+//! has already been rolled up: the last minute of hour `H` is flushed at
+//! `H+1h`, which is exactly when an hourly sweep first becomes eligible to
+//! compact `H`, so this is structural at every boundary rather than
+//! exceptional. The next sweep re-compacts `H`, and because it merges the
+//! late row *into* the existing `1h` row's decoded digest and HLL rather than
+//! over them, the result covers the whole hour — counters, quantiles and
+//! unique counts alike. (Before rule 3, only the counters survived: the
+//! sketch columns replace on conflict, so the second pass overwrote the
+//! hour's distribution with the late minute's.)
+//!
+//! Scheduling a sweep at an offset past the flush interval is therefore an
+//! efficiency choice — it keeps the re-compaction path from firing every
+//! hour, and each re-compaction costs an extra digest merge and a little
+//! t-digest accuracy — not a correctness requirement.
 
 use std::collections::HashMap;
 
@@ -161,10 +175,14 @@ fn compact_tier(
         // `start + width <= cutoff` and this window can never reach into the
         // still-open coarse bucket. `saturating_add` only guards the absurd.
         let end = start.saturating_add(width);
-        written += store.compact_window(from_tier, to_tier, start, end, |src| TierRows {
-            stats: merge_stats(src.stats, start),
-            paths: merge_paths(src.paths, start, cap),
-            breakdown: merge_breakdown(src.breakdown, start, cap),
+        // `dst` is what a previous pass already wrote for this coarse
+        // bucket — empty the first time round, non-empty when a finer row
+        // turned up after the roll-up. It is folded in as just more input, so
+        // the callback's result is always the bucket's full picture.
+        written += store.compact_window(from_tier, to_tier, start, end, |src, dst| TierRows {
+            stats: merge_stats(src.stats, dst.stats, start),
+            paths: merge_paths(src.paths, dst.paths, start, cap),
+            breakdown: merge_breakdown(src.breakdown, dst.breakdown, start, cap),
         })?;
     }
 
@@ -176,10 +194,17 @@ fn compact_tier(
 /// are unioned. Every input row belongs to `bucket` by construction — the
 /// caller reads exactly one coarse window at a time — so the output bucket is
 /// `bucket`, not something re-derived per row.
-fn merge_stats(rows: Vec<StatsRow>, bucket: i64) -> Vec<StatsRow> {
+///
+/// `existing` is the coarse tier's own current row set for the same bucket
+/// (see the module docs' rule 3). It is merged on exactly the same footing as
+/// a finer row: its already-merged digest and HLL decode and fold into the
+/// pool, its counters add in. That makes the returned row the bucket's whole
+/// picture, which is what the store writes in place of `existing`. Normally
+/// empty.
+fn merge_stats(rows: Vec<StatsRow>, existing: Vec<StatsRow>, bucket: i64) -> Vec<StatsRow> {
     let mut groups: HashMap<(String, String), StatsAcc, RandomState> = HashMap::default();
 
-    for row in rows {
+    for row in rows.into_iter().chain(existing) {
         let acc = groups.entry((row.app, row.host)).or_default();
         acc.requests += row.requests;
         acc.bytes_in += row.bytes_in;
@@ -237,7 +262,17 @@ fn merge_stats(rows: Vec<StatsRow>, bucket: i64) -> Vec<StatsRow> {
 /// As in [`merge_breakdown`], an incoming `__other__` row goes straight to
 /// [`TopN::other`] rather than through [`TopN::add`], so it can neither
 /// evict a real path nor be emitted twice.
-fn merge_paths(rows: Vec<PathRow>, bucket: i64, topn: usize) -> Vec<PathRow> {
+///
+/// `existing` — the coarse tier's current rows for this bucket, normally
+/// empty — is merged on the same footing as a finer row; see [`merge_stats`].
+/// Its `__other__` row is one of the finer tier's overflows by another name,
+/// and lands in [`TopN::other`] like any other.
+fn merge_paths(
+    rows: Vec<PathRow>,
+    existing: Vec<PathRow>,
+    bucket: i64,
+    topn: usize,
+) -> Vec<PathRow> {
     let mut groups: HashMap<(String, String), PathAcc, RandomState> = HashMap::default();
     // Per-app top-N, ranked (like every other cap in this crate) on request
     // count. Kept alongside `groups` rather than inside it because the
@@ -245,7 +280,7 @@ fn merge_paths(rows: Vec<PathRow>, bucket: i64, topn: usize) -> Vec<PathRow> {
     // does not carry.
     let mut tops: HashMap<String, TopN, RandomState> = HashMap::default();
 
-    for row in rows {
+    for row in rows.into_iter().chain(existing) {
         let top = tops.entry(row.app.clone()).or_default();
         let reqs = row.requests.max(0) as u64;
         let bytes = row.bytes_out.max(0) as u64;
@@ -310,10 +345,24 @@ fn merge_paths(rows: Vec<PathRow>, bucket: i64, topn: usize) -> Vec<PathRow> {
 /// (possibly evicting one) and could then be emitted twice — once from
 /// `counts` and once from `other` — colliding on the coarser table's primary
 /// key.
-fn merge_breakdown(rows: Vec<BreakdownRow>, bucket: i64, topn: usize) -> Vec<BreakdownRow> {
+///
+/// `existing` is the coarse tier's current rows for this bucket (normally
+/// empty). Breakdown rows carry no sketch, so re-compaction never destroyed
+/// data here the way it did for stats and paths — the store's upsert summed
+/// the counters correctly. It still has to be folded in, for two reasons: the
+/// store now replaces the coarse window wholesale rather than upserting into
+/// it, and re-deriving the top-N from the union re-ranks the *whole* group,
+/// where an incremental second pass could push the bucket past `topn` with a
+/// late value that should have been demoted into `__other__`.
+fn merge_breakdown(
+    rows: Vec<BreakdownRow>,
+    existing: Vec<BreakdownRow>,
+    bucket: i64,
+    topn: usize,
+) -> Vec<BreakdownRow> {
     let mut groups: HashMap<(String, String), TopN, RandomState> = HashMap::default();
 
-    for row in rows {
+    for row in rows.into_iter().chain(existing) {
         let entry = groups.entry((row.app, row.dimension)).or_default();
         let reqs = row.requests.max(0) as u64;
         let bytes = row.bytes_out.max(0) as u64;
@@ -1050,6 +1099,193 @@ mod tests {
             "capped at the COMPACTION_TOPN floor of 200, plus one __other__"
         );
         assert_eq!(rows.iter().filter(|r| r.value == "__other__").count(), 1);
+    }
+
+    /// The late-arrival regression, and the reason [`compact_window`] reads
+    /// its destination tier.
+    ///
+    /// [`AnalyticsStore::compact_window`]: store::traffic::AnalyticsStore::compact_window
+    ///
+    /// Hour `H` is fully compacted at `H+1h`. Then a `1m` row for `H` lands
+    /// *after* that — which is not exotic: the aggregator flushes `H`'s last
+    /// minute at `H+1h`, exactly when the hourly sweep first becomes eligible
+    /// to roll `H` up, so the two race at every hour boundary. The next sweep
+    /// picks the straggler up and compacts bucket `H` a second time.
+    ///
+    /// That second pass must recompute the hour, not describe the straggler.
+    /// When the merge only saw the finer tier, it produced a coarse row built
+    /// from the one late minute; the store's upsert then summed the counters
+    /// (so `requests` stayed right and a dashboard looked healthy) but
+    /// *replaced* `latency_tdigest` and `uniques_hll`, silently discarding
+    /// 59 minutes of latency distribution and unique visitors — and the
+    /// wreckage propagated on into the `1d` tier at the next roll-up.
+    #[test]
+    fn a_late_finer_row_merges_into_the_existing_coarse_row() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        let hour = 100 * HOUR;
+
+        // Hour H as it is first seen: three minutes, all fast, three visitors.
+        let mut early: Vec<StatsRow> = (0..3)
+            .map(|i| stats_row(hour + i * MIN, "a", "h", 1, &[1.0]))
+            .collect();
+        early[0].uniques_hll = uniques_bytes(&["1.1.1.1"]);
+        early[1].uniques_hll = uniques_bytes(&["1.1.1.2"]);
+        early[2].uniques_hll = uniques_bytes(&["1.1.1.3"]);
+        s.flush_window(
+            &early,
+            &[PathRow {
+                bucket: hour,
+                app: "a".into(),
+                path: "/x".into(),
+                requests: 3,
+                bytes_out: 30,
+                latency_tdigest: digest_bytes(&[1.0, 1.0, 1.0]),
+            }],
+            &[breakdown_row(hour, "US", 3)],
+        )
+        .unwrap();
+
+        assert_eq!(compact_1m_to_1h(&s, hour + HOUR, 50).unwrap(), 3);
+
+        // ...and now H's last minute finally flushes, slow and from a fourth
+        // visitor, into an hour that has already been rolled up.
+        let mut late = stats_row(hour + 59 * MIN, "a", "h", 1, &[100.0]);
+        late.uniques_hll = uniques_bytes(&["1.1.1.4"]);
+        s.flush_window(
+            &[late],
+            &[PathRow {
+                bucket: hour + 59 * MIN,
+                app: "a".into(),
+                path: "/x".into(),
+                requests: 1,
+                bytes_out: 10,
+                latency_tdigest: digest_bytes(&[100.0]),
+            }],
+            &[breakdown_row(hour + 59 * MIN, "US", 1)],
+        )
+        .unwrap();
+
+        // Second sweep: same coarse bucket, second visit.
+        assert_eq!(compact_1m_to_1h(&s, hour + HOUR + 5 * MIN, 50).unwrap(), 3);
+
+        let rows = s.stats_rows_between(Tier::H1, i64::MIN, i64::MAX).unwrap();
+        assert_eq!(rows.len(), 1, "still one row for hour H, not two");
+        assert_eq!(rows[0].bucket, hour);
+        assert_eq!(
+            rows[0].requests, 4,
+            "the three early minutes plus the late one, each counted once"
+        );
+        assert_eq!(rows[0].bytes_in, 40, "and no counter double-added");
+
+        let digest = LatencyDigest::from_bytes(&rows[0].latency_tdigest).unwrap();
+        assert!(
+            (digest.quantile(0.0) - 1.0).abs() < 1e-6,
+            "the already-compacted minutes' latency must survive the second \
+             pass: a digest rebuilt from the late row alone starts at 100, \
+             got {}",
+            digest.quantile(0.0)
+        );
+        assert!(
+            (digest.quantile(1.0) - 100.0).abs() < 1e-6,
+            "and the late row's must be in there too, got {}",
+            digest.quantile(1.0)
+        );
+
+        let mut uniques = Uniques::from_bytes(&rows[0].uniques_hll).unwrap();
+        assert_eq!(
+            uniques.count(),
+            4,
+            "the union of the three original visitors and the late one; \
+             replacing the HLL with the late row's would report 1"
+        );
+
+        let paths = s.paths_rows_between(Tier::H1, i64::MIN, i64::MAX).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].requests, 4);
+        assert_eq!(paths[0].bytes_out, 40);
+        let path_digest = LatencyDigest::from_bytes(&paths[0].latency_tdigest).unwrap();
+        assert!(
+            (path_digest.quantile(0.0) - 1.0).abs() < 1e-6,
+            "per-path digests are replaced on conflict too, got {}",
+            path_digest.quantile(0.0)
+        );
+        assert!((path_digest.quantile(1.0) - 100.0).abs() < 1e-6);
+
+        // Breakdown rows carry no sketch, so they were never corrupted — but
+        // they must not double-count now that the coarse window is rewritten
+        // wholesale rather than upserted into.
+        let bd = s
+            .breakdown_rows_between(Tier::H1, i64::MIN, i64::MAX)
+            .unwrap();
+        assert_eq!(bd.len(), 1);
+        assert_eq!(bd[0].requests, 4);
+        assert_eq!(bd[0].bytes_out, 40);
+
+        assert!(
+            s.stats_rows_between(Tier::M1, i64::MIN, i64::MAX)
+                .unwrap()
+                .is_empty(),
+            "the late row is consumed like any other"
+        );
+    }
+
+    /// Re-compacting a coarse bucket re-ranks its whole top-N rather than
+    /// bolting the late value onto an already-capped set: with a cap of 2, a
+    /// late value that outranks everything must push the previous runner-up
+    /// into `__other__`, not become a third row.
+    #[test]
+    fn a_late_row_re_caps_the_coarse_bucket_instead_of_widening_it() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        let hour = 100 * HOUR;
+        s.flush_window(
+            &[],
+            &[],
+            &[
+                breakdown_row(hour, "A", 10),
+                breakdown_row(hour, "B", 8),
+                breakdown_row(hour, "C", 3),
+            ],
+        )
+        .unwrap();
+        compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR, 2).unwrap();
+
+        s.flush_window(&[], &[], &[breakdown_row(hour + 59 * MIN, "D", 100)])
+            .unwrap();
+        compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR + MIN, 2).unwrap();
+
+        let rows = s
+            .breakdown_rows_between(Tier::H1, i64::MIN, i64::MAX)
+            .unwrap();
+        let mut got: Vec<(&str, i64)> = rows
+            .iter()
+            .map(|r| (r.value.as_str(), r.requests))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![("A", 10), ("D", 100), ("__other__", 11)],
+            "D(100) and A(10) are the top 2; B(8) is demoted onto the \
+             existing __other__(3)"
+        );
+    }
+
+    /// A coarse bucket whose finer tier is empty is not touched at all — the
+    /// merge never runs, so a bucket cannot be perturbed (its digests
+    /// re-merged, its top-N re-capped) by a sweep that has nothing to add.
+    #[test]
+    fn a_sweep_with_nothing_to_add_leaves_the_coarse_row_byte_identical() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        let hour = 100 * HOUR;
+        s.flush_window(&[stats_row(hour, "a", "h", 3, &[1.0, 2.0, 3.0])], &[], &[])
+            .unwrap();
+        compact_1m_to_1h(&s, hour + HOUR, 50).unwrap();
+        let before = s.stats_rows_between(Tier::H1, i64::MIN, i64::MAX).unwrap();
+
+        assert_eq!(compact_1m_to_1h(&s, hour + 5 * HOUR, 50).unwrap(), 0);
+        assert_eq!(
+            s.stats_rows_between(Tier::H1, i64::MIN, i64::MAX).unwrap(),
+            before
+        );
     }
 
     #[test]
