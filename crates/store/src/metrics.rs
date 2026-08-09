@@ -101,7 +101,7 @@ impl Store {
     }
 
     pub fn cpu_history(&self, from: i64, to: i64) -> Result<Vec<CpuRow>, StoreError> {
-        self.with_conn(|c| {
+        self.with_reader(|c| {
             let sql = format!(
                 "SELECT {CPU_COLS} FROM cpu_usage WHERE time >= ?1 AND time <= ?2 ORDER BY time ASC"
             );
@@ -119,7 +119,7 @@ impl Store {
     }
 
     pub fn memory_history(&self, from: i64, to: i64) -> Result<Vec<MemRow>, StoreError> {
-        self.with_conn(|c| {
+        self.with_reader(|c| {
             let sql = format!(
                 "SELECT {MEM_COLS} FROM memory_usage WHERE time >= ?1 AND time <= ?2 ORDER BY time ASC"
             );
@@ -137,7 +137,7 @@ impl Store {
         from: i64,
         to: i64,
     ) -> Result<Vec<CpuRow>, StoreError> {
-        self.with_conn(|c| {
+        self.with_reader(|c| {
             let sql = format!(
                 "SELECT {CPU_COLS} FROM container_cpu_usage
                  WHERE container_id = ?1 AND time >= ?2 AND time <= ?3 ORDER BY time ASC"
@@ -161,7 +161,7 @@ impl Store {
         from: i64,
         to: i64,
     ) -> Result<Vec<MemRow>, StoreError> {
-        self.with_conn(|c| {
+        self.with_reader(|c| {
             let sql = format!(
                 "SELECT {MEM_COLS} FROM container_memory_usage
                  WHERE container_id = ?1 AND time >= ?2 AND time <= ?3 ORDER BY time ASC"

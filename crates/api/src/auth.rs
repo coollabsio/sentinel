@@ -20,7 +20,7 @@ pub async fn require_token(
         return next.run(request).await;
     }
 
-    let expected = format!("Bearer {}", state.config.token);
+    let expected = &state.auth_header;
     let provided = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)

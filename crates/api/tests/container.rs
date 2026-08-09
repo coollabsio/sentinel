@@ -26,6 +26,7 @@ fn state() -> Arc<AppState> {
     let mut config = config::Config::load_for_test();
     config.token = "secret".into();
     Arc::new(AppState {
+        auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
         store,
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
@@ -82,6 +83,52 @@ async fn container_id_is_sanitised_to_alphanumerics() {
 }
 
 #[tokio::test]
+async fn hyphenated_name_stored_by_collector_is_queryable() {
+    // Regression: the collector now stores `sanitize_container_id(display_name)`
+    // (e.g. "postgres-db" -> "postgresdb"), matching the read path's identical
+    // sanitisation. Before, the raw hyphenated key was stored but the query
+    // stripped the hyphen, so the history was silently empty.
+    let store = store::Store::open_in_memory().unwrap();
+    store
+        .insert_container_batch(
+            1_700_000_000_000,
+            &[store::ContainerSample {
+                container_id: store::sanitize_container_id("postgres-db"),
+                cpu_percent: 7.0,
+                mem_total: 1,
+                mem_available: 1,
+                mem_used: 1,
+                mem_used_percent: 1.0,
+                mem_free: 1,
+            }],
+        )
+        .unwrap();
+    let mut config = config::Config::load_for_test();
+    config.token = "secret".into();
+    let st = Arc::new(AppState {
+        auth_header: format!("Bearer {}", config.token),
+        config: Arc::new(config),
+        store,
+        sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
+    });
+    let res = router(st)
+        .oneshot(
+            Request::builder()
+                .uri("/api/container/postgres-db/cpu/history")
+                .header("Authorization", "Bearer secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(j.as_array().unwrap().len(), 1, "hyphenated name must resolve");
+    assert_eq!(j.as_array().unwrap()[0]["percent"], "7.00");
+}
+
+#[tokio::test]
 async fn unknown_container_returns_empty_array() {
     let (s, j) = get("/api/container/nosuch/cpu/history").await;
     assert_eq!(s, StatusCode::OK);
@@ -123,6 +170,7 @@ async fn container_history_default_from_is_one_second_not_zero() {
     let mut config = config::Config::load_for_test();
     config.token = "secret".into();
     let st = Arc::new(AppState {
+        auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
         store,
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
@@ -178,6 +226,7 @@ async fn stats_route_reports_row_counts_and_live_memory_when_debug() {
     config.token = "secret".into();
     config.debug = true;
     let st = Arc::new(AppState {
+        auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
         store,
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),

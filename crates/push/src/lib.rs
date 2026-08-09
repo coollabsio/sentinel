@@ -145,6 +145,12 @@ impl Pusher {
             return Ok((Vec::new(), 0));
         }
 
+        // One timestamp for the whole cycle so every container in a push shares
+        // it, rather than each row carrying its own inspect-completion instant.
+        let now = time::OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_default();
+
         let mut out = Vec::with_capacity(total);
         let mut tasks = JoinSet::new();
         let mut queue = summaries.into_iter();
@@ -152,14 +158,14 @@ impl Pusher {
         for _ in 0..MAX_CONCURRENT_INSPECTS {
             match queue.next() {
                 Some(c) => {
-                    tasks.spawn(inspect(self.docker.clone(), c));
+                    tasks.spawn(inspect(self.docker.clone(), c, now.clone()));
                 }
                 None => break,
             }
         }
         while let Some(joined) = tasks.join_next().await {
             if let Some(c) = queue.next() {
-                tasks.spawn(inspect(self.docker.clone(), c));
+                tasks.spawn(inspect(self.docker.clone(), c, now.clone()));
             }
             if let Ok(Some(c)) = joined {
                 out.push(c);
@@ -178,7 +184,11 @@ impl Pusher {
     }
 }
 
-async fn inspect(docker: DockerClient, summary: docker::ContainerSummary) -> Option<Container> {
+async fn inspect(
+    docker: DockerClient,
+    summary: docker::ContainerSummary,
+    now: String,
+) -> Option<Container> {
     let health = match docker.inspect_health(&summary.id).await {
         Ok(h) => h,
         Err(e) => {
@@ -196,9 +206,7 @@ async fn inspect(docker: DockerClient, summary: docker::ContainerSummary) -> Opt
         .unwrap_or_else(|| summary.id.chars().take(12).collect());
 
     Some(Container {
-        time: time::OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .unwrap_or_default(),
+        time: now,
         id: summary.id,
         image: summary.image,
         name,

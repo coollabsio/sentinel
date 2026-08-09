@@ -21,9 +21,28 @@ pub enum StoreError {
     Poisoned,
 }
 
+/// Normalizes a container identifier to the exact form used as the storage key:
+/// drop '/' then strip every character outside `[a-zA-Z0-9]`. Both the writer
+/// (collector) and the reader (`/api/container/{id}/...`) route their container
+/// id through this single function so the two can never drift — storing a raw
+/// display name like `postgres-db` while querying for the sanitized `postgresdb`
+/// silently returned an empty history. Ported from pkg/api/controller/container.go.
+pub fn sanitize_container_id(raw: &str) -> String {
+    raw.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
+}
+
 #[derive(Clone)]
 pub struct Store {
-    conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Single read-write connection; serializes all writes (collector inserts,
+    /// retention, migration) through one `Mutex`.
+    writer: Arc<Mutex<rusqlite::Connection>>,
+    /// Dedicated read-only connection for the API's history/stats queries. In
+    /// WAL mode a reader sees the latest committed snapshot without blocking the
+    /// writer, so inbound reads no longer serialize behind the collector's 5s
+    /// inserts or the daily retention rewrite. For in-memory stores (tests) the
+    /// two separate `:memory:` databases would not share data, so `reader`
+    /// aliases `writer` there — reads and writes hit the same connection.
+    reader: Arc<Mutex<rusqlite::Connection>>,
 }
 
 impl Store {
@@ -42,7 +61,7 @@ impl Store {
         }
         match rusqlite::Connection::open(path)
             .map_err(StoreError::from)
-            .and_then(Self::init)
+            .and_then(|conn| Self::from_writer(conn, Some(path)))
         {
             Ok(store) => Ok(store),
             Err(e) => {
@@ -66,34 +85,70 @@ impl Store {
                     }
                 }
                 let conn = rusqlite::Connection::open(path)?;
-                Self::init(conn)
+                Self::from_writer(conn, Some(path))
             }
         }
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
-        Self::init(rusqlite::Connection::open_in_memory()?)
+        Self::from_writer(rusqlite::Connection::open_in_memory()?, None)
     }
 
-    fn init(conn: rusqlite::Connection) -> Result<Self, StoreError> {
+    /// Migrates the writer connection, then (for file-backed stores) opens a
+    /// separate read-only connection on the same path. `path == None` marks an
+    /// in-memory store, where the reader must alias the writer.
+    fn from_writer(conn: rusqlite::Connection, path: Option<&Path>) -> Result<Self, StoreError> {
+        Self::init_conn(&conn)?;
+        schema::migrate_legacy(&conn)?;
+        schema::apply(&conn)?;
+        let writer = Arc::new(Mutex::new(conn));
+
+        let reader = match path {
+            Some(path) => {
+                use rusqlite::OpenFlags;
+                let ro = rusqlite::Connection::open_with_flags(
+                    path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+                )?;
+                // A brief checkpoint can hold the DB; wait rather than error.
+                ro.busy_timeout(std::time::Duration::from_secs(5))?;
+                ro.pragma_update(None, "cache_size", -8000)?;
+                Arc::new(Mutex::new(ro))
+            }
+            // In-memory: a second `:memory:` connection is a distinct empty DB,
+            // so alias the writer to keep read-after-write visible in tests.
+            None => writer.clone(),
+        };
+
+        Ok(Self { writer, reader })
+    }
+
+    fn init_conn(conn: &rusqlite::Connection) -> Result<(), StoreError> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // 8 MB, down from the Go implementation's 64 MB: the working set is
         // small and a large page cache works against the footprint goal.
         conn.pragma_update(None, "cache_size", -8000)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        schema::migrate_legacy(&conn)?;
-        schema::apply(&conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        Ok(())
     }
 
+    /// Read-write connection: collector inserts, retention, migration.
     pub(crate) fn with_conn<T>(
         &self,
         f: impl FnOnce(&rusqlite::Connection) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let guard = self.conn.lock().map_err(|_| StoreError::Poisoned)?;
+        let guard = self.writer.lock().map_err(|_| StoreError::Poisoned)?;
+        f(&guard)
+    }
+
+    /// Read-only connection: API history/stats queries. Decoupled from the
+    /// writer so inbound reads don't serialize behind writes.
+    pub(crate) fn with_reader<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let guard = self.reader.lock().map_err(|_| StoreError::Poisoned)?;
         f(&guard)
     }
 }

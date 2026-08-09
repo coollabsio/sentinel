@@ -40,6 +40,7 @@ async fn fetch(uri: &str) -> serde_json::Value {
     let mut config = config::Config::load_for_test();
     config.token = "secret".into();
     let state = Arc::new(api::AppState {
+        auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
         store,
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),

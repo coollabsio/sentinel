@@ -85,16 +85,23 @@ impl Collector {
         // round to 2 decimals here to keep stored values at wire parity — the
         // same treatment sample_memory already applies to memory. The raw value
         // is only used unrounded by /api/cpu/current, which Go also returned raw.
+        // sysinfo refreshes are in-memory and cheap, so sample on the async
+        // side; only the SQLite writes go to a blocking thread (matching the
+        // API's read handlers) so a WAL fsync stall can't block a worker.
         let cpu = round2(sampler.sample_cpu());
-        if let Err(e) = self.store.insert_cpu(time, cpu) {
-            tracing::warn!(error = %e, "failed to record host cpu");
-        }
-
         let mut mem = sampler.sample_memory();
         mem.time = time;
-        if let Err(e) = self.store.insert_memory(&mem) {
-            tracing::warn!(error = %e, "failed to record host memory");
-        }
+
+        let store = self.store.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = store.insert_cpu(time, cpu) {
+                tracing::warn!(error = %e, "failed to record host cpu");
+            }
+            if let Err(e) = store.insert_memory(&mem) {
+                tracing::warn!(error = %e, "failed to record host memory");
+            }
+        })
+        .await;
 
         self.collect_containers(time).await;
     }
@@ -136,8 +143,12 @@ impl Collector {
             }
         }
 
-        if let Err(e) = self.store.insert_container_batch(time, &samples) {
-            tracing::warn!(error = %e, "failed to record container metrics");
+        let store = self.store.clone();
+        match tokio::task::spawn_blocking(move || store.insert_container_batch(time, &samples)).await
+        {
+            Ok(Err(e)) => tracing::warn!(error = %e, "failed to record container metrics"),
+            Err(e) => tracing::warn!(error = %e, "container insert task panicked"),
+            Ok(Ok(())) => {}
         }
     }
 }
@@ -169,7 +180,10 @@ async fn fetch(
     let cpu_percent = round2(calc::cpu_percent(&stats));
 
     Some(ContainerSample {
-        container_id: name,
+        // Store the sanitized key so the `/api/container/{id}/...` read path
+        // (which strips everything outside [a-zA-Z0-9]) can find it — a raw
+        // display name like `postgres-db` was previously unqueryable.
+        container_id: store::sanitize_container_id(&name),
         cpu_percent,
         mem_total: mem_limit,
         mem_available: free,

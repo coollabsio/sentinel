@@ -16,6 +16,8 @@ use tokio::sync::Mutex;
 
 pub struct AppState {
     pub config: Arc<Config>,
+    /// Precomputed `"Bearer <token>"` so auth doesn't reallocate it per request.
+    pub auth_header: String,
     pub store: Store,
     /// Shared between the API's own `/api/cpu/current`, `/api/memory/current`
     /// and `/api/stats` handlers — *not* with the collector, which constructs

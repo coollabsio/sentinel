@@ -26,6 +26,7 @@ fn state(debug: bool) -> Arc<AppState> {
     config.token = "secret".into();
 
     Arc::new(AppState {
+        auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
         store,
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
@@ -146,6 +147,7 @@ async fn cpu_history_returns_empty_array_not_null() {
     let mut config = config::Config::load_for_test();
     config.token = "secret".into();
     let st = Arc::new(AppState {
+        auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
         store,
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),

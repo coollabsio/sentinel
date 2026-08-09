@@ -111,6 +111,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(%addr, "api listening");
 
         let state = Arc::new(api::AppState {
+            auth_header: format!("Bearer {}", config.token),
             config: config.clone(),
             store: store.clone(),
             sampler: sampler.clone(),

@@ -40,7 +40,7 @@ const TABLE_SIZES: [(&str, &str); 4] = [
 
 impl Store {
     pub fn db_stats(&self) -> Result<DbStats, StoreError> {
-        self.with_conn(|c| {
+        self.with_reader(|c| {
             let page_count: i64 = c.query_row("PRAGMA page_count", [], |r| r.get(0))?;
             let page_size: i64 = c.query_row("PRAGMA page_size", [], |r| r.get(0))?;
 

@@ -99,6 +99,7 @@ fn test_state() -> std::sync::Arc<api::AppState> {
         bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
     };
     std::sync::Arc::new(api::AppState {
+        auth_header: format!("Bearer {}", config.token),
         config: std::sync::Arc::new(config),
         store: store::Store::open_in_memory().unwrap(),
         sampler: std::sync::Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),

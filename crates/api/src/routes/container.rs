@@ -14,11 +14,9 @@ use crate::types::{CpuUsage, MemUsage};
 /// This asymmetry exists in the Go implementation and is preserved.
 const DEFAULT_FROM: &str = "1970-01-01T00:00:01Z";
 
-/// Ported from pkg/api/controller/container.go: drop '/' then strip every
-/// character outside [a-zA-Z0-9].
-fn sanitize_id(raw: &str) -> String {
-    raw.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
-}
+/// Shared with the collector's write path via `store::sanitize_container_id`,
+/// so the queried key always matches the stored key.
+use store::sanitize_container_id as sanitize_id;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
