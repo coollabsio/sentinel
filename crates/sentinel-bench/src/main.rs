@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+mod storage_bench;
 mod sysinfo_report;
 
 use std::sync::Arc;
@@ -47,6 +48,8 @@ enum Command {
     Load(LoadOpts),
     /// Stress: high concurrency, mixed endpoints, optional ramp/burst/soak.
     Stress(StressOpts),
+    /// Storage-feature micro-bench: du-walk, disk sampling, store writes, downsample.
+    Storage(StorageCli),
     /// Run latency + load + stress with shared target options.
     Suite {
         #[command(flatten)]
@@ -133,6 +136,34 @@ struct StressOpts {
     health_every_secs: u64,
 }
 
+#[derive(Parser, Debug)]
+struct StorageCli {
+    /// Directory to build the synthetic tree under (a unique subdir is created).
+    #[arg(long, default_value = "/tmp")]
+    tree_dir: String,
+    /// Child directories per directory level.
+    #[arg(long, default_value_t = 4)]
+    breadth: usize,
+    /// Nesting depth of the synthetic tree.
+    #[arg(long, default_value_t = 4)]
+    depth: usize,
+    /// Regular files per directory.
+    #[arg(long, default_value_t = 8)]
+    files_per_dir: usize,
+    /// Bytes per synthetic file.
+    #[arg(long, default_value_t = 4096)]
+    file_bytes: usize,
+    /// Keep the synthetic tree after the run instead of deleting it.
+    #[arg(long, default_value_t = false)]
+    keep: bool,
+    /// Total rows for the store write / downsample phases.
+    #[arg(long, default_value_t = 100_000)]
+    rows: usize,
+    /// Use larger, worst-case parameters (deep+wide tree, more rows).
+    #[arg(long, default_value_t = false)]
+    stress: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Endpoint {
     path: &'static str,
@@ -170,6 +201,16 @@ const ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         path: "/api/memory/history",
+        weight: 2,
+        latency_n: 40,
+    },
+    Endpoint {
+        path: "/api/disk/current",
+        weight: 3,
+        latency_n: 80,
+    },
+    Endpoint {
+        path: "/api/disk/history",
         weight: 2,
         latency_n: 40,
     },
@@ -426,7 +467,11 @@ async fn run_load(opts: &LoadOpts) -> Result<(), Box<dyn std::error::Error>> {
         .filter(|e| {
             matches!(
                 e.path,
-                "/api/health" | "/api/cpu/current" | "/api/memory/current" | "/api/cpu/history"
+                "/api/health"
+                    | "/api/cpu/current"
+                    | "/api/memory/current"
+                    | "/api/cpu/history"
+                    | "/api/disk/current"
             )
         })
         .map(|e| e.path)
@@ -709,6 +754,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Load(l) => run_load(&l).await?,
         Command::Stress(s) => {
             stress_pass = run_stress(&s).await?;
+        }
+        Command::Storage(s) => {
+            let opts = storage_bench::StorageOpts {
+                tree_dir: std::path::PathBuf::from(s.tree_dir),
+                breadth: s.breadth,
+                depth: s.depth,
+                files_per_dir: s.files_per_dir,
+                file_bytes: s.file_bytes,
+                keep: s.keep,
+                rows: s.rows,
+                stress: s.stress,
+            };
+            // CPU/IO-bound and blocking, but nothing else runs concurrently in
+            // this one-shot tool, so a direct call is fine.
+            storage_bench::run(&opts)?;
         }
         Command::Suite {
             target,

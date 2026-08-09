@@ -3,7 +3,7 @@
 pub mod calc;
 pub mod model;
 
-pub use model::{ContainerStats, ContainerSummary};
+pub use model::{ContainerDisk, ContainerStats, ContainerSummary};
 
 use bollard::Docker;
 use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions, StatsOptions};
@@ -58,6 +58,20 @@ impl DockerClient {
                 labels: c.labels.unwrap_or_default(),
             })
             .collect())
+    }
+
+    /// Lists all containers with `size: true`, yielding each container's
+    /// writable-layer size (`SizeRw`) and mount source paths in one API call.
+    /// `size: true` makes the daemon compute per-container sizes, so this is
+    /// heavier than `list_containers` and runs on the slower storage ticker.
+    pub async fn list_container_sizes(&self) -> Result<Vec<ContainerDisk>, DockerError> {
+        let opts = ListContainersOptions {
+            all: true,
+            size: true,
+            ..Default::default()
+        };
+        let raw = self.inner.list_containers(Some(opts)).await?;
+        Ok(raw.into_iter().map(container_disk_from_summary).collect())
     }
 
     pub async fn stats(&self, id: &str) -> Result<ContainerStats, DockerError> {
@@ -131,9 +145,97 @@ impl DockerClient {
     }
 }
 
+/// Maps a `size: true` bollard container summary to our [`ContainerDisk`],
+/// keying on the display name (not the raw Docker id) so the recorded series
+/// matches the cpu/memory collector and the documented per-container disk
+/// endpoint key. Pure and Docker-free so it can be unit-tested directly.
+fn container_disk_from_summary(c: bollard::models::ContainerSummary) -> ContainerDisk {
+    let id = c.id.unwrap_or_default();
+    let names = c.names.unwrap_or_default();
+    let labels = c.labels.unwrap_or_default();
+    let mount_sources = c
+        .mounts
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| m.source.filter(|s| !s.is_empty()))
+        .collect();
+    ContainerDisk {
+        id: model::resolve_display_name(&labels, &names, &id),
+        // SizeRw is Option<i64>; a missing or negative value means "unknown",
+        // recorded as 0.
+        writable_layer: c.size_rw.filter(|v| *v >= 0).unwrap_or(0) as u64,
+        mount_sources,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use bollard::models::{ContainerSummaryStateEnum, HealthStatusEnum};
+    use super::container_disk_from_summary;
+    use bollard::models::{
+        ContainerSummary, ContainerSummaryStateEnum, HealthStatusEnum, MountPoint,
+    };
+
+    // A `size: true` list yields the raw Docker id, but the disk series must be
+    // keyed on the same display name as cpu/memory (coolify.name label, else the
+    // Docker name, else id[:12]) — otherwise GET /api/container/{name}/disk/*
+    // and push correlation miss. Pin that here.
+    #[test]
+    fn container_disk_keys_on_display_name_not_raw_id() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("coolify.name".to_string(), "postgres-db".to_string());
+        let c = ContainerSummary {
+            id: Some("a".repeat(64)),
+            names: Some(vec!["/some-generated-name".to_string()]),
+            labels: Some(labels),
+            size_rw: Some(2048),
+            mounts: Some(vec![MountPoint {
+                source: Some("/var/lib/docker/volumes/x/_data".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let disk = container_disk_from_summary(c);
+        assert_eq!(disk.id, "postgres-db");
+        assert_eq!(disk.writable_layer, 2048);
+        assert_eq!(
+            disk.mount_sources,
+            vec!["/var/lib/docker/volumes/x/_data".to_string()]
+        );
+    }
+
+    #[test]
+    fn container_disk_falls_back_to_truncated_id_not_full_hash() {
+        let c = ContainerSummary {
+            id: Some("abcdef0123456789deadbeef".to_string()),
+            ..Default::default()
+        };
+        let disk = container_disk_from_summary(c);
+        assert_eq!(disk.id, "abcdef012345");
+    }
+
+    #[test]
+    fn container_disk_empty_source_mounts_are_dropped() {
+        let c = ContainerSummary {
+            id: Some("id".to_string()),
+            mounts: Some(vec![
+                MountPoint {
+                    source: Some(String::new()),
+                    ..Default::default()
+                },
+                MountPoint {
+                    source: None,
+                    ..Default::default()
+                },
+                MountPoint {
+                    source: Some("/data".to_string()),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let disk = container_disk_from_summary(c);
+        assert_eq!(disk.mount_sources, vec!["/data".to_string()]);
+    }
 
     // Coolify's PushServerUpdateJob keys container status on these exact
     // lowercase strings (running / restarting / exited / paused / dead ...),

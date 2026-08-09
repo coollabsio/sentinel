@@ -50,6 +50,11 @@ pub struct Config {
     pub collector_enabled: bool,
     pub collector_retention_period_days: u32,
     pub bind_addr: SocketAddr,
+    pub storage_enabled: bool,
+    pub storage_refresh_rate_seconds: u64,
+    pub storage_volumes_enabled: bool,
+    pub storage_volumes_refresh_rate_seconds: u64,
+    pub host_mount_prefix: String,
 }
 
 impl Config {
@@ -67,6 +72,13 @@ impl Config {
         let collector_retention_period_days =
             u32::try_from(positive_from_env("COLLECTOR_RETENTION_PERIOD_DAYS", 7)?)
                 .map_err(|_| ConfigError::NotPositive("COLLECTOR_RETENTION_PERIOD_DAYS"))?;
+
+        let storage_enabled = bool_from_env("STORAGE_ENABLED", true)?;
+        let storage_refresh_rate_seconds = positive_from_env("STORAGE_REFRESH_RATE_SECONDS", 300)?;
+        let storage_volumes_enabled = bool_from_env("STORAGE_VOLUMES_ENABLED", true)?;
+        let storage_volumes_refresh_rate_seconds =
+            positive_from_env("STORAGE_VOLUMES_REFRESH_RATE_SECONDS", 900)?;
+        let host_mount_prefix = non_empty("HOST_MOUNT_PREFIX").unwrap_or_default();
 
         let port: u16 = match non_empty("PORT") {
             None => 8888,
@@ -112,6 +124,11 @@ impl Config {
             collector_enabled,
             collector_retention_period_days,
             bind_addr,
+            storage_enabled,
+            storage_refresh_rate_seconds,
+            storage_volumes_enabled,
+            storage_volumes_refresh_rate_seconds,
+            host_mount_prefix,
         })
     }
 
@@ -131,6 +148,11 @@ impl Config {
             collector_enabled: false,
             collector_retention_period_days: 7,
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 8888)),
+            storage_enabled: false,
+            storage_refresh_rate_seconds: 300,
+            storage_volumes_enabled: false,
+            storage_volumes_refresh_rate_seconds: 900,
+            host_mount_prefix: String::new(),
         }
     }
 }
@@ -310,6 +332,8 @@ mod tests {
             "PUSH_INTERVAL_SECONDS",
             "COLLECTOR_REFRESH_RATE_SECONDS",
             "COLLECTOR_RETENTION_PERIOD_DAYS",
+            "STORAGE_REFRESH_RATE_SECONDS",
+            "STORAGE_VOLUMES_REFRESH_RATE_SECONDS",
         ] {
             let _l = env_lock().lock().unwrap();
             let _g = EnvGuard::set(&[
@@ -375,6 +399,11 @@ mod tests {
             ("PUSH_INTERVAL_SECONDS", ""),
             ("COLLECTOR_REFRESH_RATE_SECONDS", ""),
             ("COLLECTOR_RETENTION_PERIOD_DAYS", ""),
+            ("STORAGE_ENABLED", ""),
+            ("STORAGE_REFRESH_RATE_SECONDS", ""),
+            ("STORAGE_VOLUMES_ENABLED", ""),
+            ("STORAGE_VOLUMES_REFRESH_RATE_SECONDS", ""),
+            ("HOST_MOUNT_PREFIX", ""),
         ]);
         let c = Config::load(false).unwrap();
         assert_eq!(c.refresh_rate_seconds, 5);
@@ -384,6 +413,13 @@ mod tests {
         assert!(!c.debug);
         assert_eq!(c.bind_addr.port(), 8888);
         assert_eq!(c.metrics_file.to_str().unwrap(), "/app/db/metrics.sqlite");
+        // Storage collection defaults on; the expensive volume walk too, but is
+        // inert until host paths are mounted (see HOST_MOUNT_PREFIX).
+        assert!(c.storage_enabled);
+        assert_eq!(c.storage_refresh_rate_seconds, 300);
+        assert!(c.storage_volumes_enabled);
+        assert_eq!(c.storage_volumes_refresh_rate_seconds, 900);
+        assert_eq!(c.host_mount_prefix, "");
     }
 
     #[test]

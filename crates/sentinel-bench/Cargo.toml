@@ -11,6 +11,8 @@ name = "sentinel-bench"
 path = "src/main.rs"
 
 [dependencies]
+collector = { path = "../collector" }
+store = { path = "../store" }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util.workspace = true
 reqwest.workspace = true

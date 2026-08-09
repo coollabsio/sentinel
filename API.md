@@ -234,6 +234,67 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ---
 
+### Disk Metrics
+
+#### Get Current Disk Usage
+
+Retrieve the latest stored filesystem usage, one entry per real mountpoint.
+
+**Endpoint:** `GET /api/disk/current`
+
+**Response:**
+```json
+[
+  {
+    "time": "1700000000000",
+    "mount": "/",
+    "total": 500000000000,
+    "used": 250000000000,
+    "available": 250000000000,
+    "usedPercent": 50.00
+  }
+]
+```
+
+**Fields:**
+- `time` (string): Unix timestamp in milliseconds
+- `mount` (string): Filesystem mountpoint
+- `total` (number): Total capacity in bytes
+- `used` (number): Used space in bytes
+- `available` (number): Available space in bytes
+- `usedPercent` (number): Disk usage percentage
+- `human_friendly_time` (string): ISO 8601 formatted timestamp (debug mode only)
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  http://localhost:8888/api/disk/current
+```
+
+---
+
+#### Get Disk Usage History
+
+Retrieve historical filesystem usage across mountpoints.
+
+**Endpoint:** `GET /api/disk/history`
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from` | string | No | `1970-01-01T00:00:00Z` | Start date in ISO 8601 format |
+| `to` | string | No | Current time | End date in ISO 8601 format |
+
+Response items use the same shape as `/api/disk/current`.
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/disk/history?from=2024-01-15T00:00:00Z&to=2024-01-15T12:00:00Z"
+```
+
+---
+
 ## Docker Container Metrics
 
 ### Get Container CPU History
@@ -322,6 +383,67 @@ Retrieve memory usage history for a specific Docker container.
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
   "http://localhost:8888/api/container/postgres-db/memory/history?from=2024-01-15T00:00:00Z&to=2024-01-15T12:00:00Z"
+```
+
+---
+
+### Get Container Storage (Current)
+
+Retrieve the latest stored storage row for a container. Returns `null` when nothing has been recorded yet.
+
+**Endpoint:** `GET /api/container/:containerId/disk/current`
+
+**Path Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `containerId` | string | Yes | Exact container display name recorded by Sentinel |
+
+**Response:**
+```json
+{
+  "time": "1700000000000",
+  "writableLayer": 12000000,
+  "volumesTotal": 340000000
+}
+```
+
+**Fields:**
+- `time` (string): Unix timestamp in milliseconds
+- `writableLayer` (number): Docker writable-layer size in bytes (`SizeRw`)
+- `volumesTotal` (number): Summed size in bytes of the container's volume/bind mounts (0 when `STORAGE_VOLUMES_ENABLED=false` or host paths aren't mounted)
+- `human_friendly_time` (string): ISO 8601 formatted timestamp (debug mode only)
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  http://localhost:8888/api/container/postgres-db/disk/current
+```
+
+---
+
+### Get Container Storage History
+
+Retrieve historical writable-layer and volume sizes for a container.
+
+**Endpoint:** `GET /api/container/:containerId/disk/history`
+
+**Path Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `containerId` | string | Yes | Exact container display name recorded by Sentinel |
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from` | string | No | `1970-01-01T00:00:01Z` | Start date in ISO 8601 format |
+| `to` | string | No | Current time | End date in ISO 8601 format |
+
+Response items use the same shape as `/api/container/:containerId/disk/current`.
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/container/postgres-db/disk/history?from=2024-01-15T00:00:00Z"
 ```
 
 ---

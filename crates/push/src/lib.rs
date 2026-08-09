@@ -8,6 +8,7 @@ use std::sync::Arc;
 use config::Config;
 use docker::DockerClient;
 use serde::Serialize;
+use store::Store;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -54,11 +55,12 @@ pub fn snapshot_metadata(inspection_failures: usize) -> serde_json::Value {
 pub struct Pusher {
     config: Arc<Config>,
     docker: DockerClient,
+    store: Store,
     client: reqwest::Client,
 }
 
 impl Pusher {
-    pub fn new(config: Arc<Config>, docker: DockerClient) -> Result<Self, PushError> {
+    pub fn new(config: Arc<Config>, docker: DockerClient, store: Store) -> Result<Self, PushError> {
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(100)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
@@ -67,6 +69,7 @@ impl Pusher {
         Ok(Self {
             config,
             docker,
+            store,
             client,
         })
     }
@@ -129,15 +132,73 @@ impl Pusher {
     pub async fn build_payload(&self) -> Result<serde_json::Value, PushError> {
         let (containers, failures) = self.container_data().await?;
         let used_percentage = fs_usage::root_used_percentage()?;
+        let (filesystem_usage, container_storage) = self.storage_data().await;
 
+        // `filesystem_usage` and `container_storage` are additive: Coolify
+        // validates only `containers` and reads other keys with data_get(), so
+        // it ignores these until updated to consume them. `filesystem_usage_root`
+        // (the frozen root-disk field) is left untouched.
         Ok(serde_json::json!({
             "containers": containers,
             "filesystem_usage_root": {
                 // Go formats this with %d into a string.
                 "used_percentage": used_percentage.to_string(),
             },
+            "filesystem_usage": filesystem_usage,
+            "container_storage": container_storage,
             "snapshot": snapshot_metadata(failures),
         }))
+    }
+
+    /// Reads the latest stored storage rows (never samples live — the `du`-walk
+    /// only runs on the storage collector's own cadence). A read failure logs
+    /// and contributes empty arrays rather than failing the whole push.
+    async fn storage_data(&self) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        let store = self.store.clone();
+        let (disks, containers) = match tokio::task::spawn_blocking(move || {
+            (store.disk_latest(), store.container_disk_latest())
+        })
+        .await
+        {
+            Ok((d, c)) => (
+                d.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to read disk usage for push");
+                    Vec::new()
+                }),
+                c.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to read container storage for push");
+                    Vec::new()
+                }),
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "storage read task panicked");
+                (Vec::new(), Vec::new())
+            }
+        };
+
+        let filesystem_usage = disks
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "mount": d.mount,
+                    "total": d.total,
+                    "used": d.used,
+                    "available": d.available,
+                    "usedPercent": d.used_percent,
+                })
+            })
+            .collect();
+        let container_storage = containers
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.container_id,
+                    "writableLayer": c.writable_layer,
+                    "volumesTotal": c.volumes_total,
+                })
+            })
+            .collect();
+        (filesystem_usage, container_storage)
     }
 
     async fn container_data(&self) -> Result<(Vec<Container>, usize), PushError> {

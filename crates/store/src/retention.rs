@@ -6,11 +6,13 @@ pub const DOWNSAMPLE_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Downsampling bucket width.
 pub const BUCKET_MS: i64 = 60_000;
 
-const TABLES: [&str; 4] = [
+const TABLES: [&str; 6] = [
     "cpu_usage",
     "memory_usage",
     "container_cpu_usage",
     "container_memory_usage",
+    "disk_usage",
+    "container_disk_usage",
 ];
 
 impl Store {
@@ -65,18 +67,36 @@ impl Store {
                 lower_bound,
                 cutoff,
             )?;
-            // Container series: bucket on (time, container_id).
-            collapsed += bucket_container(
+            // Per-entity series: bucket on (time, <entity>).
+            collapsed += bucket_entity(
                 &tx,
                 "container_cpu_usage",
+                "container_id",
                 &["percent"],
                 lower_bound,
                 cutoff,
             )?;
-            collapsed += bucket_container(
+            collapsed += bucket_entity(
                 &tx,
                 "container_memory_usage",
+                "container_id",
                 &["total", "available", "used", "used_percent", "free"],
+                lower_bound,
+                cutoff,
+            )?;
+            collapsed += bucket_entity(
+                &tx,
+                "disk_usage",
+                "mount",
+                &["total", "used", "available", "used_percent"],
+                lower_bound,
+                cutoff,
+            )?;
+            collapsed += bucket_entity(
+                &tx,
+                "container_disk_usage",
+                "container_id",
+                &["writable_layer", "volumes_total"],
                 lower_bound,
                 cutoff,
             )?;
@@ -140,9 +160,12 @@ fn bucket_host(
     Ok(raw_count as u64)
 }
 
-fn bucket_container(
+/// Like `bucket_host`, but keyed on `(time_bucket, entity)` so each distinct
+/// entity (container_id, mount, …) keeps its own one-minute averages.
+fn bucket_entity(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
+    entity: &str,
     cols: &[&str],
     lower_bound: Option<i64>,
     cutoff: i64,
@@ -164,14 +187,14 @@ fn bucket_container(
     let sql = format!(
         r#"
         CREATE TEMP TABLE _ds AS
-        SELECT (time / {BUCKET_MS}) * {BUCKET_MS} AS time, container_id, {avg_list}
+        SELECT (time / {BUCKET_MS}) * {BUCKET_MS} AS time, {entity}, {avg_list}
         FROM {table} WHERE {lower_predicate} AND time < {cutoff}
-        GROUP BY time / {BUCKET_MS}, container_id;
+        GROUP BY time / {BUCKET_MS}, {entity};
 
         DELETE FROM {table} WHERE {lower_predicate} AND time < {cutoff};
 
-        INSERT OR REPLACE INTO {table} (time, container_id, {col_list})
-        SELECT time, container_id, {col_list} FROM _ds;
+        INSERT OR REPLACE INTO {table} (time, {entity}, {col_list})
+        SELECT time, {entity}, {col_list} FROM _ds;
 
         DROP TABLE _ds;
         "#

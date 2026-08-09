@@ -97,6 +97,11 @@ fn test_state() -> std::sync::Arc<api::AppState> {
         collector_enabled: false,
         collector_retention_period_days: 7,
         bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        storage_enabled: false,
+        storage_refresh_rate_seconds: 300,
+        storage_volumes_enabled: false,
+        storage_volumes_refresh_rate_seconds: 900,
+        host_mount_prefix: String::new(),
     };
     std::sync::Arc::new(api::AppState {
         auth_header: format!("Bearer {}", config.token),

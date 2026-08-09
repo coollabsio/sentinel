@@ -8,3 +8,4 @@ Every results file must include a **System configuration** block (`./target/rele
 | Date | File | Notes |
 |------|------|-------|
 | 2026-08-09 | [2026-08-09-go-vs-rust-sentinel-bench.md](2026-08-09-go-vs-rust-sentinel-bench.md) | Canonical Go vs Rust run — size/cold-start/memory/latency/load/stress (`sentinel-bench` 1.0.0) |
+| 2026-08-09 | [2026-08-09-storage-metrics.md](2026-08-09-storage-metrics.md) | Storage-metrics feature — du-walk/sampling/store micro-bench (§4.9) + disk endpoint latency/stress |

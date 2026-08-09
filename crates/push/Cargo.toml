@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 config = { path = "../config" }
 docker = { path = "../docker" }
+store = { path = "../store" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

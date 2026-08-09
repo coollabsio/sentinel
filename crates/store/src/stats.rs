@@ -15,7 +15,7 @@ pub struct DbStats {
 }
 
 /// (table, expression summing the byte length of every column in a row)
-const TABLE_SIZES: [(&str, &str); 4] = [
+const TABLE_SIZES: [(&str, &str); 6] = [
     (
         "cpu_usage",
         "LENGTH(CAST(time AS TEXT)) + LENGTH(CAST(percent AS TEXT))",
@@ -35,6 +35,17 @@ const TABLE_SIZES: [(&str, &str); 4] = [
         "LENGTH(CAST(time AS TEXT)) + LENGTH(container_id) + LENGTH(CAST(total AS TEXT)) + \
          LENGTH(CAST(available AS TEXT)) + LENGTH(CAST(used AS TEXT)) + \
          LENGTH(CAST(used_percent AS TEXT)) + LENGTH(CAST(free AS TEXT))",
+    ),
+    (
+        "disk_usage",
+        "LENGTH(CAST(time AS TEXT)) + LENGTH(mount) + LENGTH(CAST(total AS TEXT)) + \
+         LENGTH(CAST(used AS TEXT)) + LENGTH(CAST(available AS TEXT)) + \
+         LENGTH(CAST(used_percent AS TEXT))",
+    ),
+    (
+        "container_disk_usage",
+        "LENGTH(CAST(time AS TEXT)) + LENGTH(container_id) + \
+         LENGTH(CAST(writable_layer AS TEXT)) + LENGTH(CAST(volumes_total AS TEXT))",
     ),
 ];
 

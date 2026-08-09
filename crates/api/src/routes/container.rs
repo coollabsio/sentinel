@@ -8,7 +8,7 @@ use axum::{Json, Router};
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
 use crate::time::format_millis;
-use crate::types::{CpuUsage, MemUsage};
+use crate::types::{ContainerDiskUsage, CpuUsage, MemUsage};
 
 /// Container history defaults `from` one second later than the host endpoints.
 /// This asymmetry exists in the Go implementation and is preserved.
@@ -21,6 +21,14 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/container/{containerId}/memory/history",
             get(memory_history),
+        )
+        .route(
+            "/api/container/{containerId}/disk/current",
+            get(disk_current),
+        )
+        .route(
+            "/api/container/{containerId}/disk/history",
+            get(disk_history),
         )
 }
 
@@ -100,4 +108,69 @@ async fn memory_history(
         })
         .collect();
     Json(out).into_response()
+}
+
+/// Latest stored storage row for one container (`null` when none recorded yet).
+async fn disk_current(
+    Path(container_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let permit = match state.history_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
+    let store = state.store.clone();
+    let result =
+        tokio::task::spawn_blocking(move || store.container_disk_latest_one(&container_id)).await;
+    drop(permit);
+    let row = match result {
+        Ok(Ok(row)) => row,
+        Ok(Err(e)) => return internal_error(e),
+        Err(e) => return internal_error(e),
+    };
+
+    let debug = state.config.debug;
+    Json(row.map(|r| to_container_disk(r, debug))).into_response()
+}
+
+async fn disk_history(
+    Path(container_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
+    let id = container_id;
+    let (from, to) = match resolve_range(&q, DEFAULT_FROM) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let permit = match state.history_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
+    let store = state.store.clone();
+    let result =
+        tokio::task::spawn_blocking(move || store.container_disk_history(&id, from, to)).await;
+    drop(permit);
+    let rows = match result {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => return internal_error(e),
+        Err(e) => return internal_error(e),
+    };
+
+    let debug = state.config.debug;
+    let out: Vec<ContainerDiskUsage> = rows
+        .into_iter()
+        .map(|r| to_container_disk(r, debug))
+        .collect();
+    Json(out).into_response()
+}
+
+fn to_container_disk(r: store::ContainerDiskRow, debug: bool) -> ContainerDiskUsage {
+    ContainerDiskUsage {
+        time: r.time.to_string(),
+        writable_layer: r.writable_layer,
+        volumes_total: r.volumes_total,
+        human_friendly_time: debug.then(|| format_millis(r.time)),
+    }
 }

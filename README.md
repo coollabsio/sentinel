@@ -75,10 +75,17 @@ Sentinel is configured using environment variables:
 | `COLLECTOR_ENABLED` | `false` | Enable/disable metrics collection |
 | `COLLECTOR_REFRESH_RATE_SECONDS` | 5 | Metrics collection interval |
 | `COLLECTOR_RETENTION_PERIOD_DAYS` | 7 | How long to keep metrics in database |
+| `STORAGE_ENABLED` | `true` | Enable/disable storage (disk + container storage) collection |
+| `STORAGE_REFRESH_RATE_SECONDS` | 300 | Interval for the cheap per-mount filesystem stats |
+| `STORAGE_VOLUMES_ENABLED` | `true` | Enable/disable the per-container volume `du`-walk |
+| `STORAGE_VOLUMES_REFRESH_RATE_SECONDS` | 900 | Interval for the expensive volume walk (kept separate so it can't hammer host I/O) |
+| `HOST_MOUNT_PREFIX` | *(empty)* | Path prefix under which host paths are mounted into Sentinel's container, used to resolve volume/bind sources |
 | `DEBUG` | `false` | Enable verbose logging, `human_friendly_time` fields, and the `/api/stats` route |
 | `PORT` | `8888` | HTTP server port |
 
 In development mode (`cargo run`/`cargo build` debug profile, or `SENTINEL_DEVELOPMENT=1`), `PUSH_ENDPOINT` defaults to `http://localhost:8000`.
+
+> **Storage collection & host paths.** Server disk stats reflect the filesystems Sentinel's own container can see. To size container **volumes/bind mounts**, the host paths must be mounted (read-only is fine) into Sentinel's container — typically `/var/lib/docker/volumes` plus any bind-mount roots — and `HOST_MOUNT_PREFIX` set to where they are mounted (e.g. `/host`). Paths that aren't accessible contribute `0` and log a warning rather than failing. Note that a container bind-mounting a large host tree (e.g. `/`, `/var`, or a home directory) has that whole tree walked on every volume cycle, which can be slow; the walk is capped and records a partial size past the cap, but set `STORAGE_VOLUMES_ENABLED=false` to skip the walk entirely if that's a concern.
 
 ### Example Configuration
 

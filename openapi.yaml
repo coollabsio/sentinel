@@ -225,6 +225,113 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/disk/current:
+    get:
+      summary: Get current disk usage
+      description: Latest stored filesystem usage, one entry per real mountpoint
+      tags:
+        - System Metrics
+      responses:
+        '200':
+          description: Current disk usage per mountpoint
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DiskUsage'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/disk/history:
+    get:
+      summary: Get disk usage history
+      description: Historical filesystem usage across mountpoints with optional date range filtering
+      tags:
+        - System Metrics
+      parameters:
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Historical disk usage data
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DiskUsage'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/container/{containerId}/disk/current:
+    get:
+      summary: Get current container storage
+      description: Latest stored writable-layer and volume size for a specific container (null if none recorded)
+      tags:
+        - Container Metrics
+      parameters:
+        - name: containerId
+          in: path
+          required: true
+          description: Exact container display name recorded by Sentinel
+          schema:
+            type: string
+            pattern: '^[a-zA-Z0-9._-]+$'
+          example: postgres-db
+      responses:
+        '200':
+          description: Current container storage (or null)
+          content:
+            application/json:
+              schema:
+                nullable: true
+                allOf:
+                  - $ref: '#/components/schemas/ContainerDiskUsage'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/container/{containerId}/disk/history:
+    get:
+      summary: Get container storage history
+      description: Historical writable-layer and volume sizes for a specific container
+      tags:
+        - Container Metrics
+      parameters:
+        - name: containerId
+          in: path
+          required: true
+          description: Exact container display name recorded by Sentinel
+          schema:
+            type: string
+            pattern: '^[a-zA-Z0-9._-]+$'
+          example: postgres-db
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Container storage history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ContainerDiskUsage'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /api/stats:
     get:
       summary: Get database statistics
@@ -432,6 +539,66 @@ components:
           format: int64
           description: Free memory in bytes
           example: 2000000000
+        human_friendly_time:
+          type: string
+          format: date-time
+          description: ISO 8601 formatted timestamp (only in debug mode)
+          example: "2024-01-15T10:00:00Z"
+
+    DiskUsage:
+      type: object
+      properties:
+        time:
+          type: string
+          description: Unix timestamp in milliseconds
+          example: "1700000000000"
+        mount:
+          type: string
+          description: Filesystem mountpoint
+          example: "/"
+        total:
+          type: integer
+          format: int64
+          description: Total capacity in bytes
+          example: 500000000000
+        used:
+          type: integer
+          format: int64
+          description: Used space in bytes
+          example: 250000000000
+        available:
+          type: integer
+          format: int64
+          description: Available space in bytes
+          example: 250000000000
+        usedPercent:
+          type: number
+          format: float
+          description: Disk usage percentage (0-100)
+          example: 50.00
+        human_friendly_time:
+          type: string
+          format: date-time
+          description: ISO 8601 formatted timestamp (only in debug mode)
+          example: "2024-01-15T10:00:00Z"
+
+    ContainerDiskUsage:
+      type: object
+      properties:
+        time:
+          type: string
+          description: Unix timestamp in milliseconds
+          example: "1700000000000"
+        writableLayer:
+          type: integer
+          format: int64
+          description: Docker writable-layer size in bytes (SizeRw)
+          example: 12000000
+        volumesTotal:
+          type: integer
+          format: int64
+          description: Summed size in bytes of the container's volume/bind mounts
+          example: 340000000
         human_friendly_time:
           type: string
           format: date-time

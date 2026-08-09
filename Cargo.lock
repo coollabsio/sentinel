@@ -1143,6 +1143,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "store",
  "thiserror",
  "time",
  "tokio",
@@ -1514,10 +1515,12 @@ name = "sentinel-bench"
 version = "1.0.0"
 dependencies = [
  "clap",
+ "collector",
  "futures-util",
  "reqwest",
  "serde",
  "serde_json",
+ "store",
  "tokio",
 ]
 
