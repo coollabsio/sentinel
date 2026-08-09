@@ -75,32 +75,31 @@ async fn container_memory_history_returns_numeric_fields() {
 }
 
 #[tokio::test]
-async fn container_id_is_sanitised_to_alphanumerics() {
-    // "we/b-!" sanitises to "web", matching the stored id
-    let (s, j) = get("/api/container/we%2Fb-!/cpu/history").await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(j.as_array().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn hyphenated_name_stored_by_collector_is_queryable() {
-    // Regression: the collector now stores `sanitize_container_id(display_name)`
-    // (e.g. "postgres-db" -> "postgresdb"), matching the read path's identical
-    // sanitisation. Before, the raw hyphenated key was stored but the query
-    // stripped the hyphen, so the history was silently empty.
+async fn distinct_punctuated_container_names_keep_separate_histories() {
     let store = store::Store::open_in_memory().unwrap();
     store
         .insert_container_batch(
             1_700_000_000_000,
-            &[store::ContainerSample {
-                container_id: store::sanitize_container_id("postgres-db"),
-                cpu_percent: 7.0,
-                mem_total: 1,
-                mem_available: 1,
-                mem_used: 1,
-                mem_used_percent: 1.0,
-                mem_free: 1,
-            }],
+            &[
+                store::ContainerSample {
+                    container_id: "postgres-db".into(),
+                    cpu_percent: 7.0,
+                    mem_total: 1,
+                    mem_available: 1,
+                    mem_used: 1,
+                    mem_used_percent: 1.0,
+                    mem_free: 1,
+                },
+                store::ContainerSample {
+                    container_id: "postgres_db".into(),
+                    cpu_percent: 9.0,
+                    mem_total: 1,
+                    mem_available: 1,
+                    mem_used: 1,
+                    mem_used_percent: 1.0,
+                    mem_free: 1,
+                },
+            ],
         )
         .unwrap();
     let mut config = config::Config::load_for_test();
@@ -111,25 +110,23 @@ async fn hyphenated_name_stored_by_collector_is_queryable() {
         store,
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
     });
-    let res = router(st)
-        .oneshot(
-            Request::builder()
-                .uri("/api/container/postgres-db/cpu/history")
-                .header("Authorization", "Bearer secret")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(
-        j.as_array().unwrap().len(),
-        1,
-        "hyphenated name must resolve"
-    );
-    assert_eq!(j.as_array().unwrap()[0]["percent"], "7.00");
+    for (name, expected) in [("postgres-db", "7.00"), ("postgres_db", "9.00")] {
+        let res = router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/container/{name}/cpu/history"))
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(j.as_array().unwrap().len(), 1, "{name}");
+        assert_eq!(j.as_array().unwrap()[0]["percent"], expected, "{name}");
+    }
 }
 
 #[tokio::test]

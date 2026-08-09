@@ -21,16 +21,6 @@ pub enum StoreError {
     Poisoned,
 }
 
-/// Normalizes a container identifier to the exact form used as the storage key:
-/// drop '/' then strip every character outside `[a-zA-Z0-9]`. Both the writer
-/// (collector) and the reader (`/api/container/{id}/...`) route their container
-/// id through this single function so the two can never drift — storing a raw
-/// display name like `postgres-db` while querying for the sanitized `postgresdb`
-/// silently returned an empty history. Ported from pkg/api/controller/container.go.
-pub fn sanitize_container_id(raw: &str) -> String {
-    raw.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
-}
-
 #[derive(Clone)]
 pub struct Store {
     /// Single read-write connection; serializes all writes (collector inserts,
@@ -77,12 +67,16 @@ impl Store {
                 );
                 if path.exists() {
                     let backup = path.with_extension("legacy-backup.sqlite");
+                    let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+                    let shm = std::path::PathBuf::from(format!("{}-shm", path.display()));
+                    let backup_wal = std::path::PathBuf::from(format!("{}-wal", backup.display()));
                     let _ = std::fs::remove_file(&backup);
+                    let _ = std::fs::remove_file(&backup_wal);
                     std::fs::rename(path, &backup)?;
-                    for ext in ["-wal", "-shm"] {
-                        let sidecar = path.with_extension(format!("sqlite{ext}"));
-                        let _ = std::fs::remove_file(&sidecar);
+                    if wal.exists() {
+                        std::fs::rename(&wal, &backup_wal)?;
                     }
+                    let _ = std::fs::remove_file(&shm);
                 }
                 let conn = rusqlite::Connection::open(path)?;
                 Self::from_writer(conn, Some(path))

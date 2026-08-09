@@ -118,6 +118,33 @@ fn downsample_collapses_old_samples_into_one_minute_averages() {
 }
 
 #[test]
+fn downsample_rounds_percentages_to_two_decimals() {
+    let s = Store::open_in_memory().unwrap();
+    let now = 10 * DAY;
+    let bucket = now - 2 * DAY;
+    let bucket = bucket - (bucket % retention::BUCKET_MS);
+    for (offset, value) in [10.01, 10.02, 10.02].into_iter().enumerate() {
+        s.insert_cpu(bucket + offset as i64 * 5_000, value).unwrap();
+    }
+    s.downsample(now).unwrap();
+    let rows = s.cpu_history(bucket, bucket).unwrap();
+    assert_eq!(rows[0].percent, 10.02);
+}
+
+#[test]
+fn second_downsample_only_processes_newly_aged_rows() {
+    let s = Store::open_in_memory().unwrap();
+    let first_now = 10 * DAY;
+    let first_bucket = first_now - 2 * DAY;
+    let first_bucket = first_bucket - (first_bucket % retention::BUCKET_MS);
+    for i in 0..12 {
+        s.insert_cpu(first_bucket + i * 5_000, 10.0).unwrap();
+    }
+    assert_eq!(s.downsample(first_now).unwrap(), 12);
+    assert_eq!(s.downsample(first_now + DAY).unwrap(), 0);
+}
+
+#[test]
 fn downsample_leaves_recent_samples_at_full_resolution() {
     let s = Store::open_in_memory().unwrap();
     let now = 10 * DAY;

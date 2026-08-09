@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 config = { path = "../config" }
 docker = { path = "../docker" }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

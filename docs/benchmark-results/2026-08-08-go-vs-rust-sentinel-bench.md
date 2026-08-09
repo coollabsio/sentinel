@@ -1,6 +1,6 @@
 # Sentinel Go vs Rust Benchmark
 
-**Method:** [BENCHMARK.md](../BENCHMARK.md) + `sentinel-bench` 0.0.22  
+**Method:** [BENCHMARK.md](../../BENCHMARK.md) + `sentinel-bench` 0.0.22
 **Repo git:** `f0c41e5`  
 **Agent env:** `COLLECTOR_ENABLED=true`, refresh 5s, Docker socket mounted RO, push → `http://127.0.0.1:9` (blackhole)
 

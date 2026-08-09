@@ -93,7 +93,7 @@ impl Collector {
         mem.time = time;
 
         let store = self.store.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        if let Err(e) = tokio::task::spawn_blocking(move || {
             if let Err(e) = store.insert_cpu(time, cpu) {
                 tracing::warn!(error = %e, "failed to record host cpu");
             }
@@ -101,7 +101,10 @@ impl Collector {
                 tracing::warn!(error = %e, "failed to record host memory");
             }
         })
-        .await;
+        .await
+        {
+            tracing::warn!(error = %e, "host metrics insert task panicked");
+        }
 
         self.collect_containers(time).await;
     }
@@ -181,10 +184,9 @@ async fn fetch(
     let cpu_percent = round2(calc::cpu_percent(&stats));
 
     Some(ContainerSample {
-        // Store the sanitized key so the `/api/container/{id}/...` read path
-        // (which strips everything outside [a-zA-Z0-9]) can find it — a raw
-        // display name like `postgres-db` was previously unqueryable.
-        container_id: store::sanitize_container_id(&name),
+        // Preserve the exact display name. Sanitizing punctuation is lossy:
+        // distinct names such as `app-a` and `appa` otherwise share history.
+        container_id: name,
         cpu_percent,
         mem_total: mem_limit,
         mem_available: free,

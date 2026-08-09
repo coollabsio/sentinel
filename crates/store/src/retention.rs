@@ -1,4 +1,5 @@
 use crate::{Store, StoreError};
+use rusqlite::OptionalExtension;
 
 /// Samples older than this are collapsed to one-minute averages.
 pub const DOWNSAMPLE_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -37,23 +38,44 @@ impl Store {
         let cutoff = now_ms - DOWNSAMPLE_AFTER_MS;
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
+            let lower_bound = tx
+                .query_row(
+                    "SELECT value FROM sentinel_meta WHERE key = 'downsample_cutoff'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
             let mut collapsed = 0u64;
 
             // Host series: bucket on time alone.
-            collapsed += bucket_host(&tx, "cpu_usage", &["percent"], cutoff)?;
+            collapsed += bucket_host(&tx, "cpu_usage", &["percent"], lower_bound, cutoff)?;
             collapsed += bucket_host(
                 &tx,
                 "memory_usage",
                 &["total", "available", "used", "used_percent", "free"],
+                lower_bound,
                 cutoff,
             )?;
             // Container series: bucket on (time, container_id).
-            collapsed += bucket_container(&tx, "container_cpu_usage", &["percent"], cutoff)?;
+            collapsed += bucket_container(
+                &tx,
+                "container_cpu_usage",
+                &["percent"],
+                lower_bound,
+                cutoff,
+            )?;
             collapsed += bucket_container(
                 &tx,
                 "container_memory_usage",
                 &["total", "available", "used", "used_percent", "free"],
+                lower_bound,
                 cutoff,
+            )?;
+
+            tx.execute(
+                "INSERT INTO sentinel_meta (key, value) VALUES ('downsample_cutoff', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (cutoff,),
             )?;
 
             tx.commit()?;
@@ -69,6 +91,7 @@ fn bucket_host(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
     cols: &[&str],
+    lower_bound: Option<i64>,
     cutoff: i64,
 ) -> rusqlite::Result<u64> {
     // execute_batch runs a multi-statement script and Connection::changes()
@@ -78,32 +101,25 @@ fn bucket_host(
     // rows always collapse into fewer bucket rows, that would systematically
     // under-report "rows collapsed". Count the raw rows directly instead.
     let raw_count: i64 = tx.query_row(
-        &format!("SELECT COUNT(*) FROM {table} WHERE time < ?1"),
-        (cutoff,),
+        &format!("SELECT COUNT(*) FROM {table} WHERE (?1 IS NULL OR time >= ?1) AND time < ?2"),
+        (lower_bound, cutoff),
         |r| r.get(0),
     )?;
 
-    let avg_list = cols
-        .iter()
-        .map(|c| {
-            if *c == "percent" || *c == "used_percent" {
-                format!("AVG({c}) AS {c}")
-            } else {
-                format!("CAST(ROUND(AVG({c})) AS INTEGER) AS {c}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    let avg_list = avg_list(cols);
     let col_list = cols.join(", ");
+    let lower_predicate = lower_bound
+        .map(|value| format!("time >= {value}"))
+        .unwrap_or_else(|| "1 = 1".to_string());
 
     let sql = format!(
         r#"
         CREATE TEMP TABLE _ds AS
         SELECT (time / {BUCKET_MS}) * {BUCKET_MS} AS time, {avg_list}
-        FROM {table} WHERE time < ?1
+        FROM {table} WHERE {lower_predicate} AND time < {cutoff}
         GROUP BY time / {BUCKET_MS};
 
-        DELETE FROM {table} WHERE time < ?1;
+        DELETE FROM {table} WHERE {lower_predicate} AND time < {cutoff};
 
         INSERT OR REPLACE INTO {table} (time, {col_list})
         SELECT time, {col_list} FROM _ds;
@@ -111,8 +127,6 @@ fn bucket_host(
         DROP TABLE _ds;
         "#
     );
-    // execute_batch does not bind parameters, so inline the validated integer.
-    let sql = sql.replace("?1", &cutoff.to_string());
     tx.execute_batch(&sql)?;
     Ok(raw_count as u64)
 }
@@ -121,37 +135,31 @@ fn bucket_container(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
     cols: &[&str],
+    lower_bound: Option<i64>,
     cutoff: i64,
 ) -> rusqlite::Result<u64> {
     // See bucket_host: count raw rows directly rather than trusting
     // Connection::changes() after a multi-statement execute_batch.
     let raw_count: i64 = tx.query_row(
-        &format!("SELECT COUNT(*) FROM {table} WHERE time < ?1"),
-        (cutoff,),
+        &format!("SELECT COUNT(*) FROM {table} WHERE (?1 IS NULL OR time >= ?1) AND time < ?2"),
+        (lower_bound, cutoff),
         |r| r.get(0),
     )?;
 
-    let avg_list = cols
-        .iter()
-        .map(|c| {
-            if *c == "percent" || *c == "used_percent" {
-                format!("AVG({c}) AS {c}")
-            } else {
-                format!("CAST(ROUND(AVG({c})) AS INTEGER) AS {c}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    let avg_list = avg_list(cols);
     let col_list = cols.join(", ");
+    let lower_predicate = lower_bound
+        .map(|value| format!("time >= {value}"))
+        .unwrap_or_else(|| "1 = 1".to_string());
 
     let sql = format!(
         r#"
         CREATE TEMP TABLE _ds AS
         SELECT (time / {BUCKET_MS}) * {BUCKET_MS} AS time, container_id, {avg_list}
-        FROM {table} WHERE time < ?1
+        FROM {table} WHERE {lower_predicate} AND time < {cutoff}
         GROUP BY time / {BUCKET_MS}, container_id;
 
-        DELETE FROM {table} WHERE time < ?1;
+        DELETE FROM {table} WHERE {lower_predicate} AND time < {cutoff};
 
         INSERT OR REPLACE INTO {table} (time, container_id, {col_list})
         SELECT time, container_id, {col_list} FROM _ds;
@@ -159,7 +167,19 @@ fn bucket_container(
         DROP TABLE _ds;
         "#
     );
-    let sql = sql.replace("?1", &cutoff.to_string());
     tx.execute_batch(&sql)?;
     Ok(raw_count as u64)
+}
+
+fn avg_list(cols: &[&str]) -> String {
+    cols.iter()
+        .map(|c| {
+            if *c == "percent" || *c == "used_percent" {
+                format!("ROUND(AVG({c}), 2) AS {c}")
+            } else {
+                format!("CAST(ROUND(AVG({c})) AS INTEGER) AS {c}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }

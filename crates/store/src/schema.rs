@@ -41,10 +41,23 @@ CREATE INDEX IF NOT EXISTS idx_ccu_container_time
     ON container_cpu_usage (container_id, time);
 CREATE INDEX IF NOT EXISTS idx_cmu_container_time
     ON container_memory_usage (container_id, time);
+
+CREATE TABLE IF NOT EXISTS sentinel_meta (
+    key   TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+) STRICT;
 "#;
 
 pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(DDL)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        (table,),
+        |row| row.get(0),
+    )
 }
 
 /// Returns true if a legacy (all-VARCHAR) schema was detected and migrated.
@@ -64,31 +77,39 @@ pub fn migrate_legacy(conn: &Connection) -> rusqlite::Result<bool> {
 
     let tx = conn.unchecked_transaction()?;
 
-    tx.execute_batch(
-        r#"
-        ALTER TABLE cpu_usage              RENAME TO cpu_usage_old;
-        ALTER TABLE memory_usage           RENAME TO memory_usage_old;
-        ALTER TABLE container_cpu_usage    RENAME TO container_cpu_usage_old;
-        ALTER TABLE container_memory_usage RENAME TO container_memory_usage_old;
-        "#,
-    )?;
+    let tables = [
+        "cpu_usage",
+        "memory_usage",
+        "container_cpu_usage",
+        "container_memory_usage",
+    ];
+    let mut present = Vec::new();
+    for table in tables {
+        if table_exists(&tx, table)? {
+            tx.execute_batch(&format!("ALTER TABLE {table} RENAME TO {table}_old"))?;
+            present.push(table);
+        }
+    }
     apply(&tx)?;
 
-    migrate_cpu_usage(&tx)?;
-    migrate_memory_usage(&tx)?;
-    migrate_container_cpu_usage(&tx)?;
-    migrate_container_memory_usage(&tx)?;
+    if present.contains(&"cpu_usage") {
+        migrate_cpu_usage(&tx)?;
+    }
+    if present.contains(&"memory_usage") {
+        migrate_memory_usage(&tx)?;
+    }
+    if present.contains(&"container_cpu_usage") {
+        migrate_container_cpu_usage(&tx)?;
+    }
+    if present.contains(&"container_memory_usage") {
+        migrate_container_memory_usage(&tx)?;
+    }
 
-    tx.execute_batch(
-        r#"
-        DROP TABLE cpu_usage_old;
-        DROP TABLE memory_usage_old;
-        DROP TABLE container_cpu_usage_old;
-        DROP TABLE container_memory_usage_old;
-        -- created and indexed by the Go implementation but never read or written
-        DROP TABLE IF EXISTS container_logs;
-        "#,
-    )?;
+    for table in present {
+        tx.execute_batch(&format!("DROP TABLE {table}_old"))?;
+    }
+    // Created and indexed by the Go implementation but never read or written.
+    tx.execute_batch("DROP TABLE IF EXISTS container_logs")?;
 
     tx.commit()?;
     // VACUUM cannot run inside a transaction. It only reclaims disk space left
@@ -266,22 +287,25 @@ fn migrate_container_memory_usage(tx: &rusqlite::Transaction<'_>) -> rusqlite::R
 }
 
 fn is_legacy(conn: &Connection) -> rusqlite::Result<bool> {
-    let exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cpu_usage'",
-        [],
-        |r| r.get(0),
-    )?;
-    if exists == 0 {
-        return Ok(false);
-    }
-    // table_info reports the declared type; the legacy schema declares VARCHAR.
-    let mut stmt = conn.prepare("SELECT name, type FROM pragma_table_info('cpu_usage')")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(0)?;
-        let ty: String = row.get(1)?;
-        if name == "time" {
-            return Ok(!ty.eq_ignore_ascii_case("INTEGER"));
+    for table in [
+        "cpu_usage",
+        "memory_usage",
+        "container_cpu_usage",
+        "container_memory_usage",
+    ] {
+        if !table_exists(conn, table)? {
+            continue;
+        }
+        // table_info reports the declared type; the legacy schema declares VARCHAR.
+        let sql = format!("SELECT name, type FROM pragma_table_info('{table}')");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            let ty: String = row.get(1)?;
+            if name == "time" && !ty.eq_ignore_ascii_case("INTEGER") {
+                return Ok(true);
+            }
         }
     }
     Ok(false)

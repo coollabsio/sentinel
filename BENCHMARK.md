@@ -175,7 +175,7 @@ After warm-up (≥15 s), sample **5 times** every 2 s:
 | Metric | How |
 |--------|-----|
 | Docker reported usage | `docker stats --no-stream --format '{{.MemUsage}}' "$NAME"` |
-| Process RSS / peak / threads | `docker exec "$NAME" sh -c 'pid=$(pidof sentinel); grep -E "VmRSS|VmHWM|Threads" /proc/$pid/status'` |
+| Process RSS / peak / threads | `docker exec "$NAME" sh -c 'pid=$(pidof sentinel); grep -E "VmRSS[|]VmHWM[|]Threads" /proc/$pid/status'` |
 
 Repeat **after** the load grid (§4.5) and again **after stress** (§4.6) for post-load / post-stress memory.
 
@@ -265,7 +265,7 @@ Stress answers: *“Under a nasty concurrent read mix, does the agent stay corre
 1. Error rate ≤ `--max-error-pct`
 2. Mid-stress health probes all succeed
 3. Post-stress `GET /api/health` returns 200
-4. Optional: p99 ≤ `--max-p99_ms` when set
+4. Optional: p99 ≤ `--max-p99-ms` when set
 
 Exit code **2** on stress failure (so CI can gate).
 
@@ -369,11 +369,11 @@ Unit guard: `cargo test -p collector host_sampler_new_is_fast`.
 
 Copy into `docs/benchmark-results/YYYY-MM-DD-<label>.md`:
 
-```markdown
+````markdown
 # Benchmark results — YYYY-MM-DD
 
 ## System configuration
-```
+```text
 (paste full output of: ./target/release/sentinel-bench sys)
 ```
 
@@ -430,7 +430,7 @@ Copy into `docs/benchmark-results/YYYY-MM-DD-<label>.md`:
 
 ## Notes
 - 
-```
+````
 
 ---
 

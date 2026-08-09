@@ -56,10 +56,11 @@ fn bad_request(field: &str) -> Response {
 }
 
 pub fn internal_error(e: impl std::fmt::Display) -> Response {
+    tracing::error!(error = %e, "API request failed");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorBody {
-            error: e.to_string(),
+            error: "Internal server error".to_string(),
         }),
     )
         .into_response()

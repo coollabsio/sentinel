@@ -21,6 +21,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
 [package]
 name = "sentinel"

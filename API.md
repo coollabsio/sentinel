@@ -245,7 +245,7 @@ Retrieve CPU usage history for a specific Docker container.
 **Path Parameters:**
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `containerId` | string | Yes | Docker container ID (alphanumeric characters only) |
+| `containerId` | string | Yes | Exact container display name recorded by Sentinel |
 
 **Query Parameters:**
 | Parameter | Type | Required | Default | Description |
@@ -272,7 +272,7 @@ Retrieve CPU usage history for a specific Docker container.
 **Example:**
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "http://localhost:8888/api/container/abc123def456/cpu/history?from=2024-01-15T09:00:00Z"
+  "http://localhost:8888/api/container/postgres-db/cpu/history?from=2024-01-15T09:00:00Z"
 ```
 
 ---
@@ -286,7 +286,7 @@ Retrieve memory usage history for a specific Docker container.
 **Path Parameters:**
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `containerId` | string | Yes | Docker container ID (alphanumeric characters only) |
+| `containerId` | string | Yes | Exact container display name recorded by Sentinel |
 
 **Query Parameters:**
 | Parameter | Type | Required | Default | Description |
@@ -321,7 +321,7 @@ Retrieve memory usage history for a specific Docker container.
 **Example:**
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "http://localhost:8888/api/container/abc123def456/memory/history?from=2024-01-15T00:00:00Z&to=2024-01-15T12:00:00Z"
+  "http://localhost:8888/api/container/postgres-db/memory/history?from=2024-01-15T00:00:00Z&to=2024-01-15T12:00:00Z"
 ```
 
 ---

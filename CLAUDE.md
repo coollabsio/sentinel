@@ -9,7 +9,8 @@ Sentinel is an API for gathering Linux server and Docker Engine metrics, built f
 
 ### Building and Running
 ```bash
-cargo watch -x run     # hot reload (replaces air)
+cargo install cargo-watch
+TOKEN=your-secret-token cargo watch -x run     # hot reload (replaces air)
 cargo build --release  # build
 cargo test --workspace # test
 docker build -t sentinel .

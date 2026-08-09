@@ -83,6 +83,77 @@ fn migration_is_idempotent() {
 }
 
 #[test]
+fn migrates_available_legacy_tables_when_one_is_missing() {
+    let dir = tmpdir("partial");
+    let path = dir.join("m.sqlite");
+    let _ = std::fs::remove_file(&path);
+    legacy_db(&path);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("DROP TABLE memory_usage", [])
+        .unwrap();
+
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 2);
+    assert!(s.memory_history(0, i64::MAX).unwrap().is_empty());
+    assert_eq!(
+        s.container_cpu_history("web", 0, i64::MAX).unwrap().len(),
+        1
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn detects_legacy_schema_when_cpu_table_is_missing() {
+    let dir = tmpdir("partial-no-cpu");
+    let path = dir.join("m.sqlite");
+    let _ = std::fs::remove_file(&path);
+    legacy_db(&path);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("DROP TABLE cpu_usage", [])
+        .unwrap();
+
+    let s = Store::open(&path).unwrap();
+    assert!(s.cpu_history(0, i64::MAX).unwrap().is_empty());
+    assert_eq!(s.memory_history(0, i64::MAX).unwrap().len(), 1);
+    assert_eq!(
+        s.container_cpu_history("web", 0, i64::MAX).unwrap().len(),
+        1
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn recovery_moves_sqlite_sidecars_using_appended_suffixes() {
+    let dir = tmpdir("sidecars");
+    let path = dir.join("metrics.db");
+    let backup = path.with_extension("legacy-backup.sqlite");
+    std::fs::write(&path, b"not sqlite").unwrap();
+    let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+    let shm = std::path::PathBuf::from(format!("{}-shm", path.display()));
+    std::fs::write(&wal, b"wal").unwrap();
+    std::fs::write(&shm, b"shm").unwrap();
+
+    Store::open(&path).unwrap();
+
+    assert!(backup.exists());
+    assert_ne!(
+        std::fs::read(&wal).unwrap_or_default(),
+        b"wal",
+        "the stale WAL must be removed before SQLite creates a fresh sidecar"
+    );
+    assert_ne!(
+        std::fs::read(&shm).unwrap_or_default(),
+        b"shm",
+        "the stale SHM must be removed before SQLite creates a fresh sidecar"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn skips_unparseable_rows_instead_of_failing() {
     // Three distinct corruption shapes. SQL `CAST` would silently coerce all
     // of these to 0/0.0 rather than skip them — this test only passes if

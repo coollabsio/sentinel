@@ -22,6 +22,8 @@ pub enum PushError {
     Http(#[from] reqwest::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("time format: {0}")]
+    TimeFormat(#[from] time::error::Format),
     #[error("push to {url} returned {status}: {body}")]
     Status {
         url: String,
@@ -147,9 +149,7 @@ impl Pusher {
 
         // One timestamp for the whole cycle so every container in a push shares
         // it, rather than each row carrying its own inspect-completion instant.
-        let now = time::OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .unwrap_or_default();
+        let now = time::OffsetDateTime::now_utc().format(&Rfc3339)?;
 
         let mut out = Vec::with_capacity(total);
         let mut tasks = JoinSet::new();

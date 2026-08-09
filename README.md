@@ -53,7 +53,7 @@ TOKEN=your-secret-token cargo run
 cargo install cargo-watch
 
 # Run with hot reload
-cargo watch -x run
+TOKEN=your-secret-token cargo watch -x run
 ```
 
 ## Configuration

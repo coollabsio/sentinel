@@ -7,6 +7,17 @@ use tokio::sync::{Mutex, watch};
 
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+fn unexpected_service_exit(
+    result: Option<Result<Result<(), String>, tokio::task::JoinError>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match result {
+        Some(Ok(Ok(()))) => Err("required service stopped unexpectedly".into()),
+        Some(Ok(Err(error))) => Err(error.into()),
+        Some(Err(error)) => Err(format!("required service task failed: {error}").into()),
+        None => Err("all required services stopped unexpectedly".into()),
+    }
+}
+
 /// Bind the API listener. `addr` is the dual-stack `[::]` address from config;
 /// on hosts where IPv6 is disabled that bind fails (EAFNOSUPPORT /
 /// EADDRNOTAVAIL), so fall back to the equivalent IPv4 `0.0.0.0` address. This
@@ -119,11 +130,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let app = api::router(state);
         let mut rx = shutdown_rx.clone();
         services.spawn(async move {
-            let _ = axum::serve(listener, app)
+            axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     let _ = rx.changed().await;
                 })
-                .await;
+                .await
+                .map_err(|error| format!("API service failed: {error}"))
         });
     }
 
@@ -132,7 +144,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Collector
     if config.collector_enabled {
         let c = collector::Collector::new(config.clone(), store.clone(), docker.clone());
-        services.spawn(c.run(shutdown_rx.clone()));
+        let rx = shutdown_rx.clone();
+        services.spawn(async move {
+            c.run(rx).await;
+            Ok::<(), String>(())
+        });
     } else {
         tracing::info!("collector disabled");
     }
@@ -140,7 +156,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Pusher
     {
         let pusher = push::Pusher::new(config.clone(), docker.clone())?;
-        services.spawn(pusher.run(shutdown_rx.clone()));
+        let rx = shutdown_rx.clone();
+        services.spawn(async move {
+            pusher.run(rx).await;
+            Ok::<(), String>(())
+        });
     }
 
     // Retention: cleanup + downsample, daily, with one pass at startup.
@@ -152,7 +172,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
             loop {
                 tokio::select! {
-                    _ = rx.changed() => return,
+                    _ = rx.changed() => return Ok::<(), String>(()),
                     _ = ticker.tick() => {
                         let s = store.clone();
                         let result = tokio::task::spawn_blocking(move || {
@@ -175,7 +195,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    wait_for_signal().await;
+    tokio::select! {
+        _ = wait_for_signal() => {}
+        result = services.join_next() => return unexpected_service_exit(result),
+    }
     tracing::info!("shutdown signal received");
     let _ = shutdown_tx.send(true);
 
@@ -203,6 +226,28 @@ async fn wait_for_signal() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => tracing::info!("received interrupt"),
         _ = term.recv() => tracing::info!("received SIGTERM"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unexpected_service_exit;
+
+    #[test]
+    fn a_clean_service_exit_is_still_unexpected_before_shutdown() {
+        let result = unexpected_service_exit(Some(Ok(Ok(()))));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("stopped unexpectedly")
+        );
+    }
+
+    #[test]
+    fn a_service_error_is_propagated() {
+        let result = unexpected_service_exit(Some(Ok(Err("api failed".into()))));
+        assert_eq!(result.unwrap_err().to_string(), "api failed");
     }
 }
 

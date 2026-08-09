@@ -375,8 +375,6 @@ async fn run_load_cell(
 ) -> Snapshot {
     let stats = Arc::new(Stats::new(sample_cap));
     let stop = Arc::new(AtomicBool::new(false));
-    let sem = Arc::new(Semaphore::new(concurrency));
-
     let deadline = Instant::now() + duration;
     let mut handles = Vec::with_capacity(concurrency);
 
@@ -386,21 +384,15 @@ async fn run_load_cell(
         let token = token.to_string();
         let stats = stats.clone();
         let stop = stop.clone();
-        let sem = sem.clone();
         handles.push(tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-                let Ok(permit) = sem.clone().acquire_owned().await else {
-                    break;
-                };
                 if Instant::now() >= deadline || stop.load(Ordering::Relaxed) {
-                    drop(permit);
                     break;
                 }
                 match one_get(&client, &url, &token).await {
                     Ok((200, d)) => stats.record_ok(d.as_micros() as u64),
                     Ok(_) | Err(_) => stats.record_fail(),
                 }
-                drop(permit);
             }
         }));
     }

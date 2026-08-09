@@ -56,6 +56,16 @@ async fn get_text(app: axum::Router, uri: &str) -> (StatusCode, String) {
 }
 
 #[tokio::test]
+async fn internal_errors_do_not_expose_the_underlying_message() {
+    let response = api::routes::cpu::internal_error("/app/db/metrics.sqlite is corrupt");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"], "Internal server error");
+    assert!(!body.to_string().contains("metrics.sqlite"));
+}
+
+#[tokio::test]
 async fn health_and_version_are_public_plain_text() {
     let (s, body) = get_text(router(state(false)), "/api/health").await;
     assert_eq!(s, StatusCode::OK);

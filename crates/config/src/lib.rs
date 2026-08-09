@@ -65,7 +65,8 @@ impl Config {
         let push_interval_seconds = positive_from_env("PUSH_INTERVAL_SECONDS", 60)?;
         let refresh_rate_seconds = positive_from_env("COLLECTOR_REFRESH_RATE_SECONDS", 5)?;
         let collector_retention_period_days =
-            positive_from_env("COLLECTOR_RETENTION_PERIOD_DAYS", 7)? as u32;
+            u32::try_from(positive_from_env("COLLECTOR_RETENTION_PERIOD_DAYS", 7)?)
+                .map_err(|_| ConfigError::NotPositive("COLLECTOR_RETENTION_PERIOD_DAYS"))?;
 
         let port: u16 = match non_empty("PORT") {
             None => 8888,
@@ -183,7 +184,7 @@ fn validate_endpoint(endpoint: &str) -> Result<(), ConfigError> {
     }
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
-    if authority.is_empty() || authority.contains('@') {
+    if authority.is_empty() || authority.contains('@') || authority.starts_with(':') {
         return Err(ConfigError::InvalidEndpoint);
     }
     let remainder = &rest[authority_end..];
@@ -319,6 +320,32 @@ mod tests {
             assert!(matches!(
                 Config::load(false),
                 Err(ConfigError::NotPositive(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_retention_period_above_u32_max() {
+        let _l = env_lock().lock().unwrap();
+        let _g = EnvGuard::set(&[
+            ("TOKEN", "t"),
+            ("PUSH_ENDPOINT", "https://example.com"),
+            ("COLLECTOR_RETENTION_PERIOD_DAYS", "4294967296"),
+        ]);
+        assert!(matches!(
+            Config::load(false),
+            Err(ConfigError::NotPositive("COLLECTOR_RETENTION_PERIOD_DAYS"))
+        ));
+    }
+
+    #[test]
+    fn rejects_endpoint_without_a_host() {
+        for bad in ["http://:443", "https://:8443/path"] {
+            let _l = env_lock().lock().unwrap();
+            let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", bad)]);
+            assert!(matches!(
+                Config::load(false),
+                Err(ConfigError::InvalidEndpoint)
             ));
         }
     }

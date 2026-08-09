@@ -165,7 +165,7 @@ paths:
         - name: containerId
           in: path
           required: true
-          description: Docker container ID (alphanumeric characters only)
+          description: Exact container display name recorded by Sentinel
           schema:
             type: string
             pattern: '^[a-zA-Z0-9]+$'
@@ -200,7 +200,7 @@ paths:
         - name: containerId
           in: path
           required: true
-          description: Docker container ID (alphanumeric characters only)
+          description: Exact container display name recorded by Sentinel
           schema:
             type: string
             pattern: '^[a-zA-Z0-9]+$'
