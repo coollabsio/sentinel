@@ -13,9 +13,16 @@
 //!   value) for every other cardinality-bound dimension (country, device,
 //!   status class, ...), instead of a wide table per dimension.
 //!
-//! [`AnalyticsStore::flush_window`] only ever writes the `1m` tier — rolling
-//! `1m` up into `1h`/`1d` is a later task's compaction job, not this module's
-//! concern.
+//! [`AnalyticsStore::flush_window`] only ever writes the `1m` tier. Rolling
+//! `1m` up into `1h`/`1d` is compaction's job, and it lives in the `traffic`
+//! crate (`traffic::compaction`) because merging the persisted sketch BLOBs
+//! needs that crate's sketch types — a `store → traffic` dependency would be
+//! a cycle. This module therefore exposes only the raw primitives compaction
+//! drives: [`AnalyticsStore::stats_rows_between`] and friends to read a
+//! window across all apps, [`AnalyticsStore::write_rows`] to write merged
+//! rows into any tier, and [`AnalyticsStore::delete_before`] to drop the
+//! consumed finer-tier rows. [`AnalyticsStore::retention`] is pure SQL
+//! deletion with no sketch involvement, so it does live here.
 
 use rusqlite::Connection;
 use std::path::Path;
@@ -24,8 +31,8 @@ use std::sync::{Arc, Mutex};
 use crate::StoreError;
 
 /// Typed, STRICT schema for all three roll-up tiers. `1h`/`1d` tables are
-/// created up front (compaction, a later task, writes into them) even though
-/// `flush_window` here only ever inserts into the `1m` tables.
+/// written by compaction (via `write_rows`), while `flush_window` only ever
+/// inserts into the `1m` tables.
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS traffic_stats_1m (
     bucket          INTEGER NOT NULL,
@@ -338,28 +345,43 @@ impl AnalyticsStore {
         f(&guard)
     }
 
-    /// Writes one minute-window's worth of aggregated rows in a single
-    /// transaction. Only ever targets the `_1m` tier — rolling `1m` up into
-    /// `1h`/`1d` is compaction's job (a later task), not this method's.
-    ///
-    /// `ON CONFLICT` sums the count/byte columns but *replaces* the sketch
-    /// blobs (`latency_tdigest`, `uniques_hll`) with the incoming value:
-    /// callers already hand over fully-merged sketches for the window, so
-    /// summing raw bytes would be meaningless. Under normal operation each
-    /// `(bucket, app, host)` is flushed exactly once, so the replace-not-merge
-    /// behavior is only ever exercised by compaction's later idempotent
-    /// re-flush case.
+    /// Writes one minute-window's worth of aggregated rows to the `_1m`
+    /// tier. Thin wrapper over [`Self::write_rows`], kept as the name the
+    /// minute-flush path uses.
     pub fn flush_window(
         &self,
         stats: &[StatsRow],
         paths: &[PathRow],
         breakdown: &[BreakdownRow],
     ) -> Result<(), StoreError> {
+        self.write_rows(Tier::M1, stats, paths, breakdown)
+    }
+
+    /// Writes a batch of aggregated rows into `tier`'s three tables in a
+    /// single transaction. The minute-flush uses [`Tier::M1`] (via
+    /// [`Self::flush_window`]); compaction (in the `traffic` crate) uses
+    /// [`Tier::H1`]/[`Tier::D1`] with rows it has already merged.
+    ///
+    /// `ON CONFLICT` sums the count/byte columns but *replaces* the sketch
+    /// blobs (`latency_tdigest`, `uniques_hll`) with the incoming value:
+    /// callers already hand over fully-merged sketches for the window, so
+    /// summing raw bytes would be meaningless. Under normal operation each
+    /// `(bucket, app, host)` is written exactly once per tier, so the
+    /// replace-not-merge behavior is only ever exercised by compaction's
+    /// idempotent re-write case.
+    pub fn write_rows(
+        &self,
+        tier: Tier,
+        stats: &[StatsRow],
+        paths: &[PathRow],
+        breakdown: &[BreakdownRow],
+    ) -> Result<(), StoreError> {
+        let sfx = suffix(tier);
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
             {
-                let mut ins = tx.prepare_cached(
-                    "INSERT INTO traffic_stats_1m
+                let sql = format!(
+                    "INSERT INTO traffic_stats_{sfx}
                         (bucket, app, host, requests, bytes_in, bytes_out, s2xx, s3xx, s4xx, s5xx, latency_tdigest, uniques_hll)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                      ON CONFLICT(bucket, app, host) DO UPDATE SET
@@ -371,8 +393,9 @@ impl AnalyticsStore {
                         s4xx = s4xx + excluded.s4xx,
                         s5xx = s5xx + excluded.s5xx,
                         latency_tdigest = excluded.latency_tdigest,
-                        uniques_hll = excluded.uniques_hll",
-                )?;
+                        uniques_hll = excluded.uniques_hll"
+                );
+                let mut ins = tx.prepare_cached(&sql)?;
                 for r in stats {
                     ins.execute((
                         r.bucket,
@@ -391,15 +414,16 @@ impl AnalyticsStore {
                 }
             }
             {
-                let mut ins = tx.prepare_cached(
-                    "INSERT INTO traffic_paths_1m
+                let sql = format!(
+                    "INSERT INTO traffic_paths_{sfx}
                         (bucket, app, path, requests, bytes_out, latency_tdigest)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(bucket, app, path) DO UPDATE SET
                         requests = requests + excluded.requests,
                         bytes_out = bytes_out + excluded.bytes_out,
-                        latency_tdigest = excluded.latency_tdigest",
-                )?;
+                        latency_tdigest = excluded.latency_tdigest"
+                );
+                let mut ins = tx.prepare_cached(&sql)?;
                 for r in paths {
                     ins.execute((
                         r.bucket,
@@ -412,14 +436,15 @@ impl AnalyticsStore {
                 }
             }
             {
-                let mut ins = tx.prepare_cached(
-                    "INSERT INTO traffic_breakdown_1m
+                let sql = format!(
+                    "INSERT INTO traffic_breakdown_{sfx}
                         (bucket, app, dimension, value, requests, bytes_out)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT(bucket, app, dimension, value) DO UPDATE SET
                         requests = requests + excluded.requests,
-                        bytes_out = bytes_out + excluded.bytes_out",
-                )?;
+                        bytes_out = bytes_out + excluded.bytes_out"
+                );
+                let mut ins = tx.prepare_cached(&sql)?;
                 for r in breakdown {
                     ins.execute((r.bucket, &r.app, &r.dimension, &r.value, r.requests, r.bytes_out))?;
                 }
@@ -527,6 +552,175 @@ impl AnalyticsStore {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
+        })
+    }
+
+    /// Every `tier` stats row in the half-open bucket window `[from, to)`,
+    /// across *all* apps. Compaction needs the whole window regardless of
+    /// app, so unlike [`Self::stats_range`] this takes no app filter and no
+    /// limit.
+    pub fn stats_rows_between(
+        &self,
+        tier: Tier,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<StatsRow>, StoreError> {
+        self.with_reader(|c| {
+            let sql = format!(
+                "SELECT bucket, app, host, requests, bytes_in, bytes_out, s2xx, s3xx, s4xx, s5xx, latency_tdigest, uniques_hll
+                 FROM traffic_stats_{} WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
+                suffix(tier)
+            );
+            let mut stmt = c.prepare_cached(&sql)?;
+            let rows = stmt
+                .query_map((from, to), |r| {
+                    Ok(StatsRow {
+                        bucket: r.get(0)?,
+                        app: r.get(1)?,
+                        host: r.get(2)?,
+                        requests: r.get(3)?,
+                        bytes_in: r.get(4)?,
+                        bytes_out: r.get(5)?,
+                        s2xx: r.get(6)?,
+                        s3xx: r.get(7)?,
+                        s4xx: r.get(8)?,
+                        s5xx: r.get(9)?,
+                        latency_tdigest: r.get(10)?,
+                        uniques_hll: r.get(11)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Every `tier` path row in the half-open bucket window `[from, to)`,
+    /// across all apps. See [`Self::stats_rows_between`].
+    pub fn paths_rows_between(
+        &self,
+        tier: Tier,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<PathRow>, StoreError> {
+        self.with_reader(|c| {
+            let sql = format!(
+                "SELECT bucket, app, path, requests, bytes_out, latency_tdigest
+                 FROM traffic_paths_{} WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
+                suffix(tier)
+            );
+            let mut stmt = c.prepare_cached(&sql)?;
+            let rows = stmt
+                .query_map((from, to), |r| {
+                    Ok(PathRow {
+                        bucket: r.get(0)?,
+                        app: r.get(1)?,
+                        path: r.get(2)?,
+                        requests: r.get(3)?,
+                        bytes_out: r.get(4)?,
+                        latency_tdigest: r.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Every `tier` breakdown row in the half-open bucket window
+    /// `[from, to)`, across all apps and all dimensions. See
+    /// [`Self::stats_rows_between`].
+    pub fn breakdown_rows_between(
+        &self,
+        tier: Tier,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<BreakdownRow>, StoreError> {
+        self.with_reader(|c| {
+            let sql = format!(
+                "SELECT bucket, app, dimension, value, requests, bytes_out
+                 FROM traffic_breakdown_{} WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
+                suffix(tier)
+            );
+            let mut stmt = c.prepare_cached(&sql)?;
+            let rows = stmt
+                .query_map((from, to), |r| {
+                    Ok(BreakdownRow {
+                        bucket: r.get(0)?,
+                        app: r.get(1)?,
+                        dimension: r.get(2)?,
+                        value: r.get(3)?,
+                        requests: r.get(4)?,
+                        bytes_out: r.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Deletes `tier` stats rows strictly older than `cutoff`; returns the
+    /// number of rows removed.
+    pub fn delete_stats_before(&self, tier: Tier, cutoff: i64) -> Result<usize, StoreError> {
+        self.delete_table_before("traffic_stats", tier, cutoff)
+    }
+
+    /// Deletes `tier` path rows strictly older than `cutoff`; returns the
+    /// number of rows removed.
+    pub fn delete_paths_before(&self, tier: Tier, cutoff: i64) -> Result<usize, StoreError> {
+        self.delete_table_before("traffic_paths", tier, cutoff)
+    }
+
+    /// Deletes `tier` breakdown rows strictly older than `cutoff`; returns
+    /// the number of rows removed.
+    pub fn delete_breakdown_before(&self, tier: Tier, cutoff: i64) -> Result<usize, StoreError> {
+        self.delete_table_before("traffic_breakdown", tier, cutoff)
+    }
+
+    /// Deletes every `tier` row (stats + paths + breakdown) strictly older
+    /// than `cutoff`; returns the total number of rows removed.
+    pub fn delete_before(&self, tier: Tier, cutoff: i64) -> Result<usize, StoreError> {
+        Ok(self.delete_stats_before(tier, cutoff)?
+            + self.delete_paths_before(tier, cutoff)?
+            + self.delete_breakdown_before(tier, cutoff)?)
+    }
+
+    /// Applies the per-tier retention windows (spec defaults: 48h / 30d /
+    /// 395d), deleting everything older than `now - window` in each tier;
+    /// returns the total number of rows removed.
+    ///
+    /// Pure deletion — no sketch merging happens here (that lives in the
+    /// `traffic` crate's compaction, which is what *produces* the `1h`/`1d`
+    /// rows this method later expires).
+    pub fn retention(
+        &self,
+        now: i64,
+        m1_hours: u32,
+        h1_days: u32,
+        d1_days: u32,
+    ) -> Result<usize, StoreError> {
+        const HOUR_MS: i64 = 3_600_000;
+        const DAY_MS: i64 = 86_400_000;
+        // Saturating throughout: a pathologically large configured window
+        // must clamp the cutoff at i64::MIN (delete nothing), never wrap
+        // around into a future timestamp (delete everything).
+        let m1_cutoff = now.saturating_sub((m1_hours as i64).saturating_mul(HOUR_MS));
+        let h1_cutoff = now.saturating_sub((h1_days as i64).saturating_mul(DAY_MS));
+        let d1_cutoff = now.saturating_sub((d1_days as i64).saturating_mul(DAY_MS));
+
+        Ok(self.delete_before(Tier::M1, m1_cutoff)?
+            + self.delete_before(Tier::H1, h1_cutoff)?
+            + self.delete_before(Tier::D1, d1_cutoff)?)
+    }
+
+    fn delete_table_before(
+        &self,
+        table: &str,
+        tier: Tier,
+        cutoff: i64,
+    ) -> Result<usize, StoreError> {
+        self.with_conn(|c| {
+            let sql = format!("DELETE FROM {}_{} WHERE bucket < ?1", table, suffix(tier));
+            let mut stmt = c.prepare_cached(&sql)?;
+            Ok(stmt.execute((cutoff,))?)
         })
     }
 
@@ -670,6 +864,344 @@ mod tests {
         s.flush_window(&rows, &[], &[]).unwrap();
         let apps = s.apps().unwrap();
         assert_eq!(apps, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    fn path_row(bucket: i64, app: &str, path: &str, requests: i64) -> PathRow {
+        PathRow {
+            bucket,
+            app: app.into(),
+            path: path.into(),
+            requests,
+            bytes_out: 20,
+            latency_tdigest: vec![1],
+        }
+    }
+
+    fn breakdown_row(
+        bucket: i64,
+        app: &str,
+        dim: &str,
+        value: &str,
+        requests: i64,
+    ) -> BreakdownRow {
+        BreakdownRow {
+            bucket,
+            app: app.into(),
+            dimension: dim.into(),
+            value: value.into(),
+            requests,
+            bytes_out: 20,
+        }
+    }
+
+    const HOUR_MS: i64 = 3_600_000;
+    const DAY_MS: i64 = 86_400_000;
+
+    /// The `flush_window` -> `write_rows(Tier::M1, ..)` refactor must not
+    /// change `_1m` behavior: both entry points write the same rows to the
+    /// same tier, and both still upsert-accumulate on conflict.
+    #[test]
+    fn write_rows_m1_matches_flush_window() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        s.flush_window(
+            &[stats_row(60_000, "a", "h", 5, vec![1, 2], vec![3, 4])],
+            &[path_row(60_000, "a", "/x", 5)],
+            &[breakdown_row(60_000, "a", "country", "US", 5)],
+        )
+        .unwrap();
+        s.write_rows(
+            Tier::M1,
+            &[stats_row(60_000, "a", "h", 3, vec![7, 8], vec![9, 9])],
+            &[path_row(60_000, "a", "/x", 3)],
+            &[breakdown_row(60_000, "a", "country", "US", 3)],
+        )
+        .unwrap();
+
+        let stats = s.stats_range(Tier::M1, "a", 0, 120_000).unwrap();
+        assert_eq!(stats.len(), 1, "write_rows must target the same _1m table");
+        assert_eq!(stats[0].requests, 8, "counts accumulate identically");
+        assert_eq!(stats[0].latency_tdigest, vec![7, 8], "sketch blobs replace");
+
+        let paths = s.paths_range(Tier::M1, "a", 0, 120_000, 10).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].requests, 8);
+
+        let bd = s
+            .breakdown_range(Tier::M1, "a", "country", 0, 120_000, 10)
+            .unwrap();
+        assert_eq!(bd.len(), 1);
+        assert_eq!(bd[0].requests, 8);
+    }
+
+    /// `write_rows` addresses whichever tier it is handed; a `1h` write must
+    /// not leak into `1m` (or vice versa).
+    #[test]
+    fn write_rows_targets_the_requested_tier() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        s.write_rows(
+            Tier::H1,
+            &[stats_row(HOUR_MS, "a", "h", 7, vec![], vec![])],
+            &[path_row(HOUR_MS, "a", "/x", 7)],
+            &[breakdown_row(HOUR_MS, "a", "country", "US", 7)],
+        )
+        .unwrap();
+
+        assert_eq!(s.stats_range(Tier::H1, "a", 0, i64::MAX).unwrap().len(), 1);
+        assert!(
+            s.stats_range(Tier::M1, "a", 0, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.paths_range(Tier::H1, "a", 0, i64::MAX, 10).unwrap().len(),
+            1
+        );
+        assert!(
+            s.paths_range(Tier::M1, "a", 0, i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.breakdown_range(Tier::H1, "a", "country", 0, i64::MAX, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            s.breakdown_range(Tier::M1, "a", "country", 0, i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The `*_rows_between` bulk reads are unfiltered by app — compaction
+    /// needs every app's rows in the window, not one app's.
+    #[test]
+    fn rows_between_spans_all_apps_and_honors_bounds() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        s.flush_window(
+            &[
+                stats_row(100, "a", "h", 1, vec![], vec![]),
+                stats_row(200, "b", "h", 1, vec![], vec![]),
+                stats_row(300, "c", "h", 1, vec![], vec![]),
+            ],
+            &[
+                path_row(100, "a", "/x", 1),
+                path_row(200, "b", "/y", 1),
+                path_row(300, "c", "/z", 1),
+            ],
+            &[
+                breakdown_row(100, "a", "country", "US", 1),
+                breakdown_row(200, "b", "country", "DE", 1),
+                breakdown_row(300, "c", "country", "FR", 1),
+            ],
+        )
+        .unwrap();
+
+        let stats = s.stats_rows_between(Tier::M1, i64::MIN, 300).unwrap();
+        let apps: Vec<&str> = stats.iter().map(|r| r.app.as_str()).collect();
+        assert_eq!(
+            apps,
+            vec!["a", "b"],
+            "half-open [from, to): bucket 300 is excluded, all apps included"
+        );
+
+        let paths = s.paths_rows_between(Tier::M1, i64::MIN, 300).unwrap();
+        assert_eq!(paths.len(), 2);
+        let bd = s.breakdown_rows_between(Tier::M1, i64::MIN, 300).unwrap();
+        assert_eq!(bd.len(), 2);
+
+        assert_eq!(
+            s.stats_rows_between(Tier::M1, i64::MIN, i64::MAX)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    /// `delete_before` is strictly-older-than: the row exactly at the cutoff
+    /// survives, as do newer rows.
+    #[test]
+    fn delete_before_removes_only_strictly_older_rows() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        s.flush_window(
+            &[
+                stats_row(100, "a", "h", 1, vec![], vec![]),
+                stats_row(200, "a", "h", 1, vec![], vec![]),
+                stats_row(300, "a", "h", 1, vec![], vec![]),
+            ],
+            &[
+                path_row(100, "a", "/x", 1),
+                path_row(200, "a", "/x", 1),
+                path_row(300, "a", "/x", 1),
+            ],
+            &[
+                breakdown_row(100, "a", "country", "US", 1),
+                breakdown_row(200, "a", "country", "US", 1),
+                breakdown_row(300, "a", "country", "US", 1),
+            ],
+        )
+        .unwrap();
+
+        let deleted = s.delete_before(Tier::M1, 200).unwrap();
+        assert_eq!(deleted, 3, "one row per table, only the bucket-100 rows");
+
+        let stats = s.stats_rows_between(Tier::M1, i64::MIN, i64::MAX).unwrap();
+        assert_eq!(
+            stats.iter().map(|r| r.bucket).collect::<Vec<_>>(),
+            vec![200, 300],
+            "the row exactly at the cutoff must survive"
+        );
+        assert_eq!(
+            s.paths_rows_between(Tier::M1, i64::MIN, i64::MAX)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            s.breakdown_rows_between(Tier::M1, i64::MIN, i64::MAX)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// Per-table deletes are tier-scoped: deleting from `1m` leaves `1h`
+    /// and `1d` untouched.
+    #[test]
+    fn delete_before_is_tier_scoped() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        for tier in [Tier::M1, Tier::H1, Tier::D1] {
+            s.write_rows(
+                tier,
+                &[stats_row(100, "a", "h", 1, vec![], vec![])],
+                &[path_row(100, "a", "/x", 1)],
+                &[breakdown_row(100, "a", "country", "US", 1)],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(s.delete_stats_before(Tier::M1, 200).unwrap(), 1);
+        assert_eq!(s.delete_paths_before(Tier::M1, 200).unwrap(), 1);
+        assert_eq!(s.delete_breakdown_before(Tier::M1, 200).unwrap(), 1);
+
+        assert!(
+            s.stats_rows_between(Tier::M1, i64::MIN, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.stats_rows_between(Tier::H1, i64::MIN, i64::MAX)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            s.stats_rows_between(Tier::D1, i64::MIN, i64::MAX)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Retention applies a per-tier cutoff (`now - window`) across all three
+    /// tiers in one call, keeping rows at or newer than each cutoff.
+    #[test]
+    fn retention_applies_per_tier_cutoffs() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        let now = 1_000 * DAY_MS;
+
+        // 1m tier: 48h window -> 47h old survives, 49h old goes.
+        s.write_rows(
+            Tier::M1,
+            &[
+                stats_row(now - 47 * HOUR_MS, "a", "h", 1, vec![], vec![]),
+                stats_row(now - 49 * HOUR_MS, "a", "h", 1, vec![], vec![]),
+            ],
+            &[
+                path_row(now - 47 * HOUR_MS, "a", "/x", 1),
+                path_row(now - 49 * HOUR_MS, "a", "/x", 1),
+            ],
+            &[],
+        )
+        .unwrap();
+        // 1h tier: 30d window -> 29d survives, 31d goes.
+        s.write_rows(
+            Tier::H1,
+            &[
+                stats_row(now - 29 * DAY_MS, "a", "h", 1, vec![], vec![]),
+                stats_row(now - 31 * DAY_MS, "a", "h", 1, vec![], vec![]),
+            ],
+            &[],
+            &[],
+        )
+        .unwrap();
+        // 1d tier: 395d window -> 394d survives, 396d goes.
+        s.write_rows(
+            Tier::D1,
+            &[
+                stats_row(now - 394 * DAY_MS, "a", "h", 1, vec![], vec![]),
+                stats_row(now - 396 * DAY_MS, "a", "h", 1, vec![], vec![]),
+            ],
+            &[],
+            &[breakdown_row(now - 396 * DAY_MS, "a", "country", "US", 1)],
+        )
+        .unwrap();
+
+        let deleted = s.retention(now, 48, 30, 395).unwrap();
+        assert_eq!(
+            deleted, 5,
+            "1m: 1 stats + 1 paths, 1h: 1 stats, 1d: 1 stats + 1 breakdown"
+        );
+
+        let m1 = s.stats_rows_between(Tier::M1, i64::MIN, i64::MAX).unwrap();
+        assert_eq!(m1.len(), 1);
+        assert_eq!(m1[0].bucket, now - 47 * HOUR_MS);
+        assert_eq!(
+            s.paths_rows_between(Tier::M1, i64::MIN, i64::MAX)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let h1 = s.stats_rows_between(Tier::H1, i64::MIN, i64::MAX).unwrap();
+        assert_eq!(h1.len(), 1);
+        assert_eq!(h1[0].bucket, now - 29 * DAY_MS);
+
+        let d1 = s.stats_rows_between(Tier::D1, i64::MIN, i64::MAX).unwrap();
+        assert_eq!(d1.len(), 1);
+        assert_eq!(d1[0].bucket, now - 394 * DAY_MS);
+        assert!(
+            s.breakdown_rows_between(Tier::D1, i64::MIN, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A retention window wide enough to predate the epoch must not overflow
+    /// into a positive cutoff (which would delete everything).
+    #[test]
+    fn retention_saturates_instead_of_overflowing() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        s.write_rows(
+            Tier::D1,
+            &[stats_row(0, "a", "h", 1, vec![], vec![])],
+            &[],
+            &[],
+        )
+        .unwrap();
+        // u32::MAX days is ~1.1e7 years of milliseconds: the subtraction must
+        // saturate at i64::MIN, not wrap.
+        let deleted = s
+            .retention(i64::MIN + 1, u32::MAX, u32::MAX, u32::MAX)
+            .unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(
+            s.stats_rows_between(Tier::D1, i64::MIN, i64::MAX)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

@@ -5,14 +5,15 @@
 // the only file where an `unsafe` block can compile at all.
 #![deny(unsafe_code)]
 
-pub mod event;
-pub mod parser;
-pub mod sketches;
-pub mod enrich;
 pub mod aggregator;
-pub mod tailer;
+pub mod compaction;
+pub mod enrich;
+pub mod event;
 pub mod geoip;
+pub mod parser;
 pub mod service;
+pub mod sketches;
+pub mod tailer;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrafficError {
