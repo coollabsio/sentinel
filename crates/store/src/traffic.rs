@@ -18,11 +18,16 @@
 //! crate (`traffic::compaction`) because merging the persisted sketch BLOBs
 //! needs that crate's sketch types — a `store → traffic` dependency would be
 //! a cycle. This module therefore exposes only the raw primitives compaction
-//! drives: [`AnalyticsStore::stats_rows_between`] and friends to read a
-//! window across all apps, [`AnalyticsStore::write_rows`] to write merged
-//! rows into any tier, and [`AnalyticsStore::delete_before`] to drop the
-//! consumed finer-tier rows. [`AnalyticsStore::retention`] is pure SQL
-//! deletion with no sketch involvement, so it does live here.
+//! drives: [`AnalyticsStore::distinct_buckets_before`] to enumerate the
+//! coarse buckets that have finer-tier data waiting, and
+//! [`AnalyticsStore::compact_window`] to move one such bucket up a tier
+//! atomically — it reads the finer rows, calls back into the `traffic` crate
+//! to merge them (the one step that needs the sketch types), writes the
+//! result, and deletes what it consumed, all inside one transaction on the
+//! writer connection. [`AnalyticsStore::stats_rows_between`] and friends
+//! remain for read-only inspection (and tests).
+//! [`AnalyticsStore::retention`] is pure SQL deletion with no sketch
+//! involvement, so it does live here.
 
 use rusqlite::Connection;
 use std::path::Path;
@@ -209,6 +214,29 @@ pub struct BreakdownRow {
     pub bytes_out: i64,
 }
 
+/// One bucket window's rows across all three tables of a single tier.
+///
+/// Exists so [`AnalyticsStore::compact_window`] can hand a whole window to
+/// its merge callback and take the merged result back in one value, without
+/// a three-tuple at every call site.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TierRows {
+    pub stats: Vec<StatsRow>,
+    pub paths: Vec<PathRow>,
+    pub breakdown: Vec<BreakdownRow>,
+}
+
+impl TierRows {
+    /// Total row count across the three tables.
+    pub fn len(&self) -> usize {
+        self.stats.len() + self.paths.len() + self.breakdown.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stats.is_empty() && self.paths.is_empty() && self.breakdown.is_empty()
+    }
+}
+
 #[derive(Clone)]
 pub struct AnalyticsStore {
     /// Single read-write connection; serializes all writes (minute-flush,
@@ -359,16 +387,17 @@ impl AnalyticsStore {
 
     /// Writes a batch of aggregated rows into `tier`'s three tables in a
     /// single transaction. The minute-flush uses [`Tier::M1`] (via
-    /// [`Self::flush_window`]); compaction (in the `traffic` crate) uses
-    /// [`Tier::H1`]/[`Tier::D1`] with rows it has already merged.
+    /// [`Self::flush_window`]); compaction reaches the same upsert through
+    /// [`Self::compact_window`], which additionally deletes the consumed
+    /// finer tier inside the same transaction.
     ///
     /// `ON CONFLICT` sums the count/byte columns but *replaces* the sketch
     /// blobs (`latency_tdigest`, `uniques_hll`) with the incoming value:
     /// callers already hand over fully-merged sketches for the window, so
-    /// summing raw bytes would be meaningless. Under normal operation each
-    /// `(bucket, app, host)` is written exactly once per tier, so the
-    /// replace-not-merge behavior is only ever exercised by compaction's
-    /// idempotent re-write case.
+    /// summing raw bytes would be meaningless. Summing (rather than
+    /// replacing) the counters is what makes a late-arriving row for an
+    /// already-written bucket additive instead of destructive — see
+    /// [`Self::compact_window`].
     pub fn write_rows(
         &self,
         tier: Tier,
@@ -376,81 +405,114 @@ impl AnalyticsStore {
         paths: &[PathRow],
         breakdown: &[BreakdownRow],
     ) -> Result<(), StoreError> {
-        let sfx = suffix(tier);
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
-            {
-                let sql = format!(
-                    "INSERT INTO traffic_stats_{sfx}
-                        (bucket, app, host, requests, bytes_in, bytes_out, s2xx, s3xx, s4xx, s5xx, latency_tdigest, uniques_hll)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                     ON CONFLICT(bucket, app, host) DO UPDATE SET
-                        requests = requests + excluded.requests,
-                        bytes_in = bytes_in + excluded.bytes_in,
-                        bytes_out = bytes_out + excluded.bytes_out,
-                        s2xx = s2xx + excluded.s2xx,
-                        s3xx = s3xx + excluded.s3xx,
-                        s4xx = s4xx + excluded.s4xx,
-                        s5xx = s5xx + excluded.s5xx,
-                        latency_tdigest = excluded.latency_tdigest,
-                        uniques_hll = excluded.uniques_hll"
-                );
-                let mut ins = tx.prepare_cached(&sql)?;
-                for r in stats {
-                    ins.execute((
-                        r.bucket,
-                        &r.app,
-                        &r.host,
-                        r.requests,
-                        r.bytes_in,
-                        r.bytes_out,
-                        r.s2xx,
-                        r.s3xx,
-                        r.s4xx,
-                        r.s5xx,
-                        &r.latency_tdigest,
-                        &r.uniques_hll,
-                    ))?;
-                }
-            }
-            {
-                let sql = format!(
-                    "INSERT INTO traffic_paths_{sfx}
-                        (bucket, app, path, requests, bytes_out, latency_tdigest)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(bucket, app, path) DO UPDATE SET
-                        requests = requests + excluded.requests,
-                        bytes_out = bytes_out + excluded.bytes_out,
-                        latency_tdigest = excluded.latency_tdigest"
-                );
-                let mut ins = tx.prepare_cached(&sql)?;
-                for r in paths {
-                    ins.execute((
-                        r.bucket,
-                        &r.app,
-                        &r.path,
-                        r.requests,
-                        r.bytes_out,
-                        &r.latency_tdigest,
-                    ))?;
-                }
-            }
-            {
-                let sql = format!(
-                    "INSERT INTO traffic_breakdown_{sfx}
-                        (bucket, app, dimension, value, requests, bytes_out)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(bucket, app, dimension, value) DO UPDATE SET
-                        requests = requests + excluded.requests,
-                        bytes_out = bytes_out + excluded.bytes_out"
-                );
-                let mut ins = tx.prepare_cached(&sql)?;
-                for r in breakdown {
-                    ins.execute((r.bucket, &r.app, &r.dimension, &r.value, r.requests, r.bytes_out))?;
-                }
-            }
+            insert_rows(&tx, tier, stats, paths, breakdown)?;
             tx.commit()?;
             Ok(())
+        })
+    }
+
+    /// Rolls one coarse bucket up a tier, atomically.
+    ///
+    /// Inside a single transaction on the *writer* connection (so no other
+    /// writer — another compaction pass, the minute flush, retention — can
+    /// interleave):
+    ///
+    /// 1. reads every `from_tier` row whose bucket is in `[from_bucket,
+    ///    to_bucket)`, across all three tables and all apps;
+    /// 2. hands them to `merge`, which is the `traffic` crate's sketch-aware
+    ///    roll-up (the one step that cannot live in this crate without a
+    ///    dependency cycle);
+    /// 3. upserts the merged rows into `to_tier`;
+    /// 4. deletes the consumed `from_tier` rows in the same window;
+    /// 5. commits.
+    ///
+    /// Returns the number of coarser rows written (0 if the window held no
+    /// finer rows at all, in which case nothing is written or deleted).
+    ///
+    /// The atomicity is the point: a crash, or a failure on any one of the
+    /// six statements, leaves *both* the write and the delete undone, so the
+    /// next sweep re-reads exactly the same finer rows and redoes the same
+    /// roll-up. Without it, a crash between the write and the delete would
+    /// leave the finer rows in place for the next sweep to add a second time
+    /// into a coarse row that already counted them.
+    ///
+    /// Reading inside the transaction (rather than through the read-only
+    /// connection beforehand) closes the matching lost-update window: the
+    /// `1h` tier is written by the `1m → 1h` pass *and* read-then-deleted by
+    /// the `1h → 1d` pass, and those two run off independent tickers.
+    ///
+    /// Callers are expected to pass a window that is aligned to (and no
+    /// wider than) one `to_tier` bucket, and to only pass windows that are
+    /// already closed — see `traffic::compaction`.
+    pub fn compact_window<F>(
+        &self,
+        from_tier: Tier,
+        to_tier: Tier,
+        from_bucket: i64,
+        to_bucket: i64,
+        merge: F,
+    ) -> Result<usize, StoreError>
+    where
+        F: FnOnce(TierRows) -> TierRows,
+    {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+
+            let src = TierRows {
+                stats: select_stats(&tx, from_tier, from_bucket, to_bucket)?,
+                paths: select_paths(&tx, from_tier, from_bucket, to_bucket)?,
+                breakdown: select_breakdown(&tx, from_tier, from_bucket, to_bucket)?,
+            };
+            if src.is_empty() {
+                // Nothing was written, so there is nothing to commit;
+                // dropping the transaction rolls back an empty read.
+                return Ok(0);
+            }
+
+            let merged = merge(src);
+            insert_rows(
+                &tx,
+                to_tier,
+                &merged.stats,
+                &merged.paths,
+                &merged.breakdown,
+            )?;
+
+            for table in ["traffic_stats", "traffic_paths", "traffic_breakdown"] {
+                delete_range(&tx, table, from_tier, from_bucket, to_bucket)?;
+            }
+
+            tx.commit()?;
+            Ok(merged.len())
+        })
+    }
+
+    /// Every distinct bucket timestamp present anywhere in `tier` (stats ∪
+    /// paths ∪ breakdown) strictly before `cutoff`, ascending.
+    ///
+    /// Compaction uses this to enumerate the work waiting for it without
+    /// loading a single row of it: flooring these to the coarse width yields
+    /// exactly the set of coarse buckets that need a [`Self::compact_window`]
+    /// pass, so a long backlog is processed one bounded transaction at a
+    /// time rather than in one unbounded read.
+    pub fn distinct_buckets_before(&self, tier: Tier, cutoff: i64) -> Result<Vec<i64>, StoreError> {
+        self.with_reader(|c| {
+            let sfx = suffix(tier);
+            let sql = format!(
+                "SELECT bucket FROM traffic_stats_{sfx}     WHERE bucket < ?1
+                 UNION
+                 SELECT bucket FROM traffic_paths_{sfx}     WHERE bucket < ?1
+                 UNION
+                 SELECT bucket FROM traffic_breakdown_{sfx} WHERE bucket < ?1
+                 ORDER BY 1"
+            );
+            let mut stmt = c.prepare_cached(&sql)?;
+            let rows = stmt
+                .query_map((cutoff,), |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
         })
     }
 
@@ -565,33 +627,7 @@ impl AnalyticsStore {
         from: i64,
         to: i64,
     ) -> Result<Vec<StatsRow>, StoreError> {
-        self.with_reader(|c| {
-            let sql = format!(
-                "SELECT bucket, app, host, requests, bytes_in, bytes_out, s2xx, s3xx, s4xx, s5xx, latency_tdigest, uniques_hll
-                 FROM traffic_stats_{} WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
-                suffix(tier)
-            );
-            let mut stmt = c.prepare_cached(&sql)?;
-            let rows = stmt
-                .query_map((from, to), |r| {
-                    Ok(StatsRow {
-                        bucket: r.get(0)?,
-                        app: r.get(1)?,
-                        host: r.get(2)?,
-                        requests: r.get(3)?,
-                        bytes_in: r.get(4)?,
-                        bytes_out: r.get(5)?,
-                        s2xx: r.get(6)?,
-                        s3xx: r.get(7)?,
-                        s4xx: r.get(8)?,
-                        s5xx: r.get(9)?,
-                        latency_tdigest: r.get(10)?,
-                        uniques_hll: r.get(11)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+        self.with_reader(|c| select_stats(c, tier, from, to))
     }
 
     /// Every `tier` path row in the half-open bucket window `[from, to)`,
@@ -602,27 +638,7 @@ impl AnalyticsStore {
         from: i64,
         to: i64,
     ) -> Result<Vec<PathRow>, StoreError> {
-        self.with_reader(|c| {
-            let sql = format!(
-                "SELECT bucket, app, path, requests, bytes_out, latency_tdigest
-                 FROM traffic_paths_{} WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
-                suffix(tier)
-            );
-            let mut stmt = c.prepare_cached(&sql)?;
-            let rows = stmt
-                .query_map((from, to), |r| {
-                    Ok(PathRow {
-                        bucket: r.get(0)?,
-                        app: r.get(1)?,
-                        path: r.get(2)?,
-                        requests: r.get(3)?,
-                        bytes_out: r.get(4)?,
-                        latency_tdigest: r.get(5)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+        self.with_reader(|c| select_paths(c, tier, from, to))
     }
 
     /// Every `tier` breakdown row in the half-open bucket window
@@ -634,27 +650,7 @@ impl AnalyticsStore {
         from: i64,
         to: i64,
     ) -> Result<Vec<BreakdownRow>, StoreError> {
-        self.with_reader(|c| {
-            let sql = format!(
-                "SELECT bucket, app, dimension, value, requests, bytes_out
-                 FROM traffic_breakdown_{} WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
-                suffix(tier)
-            );
-            let mut stmt = c.prepare_cached(&sql)?;
-            let rows = stmt
-                .query_map((from, to), |r| {
-                    Ok(BreakdownRow {
-                        bucket: r.get(0)?,
-                        app: r.get(1)?,
-                        dimension: r.get(2)?,
-                        value: r.get(3)?,
-                        requests: r.get(4)?,
-                        bytes_out: r.get(5)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+        self.with_reader(|c| select_breakdown(c, tier, from, to))
     }
 
     /// Deletes `tier` stats rows strictly older than `cutoff`; returns the
@@ -724,11 +720,20 @@ impl AnalyticsStore {
         })
     }
 
+    /// Test-only escape hatch: runs `sql` on the writer connection. Used to
+    /// inject a failure (a trigger that raises) into the middle of
+    /// [`Self::compact_window`]'s transaction so its atomicity can be tested
+    /// for real rather than asserted.
+    #[cfg(test)]
+    fn execute_batch_for_test(&self, sql: &str) -> Result<(), StoreError> {
+        self.with_conn(|c| Ok(c.execute_batch(sql)?))
+    }
+
     /// Distinct app UUIDs with recorded traffic. Queries only the `1m` tier:
-    /// compaction (a later task) always derives `1h`/`1d` rows from `1m`
-    /// data, so the app set is identical across tiers and `1m` — the tier
-    /// every flush populates first — is the cheapest, always-populated
-    /// source (no `UNION` across three tables needed).
+    /// compaction always derives `1h`/`1d` rows from `1m` data, so the app
+    /// set is identical across tiers and `1m` — the tier every flush
+    /// populates first — is the cheapest, always-populated source (no
+    /// `UNION` across three tables needed).
     pub fn apps(&self) -> Result<Vec<String>, StoreError> {
         self.with_reader(|c| {
             let mut stmt =
@@ -739,6 +744,222 @@ impl AnalyticsStore {
             Ok(rows)
         })
     }
+}
+
+/// Upserts a batch into `tier`'s three tables on an existing connection (in
+/// practice a `Transaction`, which derefs to `Connection`). Shared by
+/// [`AnalyticsStore::write_rows`] and [`AnalyticsStore::compact_window`] so
+/// the minute flush and compaction cannot drift apart on conflict
+/// resolution.
+///
+/// Counters sum on conflict; sketch blobs are replaced. Summing is the
+/// correct choice for *both* callers because every row that reaches this
+/// function contributes exactly once: the flush owns a minute window that is
+/// closed before it writes, and compaction deletes the finer rows it
+/// consumed in the same transaction as the write. A row that turns up later
+/// for an already-written bucket (a delayed flush landing in an hour that has
+/// already been rolled up) is therefore genuinely new information, and adding
+/// it keeps the counters right — replacing would throw the bucket's existing
+/// counters away.
+fn insert_rows(
+    conn: &Connection,
+    tier: Tier,
+    stats: &[StatsRow],
+    paths: &[PathRow],
+    breakdown: &[BreakdownRow],
+) -> Result<(), StoreError> {
+    let sfx = suffix(tier);
+    {
+        let sql = format!(
+            "INSERT INTO traffic_stats_{sfx}
+                (bucket, app, host, requests, bytes_in, bytes_out, s2xx, s3xx, s4xx, s5xx, latency_tdigest, uniques_hll)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(bucket, app, host) DO UPDATE SET
+                requests = requests + excluded.requests,
+                bytes_in = bytes_in + excluded.bytes_in,
+                bytes_out = bytes_out + excluded.bytes_out,
+                s2xx = s2xx + excluded.s2xx,
+                s3xx = s3xx + excluded.s3xx,
+                s4xx = s4xx + excluded.s4xx,
+                s5xx = s5xx + excluded.s5xx,
+                latency_tdigest = excluded.latency_tdigest,
+                uniques_hll = excluded.uniques_hll"
+        );
+        let mut ins = conn.prepare_cached(&sql)?;
+        for r in stats {
+            ins.execute((
+                r.bucket,
+                &r.app,
+                &r.host,
+                r.requests,
+                r.bytes_in,
+                r.bytes_out,
+                r.s2xx,
+                r.s3xx,
+                r.s4xx,
+                r.s5xx,
+                &r.latency_tdigest,
+                &r.uniques_hll,
+            ))?;
+        }
+    }
+    {
+        let sql = format!(
+            "INSERT INTO traffic_paths_{sfx}
+                (bucket, app, path, requests, bytes_out, latency_tdigest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(bucket, app, path) DO UPDATE SET
+                requests = requests + excluded.requests,
+                bytes_out = bytes_out + excluded.bytes_out,
+                latency_tdigest = excluded.latency_tdigest"
+        );
+        let mut ins = conn.prepare_cached(&sql)?;
+        for r in paths {
+            ins.execute((
+                r.bucket,
+                &r.app,
+                &r.path,
+                r.requests,
+                r.bytes_out,
+                &r.latency_tdigest,
+            ))?;
+        }
+    }
+    {
+        let sql = format!(
+            "INSERT INTO traffic_breakdown_{sfx}
+                (bucket, app, dimension, value, requests, bytes_out)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(bucket, app, dimension, value) DO UPDATE SET
+                requests = requests + excluded.requests,
+                bytes_out = bytes_out + excluded.bytes_out"
+        );
+        let mut ins = conn.prepare_cached(&sql)?;
+        for r in breakdown {
+            ins.execute((
+                r.bucket,
+                &r.app,
+                &r.dimension,
+                &r.value,
+                r.requests,
+                r.bytes_out,
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// `tier` stats rows in the half-open bucket window `[from, to)`, all apps.
+/// Connection-scoped so the same query can run on the read-only connection
+/// ([`AnalyticsStore::stats_rows_between`]) or inside a writer transaction
+/// ([`AnalyticsStore::compact_window`]).
+fn select_stats(
+    conn: &Connection,
+    tier: Tier,
+    from: i64,
+    to: i64,
+) -> Result<Vec<StatsRow>, StoreError> {
+    let sql = format!(
+        "SELECT bucket, app, host, requests, bytes_in, bytes_out, s2xx, s3xx, s4xx, s5xx, latency_tdigest, uniques_hll
+         FROM traffic_stats_{} WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
+        suffix(tier)
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map((from, to), |r| {
+            Ok(StatsRow {
+                bucket: r.get(0)?,
+                app: r.get(1)?,
+                host: r.get(2)?,
+                requests: r.get(3)?,
+                bytes_in: r.get(4)?,
+                bytes_out: r.get(5)?,
+                s2xx: r.get(6)?,
+                s3xx: r.get(7)?,
+                s4xx: r.get(8)?,
+                s5xx: r.get(9)?,
+                latency_tdigest: r.get(10)?,
+                uniques_hll: r.get(11)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// See [`select_stats`].
+fn select_paths(
+    conn: &Connection,
+    tier: Tier,
+    from: i64,
+    to: i64,
+) -> Result<Vec<PathRow>, StoreError> {
+    let sql = format!(
+        "SELECT bucket, app, path, requests, bytes_out, latency_tdigest
+         FROM traffic_paths_{} WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
+        suffix(tier)
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map((from, to), |r| {
+            Ok(PathRow {
+                bucket: r.get(0)?,
+                app: r.get(1)?,
+                path: r.get(2)?,
+                requests: r.get(3)?,
+                bytes_out: r.get(4)?,
+                latency_tdigest: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// See [`select_stats`].
+fn select_breakdown(
+    conn: &Connection,
+    tier: Tier,
+    from: i64,
+    to: i64,
+) -> Result<Vec<BreakdownRow>, StoreError> {
+    let sql = format!(
+        "SELECT bucket, app, dimension, value, requests, bytes_out
+         FROM traffic_breakdown_{} WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
+        suffix(tier)
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map((from, to), |r| {
+            Ok(BreakdownRow {
+                bucket: r.get(0)?,
+                app: r.get(1)?,
+                dimension: r.get(2)?,
+                value: r.get(3)?,
+                requests: r.get(4)?,
+                bytes_out: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Deletes `tier` rows of `table` in the half-open window `[from, to)`.
+/// Range-scoped, not `< cutoff`: [`AnalyticsStore::compact_window`] must
+/// delete exactly the rows it just consumed and nothing beyond them, or a
+/// bucket still queued for a later pass would be dropped un-compacted.
+fn delete_range(
+    conn: &Connection,
+    table: &str,
+    tier: Tier,
+    from: i64,
+    to: i64,
+) -> Result<usize, StoreError> {
+    let sql = format!(
+        "DELETE FROM {}_{} WHERE bucket >= ?1 AND bucket < ?2",
+        table,
+        suffix(tier)
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    Ok(stmt.execute((from, to))?)
 }
 
 #[cfg(test)]
@@ -1201,6 +1422,210 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// `compact_window` is read + merge + write + delete in one transaction:
+    /// the callback sees the finer rows, and on return the coarse rows exist
+    /// and the finer ones in that window are gone.
+    #[test]
+    fn compact_window_reads_merges_writes_and_deletes() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        s.flush_window(
+            &[
+                stats_row(HOUR_MS, "a", "h", 2, vec![1], vec![2]),
+                stats_row(HOUR_MS + 60_000, "a", "h", 3, vec![3], vec![4]),
+            ],
+            &[path_row(HOUR_MS, "a", "/x", 4)],
+            &[breakdown_row(HOUR_MS, "a", "country", "US", 6)],
+        )
+        .unwrap();
+
+        let written = s
+            .compact_window(Tier::M1, Tier::H1, HOUR_MS, 2 * HOUR_MS, |src| {
+                assert_eq!(src.stats.len(), 2, "callback sees the finer rows");
+                assert_eq!(src.paths.len(), 1);
+                assert_eq!(src.breakdown.len(), 1);
+                assert_eq!(src.len(), 4);
+                // Trivial "merge": one summed stats row for the window.
+                TierRows {
+                    stats: vec![stats_row(HOUR_MS, "a", "h", 5, vec![9], vec![9])],
+                    paths: src.paths,
+                    breakdown: src.breakdown,
+                }
+            })
+            .unwrap();
+        assert_eq!(written, 3, "1 stats + 1 paths + 1 breakdown");
+
+        let h1 = s.stats_rows_between(Tier::H1, i64::MIN, i64::MAX).unwrap();
+        assert_eq!(h1.len(), 1);
+        assert_eq!(h1[0].requests, 5);
+        assert!(
+            s.stats_rows_between(Tier::M1, i64::MIN, i64::MAX)
+                .unwrap()
+                .is_empty(),
+            "consumed finer rows are deleted in the same transaction"
+        );
+        assert!(
+            s.paths_rows_between(Tier::M1, i64::MIN, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            s.breakdown_rows_between(Tier::M1, i64::MIN, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The delete is window-scoped, not `< to_bucket`: rows *older* than the
+    /// window belong to a coarse bucket that has not been compacted yet, and
+    /// dropping them here would lose them entirely.
+    #[test]
+    fn compact_window_deletes_only_its_own_window() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        s.flush_window(
+            &[
+                stats_row(0, "a", "h", 1, vec![], vec![]),
+                stats_row(HOUR_MS, "a", "h", 2, vec![], vec![]),
+                stats_row(2 * HOUR_MS, "a", "h", 4, vec![], vec![]),
+            ],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        s.compact_window(Tier::M1, Tier::H1, HOUR_MS, 2 * HOUR_MS, |src| TierRows {
+            stats: src.stats,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let left = s.stats_rows_between(Tier::M1, i64::MIN, i64::MAX).unwrap();
+        assert_eq!(
+            left.iter().map(|r| r.bucket).collect::<Vec<_>>(),
+            vec![0, 2 * HOUR_MS],
+            "the earlier and later buckets both survive for their own passes"
+        );
+    }
+
+    /// An empty window writes nothing and reports zero.
+    #[test]
+    fn compact_window_on_an_empty_window_is_a_noop() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        let written = s
+            .compact_window(Tier::M1, Tier::H1, 0, HOUR_MS, |_| {
+                panic!("merge must not run for an empty window")
+            })
+            .unwrap();
+        assert_eq!(written, 0);
+        assert!(
+            s.stats_rows_between(Tier::H1, i64::MIN, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Atomicity, tested for real: a `BEFORE DELETE` trigger that raises
+    /// makes the delete half of `compact_window` fail *after* the coarse
+    /// rows have been inserted. The whole transaction must roll back — no
+    /// coarse rows, finer rows intact — so that the retry recomputes the
+    /// same roll-up instead of adding a second copy of it.
+    #[test]
+    fn compact_window_rolls_back_the_write_when_the_delete_fails() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        s.flush_window(
+            &[stats_row(HOUR_MS, "a", "h", 5, vec![1], vec![2])],
+            &[path_row(HOUR_MS, "a", "/x", 5)],
+            &[breakdown_row(HOUR_MS, "a", "country", "US", 5)],
+        )
+        .unwrap();
+
+        s.execute_batch_for_test(
+            "CREATE TRIGGER boom BEFORE DELETE ON traffic_stats_1m
+             BEGIN SELECT RAISE(ABORT, 'simulated crash'); END;",
+        )
+        .unwrap();
+
+        let err = s
+            .compact_window(Tier::M1, Tier::H1, HOUR_MS, 2 * HOUR_MS, |src| TierRows {
+                stats: src.stats,
+                paths: src.paths,
+                breakdown: src.breakdown,
+            })
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("simulated crash"),
+            "expected the injected failure, got {err}"
+        );
+
+        assert!(
+            s.stats_rows_between(Tier::H1, i64::MIN, i64::MAX)
+                .unwrap()
+                .is_empty(),
+            "the coarse write must roll back with the failed delete, or the \
+             retry would double-count this bucket"
+        );
+        assert!(
+            s.paths_rows_between(Tier::H1, i64::MIN, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            s.breakdown_rows_between(Tier::H1, i64::MIN, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.stats_rows_between(Tier::M1, i64::MIN, i64::MAX)
+                .unwrap()
+                .len(),
+            1,
+            "the finer rows survive for the retry"
+        );
+
+        // With the fault removed, the retry produces exactly one coarse row.
+        s.execute_batch_for_test("DROP TRIGGER boom").unwrap();
+        s.compact_window(Tier::M1, Tier::H1, HOUR_MS, 2 * HOUR_MS, |src| TierRows {
+            stats: src.stats,
+            paths: src.paths,
+            breakdown: src.breakdown,
+        })
+        .unwrap();
+        let h1 = s.stats_rows_between(Tier::H1, i64::MIN, i64::MAX).unwrap();
+        assert_eq!(h1.len(), 1);
+        assert_eq!(h1[0].requests, 5, "retry recomputes, it does not add");
+    }
+
+    /// `distinct_buckets_before` unions all three tables, dedupes, sorts, and
+    /// honors the strict `< cutoff` bound.
+    #[test]
+    fn distinct_buckets_before_unions_all_three_tables() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+        s.flush_window(
+            &[
+                stats_row(100, "a", "h", 1, vec![], vec![]),
+                stats_row(100, "b", "h", 1, vec![], vec![]),
+                stats_row(300, "a", "h", 1, vec![], vec![]),
+            ],
+            &[path_row(200, "a", "/x", 1)],
+            &[breakdown_row(400, "a", "country", "US", 1)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            s.distinct_buckets_before(Tier::M1, 400).unwrap(),
+            vec![100, 200, 300],
+            "deduped across apps, unioned across tables, cutoff exclusive"
+        );
+        assert_eq!(
+            s.distinct_buckets_before(Tier::M1, i64::MAX).unwrap(),
+            vec![100, 200, 300, 400]
+        );
+        assert!(
+            s.distinct_buckets_before(Tier::H1, i64::MAX)
+                .unwrap()
+                .is_empty()
         );
     }
 
