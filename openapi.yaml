@@ -168,8 +168,8 @@ paths:
           description: Exact container display name recorded by Sentinel
           schema:
             type: string
-            pattern: '^[a-zA-Z0-9]+$'
-          example: abc123def456
+            pattern: '^[a-zA-Z0-9._-]+$'
+          example: postgres-db
         - $ref: '#/components/parameters/FromDate'
         - $ref: '#/components/parameters/ToDate'
       responses:
@@ -203,8 +203,8 @@ paths:
           description: Exact container display name recorded by Sentinel
           schema:
             type: string
-            pattern: '^[a-zA-Z0-9]+$'
-          example: abc123def456
+            pattern: '^[a-zA-Z0-9._-]+$'
+          example: postgres-db
         - $ref: '#/components/parameters/FromDate'
         - $ref: '#/components/parameters/ToDate'
       responses:

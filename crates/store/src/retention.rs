@@ -35,7 +35,16 @@ impl Store {
     /// durable fix for metrics growth: at the default 5s rate it reduces the
     /// aged portion of each series roughly 12x.
     pub fn downsample(&self, now_ms: i64) -> Result<u64, StoreError> {
+        // Snap the cutoff down to a bucket boundary so no one-minute bucket ever
+        // straddles it. Buckets are keyed on `(time / BUCKET_MS) * BUCKET_MS`;
+        // if the cutoff fell mid-bucket, a first pass would collapse the rows
+        // below it into a bucket row, and the next pass — resuming from the
+        // stored cutoff as its lower bound — would collapse the remaining rows
+        // in that same bucket to the identical key and `INSERT OR REPLACE` over
+        // the earlier average, silently dropping the first half. A bucket-aligned
+        // cutoff keeps each bucket entirely on one side of the boundary.
         let cutoff = now_ms - DOWNSAMPLE_AFTER_MS;
+        let cutoff = cutoff - cutoff.rem_euclid(BUCKET_MS);
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
             let lower_bound = tx

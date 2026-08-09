@@ -145,6 +145,33 @@ fn second_downsample_only_processes_newly_aged_rows() {
 }
 
 #[test]
+fn downsample_preserves_a_bucket_that_straddles_the_cutoff() {
+    // Regression: a cutoff landing mid-bucket must not split that bucket across
+    // two passes. Without a bucket-aligned cutoff the first pass collapses the
+    // rows below the cutoff into the bucket key, and the second pass (resuming
+    // from the stored cutoff) collapses the rest into the same key and
+    // `INSERT OR REPLACE`s over the first half — dropping it silently.
+    let s = Store::open_in_memory().unwrap();
+    let bucket = 100 * retention::BUCKET_MS; // a bucket-aligned time
+    s.insert_cpu(bucket + 10_000, 10.0).unwrap(); // below a mid-bucket cutoff
+    s.insert_cpu(bucket + 40_000, 20.0).unwrap(); // above it
+
+    // First pass: cutoff = bucket + 30_000 (30s into the bucket).
+    s.downsample(bucket + 30_000 + retention::DOWNSAMPLE_AFTER_MS)
+        .unwrap();
+    // Second pass: cutoff now clears the whole bucket.
+    s.downsample(bucket + retention::BUCKET_MS + retention::DOWNSAMPLE_AFTER_MS)
+        .unwrap();
+
+    let rows = s.cpu_history(bucket, bucket).unwrap();
+    assert_eq!(rows.len(), 1, "the straddling bucket collapses to one row");
+    assert_eq!(
+        rows[0].percent, 15.0,
+        "both halves of the bucket must be averaged, not overwritten"
+    );
+}
+
+#[test]
 fn downsample_leaves_recent_samples_at_full_resolution() {
     let s = Store::open_in_memory().unwrap();
     let now = 10 * DAY;
