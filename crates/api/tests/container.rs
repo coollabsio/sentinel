@@ -124,7 +124,11 @@ async fn hyphenated_name_stored_by_collector_is_queryable() {
     assert_eq!(res.status(), StatusCode::OK);
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(j.as_array().unwrap().len(), 1, "hyphenated name must resolve");
+    assert_eq!(
+        j.as_array().unwrap().len(),
+        1,
+        "hyphenated name must resolve"
+    );
     assert_eq!(j.as_array().unwrap()[0]["percent"], "7.00");
 }
 

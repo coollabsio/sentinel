@@ -144,7 +144,8 @@ impl Collector {
         }
 
         let store = self.store.clone();
-        match tokio::task::spawn_blocking(move || store.insert_container_batch(time, &samples)).await
+        match tokio::task::spawn_blocking(move || store.insert_container_batch(time, &samples))
+            .await
         {
             Ok(Err(e)) => tracing::warn!(error = %e, "failed to record container metrics"),
             Err(e) => tracing::warn!(error = %e, "container insert task panicked"),

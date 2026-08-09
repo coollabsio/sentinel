@@ -66,7 +66,11 @@ enum Command {
 #[derive(Parser, Debug, Clone)]
 struct TargetOpts {
     /// Base URL, e.g. http://127.0.0.1:18889
-    #[arg(long, env = "SENTINEL_BENCH_BASE", default_value = "http://127.0.0.1:18889")]
+    #[arg(
+        long,
+        env = "SENTINEL_BENCH_BASE",
+        default_value = "http://127.0.0.1:18889"
+    )]
     base: String,
     /// Bearer token (must match container TOKEN).
     #[arg(long, env = "SENTINEL_BENCH_TOKEN", default_value = DEFAULT_TOKEN)]
@@ -286,7 +290,11 @@ fn build_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
         .build()
 }
 
-async fn one_get(client: &Client, url: &str, token: &str) -> Result<(u16, Duration), reqwest::Error> {
+async fn one_get(
+    client: &Client,
+    url: &str,
+    token: &str,
+) -> Result<(u16, Duration), reqwest::Error> {
     let t0 = Instant::now();
     let resp = client
         .get(url)
@@ -426,10 +434,7 @@ async fn run_load(opts: &LoadOpts) -> Result<(), Box<dyn std::error::Error>> {
         .filter(|e| {
             matches!(
                 e.path,
-                "/api/health"
-                    | "/api/cpu/current"
-                    | "/api/memory/current"
-                    | "/api/cpu/history"
+                "/api/health" | "/api/cpu/current" | "/api/memory/current" | "/api/cpu/history"
             )
         })
         .map(|e| e.path)
@@ -442,15 +447,7 @@ async fn run_load(opts: &LoadOpts) -> Result<(), Box<dyn std::error::Error>> {
             if c == 0 {
                 continue;
             }
-            let snap = run_load_cell(
-                &client,
-                &url,
-                &opts.target.token,
-                c,
-                duration,
-                200_000,
-            )
-            .await;
+            let snap = run_load_cell(&client, &url, &opts.target.token, c, duration, 200_000).await;
             print_row(path, c, opts.duration as f64, &snap);
         }
     }
@@ -470,7 +467,12 @@ fn pick_endpoint(tick: u64) -> &'static Endpoint {
 }
 
 /// Effective concurrency at `elapsed` for the given stress profile.
-fn stress_target_concurrency(profile: StressProfile, peak: usize, elapsed: Duration, total: Duration) -> usize {
+fn stress_target_concurrency(
+    profile: StressProfile,
+    peak: usize,
+    elapsed: Duration,
+    total: Duration,
+) -> usize {
     let peak = peak.max(1);
     match profile {
         StressProfile::Mixed | StressProfile::Soak => peak,
@@ -639,7 +641,10 @@ async fn run_stress(opts: &StressOpts) -> Result<bool, Box<dyn std::error::Error
     // Post-stress health must still work.
     let post_ok = match one_get(&client, &health_url, &opts.target.token).await {
         Ok((200, d)) => {
-            println!("post_stress_health=ok latency_ms={:.2}", d.as_secs_f64() * 1000.0);
+            println!(
+                "post_stress_health=ok latency_ms={:.2}",
+                d.as_secs_f64() * 1000.0
+            );
             true
         }
         Ok((code, _)) => {

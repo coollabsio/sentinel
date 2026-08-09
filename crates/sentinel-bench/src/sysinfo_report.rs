@@ -53,10 +53,7 @@ fn meminfo_kb(key: &str) -> Option<u64> {
     let raw = read_trimmed("/proc/meminfo")?;
     for line in raw.lines() {
         if let Some(rest) = line.strip_prefix(key) {
-            let num = rest
-                .trim_start_matches(':')
-                .split_whitespace()
-                .next()?;
+            let num = rest.trim_start_matches(':').split_whitespace().next()?;
             return num.parse().ok();
         }
     }
@@ -159,11 +156,8 @@ fn virt() -> String {
 pub fn print_system_config() {
     let uname = cmd_stdout("uname", &["-srm"]).unwrap_or_else(|| "unknown".into());
     let arch = cmd_stdout("uname", &["-m"]).unwrap_or_else(|| "unknown".into());
-    let docker_ver = cmd_stdout(
-        "docker",
-        &["version", "--format", "{{.Server.Version}}"],
-    )
-    .unwrap_or_else(|| "n/a".into());
+    let docker_ver = cmd_stdout("docker", &["version", "--format", "{{.Server.Version}}"])
+        .unwrap_or_else(|| "n/a".into());
     let docker_info = cmd_stdout(
         "docker",
         &[
@@ -174,7 +168,9 @@ pub fn print_system_config() {
     )
     .unwrap_or_else(|| "n/a".into());
 
-    let mem_total = meminfo_kb("MemTotal").map(fmt_bytes_from_kb).unwrap_or_else(|| "n/a".into());
+    let mem_total = meminfo_kb("MemTotal")
+        .map(fmt_bytes_from_kb)
+        .unwrap_or_else(|| "n/a".into());
     let mem_avail = meminfo_kb("MemAvailable")
         .map(fmt_bytes_from_kb)
         .unwrap_or_else(|| "n/a".into());
@@ -185,8 +181,8 @@ pub fn print_system_config() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     // RFC3339-ish UTC without extra deps.
-    let date_utc = cmd_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .unwrap_or_else(|| format!("unix:{now}"));
+    let date_utc =
+        cmd_stdout("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]).unwrap_or_else(|| format!("unix:{now}"));
 
     println!("=== System configuration ===");
     println!("date_utc={date_utc}");
@@ -208,9 +204,6 @@ pub fn print_system_config() {
     println!("cgroup_memory_max={mem_max}");
     println!("docker_server={docker_ver}");
     println!("docker_info={docker_info}");
-    println!(
-        "harness=sentinel-bench {}",
-        env!("CARGO_PKG_VERSION")
-    );
+    println!("harness=sentinel-bench {}", env!("CARGO_PKG_VERSION"));
     println!("============================");
 }
