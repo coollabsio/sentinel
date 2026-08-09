@@ -62,8 +62,11 @@ struct Raw<'a> {
 /// Parse a single Traefik JSON access-log line into a [`RequestEvent`].
 ///
 /// Returns `None` on any malformed input (invalid JSON, missing required
-/// fields, or an unparseable `StartUTC` timestamp) — callers should skip
-/// the line and move on rather than treat this as fatal.
+/// fields, an unparseable `StartUTC` timestamp, or a `RouterName` that does
+/// not resolve to a Coolify app UUID, e.g. Traefik's own internal routers
+/// like `api@internal`) — callers should skip the line and move on rather
+/// than treat this as fatal. This avoids misattributing Traefik's own
+/// dashboard/API traffic to a fake "app" bucket.
 pub fn parse(line: &[u8]) -> Option<RequestEvent<'_>> {
     let raw: Raw = serde_json::from_slice(line).ok()?;
 
@@ -76,7 +79,7 @@ pub fn parse(line: &[u8]) -> Option<RequestEvent<'_>> {
         .map(|(p, _)| p)
         .unwrap_or(raw.request_path);
 
-    let app = parse_app_uuid(raw.router_name).unwrap_or(raw.router_name);
+    let app = parse_app_uuid(raw.router_name)?;
 
     Some(RequestEvent {
         ts_ms,
@@ -146,5 +149,11 @@ mod tests {
     #[test]
     fn malformed_line_returns_none() {
         assert!(super::parse(b"not json").is_none());
+    }
+
+    #[test]
+    fn internal_router_is_dropped() {
+        let line = br#"{"ClientAddr":"10.0.0.5:54321","ClientHost":"10.0.0.5","DownstreamContentSize":512,"DownstreamStatus":200,"Duration":1000000,"RequestContentSize":0,"RequestHost":"traefik.example.com","RequestMethod":"GET","RequestPath":"/dashboard/","RequestProtocol":"HTTP/1.1","RequestScheme":"https","RouterName":"api@internal","StartUTC":"2026-08-09T12:00:10.000000000Z","time":"2026-08-09T12:00:10Z"}"#;
+        assert!(super::parse(line).is_none());
     }
 }
