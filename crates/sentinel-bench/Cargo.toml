@@ -1,0 +1,19 @@
+[package]
+name = "sentinel-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "HTTP load / latency / stress harness for Sentinel (see BENCHMARK.md)"
+
+[[bin]]
+name = "sentinel-bench"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }

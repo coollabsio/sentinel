@@ -9,7 +9,7 @@ info:
     REST endpoints.
 
     This service is designed for integration with [Coolify.io](https://coolify.io).
-  version: 0.0.22
+  version: 1.0.0
   contact:
     name: Coolify
     url: https://coolify.io
@@ -34,7 +34,7 @@ tags:
   - name: Container Metrics
     description: Metrics for Docker containers
   - name: Debug
-    description: Debug and profiling endpoints (only available when DEBUG=true)
+    description: Debug-only endpoints (available when DEBUG=true)
 
 paths:
   /api/health:
@@ -67,7 +67,7 @@ paths:
             text/plain:
               schema:
                 type: string
-                example: 0.0.22
+                example: 1.0.0
 
   /api/cpu/current:
     get:
@@ -165,11 +165,11 @@ paths:
         - name: containerId
           in: path
           required: true
-          description: Docker container ID (alphanumeric characters only)
+          description: Exact container display name recorded by Sentinel
           schema:
             type: string
-            pattern: '^[a-zA-Z0-9]+$'
-          example: abc123def456
+            pattern: '^[a-zA-Z0-9._-]+$'
+          example: postgres-db
         - $ref: '#/components/parameters/FromDate'
         - $ref: '#/components/parameters/ToDate'
       responses:
@@ -200,11 +200,11 @@ paths:
         - name: containerId
           in: path
           required: true
-          description: Docker container ID (alphanumeric characters only)
+          description: Exact container display name recorded by Sentinel
           schema:
             type: string
-            pattern: '^[a-zA-Z0-9]+$'
-          example: abc123def456
+            pattern: '^[a-zA-Z0-9._-]+$'
+          example: postgres-db
         - $ref: '#/components/parameters/FromDate'
         - $ref: '#/components/parameters/ToDate'
       responses:

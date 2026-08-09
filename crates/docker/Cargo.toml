@@ -1,0 +1,10 @@
+[package]
+name = "docker"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bollard.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

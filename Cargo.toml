@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+axum = "0.8.9"
+bollard = "0.21"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.39.6"
+thiserror = "2"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+[package]
+name = "sentinel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+api = { path = "crates/api" }
+collector = { path = "crates/collector" }
+config = { path = "crates/config" }
+docker = { path = "crates/docker" }
+push = { path = "crates/push" }
+store = { path = "crates/store" }
+axum.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dotenvy = "0.15"
+
+[dev-dependencies]
+serde_json.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+# `panic` is deliberately left at its default (`unwind`), not set to "abort":
+# a collection cycle failure, a single container's stats call failing, or a
+# panicking task must never take down the whole agent. The collector's and
+# retention's "task panicked" log branches, and StoreError::Poisoned, exist
+# specifically to handle a panic inside a spawned task without crashing the
+# process — `panic = "abort"` would convert any panic anywhere into an
+# immediate process abort and make those branches unreachable dead code.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3

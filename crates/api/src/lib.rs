@@ -1,0 +1,109 @@
+#![forbid(unsafe_code)]
+
+pub mod auth;
+pub mod routes;
+pub mod time;
+pub mod types;
+
+use std::sync::{Arc, RwLock};
+
+use axum::Router;
+use axum::routing::get;
+use collector::HostSampler;
+use config::Config;
+use store::{MemRow, Store};
+use tokio::sync::{Mutex, Semaphore};
+
+pub const MAX_CONCURRENT_HISTORY_QUERIES: usize = 8;
+
+pub struct CachedMemory(RwLock<MemRow>);
+
+impl CachedMemory {
+    pub fn new(row: MemRow) -> Self {
+        Self(RwLock::new(row))
+    }
+
+    pub fn get(&self) -> MemRow {
+        *self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set(&self, row: MemRow) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = row;
+    }
+}
+
+pub struct AppState {
+    pub config: Arc<Config>,
+    /// Precomputed `"Bearer <token>"` so auth doesn't reallocate it per request.
+    pub auth_header: String,
+    pub store: Store,
+    /// Shared by `/api/cpu/current` and the fixed-cadence memory refresher —
+    /// *not* with the collector, which constructs its own `HostSampler`.
+    /// sysinfo CPU readings are differential, so the API must use one warm,
+    /// consistently-refreshed instance rather than a fresh one per request.
+    ///
+    /// Consequence: `/api/cpu/current` reports usage *since the last call to
+    /// `/api/cpu/current` reports usage since its previous refresh (or the
+    /// memory ticker's refresh, which does not refresh CPU), not usage over a
+    /// fixed 5-second window like the collector's independent history rows.
+    pub sampler: Arc<Mutex<HostSampler>>,
+    /// Refreshed at a fixed cadence, so HTTP requests never read /proc/meminfo.
+    pub memory: Arc<CachedMemory>,
+    /// Bounds admission to SQLite's blocking history path. The store has one
+    /// reader, so more blocking tasks only consume threads while waiting.
+    pub history_queries: Arc<Semaphore>,
+}
+
+pub fn router(state: Arc<AppState>) -> Router {
+    let debug = state.config.debug;
+
+    let mut app = Router::new()
+        .route("/api/health", get(|| async { "ok" }))
+        .route(
+            "/api/version",
+            get({
+                let v = state.config.version.clone();
+                move || async move { v }
+            }),
+        )
+        .merge(routes::cpu::routes())
+        .merge(routes::memory::routes())
+        .merge(routes::container::routes());
+
+    if debug {
+        app = app.merge(routes::stats::routes());
+    }
+
+    app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        auth::require_token,
+    ))
+    .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CachedMemory;
+    use store::MemRow;
+
+    fn memory(used: u64) -> MemRow {
+        MemRow {
+            time: 0,
+            total: 100,
+            available: 100 - used,
+            used,
+            used_percent: used as f64,
+            free: 100 - used,
+        }
+    }
+
+    #[test]
+    fn cached_memory_returns_the_latest_snapshot() {
+        let cache = CachedMemory::new(memory(10));
+        assert_eq!(cache.get().used, 10);
+
+        cache.set(memory(25));
+
+        assert_eq!(cache.get().used, 25);
+    }
+}

@@ -3,3 +3,7 @@ output
 db/*
 .env
 sentinel
+/target
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

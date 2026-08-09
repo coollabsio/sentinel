@@ -71,7 +71,7 @@ Get the current version of Sentinel.
 
 **Response:**
 ```
-0.0.22
+1.0.0
 ```
 
 **Example:**
@@ -245,7 +245,7 @@ Retrieve CPU usage history for a specific Docker container.
 **Path Parameters:**
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `containerId` | string | Yes | Docker container ID (alphanumeric characters only) |
+| `containerId` | string | Yes | Exact container display name recorded by Sentinel |
 
 **Query Parameters:**
 | Parameter | Type | Required | Default | Description |
@@ -272,7 +272,7 @@ Retrieve CPU usage history for a specific Docker container.
 **Example:**
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "http://localhost:8888/api/container/abc123def456/cpu/history?from=2024-01-15T09:00:00Z"
+  "http://localhost:8888/api/container/postgres-db/cpu/history?from=2024-01-15T09:00:00Z"
 ```
 
 ---
@@ -286,7 +286,7 @@ Retrieve memory usage history for a specific Docker container.
 **Path Parameters:**
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `containerId` | string | Yes | Docker container ID (alphanumeric characters only) |
+| `containerId` | string | Yes | Exact container display name recorded by Sentinel |
 
 **Query Parameters:**
 | Parameter | Type | Required | Default | Description |
@@ -321,7 +321,7 @@ Retrieve memory usage history for a specific Docker container.
 **Example:**
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
-  "http://localhost:8888/api/container/abc123def456/memory/history?from=2024-01-15T00:00:00Z&to=2024-01-15T12:00:00Z"
+  "http://localhost:8888/api/container/postgres-db/memory/history?from=2024-01-15T00:00:00Z&to=2024-01-15T12:00:00Z"
 ```
 
 ---
@@ -371,19 +371,6 @@ Retrieve database storage statistics and estimated logical table sizes.
 curl -H "Authorization: Bearer YOUR_TOKEN" \
   http://localhost:8888/api/stats
 ```
-
-### Profiling Endpoints
-
-Additional debug endpoints for Go profiling (requires `DEBUG=true`):
-
-- `GET /debug/pprof` - pprof index
-- `GET /debug/cmdline` - Command line invocation
-- `GET /debug/profile` - CPU profile
-- `GET /debug/symbol` - Symbol lookup
-- `GET /debug/trace` - Execution trace
-- `GET /debug/heap` - Heap profile
-- `GET /debug/goroutine` - Goroutine profile
-- `GET /debug/block` - Block profile
 
 ---
 

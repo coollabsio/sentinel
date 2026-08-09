@@ -1,0 +1,12 @@
+[package]
+name = "collector"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+config = { path = "../config" }
+docker = { path = "../docker" }
+store = { path = "../store" }
+sysinfo.workspace = true
+tokio.workspace = true
+tracing.workspace = true

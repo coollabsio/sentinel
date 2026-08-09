@@ -1,0 +1,9 @@
+[package]
+name = "store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
