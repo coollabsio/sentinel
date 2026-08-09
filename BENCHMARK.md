@@ -4,7 +4,7 @@ How to measure Sentinel so results are comparable across **versions**, **impleme
 
 This is a **specification**, not a one-off report. Record every run in a dated results file (suggested: `docs/benchmark-results/YYYY-MM-DD-<label>.md`) using the template at the end.
 
-Dated run reports live under `docs/benchmark-results/` (e.g. the initial Go vs Rust suite).
+Dated run reports live under `docs/benchmark-results/` (canonical run: the Go vs Rust suite).
 
 **Harness:** all HTTP load / latency / stress work uses the in-tree Rust tool:
 
@@ -336,20 +336,21 @@ Comparisons are only valid **same machine, same method**. When publishing a cros
 
 ---
 
-## 7. Baseline snapshot (2026-08-08, `sentinel-bench`)
+## 7. Baseline snapshot (2026-08-09, `sentinel-bench` 1.0.0)
 
-One reference point so future runs have a known anchor. **Do not treat these as SLOs** — historical numbers on one Linux Docker host. Full tables: `docs/benchmark-results/2026-08-08-go-vs-rust-sentinel-bench.md`.
+One reference point so future runs have a known anchor. **Do not treat these as SLOs** — historical numbers on one Linux Docker host. Full tables: `docs/benchmark-results/2026-08-09-go-vs-rust-sentinel-bench.md`.
 
-| Metric | Go `coollabsio/sentinel:latest` 0.0.22 | Rust `sentinel:rust` 0.0.22 |
+| Metric | Go `coollabsio/sentinel:latest` 0.0.22 | Rust `sentinel:rust` 1.0.0 |
 |--------|----------------------------------------|------------------------------|
-| Image size | 13 351 554 B (~12.7 MiB) | 11 208 346 B (~10.7 MiB) |
-| Binary size | 17 585 816 B | 9 820 560 B |
-| Cold start avg (n=5) | ~316 ms | ~301 ms |
-| Idle VmRSS | ~12.9 MB | ~4.6 MB |
-| Health RPS c=10 | ~23 971 | ~40 435 |
-| cpu/current RPS c=10 | ~16 125 | ~36 452 |
-| Stress mixed 256×30s RPS | ~26 277 | ~40 232 |
-| Stress mixed p99 | ~54 ms | ~18 ms |
+| Image size | 13 351 554 B (~12.7 MiB) | 11 230 869 B (~10.7 MiB) |
+| Binary size | 17 585 816 B | 9 886 224 B |
+| Cold start avg (n=5) | ~313 ms | ~291 ms |
+| Idle VmRSS | ~12.8 MB | ~4.7 MB |
+| Health RPS c=10 | ~25 700 | ~41 052 |
+| cpu/current RPS c=10 | ~19 475 | ~39 084 |
+| memory/current RPS c=32 | ~24 599 | ~50 647 |
+| Stress mixed 256×30s RPS | ~24 821 | ~41 393 |
+| Stress mixed p99 | ~56 ms | ~28 ms |
 
 Earlier Rust cold start was ~590 ms avg; fixed by removing a 200 ms CPU warm-up sleep before bind (see §8).
 

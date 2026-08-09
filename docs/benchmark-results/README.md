@@ -7,4 +7,4 @@ Every results file must include a **System configuration** block (`./target/rele
 
 | Date | File | Notes |
 |------|------|-------|
-| 2026-08-08 | [2026-08-08-go-vs-rust-sentinel-bench.md](2026-08-08-go-vs-rust-sentinel-bench.md) | Full Go vs Rust with latency/load/stress (`sentinel-bench`) |
+| 2026-08-09 | [2026-08-09-go-vs-rust-sentinel-bench.md](2026-08-09-go-vs-rust-sentinel-bench.md) | Canonical Go vs Rust run — size/cold-start/memory/latency/load/stress (`sentinel-bench` 1.0.0) |
