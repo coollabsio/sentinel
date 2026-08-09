@@ -1,2 +1,736 @@
+// `deny`, not `forbid`: this module contains the crate's only `unsafe` block
+// (`Reader::open_mmap`), which needs a scoped `#[allow(unsafe_code)]`. `forbid`
+// cannot be lifted by an inner `allow`, so it would make that impossible.
+#![deny(unsafe_code)]
+
 //! GeoIP database management and lookup.
-//! Implementation in Task 8.
+//!
+//! Resolves an ordered list of candidate database sources (spec §6), downloads
+//! the first one that works, decompresses it, memory-maps it, and publishes it
+//! through an [`ArcSwap`] so lookups stay lock-free across hot reloads.
+//!
+//! Source resolution, in priority order:
+//! 1. `geoip_maxmind_key` set — the licensed MaxMind tarball, no fallback (an
+//!    explicit credential means the operator wants *that* database).
+//! 2. `geoip_db_url` set — that URL only, no fallback (explicit override).
+//! 3. Otherwise — the jsDelivr mirror, then DB-IP Lite for the current month,
+//!    then DB-IP Lite for the previous month. DB-IP's URLs are date-derived and
+//!    the current month's build is not published until some point into the
+//!    month, so the previous month is carried as a third candidate rather than
+//!    special-cased inside the DB-IP attempt.
+//!
+//! Every refresh writes a *new* dated file and only removes the previous one
+//! after the new mapping is live; see the `SAFETY` note on [`GeoIp::install`].
+
+use std::io::{Read, Write};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use arc_swap::ArcSwap;
+use config::TrafficSettings;
+use flate2::read::GzDecoder;
+use maxminddb::{Mmap, Reader, geoip2};
+use reqwest::StatusCode;
+use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+
+use crate::TrafficError;
+use crate::enrich::CountryLookup;
+
+/// Default database source: a GeoLite2-Country mirror published on npm and
+/// served by the jsDelivr CDN. Requires no MaxMind account.
+pub const MIRROR_URL: &str =
+    "https://cdn.jsdelivr.net/npm/geolite2-country/GeoLite2-Country.mmdb.gz";
+
+/// Gzip magic number; used to sanity-check URL-derived archive detection.
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// Refuse bodies larger than this. The largest legitimate candidate (a
+/// GeoLite2-City tarball) is well under 100 MiB.
+const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How the bytes at a source URL are packaged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Archive {
+    /// A gzip-compressed tar containing an `.mmdb` member (MaxMind's layout).
+    TarGz,
+    /// A gzip-compressed `.mmdb` file.
+    Gz,
+    /// A bare, uncompressed `.mmdb` file.
+    Raw,
+}
+
+/// One candidate database source.
+#[derive(Debug, Clone)]
+pub struct Source {
+    /// URL to fetch.
+    pub url: String,
+    /// How to unpack the response body.
+    pub archive: Archive,
+}
+
+/// Build the ordered list of candidate sources for `cfg`. Callers try them in
+/// order and keep the first that succeeds.
+pub fn resolve_sources(cfg: &TrafficSettings) -> Vec<Source> {
+    if let Some(key) = cfg.geoip_maxmind_key.as_deref() {
+        return vec![Source {
+            url: maxmind_url(key, &cfg.geoip_maxmind_edition),
+            archive: Archive::TarGz,
+        }];
+    }
+
+    if let Some(url) = cfg.geoip_db_url.as_deref() {
+        return vec![Source {
+            archive: archive_from_url(url),
+            url: url.to_string(),
+        }];
+    }
+
+    let now = time::OffsetDateTime::now_utc();
+    let (year, month) = (now.year(), now.month() as u32);
+    let (prev_year, prev_month) = if month == 1 {
+        (year - 1, 12)
+    } else {
+        (year, month - 1)
+    };
+
+    vec![
+        Source {
+            url: MIRROR_URL.to_string(),
+            archive: Archive::Gz,
+        },
+        Source {
+            url: dbip_url(year, month),
+            archive: Archive::Gz,
+        },
+        Source {
+            url: dbip_url(prev_year, prev_month),
+            archive: Archive::Gz,
+        },
+    ]
+}
+
+/// MaxMind's licensed download URL for `edition`, authenticated with `key`.
+pub fn maxmind_url(key: &str, edition: &str) -> String {
+    format!(
+        "https://download.maxmind.com/app/geoip_download?edition_id={edition}&license_key={key}&suffix=tar.gz"
+    )
+}
+
+/// DB-IP's free country-lite download URL for a given year and month.
+pub fn dbip_url(year: i32, month: u32) -> String {
+    format!("https://download.db-ip.com/free/dbip-country-lite-{year:04}-{month:02}.mmdb.gz")
+}
+
+/// Guess the packaging of `url` from its path suffix (query/fragment ignored).
+pub fn archive_from_url(url: &str) -> Archive {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        Archive::TarGz
+    } else if lower.ends_with(".gz") {
+        Archive::Gz
+    } else {
+        Archive::Raw
+    }
+}
+
+/// Reconcile URL-derived packaging against the body's gzip magic number, so a
+/// server that serves a bare `.mmdb` from a `.gz` URL (or vice versa) still
+/// works. Cannot distinguish `TarGz` from `Gz`; that stays URL-driven.
+fn reconcile_archive(archive: &Archive, bytes: &[u8]) -> Archive {
+    let looks_gzipped = bytes.len() >= 2 && bytes[..2] == GZIP_MAGIC;
+    match (archive, looks_gzipped) {
+        (Archive::TarGz | Archive::Gz, false) => Archive::Raw,
+        (Archive::Raw, true) => Archive::Gz,
+        _ => *archive,
+    }
+}
+
+/// Unpack a downloaded body into raw `.mmdb` bytes.
+fn extract_mmdb(bytes: &[u8], archive: &Archive) -> Result<Vec<u8>, TrafficError> {
+    match reconcile_archive(archive, bytes) {
+        Archive::Raw => Ok(bytes.to_vec()),
+        Archive::Gz => {
+            let mut out = Vec::new();
+            GzDecoder::new(bytes)
+                .read_to_end(&mut out)
+                .map_err(|e| TrafficError::Decompress(format!("gunzip: {e}")))?;
+            Ok(out)
+        }
+        Archive::TarGz => {
+            let mut tar = tar::Archive::new(GzDecoder::new(bytes));
+            let entries = tar
+                .entries()
+                .map_err(|e| TrafficError::Decompress(format!("tar entries: {e}")))?;
+            for entry in entries {
+                let mut entry =
+                    entry.map_err(|e| TrafficError::Decompress(format!("tar entry: {e}")))?;
+                let is_mmdb = entry
+                    .path()
+                    .map(|p| {
+                        p.extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("mmdb"))
+                    })
+                    .unwrap_or(false);
+                if !is_mmdb {
+                    continue;
+                }
+                let mut out = Vec::new();
+                entry
+                    .read_to_end(&mut out)
+                    .map_err(|e| TrafficError::Decompress(format!("tar member: {e}")))?;
+                return Ok(out);
+            }
+            Err(TrafficError::Decompress(
+                "no .mmdb member in tar.gz".to_string(),
+            ))
+        }
+    }
+}
+
+/// Bookkeeping for the currently-loaded database.
+struct Meta {
+    /// `ETag` of the response the current database came from, if the server
+    /// sent one.
+    etag: Option<String>,
+    /// `Last-Modified` of that response, used only when there is no `ETag`.
+    last_modified: Option<String>,
+    /// On-disk path of the file currently mapped by `db`.
+    path: PathBuf,
+    /// URL the current database was fetched from. Conditional-request headers
+    /// are only replayed against this exact URL.
+    source_url: String,
+}
+
+/// Outcome of a conditional GET.
+enum Fetched {
+    /// Server answered `304 Not Modified`.
+    NotModified,
+    /// Server answered with a body.
+    Body {
+        bytes: Vec<u8>,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
+}
+
+/// A memory-mapped GeoIP country database with lock-free reads and atomic
+/// hot-reload.
+pub struct GeoIp {
+    db: ArcSwap<Reader<Mmap>>,
+    meta: Mutex<Meta>,
+}
+
+impl GeoIp {
+    /// Download and map a database, trying each candidate from
+    /// [`resolve_sources`] in order.
+    ///
+    /// Returns `Err` only when *every* candidate fails; the caller is expected
+    /// to fall back to [`crate::enrich::NoGeo`] rather than treat that as
+    /// fatal. On success the returned `GeoIp` always has a live mapping.
+    pub async fn bootstrap(
+        cfg: &TrafficSettings,
+        db_dir: &Path,
+    ) -> Result<Arc<GeoIp>, TrafficError> {
+        std::fs::create_dir_all(db_dir)?;
+        let client = http_client()?;
+
+        let mut last_err: Option<TrafficError> = None;
+        for source in resolve_sources(cfg) {
+            let (bytes, etag, last_modified) = match Self::fetch(&client, &source, None, None).await
+            {
+                Ok(Fetched::Body {
+                    bytes,
+                    etag,
+                    last_modified,
+                }) => (bytes, etag, last_modified),
+                // No conditional headers were sent, so 304 is a protocol
+                // violation; treat it as a failed candidate.
+                Ok(Fetched::NotModified) => {
+                    last_err = Some(TrafficError::Download(format!(
+                        "{}: unexpected 304 without conditional request",
+                        source.url
+                    )));
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(url = %source.url, error = %e, "geoip source failed");
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+
+            match Self::install(&bytes, &source, db_dir) {
+                Ok((reader, path)) => {
+                    tracing::info!(url = %source.url, path = %path.display(), "geoip database loaded");
+                    let geo = Arc::new(GeoIp {
+                        db: ArcSwap::new(Arc::new(reader)),
+                        meta: Mutex::new(Meta {
+                            etag,
+                            last_modified,
+                            path: path.clone(),
+                            source_url: source.url.clone(),
+                        }),
+                    });
+                    // Only now that the new file is mapped and published is it
+                    // safe to remove anything else left in the directory.
+                    prune_old(db_dir, &path);
+                    return Ok(geo);
+                }
+                Err(e) => {
+                    tracing::debug!(url = %source.url, error = %e, "geoip source unusable");
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            TrafficError::GeoIp("no geoip sources resolved from configuration".to_string())
+        }))
+    }
+
+    /// Re-check the configured sources and hot-swap in a newer database.
+    ///
+    /// Returns `Ok(true)` if a new database was mapped and swapped in,
+    /// `Ok(false)` if the active source answered `304 Not Modified` (nothing to
+    /// do), and `Err` if every candidate failed. The currently-mapped database
+    /// is never disturbed on `Ok(false)` or `Err`.
+    pub async fn refresh(
+        self: &Arc<Self>,
+        cfg: &TrafficSettings,
+        db_dir: &Path,
+    ) -> Result<bool, TrafficError> {
+        std::fs::create_dir_all(db_dir)?;
+        let client = http_client()?;
+
+        let (active_url, etag, last_modified) = {
+            let meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                meta.source_url.clone(),
+                meta.etag.clone(),
+                meta.last_modified.clone(),
+            )
+        };
+
+        let mut last_err: Option<TrafficError> = None;
+        for source in resolve_sources(cfg) {
+            // Validators are only meaningful for the URL they came from.
+            let (cond_etag, cond_lm) = if source.url == active_url {
+                (etag.as_deref(), last_modified.as_deref())
+            } else {
+                (None, None)
+            };
+
+            let (bytes, new_etag, new_lm) =
+                match Self::fetch(&client, &source, cond_etag, cond_lm).await {
+                    Ok(Fetched::Body {
+                        bytes,
+                        etag,
+                        last_modified,
+                    }) => (bytes, etag, last_modified),
+                    Ok(Fetched::NotModified) => {
+                        tracing::debug!(url = %source.url, "geoip database unchanged");
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        tracing::debug!(url = %source.url, error = %e, "geoip refresh source failed");
+                        last_err = Some(e);
+                        continue;
+                    }
+                };
+
+            let (reader, path) = match Self::install(&bytes, &source, db_dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(url = %source.url, error = %e, "geoip refresh source unusable");
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+
+            // The new file is written and mapped; publish it before touching
+            // the old one.
+            self.db.store(Arc::new(reader));
+            {
+                let mut meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
+                meta.path = path.clone();
+                meta.etag = new_etag;
+                meta.last_modified = new_lm;
+                meta.source_url = source.url.clone();
+            }
+            tracing::info!(url = %source.url, path = %path.display(), "geoip database refreshed");
+            // Only now: the superseded file is unlinked strictly after the new
+            // one is mapped and published. Readers still holding the old
+            // mapping are unaffected — unlinking a mapped file does not
+            // invalidate existing mappings on Linux.
+            prune_old(db_dir, &path);
+            return Ok(true);
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            TrafficError::GeoIp("no geoip sources resolved from configuration".to_string())
+        }))
+    }
+
+    /// Conditional GET of `source`. `etag`/`last_modified` are the validators
+    /// for the *currently loaded* copy of this exact URL, if any.
+    async fn fetch(
+        client: &reqwest::Client,
+        source: &Source,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<Fetched, TrafficError> {
+        let mut req = client.get(&source.url);
+        // Prefer ETag: servers that receive both validators ignore the date.
+        if let Some(etag) = etag {
+            req = req.header(IF_NONE_MATCH, etag);
+        } else if let Some(lm) = last_modified {
+            req = req.header(IF_MODIFIED_SINCE, lm);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| TrafficError::Download(format!("{}: {e}", source.url)))?;
+
+        if resp.status() == StatusCode::NOT_MODIFIED {
+            return Ok(Fetched::NotModified);
+        }
+        if !resp.status().is_success() {
+            return Err(TrafficError::Download(format!(
+                "{}: http {}",
+                source.url,
+                resp.status()
+            )));
+        }
+        if let Some(len) = resp.content_length()
+            && len > MAX_DOWNLOAD_BYTES
+        {
+            return Err(TrafficError::Download(format!(
+                "{}: content-length {len} exceeds {MAX_DOWNLOAD_BYTES}",
+                source.url
+            )));
+        }
+
+        let header = |name: reqwest::header::HeaderName| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        };
+        let etag = header(ETAG);
+        let last_modified = header(LAST_MODIFIED);
+
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| TrafficError::Download(format!("{}: body: {e}", source.url)))?;
+        if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+            return Err(TrafficError::Download(format!(
+                "{}: body of {} bytes exceeds {MAX_DOWNLOAD_BYTES}",
+                source.url,
+                bytes.len()
+            )));
+        }
+
+        Ok(Fetched::Body {
+            bytes: bytes.to_vec(),
+            etag,
+            last_modified,
+        })
+    }
+
+    /// Unpack `bytes`, write them to a brand-new file under `db_dir`, and map
+    /// it. Never touches an existing file.
+    fn install(
+        bytes: &[u8],
+        source: &Source,
+        db_dir: &Path,
+    ) -> Result<(Reader<Mmap>, PathBuf), TrafficError> {
+        let mmdb = extract_mmdb(bytes, &source.archive)?;
+        let path = write_fresh(db_dir, &mmdb)?;
+
+        // SAFETY: `Reader::open_mmap` requires that the mapped file is never
+        // modified or truncated for as long as the returned `Reader` lives.
+        // `write_fresh` above created `path` with `create_new(true)`, so it is
+        // a filename no other file has ever occupied, and it was fully written
+        // and closed before this call. Nothing in this crate ever reopens a
+        // `geoip-*.mmdb` file for writing: every download lands on a new
+        // timestamped path, and the only other operation performed on these
+        // files is `prune_old`'s unlink of paths *other* than the live one.
+        // Unlinking is not modification or truncation, and on Linux an
+        // existing mapping survives its file being unlinked, so even a reader
+        // still in flight during a swap stays sound.
+        #[allow(unsafe_code)]
+        let reader = unsafe { Reader::open_mmap(&path) }.map_err(|e| {
+            // The file is unusable; drop it rather than leave it for prune.
+            let _ = std::fs::remove_file(&path);
+            TrafficError::GeoIp(format!("open {}: {e}", path.display()))
+        })?;
+
+        Ok((reader, path))
+    }
+}
+
+impl CountryLookup for GeoIp {
+    fn country(&self, ip: IpAddr) -> Option<String> {
+        let guard = self.db.load();
+        let result = guard.lookup(ip).ok()?;
+        let record = result.decode::<geoip2::Country>().ok()??;
+        record.country.iso_code.map(str::to_string)
+    }
+}
+
+/// HTTP client for database downloads. Timeouts are generous: the MaxMind
+/// tarball is tens of megabytes and this runs on a background schedule.
+fn http_client() -> Result<reqwest::Client, TrafficError> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|e| TrafficError::Download(format!("client: {e}")))
+}
+
+/// Write `mmdb` to a path under `db_dir` that did not previously exist.
+fn write_fresh(db_dir: &Path, mmdb: &[u8]) -> Result<PathBuf, TrafficError> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    // `create_new` makes the "never write over a mapped file" invariant an
+    // enforced property rather than a convention; the counter only exists so a
+    // freak nanosecond collision degrades to a retry instead of an error.
+    for attempt in 0..16u32 {
+        let path = if attempt == 0 {
+            db_dir.join(format!("geoip-{stamp}.mmdb"))
+        } else {
+            db_dir.join(format!("geoip-{stamp}-{attempt}.mmdb"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(mmdb)?;
+                file.sync_all()?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(TrafficError::GeoIp(format!(
+        "could not allocate a fresh database filename in {}",
+        db_dir.display()
+    )))
+}
+
+/// Best-effort removal of every `geoip-*.mmdb` in `db_dir` except `keep`.
+/// Called only after `keep` is mapped and published.
+fn prune_old(db_dir: &Path, keep: &Path) {
+    let entries = match std::fs::read_dir(db_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(dir = %db_dir.display(), error = %e, "geoip prune skipped");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let is_db = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("geoip-") && n.ends_with(".mmdb"));
+        if !is_db {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::debug!(path = %path.display(), error = %e, "geoip prune failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
+    fn default_settings() -> config::TrafficSettings {
+        config::Config::load_for_test().traffic
+    }
+
+    fn gz(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn maxmind_url_format() {
+        assert_eq!(
+            maxmind_url("KEY", "GeoLite2-Country"),
+            "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=KEY&suffix=tar.gz"
+        );
+    }
+
+    #[test]
+    fn dbip_url_format() {
+        assert_eq!(
+            dbip_url(2026, 8),
+            "https://download.db-ip.com/free/dbip-country-lite-2026-08.mmdb.gz"
+        );
+    }
+
+    #[test]
+    fn resolve_default_is_mirror_then_dbip() {
+        let cfg = default_settings(); // no key, no db_url
+        let s = resolve_sources(&cfg);
+        assert_eq!(s[0].url, MIRROR_URL);
+        assert!(s[1].url.starts_with("https://download.db-ip.com/free/dbip-country-lite-"));
+        assert!(matches!(s[0].archive, Archive::Gz));
+        // Third candidate is the previous month's DB-IP file: the current
+        // month's build may not be published yet at the start of a month.
+        assert_eq!(s.len(), 3);
+        assert!(s[2].url.starts_with("https://download.db-ip.com/free/dbip-country-lite-"));
+        assert_ne!(s[1].url, s[2].url);
+    }
+
+    #[test]
+    fn resolve_key_is_maxmind_only_no_fallback() {
+        let mut cfg = default_settings();
+        cfg.geoip_maxmind_key = Some("K".into());
+        let s = resolve_sources(&cfg);
+        assert_eq!(s.len(), 1);
+        assert!(matches!(s[0].archive, Archive::TarGz));
+    }
+
+    #[test]
+    fn resolve_explicit_url_no_fallback() {
+        let mut cfg = default_settings();
+        cfg.geoip_db_url = Some("https://x/y.mmdb".into());
+        let s = resolve_sources(&cfg);
+        assert_eq!(s.len(), 1);
+        assert!(matches!(s[0].archive, Archive::Raw)); // .mmdb => raw
+    }
+
+    #[test]
+    fn archive_detection() {
+        assert!(matches!(archive_from_url("a.tar.gz"), Archive::TarGz));
+        assert!(matches!(archive_from_url("a.mmdb.gz"), Archive::Gz));
+        assert!(matches!(archive_from_url("a.mmdb"), Archive::Raw));
+    }
+
+    #[test]
+    fn extract_gz_roundtrip() {
+        let original = b"a fake mmdb payload".repeat(64);
+        let compressed = gz(&original);
+        let out = extract_mmdb(&compressed, &Archive::Gz).unwrap();
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn extract_targz_finds_mmdb_member() {
+        let payload = b"nested mmdb bytes".repeat(32);
+
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+        // A README member that must be skipped, then the real .mmdb, nested a
+        // directory deep exactly like MaxMind's tarball layout.
+        let mut header = tar::Header::new_gnu();
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "GeoLite2-Country_20260801/README", &b"hello"[..])
+            .unwrap();
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "GeoLite2-Country_20260801/GeoLite2-Country.mmdb",
+                &payload[..],
+            )
+            .unwrap();
+
+        let archive = builder.into_inner().unwrap().finish().unwrap();
+
+        let out = extract_mmdb(&archive, &Archive::TarGz).unwrap();
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn extract_raw_is_passthrough() {
+        assert_eq!(extract_mmdb(b"abc", &Archive::Raw).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn magic_reconciles_mismatched_suffix() {
+        // A server that hands back a bare .mmdb from a .gz URL still works.
+        assert_eq!(extract_mmdb(b"raw bytes", &Archive::Gz).unwrap(), b"raw bytes");
+        // ...and vice versa.
+        let compressed = gz(b"payload");
+        assert_eq!(extract_mmdb(&compressed, &Archive::Raw).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn write_fresh_never_reuses_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_fresh(dir.path(), b"first").unwrap();
+        let b = write_fresh(dir.path(), b"second").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second");
+    }
+
+    #[test]
+    fn prune_old_keeps_the_live_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_fresh(dir.path(), b"old").unwrap();
+        let live = write_fresh(dir.path(), b"live").unwrap();
+        std::fs::write(dir.path().join("unrelated.sqlite"), b"x").unwrap();
+
+        prune_old(dir.path(), &live);
+
+        assert!(!old.exists(), "previous database should be removed");
+        assert!(live.exists(), "live database must survive pruning");
+        assert!(dir.path().join("unrelated.sqlite").exists());
+    }
+
+    /// Network-gated: actually downloads from the default source chain.
+    /// Run manually with `cargo test -p traffic geoip -- --ignored`.
+    #[tokio::test]
+    #[ignore = "hits the network"]
+    async fn bootstrap_downloads_and_looks_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = default_settings();
+
+        let geo = GeoIp::bootstrap(&cfg, dir.path()).await.unwrap();
+        let country = geo.country("89.160.20.128".parse().unwrap());
+        assert!(country.is_some(), "expected a country for a known public IP");
+
+        // A second pass either 304s (Ok(false)) or re-downloads (Ok(true));
+        // either way the database stays usable and only one file remains.
+        let swapped = geo.refresh(&cfg, dir.path()).await.unwrap();
+        assert!(geo.country("89.160.20.128".parse().unwrap()).is_some());
+        let dbs = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("geoip-"))
+            .count();
+        assert_eq!(dbs, 1, "swapped={swapped}");
+    }
+}
