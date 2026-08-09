@@ -35,10 +35,15 @@ async fn cpu_history(
         Err(resp) => return resp,
     };
 
+    let permit = match state.history_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
     let store = state.store.clone();
-    let rows = match tokio::task::spawn_blocking(move || store.container_cpu_history(&id, from, to))
-        .await
-    {
+    let result =
+        tokio::task::spawn_blocking(move || store.container_cpu_history(&id, from, to)).await;
+    drop(permit);
+    let rows = match result {
         Ok(Ok(rows)) => rows,
         Ok(Err(e)) => return internal_error(e),
         Err(e) => return internal_error(e),
@@ -67,15 +72,19 @@ async fn memory_history(
         Err(resp) => return resp,
     };
 
+    let permit = match state.history_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
     let store = state.store.clone();
-    let rows =
-        match tokio::task::spawn_blocking(move || store.container_memory_history(&id, from, to))
-            .await
-        {
-            Ok(Ok(rows)) => rows,
-            Ok(Err(e)) => return internal_error(e),
-            Err(e) => return internal_error(e),
-        };
+    let result =
+        tokio::task::spawn_blocking(move || store.container_memory_history(&id, from, to)).await;
+    drop(permit);
+    let rows = match result {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => return internal_error(e),
+        Err(e) => return internal_error(e),
+    };
 
     let debug = state.config.debug;
     let out: Vec<MemUsage> = rows

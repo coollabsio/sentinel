@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Semaphore, watch};
 
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -98,7 +98,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // collector and pusher, so it is opened *after* the listener binds —
     // keeping the path to `/api/health` as short as possible.
     let store = store::Store::open(&config.metrics_file)?;
-    let sampler = Arc::new(Mutex::new(collector::HostSampler::new()));
+    let mut host_sampler = collector::HostSampler::new();
+    let memory = Arc::new(api::CachedMemory::new(host_sampler.sample_memory()));
+    let sampler = Arc::new(Mutex::new(host_sampler));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut services = tokio::task::JoinSet::new();
@@ -126,6 +128,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config: config.clone(),
             store: store.clone(),
             sampler: sampler.clone(),
+            memory: memory.clone(),
+            history_queries: Arc::new(Semaphore::new(api::MAX_CONCURRENT_HISTORY_QUERIES)),
         });
         let app = api::router(state);
         let mut rx = shutdown_rx.clone();
@@ -136,6 +140,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await
                 .map_err(|error| format!("API service failed: {error}"))
+        });
+    }
+
+    // Refresh the in-memory host snapshot independently of request volume.
+    // /proc/meminfo can be a comparatively expensive FUSE read inside LXC,
+    // so current-memory requests only copy this cached value.
+    {
+        let sampler = sampler.clone();
+        let memory = memory.clone();
+        let mut rx = shutdown_rx.clone();
+        services.spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                tokio::select! {
+                    _ = rx.changed() => return Ok::<(), String>(()),
+                    _ = ticker.tick() => {
+                        let row = sampler.lock().await.sample_memory();
+                        memory.set(row);
+                    }
+                }
+            }
         });
     }
 

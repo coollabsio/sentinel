@@ -103,6 +103,12 @@ fn test_state() -> std::sync::Arc<api::AppState> {
         config: std::sync::Arc::new(config),
         store: store::Store::open_in_memory().unwrap(),
         sampler: std::sync::Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
+        memory: std::sync::Arc::new(api::CachedMemory::new(
+            collector::HostSampler::new().sample_memory(),
+        )),
+        history_queries: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_HISTORY_QUERIES,
+        )),
     })
 }
 

@@ -13,17 +13,20 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Response {
+    let permit = match state.history_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
     let store = state.store.clone();
-    let db = match tokio::task::spawn_blocking(move || store.db_stats()).await {
+    let result = tokio::task::spawn_blocking(move || store.db_stats()).await;
+    drop(permit);
+    let db = match result {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return internal_error(e),
         Err(e) => return internal_error(e),
     };
 
-    let memory = {
-        let mut sampler = state.sampler.lock().await;
-        sampler.sample_memory()
-    };
+    let memory = state.memory.get();
 
     let tables: Vec<_> = db
         .tables

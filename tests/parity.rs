@@ -44,6 +44,12 @@ async fn fetch(uri: &str) -> serde_json::Value {
         config: Arc::new(config),
         store,
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
+        memory: Arc::new(api::CachedMemory::new(
+            collector::HostSampler::new().sample_memory(),
+        )),
+        history_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_HISTORY_QUERIES,
+        )),
     });
 
     let res = api::router(state)

@@ -30,6 +30,12 @@ fn state(debug: bool) -> Arc<AppState> {
         config: Arc::new(config),
         store,
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
+        memory: Arc::new(api::CachedMemory::new(
+            collector::HostSampler::new().sample_memory(),
+        )),
+        history_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_HISTORY_QUERIES,
+        )),
     })
 }
 
@@ -161,6 +167,12 @@ async fn cpu_history_returns_empty_array_not_null() {
         config: Arc::new(config),
         store,
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
+        memory: Arc::new(api::CachedMemory::new(
+            collector::HostSampler::new().sample_memory(),
+        )),
+        history_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_HISTORY_QUERIES,
+        )),
     });
     let (s, j) = get(router(st), "/api/cpu/history", Some("secret")).await;
     assert_eq!(s, StatusCode::OK);
