@@ -143,13 +143,33 @@ fn resolve_host_path(prefix: &str, source: &str) -> PathBuf {
     }
 }
 
+/// Hard cap on directory entries visited in a single [`dir_size`] walk. A
+/// pathological bind mount (a container mounting `/`, `/var`, or a home dir for
+/// tooling) can otherwise enumerate millions of inodes on every storage cycle
+/// and stall the storage collector loop. Set well above any realistic single
+/// volume; when hit, [`dir_size`] logs a warning and records the partial sum.
+const MAX_WALK_ENTRIES: u64 = 2_000_000;
+
 /// Recursively sums on-disk block usage (like `du`) under `path`. Symlinks are
 /// never followed and any I/O error degrades to 0 with a warning — the walk
 /// must never crash a collection cycle.
 ///
+/// The walk is unbounded by depth and does not stop at filesystem boundaries,
+/// so a mount source that points at an arbitrarily large host tree (any bind
+/// mount, not just a Docker volume) is walked in full. To keep one pathological
+/// mount from stalling the collector, the walk is capped at [`MAX_WALK_ENTRIES`]
+/// entries; past that it logs a warning and returns the partial sum. Operators
+/// who don't want bind mounts walked can set `STORAGE_VOLUMES_ENABLED=false`.
+///
 /// `pub` so the host-only `sentinel-bench storage` harness can measure the real
 /// walk (see BENCHMARK.md §4.9); not part of any runtime API surface.
 pub fn dir_size(path: &Path) -> u64 {
+    dir_size_bounded(path, MAX_WALK_ENTRIES)
+}
+
+/// [`dir_size`] with an explicit entry budget, so the cap behaviour is testable
+/// without materializing millions of files.
+fn dir_size_bounded(path: &Path, max_entries: u64) -> u64 {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) => {
@@ -169,6 +189,7 @@ pub fn dir_size(path: &Path) -> u64 {
     }
 
     let mut total = meta.blocks() * 512;
+    let mut entries_seen: u64 = 0;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -191,6 +212,16 @@ pub fn dir_size(path: &Path) -> u64 {
                 stack.push(entry.path());
             } else if ft.is_file() {
                 total += md.blocks() * 512;
+            }
+            entries_seen += 1;
+            if entries_seen >= max_entries {
+                tracing::warn!(
+                    path = %path.display(),
+                    entries = entries_seen,
+                    "storage: mount source walk exceeded entry budget, recording partial size \
+                     (a large bind mount? disable with STORAGE_VOLUMES_ENABLED=false)"
+                );
+                return total;
             }
         }
     }
@@ -305,6 +336,25 @@ mod tests {
         std::fs::write(dir.join("sub/b.bin"), vec![0u8; 4096]).unwrap();
         // At least the two files' worth of blocks (12 KiB) must be counted.
         assert!(dir_size(&dir) >= 12 * 1024);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dir_size_bounded_stops_at_entry_cap() {
+        let dir =
+            std::env::temp_dir().join(format!("sentinel-storage-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A flat directory of ten one-block files. Each contributes >0 blocks
+        // regardless of read_dir ordering, so a walk that stops after 3 entries
+        // is strictly smaller than the full walk — order-independent proof the
+        // cap short-circuits.
+        for i in 0..10 {
+            std::fs::write(dir.join(format!("f{i}.bin")), vec![0u8; 4096]).unwrap();
+        }
+        let full = dir_size_bounded(&dir, u64::MAX);
+        let capped = dir_size_bounded(&dir, 3);
+        assert!(capped < full, "capped={capped} full={full}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

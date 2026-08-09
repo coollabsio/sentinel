@@ -10,27 +10,44 @@ pub struct ContainerSummary {
 }
 
 impl ContainerSummary {
-    /// Name resolution ported from the Go collector: prefer the `coolify.name`
-    /// label, then the first Docker name with its leading '/' stripped, then a
-    /// 12-character truncation of the container id.
+    /// See [`resolve_display_name`].
     pub fn display_name(&self) -> String {
-        if let Some(n) = self.labels.get("coolify.name")
-            && !n.is_empty()
-        {
-            return n.clone();
-        }
-        if let Some(first) = self.names.first()
-            && !first.is_empty()
-        {
-            return first.trim_start_matches('/').to_string();
-        }
-        self.id.chars().take(12).collect()
+        resolve_display_name(&self.labels, &self.names, &self.id)
     }
+}
+
+/// Name resolution ported from the Go collector: prefer the `coolify.name`
+/// label, then the first Docker name with its leading '/' stripped, then a
+/// 12-character truncation of the container id.
+///
+/// Every container metric series (cpu/memory/disk) keys on this value, so the
+/// disk collector must resolve names identically to the cpu/memory collector —
+/// keying disk rows on the raw Docker id would make the per-container disk
+/// endpoints and push correlation miss on the documented display-name key.
+pub fn resolve_display_name(
+    labels: &HashMap<String, String>,
+    names: &[String],
+    id: &str,
+) -> String {
+    if let Some(n) = labels.get("coolify.name")
+        && !n.is_empty()
+    {
+        return n.clone();
+    }
+    if let Some(first) = names.first()
+        && !first.is_empty()
+    {
+        return first.trim_start_matches('/').to_string();
+    }
+    id.chars().take(12).collect()
 }
 
 /// Per-container storage inputs from a `size: true` container list.
 #[derive(Debug, Clone, Default)]
 pub struct ContainerDisk {
+    /// Container display name (see [`resolve_display_name`]), matching the key
+    /// used by the cpu/memory series — NOT the raw Docker id — so the disk
+    /// endpoints and push payload correlate on the documented display name.
     pub id: String,
     /// Docker `SizeRw` — writable-layer bytes.
     pub writable_layer: u64,
