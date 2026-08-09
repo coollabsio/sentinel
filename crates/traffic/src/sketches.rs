@@ -157,21 +157,33 @@ impl LatencyDigest {
     /// Decodes a digest previously produced by [`Self::to_bytes`]. An empty
     /// payload decodes to an empty digest (`Self(None)`), never calling
     /// `TDigest::from_centroids` with zero centroids.
+    ///
+    /// Also guards against corrupted/malformed blobs (e.g. a partially
+    /// overwritten SQLite page) that decode to a structurally valid but
+    /// semantically empty `Vec<CentroidData>` — every entry with
+    /// `weight <= 0.0` or a NaN `mean`. `tdigests::TDigest::from_centroids`
+    /// filters those out internally with the *same* predicate used below and
+    /// then `assert!`s the remainder is non-empty, which would panic on such
+    /// input. Filtering here first lets us fall back to the empty
+    /// representation instead of crashing.
     pub fn from_bytes(b: &[u8]) -> Result<Self, TrafficError> {
         let data: Vec<CentroidData> =
             postcard::from_bytes(b).map_err(|e| TrafficError::Codec(e.to_string()))?;
 
-        if data.is_empty() {
-            return Ok(Self(None));
-        }
-
+        // Mirrors tdigests' internal `retain(|c| c.weight > 0.0 && !c.mean.is_nan())`.
         let centroids: Vec<Centroid> = data
             .into_iter()
+            .filter(|c| c.weight > 0.0 && !c.mean.is_nan())
             .map(|c| Centroid {
                 mean: c.mean,
                 weight: c.weight,
             })
             .collect();
+
+        if centroids.is_empty() {
+            return Ok(Self(None));
+        }
+
         Ok(Self(Some(TDigest::from_centroids(centroids))))
     }
 }
@@ -208,14 +220,25 @@ impl Uniques {
         self.0.insert(&bytes);
     }
 
-    /// Merges `other`'s multiset into `self`. Both sketches must share the
-    /// same precision (guaranteed here since `HLL_PRECISION` is a single
-    /// crate-wide constant); merge is exact (a true set union), not
-    /// approximate on top of the estimate.
+    /// Merges `other`'s multiset into `self`. Both sketches are expected to
+    /// share the same precision (guaranteed in the happy path, since
+    /// `HLL_PRECISION` is a single crate-wide constant); merge is exact (a
+    /// true set union), not approximate on top of the estimate.
+    ///
+    /// `HyperLogLogPlus`'s derived `Deserialize` does not validate the
+    /// `precision` field, so a corrupted blob (or a future `HLL_PRECISION`
+    /// change mixing old and new persisted rows) can produce a sketch whose
+    /// precision genuinely differs from `self`'s. [`Self::from_bytes`]
+    /// rejects that at decode time, but this is defense-in-depth: if an
+    /// incompatible sketch ever gets here anyway, degrade gracefully (log
+    /// and skip incorporating `other`'s data) instead of panicking.
     pub fn merge_from(&mut self, other: &Uniques) {
-        self.0
-            .merge(&other.0)
-            .expect("Uniques always uses the fixed HLL_PRECISION, so precision always matches");
+        if let Err(err) = self.0.merge(&other.0) {
+            tracing::warn!(
+                error = %err,
+                "Uniques::merge_from: incompatible sketch, skipping merge"
+            );
+        }
     }
 
     /// Estimates the number of distinct IPs seen.
@@ -229,9 +252,27 @@ impl Uniques {
     }
 
     /// Decodes a sketch previously produced by [`Self::to_bytes`].
+    ///
+    /// `HyperLogLogPlus`'s derived `Deserialize` does not validate the
+    /// `precision` field against the crate's valid range (4..=18), nor
+    /// against `HLL_PRECISION` — only its `new()` constructor checks that. A
+    /// corrupted blob (or stale data from a since-changed `HLL_PRECISION`)
+    /// could otherwise carry a precision that later makes `merge`,
+    /// `add_ip`/`insert`, or `count` panic or behave unsoundly (e.g.
+    /// register-index overflow). Guard against that here by probing a merge
+    /// against a freshly-constructed, known-good sketch: `merge` is the one
+    /// operation that explicitly validates precision compatibility, so a
+    /// successful probe proves the decoded sketch is safe to use.
     pub fn from_bytes(b: &[u8]) -> Result<Self, TrafficError> {
         let hll: HllType =
             postcard::from_bytes(b).map_err(|e| TrafficError::Codec(e.to_string()))?;
+
+        let mut probe = Uniques::new();
+        probe
+            .0
+            .merge(&hll)
+            .map_err(|e| TrafficError::Codec(format!("incompatible HLL precision: {e}")))?;
+
         Ok(Self(hll))
     }
 }
@@ -389,5 +430,103 @@ mod tests {
             (before as i64 - after as i64).abs() <= 1,
             "roundtrip changed count: {before} -> {after}"
         );
+    }
+
+    /// A corrupted BLOB that decodes to a structurally valid but
+    /// semantically empty `Vec<CentroidData>` (every entry has
+    /// `weight == 0.0`) must not panic in `TDigest::from_centroids`'s
+    /// internal `assert!(!centroids.is_empty())` after its own filtering.
+    /// `from_bytes` must filter these out itself and fall back to the empty
+    /// representation.
+    #[test]
+    fn latency_from_bytes_all_zero_weight_centroids_does_not_panic() {
+        let bad_data = vec![
+            CentroidData {
+                mean: 1.0,
+                weight: 0.0,
+            },
+            CentroidData {
+                mean: 2.0,
+                weight: 0.0,
+            },
+        ];
+        let bad_bytes = postcard::to_stdvec(&bad_data).unwrap();
+
+        let restored = LatencyDigest::from_bytes(&bad_bytes).unwrap();
+        assert!(restored.0.is_none());
+        assert_eq!(restored.quantile(0.5), 0.0);
+    }
+
+    /// A NaN-mean centroid is also filtered out (mirrors tdigests' own
+    /// `!c.mean.is_nan()` predicate), independent of weight validity.
+    #[test]
+    fn latency_from_bytes_nan_mean_centroid_does_not_panic() {
+        let bad_data = vec![CentroidData {
+            mean: f64::NAN,
+            weight: 1.0,
+        }];
+        let bad_bytes = postcard::to_stdvec(&bad_data).unwrap();
+
+        let restored = LatencyDigest::from_bytes(&bad_bytes).unwrap();
+        assert!(restored.0.is_none());
+    }
+
+    /// A mix of valid and invalid centroids keeps only the valid ones
+    /// instead of failing the whole decode.
+    #[test]
+    fn latency_from_bytes_filters_invalid_keeps_valid() {
+        let data = vec![
+            CentroidData {
+                mean: 5.0,
+                weight: 0.0, // invalid, dropped
+            },
+            CentroidData {
+                mean: 10.0,
+                weight: 1.0, // valid, kept
+            },
+        ];
+        let bytes = postcard::to_stdvec(&data).unwrap();
+
+        let restored = LatencyDigest::from_bytes(&bytes).unwrap();
+        assert!(restored.0.is_some());
+        assert!((restored.quantile(0.5) - 10.0).abs() < 1e-9);
+    }
+
+    /// A sketch persisted with a different HLL precision than the crate's
+    /// current `HLL_PRECISION` (e.g. from corruption, or a pre-change row
+    /// after a future `HLL_PRECISION` bump) must be rejected at decode time
+    /// with an `Err`, not accepted and later panic inside `merge_from`'s
+    /// `.expect` (now removed) or misbehave in `add_ip`/`count`.
+    #[test]
+    fn uniques_from_bytes_rejects_incompatible_precision() {
+        let other_precision_hll: HllType =
+            HyperLogLogPlus::new(HLL_PRECISION + 1, HllHasherBuilder::default())
+                .expect("valid precision within 4..=18");
+        let bytes = postcard::to_stdvec(&other_precision_hll).unwrap();
+
+        let result = Uniques::from_bytes(&bytes);
+        assert!(
+            result.is_err(),
+            "expected incompatible-precision sketch to be rejected"
+        );
+    }
+
+    /// Defense-in-depth: even if an incompatible sketch somehow reaches
+    /// `merge_from` directly (bypassing `from_bytes`'s validation), it must
+    /// degrade gracefully (skip the merge) rather than panic.
+    #[test]
+    fn uniques_merge_from_incompatible_precision_does_not_panic() {
+        let mut a = Uniques::new();
+        a.add_ip(IpAddr::V4(Ipv4Addr::from(1u32)));
+        let before = a.count();
+
+        let other_precision_hll: HllType =
+            HyperLogLogPlus::new(HLL_PRECISION + 1, HllHasherBuilder::default())
+                .expect("valid precision within 4..=18");
+        let incompatible = Uniques(other_precision_hll);
+
+        // Must not panic.
+        a.merge_from(&incompatible);
+        assert_eq!(a.count(), before, "incompatible merge should be a no-op");
     }
 }
