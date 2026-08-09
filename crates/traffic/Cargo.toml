@@ -1,0 +1,33 @@
+[package]
+name = "traffic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+store = { path = "../store" }
+config = { path = "../config" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+maxminddb = { workspace = true }
+arc-swap = { workspace = true }
+foldhash = { workspace = true }
+postcard = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+woothee = { workspace = true }
+lru = { workspace = true }
+# tdigest has a conflicting syn requirement (2.0.81) incompatible with the
+# current ecosystem; deferred to later when Task 1 dependencies are fixed
+# tdigest = { workspace = true }
+hyperloglogplus = { workspace = true }
+siphasher = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
