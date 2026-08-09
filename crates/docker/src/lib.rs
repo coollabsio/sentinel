@@ -171,7 +171,9 @@ fn container_disk_from_summary(c: bollard::models::ContainerSummary) -> Containe
 #[cfg(test)]
 mod tests {
     use super::container_disk_from_summary;
-    use bollard::models::{ContainerSummary, ContainerSummaryStateEnum, HealthStatusEnum, MountPoint};
+    use bollard::models::{
+        ContainerSummary, ContainerSummaryStateEnum, HealthStatusEnum, MountPoint,
+    };
 
     // A `size: true` list yields the raw Docker id, but the disk series must be
     // keyed on the same display name as cpu/memory (coolify.name label, else the

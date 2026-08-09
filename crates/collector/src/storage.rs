@@ -341,8 +341,7 @@ mod tests {
 
     #[test]
     fn dir_size_bounded_stops_at_entry_cap() {
-        let dir =
-            std::env::temp_dir().join(format!("sentinel-storage-cap-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("sentinel-storage-cap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // A flat directory of ten one-block files. Each contributes >0 blocks
