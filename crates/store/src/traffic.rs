@@ -767,15 +767,27 @@ impl AnalyticsStore {
         self.with_conn(|c| Ok(c.execute_batch(sql)?))
     }
 
-    /// Distinct app UUIDs with recorded traffic. Queries only the `1m` tier:
-    /// compaction always derives `1h`/`1d` rows from `1m` data, so the app
-    /// set is identical across tiers and `1m` — the tier every flush
-    /// populates first — is the cheapest, always-populated source (no
-    /// `UNION` across three tables needed).
+    /// Distinct app UUIDs with recorded traffic, across every tier.
+    ///
+    /// The `UNION` is required, not defensive. `1h`/`1d` rows are indeed
+    /// derived from `1m` data, but compaction *deletes* the finer rows it
+    /// consumes (that delete is its watermark against double-counting), so
+    /// `traffic_stats_1m` only ever holds the window compaction has not swept
+    /// yet — roughly the last hour or two. Querying it alone would hide any
+    /// app idle for longer than that, even though its full 30-day/395-day
+    /// history is still there and still queryable through every other
+    /// endpoint.
+    ///
+    /// `UNION` (not `UNION ALL`) already de-duplicates, so the per-branch
+    /// `DISTINCT`s only shrink what each branch feeds it.
     pub fn apps(&self) -> Result<Vec<String>, StoreError> {
         self.with_reader(|c| {
-            let mut stmt =
-                c.prepare_cached("SELECT DISTINCT app FROM traffic_stats_1m ORDER BY app")?;
+            let mut stmt = c.prepare_cached(
+                "SELECT DISTINCT app FROM traffic_stats_1m
+                 UNION SELECT DISTINCT app FROM traffic_stats_1h
+                 UNION SELECT DISTINCT app FROM traffic_stats_1d
+                 ORDER BY app",
+            )?;
             let rows = stmt
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1129,6 +1141,53 @@ mod tests {
         s.flush_window(&rows, &[], &[]).unwrap();
         let apps = s.apps().unwrap();
         assert_eq!(apps, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// An app whose `1m` rows compaction has already consumed and deleted must
+    /// still be listed — its history lives in the coarser tiers and is fully
+    /// queryable, so omitting it from `apps()` would make it unreachable
+    /// through the UI while every other endpoint still answered for it.
+    ///
+    /// The coarse rows are written directly rather than via `flush_window`
+    /// (which only ever writes `1m`), reproducing exactly the state
+    /// compaction leaves behind: coarse rows present, finer rows gone.
+    #[test]
+    fn apps_lists_apps_whose_data_only_survives_in_the_coarse_tiers() {
+        let s = AnalyticsStore::open_in_memory().unwrap();
+
+        // Recently active: still un-compacted, so present in `1m`.
+        s.flush_window(
+            &[stats_row(60_000, "recent", "h1", 1, vec![], vec![])],
+            &[],
+            &[],
+        )
+        .unwrap();
+        // Idle for hours: compacted up to `1h`, its `1m` rows deleted.
+        s.write_rows(
+            Tier::H1,
+            &[stats_row(3_600_000, "hourly-only", "h1", 1, vec![], vec![])],
+            &[],
+            &[],
+        )
+        .unwrap();
+        // Idle for days: compacted all the way to `1d`.
+        s.write_rows(
+            Tier::D1,
+            &[stats_row(86_400_000, "daily-only", "h1", 1, vec![], vec![])],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            s.apps().unwrap(),
+            vec![
+                "daily-only".to_string(),
+                "hourly-only".to_string(),
+                "recent".to_string()
+            ],
+            "every tier contributes; a 1m-only query would have returned just `recent`"
+        );
     }
 
     fn path_row(bucket: i64, app: &str, path: &str, requests: i64) -> PathRow {

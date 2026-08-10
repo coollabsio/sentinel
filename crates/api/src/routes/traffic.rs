@@ -81,9 +81,12 @@ const MAX_SCAN_ROWS: usize = 1_000_000;
 /// at typical usage: `TopN` emits at most `cap` keys plus one `__other__`
 /// roll-up row per (bucket, app, key-space), so a full-depth window is
 /// `buckets × (cap + 1)` rows. A fixed constant instead truncates real
-/// queries — at `topn = 50` a 100_000-row cap covers only ~1961 of the `1m`
-/// tier's 2880 buckets, and since these queries order by bucket ascending the
-/// rows it drops are the *newest* ones.
+/// queries — at `topn = 50` a 100_000-row cap covers only ~1961 buckets,
+/// short of what a wide `1h` query spans, and since these queries order by
+/// bucket ascending the rows it drops are the *newest* ones. (The `1m` tier
+/// is now only ever reached for spans under [`M1_TRUSTED_SPAN_MS`], so its
+/// own worst case is 120 buckets, but the arithmetic here is tier-generic and
+/// must stay correct if that ceiling moves.)
 ///
 /// `cap` is *not* the same across tiers. `1m` rows come straight from
 /// `flush_window` and are capped at the configured `topn` by the aggregator.
@@ -163,12 +166,47 @@ impl TopQuery {
     }
 }
 
-/// Finest tier whose retention window plausibly covers the requested span
-/// (design spec §7): `1m` data is kept 48h and `1h` data 30d, so a query
-/// wider than either would read a partially-expired series.
+/// How long the `1m` tier can be relied on to still hold its rows.
+///
+/// Compaction runs hourly and *deletes* the `1m` rows for each window it
+/// folds into `1h` (see `traffic::compaction::compact_1m_to_1h`) — that
+/// delete is the watermark that stops a re-compaction from double-counting,
+/// so it is load-bearing, not incidental. The practical consequence is that
+/// `traffic_stats_1m` holds the currently-open hour plus, at worst, one hour
+/// the sweep has not reached yet. Two hours is that ceiling with a full extra
+/// cadence of slack for a delayed or missed sweep.
+const M1_TRUSTED_SPAN_MS: i64 = 2 * HOUR_MS;
+
+/// Finest tier that actually still holds data for the requested span.
+///
+/// This is *not* the same as each tier's configured retention, and the
+/// difference matters:
+///
+/// - **`1m`** only ever holds what compaction has not yet consumed —
+///   [`M1_TRUSTED_SPAN_MS`], i.e. ~1–2 hours, regardless of what
+///   `TRAFFIC_RETENTION_1M_HOURS` says. That variable is a safety net
+///   bounding how far un-compacted rows may pile up if compaction falls
+///   behind; it is not a queryable minute-resolution history window.
+/// - **`1h`** holds real, undeleted history for its full 30-day retention.
+///   The same delete-as-watermark applies one tier up (`1h` → `1d`), but at
+///   a *daily* cadence, so it only ever affects the current day.
+/// - **`1d`** holds real history for its full 395-day retention.
+///
+/// Routing a 24h query at `1m` — as an "`1m` is kept 48h" reading of the
+/// config would — reads a table holding roughly one hour of data and reports
+/// ~1/24th of the traffic as if it were the whole picture, silently. So
+/// anything wider than the `1m` tier's trusted span reads `1h`, which is
+/// where that data has actually landed.
+///
+/// One known consequence, accepted deliberately: a query that resolves to a
+/// coarser tier does not see the *currently-open* finer window, because
+/// compaction has not folded it up yet. A 24h query therefore trails real
+/// time by up to an hour. Closing that gap means unioning tiers per query,
+/// which risks double-counting against compaction's delete-as-watermark
+/// invariant, so it is not worth trading a bounded, predictable lag for.
 fn tier_for_span(from: i64, to: i64) -> Tier {
     let span = to.saturating_sub(from);
-    if span < 48 * HOUR_MS {
+    if span < M1_TRUSTED_SPAN_MS {
         Tier::M1
     } else if span < 30 * DAY_MS {
         Tier::H1
@@ -538,9 +576,10 @@ mod tests {
     /// 2023-11-14T22:13:20Z. Both seeded buckets sit inside RANGE below.
     const BUCKET: i64 = 1_700_000_000_000;
     const NEXT_BUCKET: i64 = BUCKET + 60_000;
-    /// A 24h window (< 48h) so tier selection lands on the `1m` tier, which
+    /// A 1h window around `BUCKET` (2023-11-14T22:13:20Z). Narrower than
+    /// [`M1_TRUSTED_SPAN_MS`] so tier selection lands on the `1m` tier, which
     /// is the only one `flush_window` writes.
-    const RANGE: &str = "from=2023-11-14T00:00:00Z&to=2023-11-15T00:00:00Z";
+    const RANGE: &str = "from=2023-11-14T22:00:00Z&to=2023-11-14T23:00:00Z";
 
     fn digest_bytes(values: &[f64]) -> Vec<u8> {
         let mut d = LatencyDigest::new();
@@ -698,15 +737,20 @@ mod tests {
 
     #[test]
     fn tier_is_selected_by_span() {
-        // Boundaries are exclusive at the low end: exactly 48h is already
-        // too wide for the 1m tier, exactly 30d too wide for 1h.
-        assert_eq!(tier_for_span(0, 48 * HOUR_MS - 1), Tier::M1);
-        assert_eq!(tier_for_span(0, 48 * HOUR_MS), Tier::H1);
+        // Boundaries are exclusive at the low end: exactly 2h is already too
+        // wide for the 1m tier, exactly 30d too wide for 1h.
+        assert_eq!(tier_for_span(0, M1_TRUSTED_SPAN_MS - 1), Tier::M1);
+        assert_eq!(tier_for_span(0, M1_TRUSTED_SPAN_MS), Tier::H1);
         assert_eq!(tier_for_span(0, 30 * DAY_MS - 1), Tier::H1);
         assert_eq!(tier_for_span(0, 30 * DAY_MS), Tier::D1);
         assert_eq!(tier_for_span(0, 400 * DAY_MS), Tier::D1);
         // Offset windows are judged on width, not absolute position.
         assert_eq!(tier_for_span(BUCKET, BUCKET + HOUR_MS), Tier::M1);
+        // Compaction empties the `1m` tier hourly, so anything wider than a
+        // couple of hours must read `1h`, where that data actually lives —
+        // routing a day-wide query at `1m` reported ~1/24th of real traffic.
+        assert_eq!(tier_for_span(0, 24 * HOUR_MS), Tier::H1);
+        assert_eq!(tier_for_span(0, 47 * HOUR_MS), Tier::H1);
     }
 
     #[tokio::test]
@@ -948,22 +992,79 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "empty bounds must default, not 400");
     }
 
+    /// A day of minute-resolution traffic, put through the *real* hourly
+    /// compaction sweep, must still be fully visible to a day-wide query.
+    ///
+    /// This is the regression test for the tier-selection bug. `compact_1m_to_1h`
+    /// deletes the `1m` rows for every window it folds into `1h` — that delete is
+    /// the watermark that keeps a re-compaction from double-counting, so it is
+    /// deliberate and load-bearing. The old `tier_for_span` nonetheless routed
+    /// any span under 48h to `Tier::M1`, reading a table compaction had already
+    /// emptied: this fixture would have come back as `requests: 0` while
+    /// reporting HTTP 200, i.e. "no traffic" for a day that had 240 requests.
+    #[tokio::test]
+    async fn a_day_wide_query_sees_data_the_hourly_compaction_has_already_swept() {
+        const HOURS: i64 = 24;
+        const PER_HOUR: i64 = 10;
+        // 2023-11-14T00:00:00Z, hour-aligned so each hour is a whole bucket.
+        const START: i64 = 1_699_920_000_000;
+
+        let a = AnalyticsStore::open_in_memory().unwrap();
+        let rows: Vec<StatsRow> = (0..HOURS)
+            .map(|h| {
+                stats(
+                    START + h * HOUR_MS,
+                    "app-a",
+                    "h1",
+                    PER_HOUR,
+                    digest_bytes(&ramp(1, 10)),
+                    uniques_bytes(0..10),
+                )
+            })
+            .collect();
+        a.flush_window(&rows, &[], &[]).unwrap();
+
+        // The real sweep, not a stand-in: every one of these hours is closed
+        // as of `now`, so all of them roll into `1h` and their `1m` rows go.
+        let now = START + HOURS * HOUR_MS + HOUR_MS;
+        traffic::compaction::compact_1m_to_1h(&a, now, 50).unwrap();
+        assert!(
+            a.stats_range(Tier::M1, "app-a", START, now)
+                .unwrap()
+                .is_empty(),
+            "compaction must have emptied the 1m tier — that premise is the whole bug"
+        );
+
+        let (s, j) = get_with(
+            state(Some(a)),
+            "/api/app/app-a/traffic/overview?from=2023-11-14T00:00:00Z&to=2023-11-15T00:00:00Z",
+        )
+        .await;
+
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            j["requests"],
+            HOURS * PER_HOUR,
+            "a 24h span must read the 1h tier, where compaction actually put this data"
+        );
+    }
+
     /// 2023-11-14T00:00:00Z, the start of WIDE_RANGE below.
     const WIDE_FROM: i64 = 1_699_920_000_000;
-    /// 47h — inside the `1m` tier's 48h ceiling, so the widest window the
-    /// finest tier can be asked for: 2820 one-minute buckets.
-    const WIDE_BUCKETS: i64 = 47 * 60;
-    const WIDE_RANGE: &str = "from=2023-11-14T00:00:00Z&to=2023-11-15T23:00:00Z";
-    /// Distinct paths per bucket. 40 × 2820 = 112,800 rows, comfortably over
-    /// the 100_000 fixed budget this used to be capped at, and under the
-    /// tier-aware budget of 2820 × (topn + 1) = 143,820.
+    /// 119 minutes — just inside [`M1_TRUSTED_SPAN_MS`], so the widest window
+    /// the finest tier can be asked for: 119 one-minute buckets.
+    const WIDE_BUCKETS: i64 = 119;
+    const WIDE_RANGE: &str = "from=2023-11-14T00:00:00Z&to=2023-11-14T01:59:00Z";
+    /// Distinct paths per bucket, just under the configured `topn` (50) —
+    /// the aggregator caps a `1m` bucket at `topn` (+ `__other__`), so this is
+    /// a genuinely full-depth window rather than an impossible one.
     const WIDE_PATHS: i64 = 40;
 
-    /// A realistic worst case for the `1m` tier: every bucket of a 47h window
-    /// carrying a full set of per-path rows. The old fixed `MAX_SCAN_ROWS`
-    /// (100_000) truncated this at 2500 buckets, silently dropping the newest
-    /// 320 buckets — `paths_range` orders by bucket ascending, so the rows the
-    /// LIMIT discards are the most recent ones.
+    /// A full-depth worst case for the `1m` tier: every bucket of the widest
+    /// window that tier can now be asked for carrying a full set of per-path
+    /// rows. `paths_range` orders by bucket ascending, so anything the SQL
+    /// LIMIT discards is the *most recent* data — truncation here would be
+    /// both silent and biased towards losing the newest buckets.
     #[tokio::test]
     async fn a_full_width_1m_window_is_not_truncated_by_the_scan_budget() {
         let a = AnalyticsStore::open_in_memory().unwrap();
@@ -980,10 +1081,6 @@ mod tests {
                 ));
             }
         }
-        assert!(
-            rows.len() > 100_000,
-            "the fixture must exceed the old fixed budget to be a regression test"
-        );
         a.flush_window(&[], &rows, &[]).unwrap();
 
         let (s, j) = get_with(
@@ -1003,14 +1100,15 @@ mod tests {
         }
     }
 
-    /// 7 days — over the `1m` tier's 48h ceiling and under the `1h` tier's
-    /// 30d one, so this resolves to `Tier::H1`: 168 one-hour buckets.
-    const COARSE_BUCKETS: i64 = 7 * 24;
-    const COARSE_RANGE: &str = "from=2023-11-14T00:00:00Z&to=2023-11-21T00:00:00Z";
+    /// 29 days — over [`M1_TRUSTED_SPAN_MS`] and under the `1h` tier's 30d
+    /// retention, so this resolves to `Tier::H1`: 696 one-hour buckets.
+    const COARSE_BUCKETS: i64 = 29 * 24;
+    const COARSE_RANGE: &str = "from=2023-11-14T00:00:00Z&to=2023-12-13T00:00:00Z";
     /// Distinct paths per *coarse* bucket. Above the configured `topn` (50)
     /// and below the compaction floor (200), i.e. squarely in the band a
-    /// `buckets × (topn + 1)` budget wrongly rules out. 150 × 168 = 25,200
-    /// rows, versus a `topn`-sized budget of 168 × 51 = 8,568.
+    /// `buckets × (topn + 1)` budget wrongly rules out. 150 × 696 = 104,400
+    /// rows: over the 100_000 fixed budget the scan was once capped at, and
+    /// under the tier-aware budget of 696 × 201 = 139,896.
     const COARSE_PATHS: i64 = 150;
 
     /// Compaction re-caps each coarse `(bucket, app)` group at
@@ -1041,6 +1139,10 @@ mod tests {
         assert!(
             rows.len() as i64 > COARSE_BUCKETS * 51,
             "the fixture must exceed a topn-sized budget to be a regression test"
+        );
+        assert!(
+            rows.len() > 100_000,
+            "…and the old fixed 100_000-row budget too"
         );
 
         let (s, j) = get_with(

@@ -95,9 +95,11 @@ Inert unless Sentinel is built with the `traffic` Cargo feature. See [Traffic An
 | `TRAFFIC_PROXY_TYPE` | `auto` | `traefik`, `caddy`, or `auto` (sniffs the format; Nginx is deferred) |
 | `TRAFFIC_TOPN` | `50` | Top-N cap per dimension (paths, countries, browsers, ...); overflow folds into a `__other__` row |
 | `TRAFFIC_SAMPLE_THRESHOLD` | `0` (off) | Events/sec above which to sample, as a graceful-degradation valve under extreme load |
-| `TRAFFIC_RETENTION_1M_HOURS` | `48` | How long per-minute rollups are kept before deletion |
-| `TRAFFIC_RETENTION_1H_DAYS` | `30` | How long hourly rollups are kept before deletion |
+| `TRAFFIC_RETENTION_1M_HOURS` | `48` | Safety net, **not** a queryable window — see note below |
+| `TRAFFIC_RETENTION_1H_DAYS` | `30` | How long hourly rollups are kept; this is your real fine-grained history |
 | `TRAFFIC_RETENTION_1D_DAYS` | `395` | How long daily rollups are kept before deletion (~13 months) |
+
+> **What `TRAFFIC_RETENTION_1M_HOURS` actually does.** Compaction runs hourly and *deletes* the per-minute rows for each hour it folds into the hourly tier — that delete is what stops a repeated compaction pass from double-counting. So the per-minute table normally holds only the last hour or two, never 48. This variable bounds how long *un-compacted* per-minute rows may pile up if compaction ever falls behind (a stuck sweep, a long outage), so a backlog cannot grow without limit; it is not a 48-hour minute-resolution history you can query. Queries spanning more than ~2 hours are answered from the hourly tier, and anything from 30 days out from the daily tier.
 | `GEOIP_ENABLED` | `true` | Enable/disable country enrichment |
 | `GEOIP_DB_URL` | *(unset)* | Explicit GeoIP database URL override. When set, that URL is used with no fallback. When unset, the default resolution chain applies (see [GeoIP licensing](#geoip-licensing)) |
 | `GEOIP_MAXMIND_LICENSE_KEY` | *(unset)* | A MaxMind account's license key. When set, GeoLite2 is downloaded directly from MaxMind (properly licensed), taking priority over `GEOIP_DB_URL` and the default chain |
