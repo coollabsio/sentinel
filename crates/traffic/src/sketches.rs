@@ -283,6 +283,43 @@ impl Default for Uniques {
     }
 }
 
+/// Longest aggregation key retained, in bytes.
+///
+/// Keys are attacker-controlled — a path, a `Referer`, a Cloudflare header
+/// value — and nothing upstream bounds their length, so without this a
+/// request can pin an arbitrarily large `String` in the aggregator's map for
+/// a whole window. 512 bytes is generously above any path or header worth
+/// distinguishing in a top-N; two URLs identical for their first 512 bytes
+/// are the same line item for reporting purposes.
+pub const MAX_KEY_BYTES: usize = 512;
+
+/// Multiple of `topn` at which [`TopN::add_bounded`] trims mid-window.
+const SOFT_CAP_TRIGGER: usize = 8;
+
+/// Multiple of `topn` that a mid-window trim keeps. See
+/// [`TopN::add_bounded`] for why this is wider than `topn` itself.
+const SOFT_CAP_KEEP: usize = 4;
+
+/// Truncate `key` to at most [`MAX_KEY_BYTES`], on a UTF-8 character boundary.
+///
+/// Slicing a `&str` at a byte offset that lands mid-codepoint panics, and
+/// these keys are arbitrary bytes from the wire, so the cut has to be found
+/// rather than assumed. Borrows unchanged in the overwhelmingly common case.
+pub fn truncate_key(key: &str) -> &str {
+    if key.len() <= MAX_KEY_BYTES {
+        return key;
+    }
+    // The last boundary at or below the limit. `char_indices` yields only
+    // valid boundaries, so this can never split a multi-byte character.
+    let end = key
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|i| *i <= MAX_KEY_BYTES)
+        .last()
+        .unwrap_or(0);
+    &key[..end]
+}
+
 /// Exact per-key request/byte counters, capped to the top-N keys by request
 /// count with everything else folded into `other`.
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -295,10 +332,41 @@ pub struct TopN {
 
 impl TopN {
     /// Adds `reqs` requests and `bytes` bytes-out to `key`'s running totals.
+    ///
+    /// `key` is truncated to [`MAX_KEY_BYTES`] first: paths, referers and
+    /// Cloudflare header values all come straight off the wire, and nothing
+    /// upstream bounds their length.
     pub fn add(&mut self, key: &str, reqs: u64, bytes: u64) {
-        let entry = self.counts.entry(key.to_string()).or_insert((0, 0));
+        let entry = self
+            .counts
+            .entry(truncate_key(key).to_string())
+            .or_insert((0, 0));
         entry.0 += reqs;
         entry.1 += bytes;
+    }
+
+    /// [`Self::add`], plus a soft cap that bounds the map *within* the window
+    /// instead of only at its end.
+    ///
+    /// `cap` normally runs once, at drain time — once a minute. Until then the
+    /// map is unbounded, so a flood of requests carrying distinct attacker-
+    /// chosen paths or headers can grow it freely for a whole window. This
+    /// keeps `counts.len()` under `topn × `[`SOFT_CAP_TRIGGER`].
+    ///
+    /// It trims down to `topn × `[`SOFT_CAP_KEEP`], not to `topn`: bounding
+    /// memory to the same order either way, but retaining a far wider set of
+    /// candidates, so a key that is mid-table now and a leader by the end of
+    /// the window can still get there. Under any normal cardinality the
+    /// trigger is never reached and this is exactly [`Self::add`].
+    pub fn add_bounded(&mut self, key: &str, reqs: u64, bytes: u64, topn: usize) {
+        self.add(key, reqs, bytes);
+
+        // `max(1)`: a configured top-N of 0 would otherwise make the trigger 0
+        // and fold every single key straight into `__other__`.
+        let topn = topn.max(1);
+        if self.counts.len() > topn.saturating_mul(SOFT_CAP_TRIGGER) {
+            self.cap(topn.saturating_mul(SOFT_CAP_KEEP));
+        }
     }
 
     /// Sums `other`'s counters into `self`, key by key, plus its `other`
@@ -415,6 +483,86 @@ mod tests {
         assert_eq!(a.counts.get("y").unwrap().0, 3);
         assert!(!a.counts.contains_key("z"));
         assert_eq!(a.other.0, 1); // z folded into __other__
+    }
+
+    /// Keys come off the wire (a path, a `Referer`, a CF header) with no
+    /// upstream length bound, so an attacker could otherwise pin arbitrarily
+    /// large `String`s in the map for a whole window.
+    #[test]
+    fn topn_truncates_oversized_keys() {
+        let mut t = TopN::default();
+        let huge = "a".repeat(MAX_KEY_BYTES * 4);
+        t.add(&huge, 1, 10);
+
+        let (key, _) = t.counts.iter().next().unwrap();
+        assert_eq!(key.len(), MAX_KEY_BYTES);
+
+        // Two keys sharing their first MAX_KEY_BYTES bytes collapse into one
+        // line item, which is the intended reporting behaviour.
+        t.add(&format!("{huge}different-tail"), 1, 10);
+        assert_eq!(t.counts.len(), 1);
+        assert_eq!(t.counts.values().next().unwrap().0, 2);
+    }
+
+    /// Truncation must land on a character boundary — slicing a `&str`
+    /// mid-codepoint panics, and these keys are arbitrary bytes from the wire.
+    #[test]
+    fn topn_truncates_multibyte_keys_without_panicking() {
+        // "€" is 3 bytes, so no multiple of 3 lands exactly on 512: the cut
+        // has to be found, not assumed.
+        let mut t = TopN::default();
+        let key = "€".repeat(MAX_KEY_BYTES);
+        t.add(&key, 1, 10);
+
+        let stored = t.counts.keys().next().unwrap();
+        assert!(stored.len() <= MAX_KEY_BYTES);
+        assert!(stored.len() > MAX_KEY_BYTES - 3, "should fill the budget");
+        // Round-trips as valid UTF-8, i.e. nothing was split.
+        assert!(stored.chars().all(|c| c == '€'));
+    }
+
+    /// `cap` normally runs once per window, at drain time; until then the map
+    /// is unbounded and a flood of distinct attacker-chosen keys can grow it
+    /// freely for a full minute. `add_bounded` trims mid-window instead.
+    #[test]
+    fn add_bounded_caps_growth_within_the_window() {
+        const TOPN: usize = 10;
+        let mut t = TopN::default();
+
+        for i in 0..10_000u64 {
+            t.add_bounded(&format!("/k{i}"), 1, 1, TOPN);
+            assert!(
+                t.counts.len() <= TOPN * SOFT_CAP_TRIGGER,
+                "map grew past the soft cap at key {i}: {}",
+                t.counts.len()
+            );
+        }
+
+        // Nothing is lost, only demoted: evicted keys land in `__other__`.
+        let kept: u64 = t.counts.values().map(|(reqs, _)| reqs).sum();
+        assert_eq!(kept + t.other.0, 10_000);
+    }
+
+    /// The soft cap must be invisible under normal cardinality — an app with
+    /// fewer distinct keys than the trigger behaves exactly as before.
+    #[test]
+    fn add_bounded_is_a_no_op_below_the_trigger() {
+        const TOPN: usize = 50;
+        let mut t = TopN::default();
+        for i in 0..TOPN * SOFT_CAP_TRIGGER {
+            t.add_bounded(&format!("/k{i}"), 1, 1, TOPN);
+        }
+        assert_eq!(t.counts.len(), TOPN * SOFT_CAP_TRIGGER);
+        assert_eq!(t.other, (0, 0), "nothing should have been demoted yet");
+    }
+
+    /// A configured top-N of 0 must not make the trigger 0 and fold every
+    /// single key straight into `__other__`.
+    #[test]
+    fn add_bounded_tolerates_a_zero_topn() {
+        let mut t = TopN::default();
+        t.add_bounded("/a", 1, 1, 0);
+        assert_eq!(t.counts.get("/a").unwrap().0, 1);
     }
 
     #[test]

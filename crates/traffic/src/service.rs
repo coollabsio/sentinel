@@ -235,9 +235,7 @@ impl TrafficService {
                 }
                 _ = flush_check.tick() => {
                     let bucket_now = bucket_of(now_ms(), self.window_ms);
-                    if bucket_now > self.current_bucket {
-                        let closed = self.current_bucket;
-                        self.current_bucket = bucket_now;
+                    if let Some(closed) = self.take_closed_bucket(bucket_now) {
                         let rollup = self.aggregator.take_rollup(closed);
                         Self::flush(&self.store, rollup, closed).await;
                     }
@@ -269,6 +267,26 @@ impl TrafficService {
             self.process_line(line);
         }
         lines.clear();
+    }
+
+    /// If the clock has moved into a different window, adopt it and return the
+    /// bucket that was open until now (which the caller must then flush).
+    ///
+    /// The comparison is `!=`, not `>`, and that difference is the whole point
+    /// of this being a named method. A backward wall-clock step — an NTP
+    /// correction, a VM restored from a snapshot, a manual `date` — leaves
+    /// `bucket_now` below `current_bucket`, and a `>` test would then never
+    /// fire again: no window would ever close, no flush would ever run, and
+    /// the aggregator's in-memory window (the only thing bounding its own
+    /// growth) would accumulate forever. Treating *any* change as a close
+    /// resynchronizes instead: whatever was open is written under its own
+    /// bucket, and the clock's current window takes over. Forward progress,
+    /// the overwhelmingly common case, is unchanged.
+    fn take_closed_bucket(&mut self, bucket_now: i64) -> Option<i64> {
+        if bucket_now == self.current_bucket {
+            return None;
+        }
+        Some(std::mem::replace(&mut self.current_bucket, bucket_now))
     }
 
     /// Detect (once) -> parse -> sample -> enrich -> record for a single line.
@@ -626,6 +644,44 @@ mod tests {
             3,
             "sampled-away events count as dropped"
         );
+    }
+
+    /// A backward wall-clock step must not wedge the flush gate shut. Under
+    /// the previous `bucket_now > current_bucket` test, one NTP correction
+    /// pushing the clock back a minute meant no window ever closed again —
+    /// nothing was ever written, and the aggregator grew unbounded.
+    #[tokio::test]
+    async fn a_backward_clock_step_still_closes_the_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("access.log");
+        std::fs::File::create(&log).expect("create access log");
+        let store = AnalyticsStore::open_in_memory().expect("open store");
+        let mut svc = TrafficService::build(&test_config(log, 0), store, Arc::new(NoGeo))
+            .await
+            .expect("build service");
+
+        svc.current_bucket = 600_000;
+
+        // Same window: nothing closes.
+        assert_eq!(svc.take_closed_bucket(600_000), None);
+        assert_eq!(svc.current_bucket, 600_000);
+
+        // Forward, the ordinary case: the old window closes and is adopted.
+        assert_eq!(svc.take_closed_bucket(660_000), Some(600_000));
+        assert_eq!(svc.current_bucket, 660_000);
+
+        // Backward: the open window must still close, and the service must
+        // resynchronize onto the clock's new window rather than stalling.
+        assert_eq!(
+            svc.take_closed_bucket(540_000),
+            Some(660_000),
+            "a backward step must still close the open window"
+        );
+        assert_eq!(svc.current_bucket, 540_000);
+
+        // …and it keeps working afterwards, rather than being wedged.
+        assert_eq!(svc.take_closed_bucket(600_000), Some(540_000));
+        assert_eq!(svc.current_bucket, 600_000);
     }
 
     #[test]

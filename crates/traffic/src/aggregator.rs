@@ -18,7 +18,7 @@ use store::traffic::{BreakdownRow, PathRow, StatsRow};
 
 use crate::enrich::Enriched;
 use crate::event::{RequestEvent, StatusClass, status_class};
-use crate::sketches::{LatencyDigest, TopN, Uniques};
+use crate::sketches::{LatencyDigest, TopN, Uniques, truncate_key};
 
 /// Per-`(app, host)` exact counters plus mergeable sketches, accumulated
 /// over the current minute window.
@@ -105,15 +105,23 @@ impl Aggregator {
             acc.uniques.add_ip(ip);
         }
 
-        // Per-app path top-N + per-(app,path) latency.
-        self.paths
-            .entry(app.clone())
-            .or_default()
-            .add(&ev.path, 1, ev.bytes_out);
-        self.path_latency
-            .entry((app.clone(), ev.path.to_string()))
-            .or_default()
-            .add(&[ev.duration_ms]);
+        // Per-app path top-N + per-(app,path) latency. The path is truncated
+        // up front, with the *same* helper `TopN::add` uses, so the key stored
+        // here matches the one `take_rollup` looks the digest back up by.
+        let path = truncate_key(&ev.path);
+        let paths = self.paths.entry(app.clone()).or_default();
+        paths.add_bounded(path, 1, ev.bytes_out, self.topn);
+
+        // Only keep a latency digest for a path still in the top-N candidate
+        // set: one already folded into `__other__` has its digest discarded at
+        // drain time regardless, and skipping it keeps `path_latency` bounded
+        // by the same soft cap rather than growing without limit alongside it.
+        if paths.counts.contains_key(path) {
+            self.path_latency
+                .entry((app.clone(), path.to_string()))
+                .or_default()
+                .add(&[ev.duration_ms]);
+        }
 
         // Breakdown dimensions.
         let status_str = ev.status.to_string();
@@ -123,6 +131,7 @@ impl Aggregator {
             "status",
             &status_str,
             ev.bytes_out,
+            self.topn,
         );
         record_breakdown(
             &mut self.breakdown,
@@ -130,12 +139,27 @@ impl Aggregator {
             "method",
             &ev.method,
             ev.bytes_out,
+            self.topn,
         );
         if let Some(country) = &en.country {
-            add_breakdown(&mut self.breakdown, &app, "country", country, ev.bytes_out);
+            add_breakdown(
+                &mut self.breakdown,
+                &app,
+                "country",
+                country,
+                ev.bytes_out,
+                self.topn,
+            );
         }
         if let Some(referer) = ev.referer.as_deref() {
-            add_breakdown(&mut self.breakdown, &app, "referer", referer, ev.bytes_out);
+            add_breakdown(
+                &mut self.breakdown,
+                &app,
+                "referer",
+                referer,
+                ev.bytes_out,
+                self.topn,
+            );
         }
         add_breakdown(
             &mut self.breakdown,
@@ -143,14 +167,23 @@ impl Aggregator {
             "browser",
             &en.ua.browser,
             ev.bytes_out,
+            self.topn,
         );
-        add_breakdown(&mut self.breakdown, &app, "os", &en.ua.os, ev.bytes_out);
+        add_breakdown(
+            &mut self.breakdown,
+            &app,
+            "os",
+            &en.ua.os,
+            ev.bytes_out,
+            self.topn,
+        );
         add_breakdown(
             &mut self.breakdown,
             &app,
             "device",
             &en.ua.device,
             ev.bytes_out,
+            self.topn,
         );
         record_breakdown(
             &mut self.breakdown,
@@ -158,6 +191,7 @@ impl Aggregator {
             "protocol",
             &ev.protocol,
             ev.bytes_out,
+            self.topn,
         );
         record_breakdown(
             &mut self.breakdown,
@@ -165,12 +199,27 @@ impl Aggregator {
             "scheme",
             &ev.scheme,
             ev.bytes_out,
+            self.topn,
         );
         if let Some(tls) = &ev.tls_version {
-            add_breakdown(&mut self.breakdown, &app, "tls", tls, ev.bytes_out);
+            add_breakdown(
+                &mut self.breakdown,
+                &app,
+                "tls",
+                tls,
+                ev.bytes_out,
+                self.topn,
+            );
         }
         if let Some(cache) = &en.cache {
-            add_breakdown(&mut self.breakdown, &app, "cache", cache, ev.bytes_out);
+            add_breakdown(
+                &mut self.breakdown,
+                &app,
+                "cache",
+                cache,
+                ev.bytes_out,
+                self.topn,
+            );
         }
         record_breakdown(
             &mut self.breakdown,
@@ -178,6 +227,7 @@ impl Aggregator {
             "bot",
             if en.bot { "true" } else { "false" },
             ev.bytes_out,
+            self.topn,
         );
     }
 
@@ -281,11 +331,12 @@ fn add_breakdown(
     dim: &str,
     value: &str,
     bytes_out: u64,
+    topn: usize,
 ) {
     if value.is_empty() {
         return;
     }
-    record_breakdown(map, app, dim, value, bytes_out);
+    record_breakdown(map, app, dim, value, bytes_out, topn);
 }
 
 /// Adds one `(app, dimension)` top-N entry unconditionally, even if
@@ -300,10 +351,11 @@ fn record_breakdown(
     dim: &str,
     value: &str,
     bytes_out: u64,
+    topn: usize,
 ) {
     map.entry((app.to_string(), dim.to_string()))
         .or_default()
-        .add(value, 1, bytes_out);
+        .add_bounded(value, 1, bytes_out, topn);
 }
 
 #[cfg(test)]
