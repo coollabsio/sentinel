@@ -10,9 +10,9 @@ use traffic::sketches::{LatencyDigest, Uniques};
 /// 2023-11-14T22:13:20Z. Both seeded buckets sit inside RANGE below.
 const BUCKET: i64 = 1_700_000_000_000;
 const NEXT_BUCKET: i64 = BUCKET + 60_000;
-/// A 1h window around `BUCKET` (2023-11-14T22:13:20Z). Narrower than
-/// [`M1_TRUSTED_SPAN_MS`] so tier selection lands on the `1m` tier, which
-/// is the only one `flush_window` writes.
+/// A 1h window around `BUCKET` (2023-11-14T22:13:20Z). The union read still
+/// picks these rows up out of the `1m` tier (the only one `flush_window`
+/// writes); the empty `1h`/`1d` reads contribute nothing.
 const RANGE: &str = "from=2023-11-14T22:00:00Z&to=2023-11-14T23:00:00Z";
 
 fn digest_bytes(values: &[f64]) -> Vec<u8> {
@@ -173,21 +173,85 @@ async fn get(uri: &str) -> (StatusCode, serde_json::Value) {
 }
 
 #[test]
-fn tier_is_selected_by_span() {
-    // Boundaries are exclusive at the low end: exactly 2h is already too
-    // wide for the 1m tier, exactly 30d too wide for 1h.
-    assert_eq!(tier_for_span(0, M1_TRUSTED_SPAN_MS - 1), Tier::M1);
-    assert_eq!(tier_for_span(0, M1_TRUSTED_SPAN_MS), Tier::H1);
-    assert_eq!(tier_for_span(0, 30 * DAY_MS - 1), Tier::H1);
-    assert_eq!(tier_for_span(0, 30 * DAY_MS), Tier::D1);
-    assert_eq!(tier_for_span(0, 400 * DAY_MS), Tier::D1);
-    // Offset windows are judged on width, not absolute position.
-    assert_eq!(tier_for_span(BUCKET, BUCKET + HOUR_MS), Tier::M1);
-    // Compaction empties the `1m` tier hourly, so anything wider than a
-    // couple of hours must read `1h`, where that data actually lives —
-    // routing a day-wide query at `1m` reported ~1/24th of real traffic.
-    assert_eq!(tier_for_span(0, 24 * HOUR_MS), Tier::H1);
-    assert_eq!(tier_for_span(0, 47 * HOUR_MS), Tier::H1);
+fn tier_reads_cover_every_tier_floored_to_its_bucket() {
+    // BUCKET (2023-11-14T22:13:20Z) is mid-minute, mid-hour, and mid-day, so
+    // each tier's flooring is visible and distinct.
+    let from = BUCKET;
+    let to = BUCKET + HOUR_MS;
+    let reads = tier_reads(from, to);
+
+    // One read per tier, finest first, each ending at the raw `to`.
+    assert_eq!(reads[0].0, Tier::M1);
+    assert_eq!(reads[1].0, Tier::H1);
+    assert_eq!(reads[2].0, Tier::D1);
+    for (_, _, hi) in reads {
+        assert_eq!(hi, to, "every tier read runs to the requested end");
+    }
+
+    // Each low bound is `from` floored to that tier's bucket width, so a range
+    // starting partway through a coarse bucket still includes that bucket
+    // instead of silently dropping it.
+    assert_eq!(reads[0].1, (from / MIN_MS) * MIN_MS);
+    assert_eq!(reads[1].1, (from / HOUR_MS) * HOUR_MS);
+    assert_eq!(reads[2].1, (from / DAY_MS) * DAY_MS);
+    assert!(
+        reads[2].1 <= reads[1].1 && reads[1].1 <= reads[0].1 && reads[0].1 <= from,
+        "coarser tiers floor to an earlier-or-equal boundary"
+    );
+}
+
+/// The whole point of the union: compaction splits a range's data across tiers
+/// (current hour in `1m`, an already-folded hour in `1h`, an older day in
+/// `1d`), and one query spanning all three must sum every part *exactly once*.
+/// This is what makes a "last hour" query whole right after a compaction sweep,
+/// and what stops the default all-history query from reading an empty coarse
+/// tier — the two bugs the single-tier routing had.
+#[tokio::test]
+async fn a_range_split_across_tiers_is_summed_not_dropped() {
+    let a = AnalyticsStore::open_in_memory().unwrap();
+    // Each row written into the tier compaction would have left it in; the
+    // buckets are aligned and disjoint, exactly as the moving compaction keeps
+    // them at steady state.
+    a.write_rows(
+        Tier::D1,
+        &[stats(0, "app-a", "h", 100, digest_bytes(&[1.0]), vec![])],
+        &[],
+        &[],
+    )
+    .unwrap();
+    a.write_rows(
+        Tier::H1,
+        &[stats(DAY_MS, "app-a", "h", 20, digest_bytes(&[1.0]), vec![])],
+        &[],
+        &[],
+    )
+    .unwrap();
+    a.flush_window(
+        &[stats(
+            DAY_MS + HOUR_MS,
+            "app-a",
+            "h",
+            3,
+            digest_bytes(&[1.0]),
+            vec![],
+        )],
+        &[],
+        &[],
+    )
+    .unwrap();
+
+    // `from` omitted (all history) with a far-future `to` so the range covers
+    // all three buckets regardless of the wall clock.
+    let (s, j) = get_with(
+        state(Some(a)),
+        "/api/app/app-a/traffic/overview?to=2100-01-01T00:00:00Z",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        j["requests"], 123,
+        "100 (1d) + 20 (1h) + 3 (1m) must all be summed across tiers"
+    );
 }
 
 #[tokio::test]
@@ -435,10 +499,10 @@ async fn empty_query_values_fall_back_to_defaults() {
 /// This is the regression test for the tier-selection bug. `compact_1m_to_1h`
 /// deletes the `1m` rows for every window it folds into `1h` — that delete is
 /// the watermark that keeps a re-compaction from double-counting, so it is
-/// deliberate and load-bearing. The old `tier_for_span` nonetheless routed
-/// any span under 48h to `Tier::M1`, reading a table compaction had already
-/// emptied: this fixture would have come back as `requests: 0` while
-/// reporting HTTP 200, i.e. "no traffic" for a day that had 240 requests.
+/// deliberate and load-bearing. Single-tier routing that picked `1m` for this
+/// span would read a table compaction had already emptied: the fixture would
+/// come back as `requests: 0` at HTTP 200, i.e. "no traffic" for a day that had
+/// 240 requests. The union read instead sums the `1h` rows compaction produced.
 #[tokio::test]
 async fn a_day_wide_query_sees_data_the_hourly_compaction_has_already_swept() {
     const HOURS: i64 = 24;
@@ -482,14 +546,15 @@ async fn a_day_wide_query_sees_data_the_hourly_compaction_has_already_swept() {
     assert_eq!(
         j["requests"],
         HOURS * PER_HOUR,
-        "a 24h span must read the 1h tier, where compaction actually put this data"
+        "the union's 1h read must surface the data compaction moved out of 1m"
     );
 }
 
 /// 2023-11-14T00:00:00Z, the start of WIDE_RANGE below.
 const WIDE_FROM: i64 = 1_699_920_000_000;
-/// 119 minutes — just inside [`M1_TRUSTED_SPAN_MS`], so the widest window
-/// the finest tier can be asked for: 119 one-minute buckets.
+/// 119 one-minute buckets of `1m` data — a deep window whose rows all come
+/// from the finest tier's read (the `1h`/`1d` reads over the same range are
+/// empty here).
 const WIDE_BUCKETS: i64 = 119;
 const WIDE_RANGE: &str = "from=2023-11-14T00:00:00Z&to=2023-11-14T01:59:00Z";
 /// Distinct paths per bucket, just under the configured `topn` (50) —
@@ -537,8 +602,8 @@ async fn a_full_width_1m_window_is_not_truncated_by_the_scan_limit() {
     }
 }
 
-/// 29 days — over [`M1_TRUSTED_SPAN_MS`] and under the `1h` tier's 30d
-/// retention, so this resolves to `Tier::H1`: 696 one-hour buckets.
+/// 696 one-hour buckets of `1h` data (29 days). Over this range the union's
+/// `1h` read carries every row; the `1m`/`1d` reads are empty.
 const COARSE_BUCKETS: i64 = 29 * 24;
 const COARSE_RANGE: &str = "from=2023-11-14T00:00:00Z&to=2023-12-13T00:00:00Z";
 /// Distinct paths per *coarse* bucket. Above the configured `topn` (50)
@@ -645,39 +710,43 @@ fn top_paths_merges_the_latencies_of_every_bucket() {
     );
 }
 
-/// Pins the documented consequence of `DEFAULT_FROM`: omitting `from`
-/// asks for all of history, which is a `1d`-tier question, so freshly
-/// flushed `1m` rows are deliberately not visible until compaction has
-/// rolled them up. This is behaviour, not a bug — but it is surprising
-/// enough to be worth a test that fails loudly if either the default or
-/// the tier thresholds are changed without thinking about it.
+/// Regression test for the default-view bug. Omitting `from` asks for all of
+/// history, which the old single-tier routing answered from the `1d` tier
+/// alone — so a fresh agent's `1m` rows were invisible until a daily compaction
+/// ran, leaving the default dashboard empty for up to 24h. The union read
+/// surfaces those rows immediately, and still sums whatever the `1d` tier
+/// already holds.
 #[tokio::test]
-async fn an_unbounded_range_reads_the_daily_tier() {
+async fn an_unbounded_range_sees_fresh_1m_data_immediately() {
+    // `seeded()` only ever flushed to `1m`; the default (all-history) query
+    // must still return it rather than an empty body.
     let (s, j) = get("/api/app/app-a/traffic/paths").await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(
-        j,
-        serde_json::json!([]),
-        "1m rows must not surface in a 1d-tier query"
+        j.as_array().unwrap().len(),
+        2,
+        "freshly flushed 1m rows must show without waiting for compaction"
     );
 
+    // A `1d` row for the same app is summed in alongside the `1m` rows.
     let a = seeded();
-    // The same rows written to the 1d tier are visible to that query.
     a.write_rows(
         Tier::D1,
         &[],
-        &[path_row(
-            BUCKET,
-            "app-a",
-            "/a",
-            5,
-            digest_bytes(&ramp(1, 10)),
-        )],
+        &[path_row(0, "app-a", "/c", 5, digest_bytes(&ramp(1, 10)))],
         &[],
     )
     .unwrap();
     let (s, j) = get_with(state(Some(a)), "/api/app/app-a/traffic/paths").await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(j.as_array().unwrap().len(), 1);
-    assert_eq!(j.as_array().unwrap()[0]["path"], "/a");
+    let paths: Vec<&str> = j
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        paths.contains(&"/a") && paths.contains(&"/b") && paths.contains(&"/c"),
+        "1m (/a, /b) and 1d (/c) rows must all appear: {paths:?}"
+    );
 }

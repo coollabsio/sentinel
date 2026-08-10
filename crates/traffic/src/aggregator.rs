@@ -28,6 +28,11 @@ struct StatsAcc {
     uniques: Uniques,
 }
 
+/// Per-app breakdown map: dimension name -> its top-N. The dimension key is a
+/// `&'static str` (every dimension is a string literal in [`Aggregator::record`]),
+/// so folding an event allocates nothing for the dimension key.
+type DimMap = HashMap<&'static str, TopN, RandomState>;
+
 /// One minute-window's worth of aggregated rows, ready for
 /// `AnalyticsStore::flush_window`.
 pub struct WindowRollup {
@@ -50,8 +55,11 @@ pub struct Aggregator {
     /// Per-`(app, path)` latency digest, independent of whether the path
     /// survives `paths`' top-N cap.
     path_latency: HashMap<(String, String), LatencyDigest, RandomState>,
-    /// Per-`(app, dimension)` top-N of dimension values (by request count).
-    breakdown: HashMap<(String, String), TopN, RandomState>,
+    /// Per-app, per-dimension top-N of dimension values (by request count).
+    /// Nested (app -> dimension -> top-N) so recording an event enters the
+    /// per-app map once and then looks up each dimension by a `&'static str`,
+    /// rather than allocating a fresh `(app, dimension)` key per dimension.
+    breakdown: HashMap<String, DimMap, RandomState>,
 }
 
 impl Aggregator {
@@ -117,32 +125,34 @@ impl Aggregator {
         }
 
         // Breakdown dimensions. `skip_empty=false` for the always-recorded
-        // dimensions (required fields), `true` for the optional ones.
+        // dimensions (required fields), `true` for the optional ones. Enter the
+        // per-app map once (consuming `app`, its last use here) so each
+        // dimension below is a plain `&'static str` lookup with no allocation.
         let bytes = ev.bytes_out;
         let topn = self.topn;
-        let map = &mut self.breakdown;
+        let dims = self.breakdown.entry(app).or_default();
         let status_str = ev.status.to_string();
-        record_breakdown(map, &app, "status", &status_str, bytes, topn, false);
-        record_breakdown(map, &app, "method", &ev.method, bytes, topn, false);
+        record_breakdown(dims, "status", &status_str, bytes, topn, false);
+        record_breakdown(dims, "method", &ev.method, bytes, topn, false);
         if let Some(country) = &en.country {
-            record_breakdown(map, &app, "country", country, bytes, topn, true);
+            record_breakdown(dims, "country", country, bytes, topn, true);
         }
         if let Some(referer) = ev.referer.as_deref() {
-            record_breakdown(map, &app, "referer", referer, bytes, topn, true);
+            record_breakdown(dims, "referer", referer, bytes, topn, true);
         }
-        record_breakdown(map, &app, "browser", &en.ua.browser, bytes, topn, true);
-        record_breakdown(map, &app, "os", &en.ua.os, bytes, topn, true);
-        record_breakdown(map, &app, "device", &en.ua.device, bytes, topn, true);
-        record_breakdown(map, &app, "protocol", &ev.protocol, bytes, topn, false);
-        record_breakdown(map, &app, "scheme", &ev.scheme, bytes, topn, false);
+        record_breakdown(dims, "browser", &en.ua.browser, bytes, topn, true);
+        record_breakdown(dims, "os", &en.ua.os, bytes, topn, true);
+        record_breakdown(dims, "device", &en.ua.device, bytes, topn, true);
+        record_breakdown(dims, "protocol", &ev.protocol, bytes, topn, false);
+        record_breakdown(dims, "scheme", &ev.scheme, bytes, topn, false);
         if let Some(tls) = &ev.tls_version {
-            record_breakdown(map, &app, "tls", tls, bytes, topn, true);
+            record_breakdown(dims, "tls", tls, bytes, topn, true);
         }
         if let Some(cache) = &en.cache {
-            record_breakdown(map, &app, "cache", cache, bytes, topn, true);
+            record_breakdown(dims, "cache", cache, bytes, topn, true);
         }
         let bot = if en.bot { "true" } else { "false" };
-        record_breakdown(map, &app, "bot", bot, bytes, topn, false);
+        record_breakdown(dims, "bot", bot, bytes, topn, false);
     }
 
     /// Drains the current window into row types for `bucket`, capping
@@ -202,27 +212,29 @@ impl Aggregator {
         self.path_latency.clear();
 
         let mut breakdown = Vec::new();
-        for ((app, dim), mut topn) in self.breakdown.drain() {
-            topn.cap(self.topn);
-            for (value, (reqs, bytes)) in topn.counts.into_iter() {
-                breakdown.push(BreakdownRow {
-                    bucket,
-                    app: app.clone(),
-                    dimension: dim.clone(),
-                    value,
-                    requests: reqs as i64,
-                    bytes_out: bytes as i64,
-                });
-            }
-            if topn.other.0 > 0 {
-                breakdown.push(BreakdownRow {
-                    bucket,
-                    app: app.clone(),
-                    dimension: dim.clone(),
-                    value: "__other__".to_string(),
-                    requests: topn.other.0 as i64,
-                    bytes_out: topn.other.1 as i64,
-                });
+        for (app, dims) in self.breakdown.drain() {
+            for (dim, mut topn) in dims {
+                topn.cap(self.topn);
+                for (value, (reqs, bytes)) in topn.counts.into_iter() {
+                    breakdown.push(BreakdownRow {
+                        bucket,
+                        app: app.clone(),
+                        dimension: dim.to_string(),
+                        value,
+                        requests: reqs as i64,
+                        bytes_out: bytes as i64,
+                    });
+                }
+                if topn.other.0 > 0 {
+                    breakdown.push(BreakdownRow {
+                        bucket,
+                        app: app.clone(),
+                        dimension: dim.to_string(),
+                        value: "__other__".to_string(),
+                        requests: topn.other.0 as i64,
+                        bytes_out: topn.other.1 as i64,
+                    });
+                }
             }
         }
 
@@ -234,7 +246,8 @@ impl Aggregator {
     }
 }
 
-/// Adds one `(app, dimension)` top-N entry. With `skip_empty`, an empty
+/// Adds one value to a dimension's top-N within an app's [`DimMap`]. With
+/// `skip_empty`, an empty
 /// `value` (a woothee UA-parse fallback, or an absent event field) is dropped
 /// rather than recorded — used by the seven optional dimensions (`country`,
 /// `referer`, `browser`, `os`, `device`, `tls`, `cache`). The five
@@ -242,9 +255,8 @@ impl Aggregator {
 /// `bot`), drawn from required fields, pass `skip_empty=false` so an empty
 /// value is never silently dropped.
 fn record_breakdown(
-    map: &mut HashMap<(String, String), TopN, RandomState>,
-    app: &str,
-    dim: &str,
+    dims: &mut DimMap,
+    dim: &'static str,
     value: &str,
     bytes_out: u64,
     topn: usize,
@@ -253,7 +265,7 @@ fn record_breakdown(
     if skip_empty && value.is_empty() {
         return;
     }
-    map.entry((app.to_string(), dim.to_string()))
+    dims.entry(dim)
         .or_default()
         .add_bounded(value, 1, bytes_out, topn);
 }

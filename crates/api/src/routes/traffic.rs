@@ -20,11 +20,14 @@ use crate::types::{
     TrafficPath, TrafficStatusBreakdown,
 };
 
+const MIN_MS: i64 = 60_000;
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
 
-/// Matches the host endpoints' default and intentionally selects daily-tier
-/// history when `from` is omitted.
+/// Matches the host endpoints' default. With `from` omitted the range spans all
+/// history; the tier union (see [`tier_reads`]) then returns every tier's data —
+/// day, hour, and current-minute — so even a brand-new agent with only `1m`
+/// rows answers immediately rather than waiting a day for the `1d` tier to fill.
 const DEFAULT_FROM: &str = "1970-01-01T00:00:00Z";
 
 const DEFAULT_LIMIT: usize = 50;
@@ -89,35 +92,38 @@ impl TopQuery {
     }
 }
 
-/// How long the `1m` tier can be relied on to still hold its rows.
-///
-/// Compaction runs hourly and *deletes* the `1m` rows for each window it
-/// folds into `1h` (see `traffic::compaction::compact_1m_to_1h`) — that
-/// delete is the watermark that stops a re-compaction from double-counting,
-/// so it is load-bearing, not incidental. The practical consequence is that
-/// `traffic_stats_1m` holds the currently-open hour plus, at worst, one hour
-/// the sweep has not reached yet. Two hours is that ceiling with a full extra
-/// cadence of slack for a delayed or missed sweep.
-const M1_TRUSTED_SPAN_MS: i64 = 2 * HOUR_MS;
+/// Floors `ts` to the start of its containing `width`-wide bucket. `div_euclid`
+/// (not `/`) so a pre-epoch `ts` rounds *down* into the earlier bucket rather
+/// than towards zero, matching `traffic::compaction::floor_to`.
+fn floor_to(ts: i64, width: i64) -> i64 {
+    ts.div_euclid(width) * width
+}
 
-/// Finest tier that actually still holds data for the requested span — which
-/// is *not* each tier's configured retention. `1m` only ever holds what
-/// compaction has not yet consumed ([`M1_TRUSTED_SPAN_MS`], ~1–2h), so a span
-/// wider than that must read `1h` (real history for its 30d retention) or `1d`
-/// (395d), where compaction has actually landed the data. Routing a 24h query
-/// at `1m` would read a near-empty table and silently report ~1/24th of the
-/// traffic. The tradeoff: a coarser-tier query trails real time by up to one
-/// compaction cadence, since the currently-open finer window is not folded up
-/// yet — accepted over unioning tiers, which risks double-counting.
-fn tier_for_span(from: i64, to: i64) -> Tier {
-    let span = to.saturating_sub(from);
-    if span < M1_TRUSTED_SPAN_MS {
-        Tier::M1
-    } else if span < 30 * DAY_MS {
-        Tier::H1
-    } else {
-        Tier::D1
-    }
+/// The three tier reads a range query must union to see its whole range, each
+/// floored to that tier's own bucket width so a range starting mid-bucket still
+/// includes the bucket it falls in (the standard "covering buckets" semantics
+/// of any rolled-up store) rather than dropping it.
+///
+/// Compaction *moves* a window between tiers in one transaction — writes the
+/// coarser row and deletes the finer ones together (see
+/// `traffic::compaction`), and readers see a WAL snapshot, never a half-applied
+/// move. So at any instant a given timestamp lives in exactly one tier: the
+/// current hour in `1m`, earlier hours of today in `1h`, older days in `1d`.
+/// Summing all three therefore reassembles the full range with each part fresh
+/// to its own granularity and *never* double-counts. This is what makes a
+/// "last hour" query whole again — the current minutes from `1m` plus the hour
+/// compaction has already folded into `1h` — and what lets the default
+/// all-history query answer without waiting for the coarse tiers to fill.
+///
+/// A late `1m` row for an already-folded hour is disjoint from that hour's `1h`
+/// total (it arrived after the fold), so the sum stays correct until the next
+/// sweep re-merges it; it can never inflate a count.
+fn tier_reads(from: i64, to: i64) -> [(Tier, i64, i64); 3] {
+    [
+        (Tier::M1, floor_to(from, MIN_MS), to),
+        (Tier::H1, floor_to(from, HOUR_MS), to),
+        (Tier::D1, floor_to(from, DAY_MS), to),
+    ]
 }
 
 #[allow(clippy::result_large_err)]
@@ -201,7 +207,6 @@ async fn overview(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    let tier = tier_for_span(from, to);
 
     let permit = match state.analytics_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
@@ -211,9 +216,11 @@ async fn overview(
     // work over potentially thousands of BLOBs and has no business on the
     // async runtime's worker threads.
     let result = tokio::task::spawn_blocking(move || {
-        analytics
-            .stats_range(tier, &app, from, to)
-            .map(summarize_stats)
+        let mut rows = Vec::new();
+        for (tier, lo, hi) in tier_reads(from, to) {
+            rows.extend(analytics.stats_range(tier, &app, lo, hi)?);
+        }
+        Ok::<_, store::StoreError>(summarize_stats(rows))
     })
     .await;
     drop(permit);
@@ -240,7 +247,6 @@ async fn paths(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let tier = tier_for_span(from, to);
     let budget = MAX_SCAN_ROWS;
 
     let permit = match state.analytics_queries.clone().acquire_owned().await {
@@ -248,12 +254,13 @@ async fn paths(
         Err(e) => return internal_error(e),
     };
     let result = tokio::task::spawn_blocking(move || {
-        analytics
-            .paths_range(tier, &app, from, to, budget)
-            .map(|rows| {
-                warn_if_truncated("paths", &app, rows.len(), budget);
-                top_paths(rows, limit)
-            })
+        let mut rows = Vec::new();
+        for (tier, lo, hi) in tier_reads(from, to) {
+            let r = analytics.paths_range(tier, &app, lo, hi, budget)?;
+            warn_if_truncated("paths", &app, r.len(), budget);
+            rows.extend(r);
+        }
+        Ok::<_, store::StoreError>(top_paths(rows, limit))
     })
     .await;
     drop(permit);
@@ -280,7 +287,6 @@ async fn breakdown(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let tier = tier_for_span(from, to);
     let budget = MAX_SCAN_ROWS;
 
     let permit = match state.analytics_queries.clone().acquire_owned().await {
@@ -288,12 +294,13 @@ async fn breakdown(
         Err(e) => return internal_error(e),
     };
     let result = tokio::task::spawn_blocking(move || {
-        analytics
-            .breakdown_range(tier, &app, &dimension, from, to, budget)
-            .map(|rows| {
-                warn_if_truncated("breakdown", &app, rows.len(), budget);
-                top_breakdown(rows, limit)
-            })
+        let mut rows = Vec::new();
+        for (tier, lo, hi) in tier_reads(from, to) {
+            let r = analytics.breakdown_range(tier, &app, &dimension, lo, hi, budget)?;
+            warn_if_truncated("breakdown", &app, r.len(), budget);
+            rows.extend(r);
+        }
+        Ok::<_, store::StoreError>(top_breakdown(rows, limit))
     })
     .await;
     drop(permit);

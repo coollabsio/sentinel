@@ -372,14 +372,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         _ = ticker.tick() => {
                             let s = analytics.clone();
                             let result = tokio::task::spawn_blocking(move || {
-                                traffic::compaction::compact_1m_to_1h(&s, collector::now_millis(), topn)
+                                let written = traffic::compaction::compact_1m_to_1h(&s, collector::now_millis(), topn);
+                                // Checkpoint regardless of the compaction result:
+                                // `wal_autocheckpoint` is disabled, so this hourly
+                                // `wal_checkpoint(TRUNCATE)` is the only thing that
+                                // keeps analytics.sqlite-wal from growing without
+                                // bound across the minute-cadence flushes.
+                                let checkpointed = s.checkpoint();
+                                (written, checkpointed)
                             })
                             .await;
                             match result {
-                                Ok(Ok(written)) => tracing::info!(
-                                    written, "traffic 1m->1h compaction complete"
-                                ),
-                                Ok(Err(e)) => tracing::warn!(error = %e, "traffic 1m->1h compaction failed"),
+                                Ok((written, checkpointed)) => {
+                                    match written {
+                                        Ok(written) => tracing::info!(written, "traffic 1m->1h compaction complete"),
+                                        Err(e) => tracing::warn!(error = %e, "traffic 1m->1h compaction failed"),
+                                    }
+                                    if let Err(e) = checkpointed {
+                                        tracing::warn!(error = %e, "traffic WAL checkpoint failed");
+                                    }
+                                }
                                 Err(e) => tracing::warn!(error = %e, "traffic compaction task panicked"),
                             }
                         }

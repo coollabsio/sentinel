@@ -24,8 +24,8 @@ fn stats_row(
     }
 }
 
-/// Design spec §9: `wal_autocheckpoint=0` (a later task's timed
-/// `wal_checkpoint(TRUNCATE)` owns checkpointing instead) and
+/// Design spec §9: `wal_autocheckpoint=0` ([`AnalyticsStore::checkpoint`]'s
+/// timed `wal_checkpoint(TRUNCATE)` owns checkpointing instead) and
 /// `auto_vacuum=INCREMENTAL` (reported back as `2`) must both actually
 /// take effect on the writer connection, not just be sent and ignored.
 #[test]
@@ -51,6 +51,49 @@ fn writer_pragmas_take_effect() {
     // busy_timeout has no readback pragma in rusqlite; init_conn sets it
     // via `conn.busy_timeout(Duration::from_secs(5))`, mirroring the
     // reader connection's setting above.
+}
+
+/// With `wal_autocheckpoint` disabled, writes accumulate in the `-wal` file
+/// and nothing reclaims it on the write path — [`AnalyticsStore::checkpoint`]
+/// is the only thing that does. After a batch of flushes the WAL is non-empty;
+/// a checkpoint truncates it back to zero. This is the regression guard for the
+/// unbounded-WAL-growth bug: without the timed checkpoint the file only ever
+/// grows.
+#[test]
+fn checkpoint_truncates_the_wal() {
+    let dir = std::env::temp_dir().join(format!("sentinel-traffic-wal-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("analytics.sqlite");
+    let wal = dir.join("analytics.sqlite-wal");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal);
+
+    {
+        let s = AnalyticsStore::open(&path).unwrap();
+        // Enough separate commits that the WAL definitely holds pages.
+        for b in 0..50i64 {
+            let stats = vec![stats_row(b * 60_000, "a", "h", 1, vec![1, 2], vec![3, 4])];
+            s.flush_window(&stats, &[], &[]).unwrap();
+        }
+        let grew = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            grew > 0,
+            "writes with auto-checkpoint off must leave a non-empty WAL"
+        );
+
+        // No reader is active here, so TRUNCATE runs to completion.
+        s.checkpoint().unwrap();
+        let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            after, 0,
+            "wal_checkpoint(TRUNCATE) must truncate the -wal file back to zero"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal);
+    let _ = std::fs::remove_file(dir.join("analytics.sqlite-shm"));
+    let _ = std::fs::remove_dir(&dir);
 }
 
 #[test]

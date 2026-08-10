@@ -254,9 +254,10 @@ impl AnalyticsStore {
         // can hold the writer lock; wait rather than error immediately,
         // matching the reader connection below.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        // Disable SQLite's automatic checkpoint: a later task adds an
-        // explicit timed `wal_checkpoint(TRUNCATE)` that owns checkpointing
-        // instead, so it isn't racing an implicit one here (design spec §9).
+        // Disable SQLite's automatic checkpoint: the timed
+        // [`AnalyticsStore::checkpoint`] (`wal_checkpoint(TRUNCATE)`, driven
+        // hourly from `main.rs`) owns checkpointing instead, so it isn't racing
+        // an implicit one on the minute-flush write path (design spec §9).
         conn.pragma_update(None, "wal_autocheckpoint", 0)?;
         // Must be set before any table exists (below, via `apply`) to take
         // effect without a full VACUUM later (design spec §9).
@@ -271,6 +272,24 @@ impl AnalyticsStore {
     ) -> Result<T, StoreError> {
         let guard = self.writer.lock().map_err(|_| StoreError::Poisoned)?;
         f(&guard)
+    }
+
+    /// Forces a `wal_checkpoint(TRUNCATE)`: flushes the WAL's committed pages
+    /// into the main database file and truncates the `-wal` file back to zero.
+    ///
+    /// [`Self::init_conn`] disables `wal_autocheckpoint`, so nothing checkpoints
+    /// on the write path — this timed call is the *only* thing that reclaims the
+    /// WAL, and without it `analytics.sqlite-wal` grows without bound across the
+    /// minute-cadence flushes and compaction rewrites (design spec §9). Runs on
+    /// the writer connection; a concurrent reader can make `TRUNCATE` fall back
+    /// to a partial checkpoint, which is fine — the next tick truncates.
+    pub fn checkpoint(&self) -> Result<(), StoreError> {
+        self.with_conn(|c| {
+            // A query pragma (returns busy/log/checkpointed columns); run it
+            // for effect and discard the row.
+            c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            Ok(())
+        })
     }
 
     /// Read-only connection: range queries. Decoupled from the writer so

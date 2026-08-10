@@ -58,6 +58,14 @@ pub struct AppState {
     /// (`analytics.sqlite`) with far heavier queries (million-row scans,
     /// t-digest/HLL decode+merge); sharing one semaphore let heavy analytics
     /// scans starve unrelated metric-history responses.
+    ///
+    /// This bounds *admission*, not parallelism: the store exposes a single
+    /// read-only connection, so admitted analytics queries still serialize on
+    /// its `Mutex`. The cap therefore limits how many analytics requests can be
+    /// in flight (and thus how many blocking-pool threads they can tie up)
+    /// rather than running that many scans at once. Real read concurrency would
+    /// need a pool of reader connections, which this feature deliberately does
+    /// not open (see `store::traffic::AnalyticsStore`).
     pub analytics_queries: Arc<Semaphore>,
     /// Traffic-analytics database, when the subsystem is both compiled in
     /// (the binary's `traffic` feature) and enabled (`TRAFFIC_ENABLED`) and

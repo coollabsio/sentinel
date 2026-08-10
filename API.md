@@ -72,7 +72,7 @@ Get the current version of Sentinel.
 
 **Response:**
 ```
-1.1.0
+1.0.0
 ```
 
 **Example:**
@@ -455,7 +455,7 @@ On-box, aggregate-only web/traffic analytics computed from the reverse-proxy acc
 
 **These endpoints only exist when Sentinel is built with the `traffic` Cargo feature *and* `TRAFFIC_ENABLED=true` at runtime.** A build without the feature never registers the routes (`404` from the router's fallback). A build with the feature but the subsystem disabled (or its database failed to open) returns a `404` with `{"error": "traffic analytics not enabled"}` from every endpoint below.
 
-Query ranges auto-select the finest storage tier that plausibly covers the span: under 48h reads the `1m` tier, under 30 days the `1h` tier, otherwise the `1d` tier. Omitting `from` therefore asks for "all of history", which resolves to the `1d` tier — so very recent traffic (still only in the `1m` tier) won't show up until compaction has rolled it up, unless a `from` is passed explicitly.
+A query reads **every** storage tier its range touches and sums them: the current hour from the `1m` tier, earlier hours of the day from `1h`, and older days from `1d`. Because compaction *moves* data between tiers rather than copying it, each moment lives in exactly one tier, so the sum counts every request once. This means recent traffic (still only in `1m`) and the default `from`-omitted "all of history" query both return complete, up-to-the-minute results — there is no waiting for compaction and no empty window on a fresh agent. The only caveat is granularity: once data has been rolled up, a range whose `from` falls partway through an hour or day is answered from that whole bucket, so the very start of a wide range effectively snaps to its bucket boundary.
 
 ### Get Recorded Apps
 

@@ -296,12 +296,16 @@ impl TopN {
     /// Adds `reqs`/`bytes` to `key`'s running totals, truncating `key` to
     /// [`MAX_KEY_BYTES`] first (wire values have no upstream length bound).
     pub fn add(&mut self, key: &str, reqs: u64, bytes: u64) {
-        let entry = self
-            .counts
-            .entry(truncate_key(key).to_string())
-            .or_insert((0, 0));
-        entry.0 += reqs;
-        entry.1 += bytes;
+        let key = truncate_key(key);
+        // Look up by the borrowed key first: on the common hit path (a key
+        // already seen this window) this allocates nothing, where an
+        // `entry(key.to_string())` would allocate an owned key on every call.
+        if let Some(entry) = self.counts.get_mut(key) {
+            entry.0 += reqs;
+            entry.1 += bytes;
+        } else {
+            self.counts.insert(key.to_string(), (reqs, bytes));
+        }
     }
 
     /// [`Self::add`], plus a soft cap that bounds the map *within* the window,
