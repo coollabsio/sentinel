@@ -8,12 +8,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
+use config::TrafficSettings;
 use reqwest::Client;
 use store::traffic::{AnalyticsStore, Tier};
 use traffic::aggregator::Aggregator;
 use traffic::compaction::{compact_1h_to_1d, compact_1m_to_1h};
-use traffic::enrich::{Enricher, NoGeo};
+use traffic::enrich::{CountryLookup, Enricher, NoGeo};
+use traffic::geoip::{self, GeoIp};
 use traffic::parser::{ProxyType, parse_line};
+
+/// Public resolvers / CDNs that GeoLite2/DB-IP usually map to a country.
+/// Documentation ranges (203.0.113.0/24) deliberately avoided — they miss.
+const GEOIP_IPS: &[&str] = &[
+    "8.8.8.8",         // Google DNS
+    "1.1.1.1",         // Cloudflare DNS
+    "9.9.9.9",         // Quad9
+    "208.67.222.222",  // OpenDNS
+    "94.140.14.14",    // AdGuard
+    "185.228.168.9",   // CleanBrowsing
+    "149.112.112.112", // Quad9 secondary
+    "64.6.64.6",       // Verisign
+    "142.250.190.14",  // Google edge
+    "104.16.1.1",      // Cloudflare edge
+];
+
+const CF_COUNTRIES: &[&str] = &["US", "DE", "FR", "JP", "BR", "IN", "GB", "AU", "CA", "NL"];
 
 #[derive(Debug, Clone)]
 pub struct AnalyticsOpts {
@@ -33,6 +52,18 @@ pub struct AnalyticsOpts {
     pub max_error_pct: f64,
     pub max_p99_ms: f64,
     pub stress_profile: AnalyticsStressProfile,
+    /// Percent of synthetic lines that carry `request_Cf-Ipcountry` (0–100).
+    /// The remainder omit CF country so enrichment falls through to GeoIP.
+    pub cf_header_pct: u8,
+    /// Skip GeoIP bootstrap; country only comes from CF headers.
+    pub no_geoip: bool,
+    /// Fail if GeoIP cannot be loaded (in-process) or attribution stays null (live).
+    pub require_geoip: bool,
+    /// Directory for downloaded `.mmdb` files during in-process bootstrap.
+    pub geoip_dir: PathBuf,
+    pub geoip_db_url: Option<String>,
+    pub geoip_maxmind_key: Option<String>,
+    pub geoip_maxmind_edition: String,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -43,7 +74,25 @@ pub enum AnalyticsStressProfile {
     Soak,
 }
 
-pub fn generate_lines(count: usize, apps: usize, paths: usize, ts_ms: i64) -> Vec<String> {
+/// Whether line `i` of a stream should include a Cloudflare country header.
+pub fn line_uses_cf_header(i: usize, cf_header_pct: u8) -> bool {
+    let pct = u8::min(cf_header_pct, 100) as usize;
+    (i % 100) < pct
+}
+
+/// Generate deterministic Traefik JSON lines with a mixed CF / GeoIP country path.
+///
+/// * CF path (`line_uses_cf_header`): sets `request_Cf-Ipcountry` so enrichment
+///   never touches the database.
+/// * GeoIP path: omits CF country (and CF connecting IP) and uses a public
+///   `ClientHost` that a real GeoIP DB can resolve.
+pub fn generate_lines(
+    count: usize,
+    apps: usize,
+    paths: usize,
+    ts_ms: i64,
+    cf_header_pct: u8,
+) -> Vec<String> {
     let apps = apps.max(1);
     let paths = paths.max(1);
     (0..count)
@@ -51,14 +100,23 @@ pub fn generate_lines(count: usize, apps: usize, paths: usize, ts_ms: i64) -> Ve
             let app = format!("bench-app-{}", i % apps);
             let path = format!("/bench/path/{}", i % paths);
             let status = [200, 200, 200, 302, 404, 500][i % 6];
-            let ip = format!("203.0.113.{}", i % 250 + 1);
-            format!(
-                r#"{{"ClientHost":"{ip}","DownstreamContentSize":{},"DownstreamStatus":{status},"Duration":{},"RequestContentSize":{},"RequestHost":"app{}.example.test","RequestMethod":"GET","RequestPath":"{path}?n={i}","RequestProtocol":"HTTP/1.1","RequestScheme":"https","RouterName":"https-0-{app}@docker","StartUTC":"2026-08-10T00:00:00Z","TLSVersion":"1.3","request_Cf-Connecting-Ip":"{ip}","request_Cf-Ipcountry":"US","request_User-Agent":"Mozilla/5.0 Chrome/120.0","time":"2026-08-10T00:00:00Z","bench_ts_ms":{ts_ms}}}"#,
-                512 + i % 4096,
-                1_000_000 + (i % 100) * 10_000,
-                i % 1024,
-                i % apps,
-            )
+            let size = 512 + i % 4096;
+            let duration = 1_000_000 + (i % 100) * 10_000;
+            let req_size = i % 1024;
+            let host_n = i % apps;
+            let ua = "Mozilla/5.0 Chrome/120.0";
+            if line_uses_cf_header(i, cf_header_pct) {
+                let ip = format!("203.0.113.{}", i % 250 + 1);
+                let country = CF_COUNTRIES[i % CF_COUNTRIES.len()];
+                format!(
+                    r#"{{"ClientHost":"{ip}","DownstreamContentSize":{size},"DownstreamStatus":{status},"Duration":{duration},"RequestContentSize":{req_size},"RequestHost":"app{host_n}.example.test","RequestMethod":"GET","RequestPath":"{path}?n={i}","RequestProtocol":"HTTP/1.1","RequestScheme":"https","RouterName":"https-0-{app}@docker","StartUTC":"2026-08-10T00:00:00Z","TLSVersion":"1.3","request_Cf-Connecting-Ip":"{ip}","request_Cf-Ipcountry":"{country}","request_User-Agent":"{ua}","time":"2026-08-10T00:00:00Z","bench_ts_ms":{ts_ms}}}"#
+                )
+            } else {
+                let ip = GEOIP_IPS[i % GEOIP_IPS.len()];
+                format!(
+                    r#"{{"ClientHost":"{ip}","DownstreamContentSize":{size},"DownstreamStatus":{status},"Duration":{duration},"RequestContentSize":{req_size},"RequestHost":"app{host_n}.example.test","RequestMethod":"GET","RequestPath":"{path}?n={i}","RequestProtocol":"HTTP/1.1","RequestScheme":"https","RouterName":"https-0-{app}@docker","StartUTC":"2026-08-10T00:00:00Z","TLSVersion":"1.3","request_User-Agent":"{ua}","time":"2026-08-10T00:00:00Z","bench_ts_ms":{ts_ms}}}"#
+                )
+            }
         })
         .collect()
 }
@@ -129,30 +187,162 @@ fn percentile_ms(samples: &mut [Duration], pct: usize) -> f64 {
         * 1000.0
 }
 
+fn traffic_settings(opts: &AnalyticsOpts) -> TrafficSettings {
+    TrafficSettings {
+        enabled: true,
+        access_log_path: PathBuf::from("/dev/null"),
+        proxy_type: "traefik".into(),
+        topn: 50,
+        sample_threshold: 0,
+        retention_1m_hours: 48,
+        retention_1h_days: 30,
+        retention_1d_days: 395,
+        analytics_file: PathBuf::from(":memory:"),
+        geoip_enabled: true,
+        geoip_db_url: opts.geoip_db_url.clone(),
+        geoip_maxmind_key: opts.geoip_maxmind_key.clone(),
+        geoip_maxmind_edition: opts.geoip_maxmind_edition.clone(),
+        geoip_refresh_days: 30,
+    }
+}
+
+async fn load_geoip(
+    opts: &AnalyticsOpts,
+) -> Result<Arc<dyn CountryLookup>, Box<dyn std::error::Error>> {
+    if opts.no_geoip {
+        println!("[geoip] disabled (--no-geoip); CF-header lines only get country");
+        return Ok(Arc::new(NoGeo));
+    }
+
+    std::fs::create_dir_all(&opts.geoip_dir)?;
+    let cfg = traffic_settings(opts);
+    let sources = geoip::resolve_sources(&cfg);
+    println!(
+        "[geoip] bootstrapping into {} (candidates={})",
+        opts.geoip_dir.display(),
+        sources.len()
+    );
+    match GeoIp::bootstrap(&cfg, &opts.geoip_dir).await {
+        Ok(geo) => {
+            let attribution = geo.attribution().unwrap_or_else(|| "(unrecognized source)".into());
+            println!("[geoip] loaded: {attribution}");
+            Ok(geo)
+        }
+        Err(e) => {
+            if opts.require_geoip {
+                return Err(format!("geoip bootstrap failed and --require-geoip set: {e}").into());
+            }
+            println!("[geoip] bootstrap failed ({e}); continuing with NoGeo");
+            Ok(Arc::new(NoGeo))
+        }
+    }
+}
+
+async fn wait_live_geoip(
+    client: &Client,
+    base: &str,
+    token: &str,
+    timeout: Duration,
+    require: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last: Option<Option<String>> = None;
+    loop {
+        let attribution = client
+            .get(format!("{base}/api/traffic/attribution"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .ok()
+            .filter(|r| r.status().is_success());
+        if let Some(resp) = attribution
+            && let Ok(body) = resp.json::<serde_json::Value>().await
+        {
+            let attr = body
+                .get("attribution")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            last = Some(attr.clone());
+            if let Some(s) = attr {
+                println!("[geoip] live attribution ready: {s}");
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    match last {
+        Some(None) | None => {
+            let msg = "live Sentinel GeoIP attribution is null (database not loaded or GEOIP_ENABLED=false)";
+            if require {
+                return Err(msg.into());
+            }
+            println!("[geoip] WARN: {msg}; GeoIP-path lines will lack country");
+            Ok(())
+        }
+        Some(Some(_)) => Ok(()), // unreachable: would have returned earlier
+    }
+}
+
 pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Traffic analytics benchmark ===");
     println!(
-        "events={} apps={} paths={} minutes={} topn={} query_iterations={}",
-        opts.events, opts.apps, opts.paths, opts.minutes, opts.topn, opts.query_iterations
+        "events={} apps={} paths={} minutes={} topn={} query_iterations={} cf_header_pct={}%",
+        opts.events,
+        opts.apps,
+        opts.paths,
+        opts.minutes,
+        opts.topn,
+        opts.query_iterations,
+        opts.cf_header_pct.min(100)
     );
 
+    let lookup = load_geoip(opts).await?;
+    let enricher = Enricher::new(lookup, 1024);
+
     let now = 1_700_000_000_000i64;
-    let lines = generate_lines(opts.events, opts.apps, opts.paths, now);
-    let enricher = Enricher::new(Arc::new(NoGeo), 1024);
+    let lines = generate_lines(
+        opts.events,
+        opts.apps,
+        opts.paths,
+        now,
+        opts.cf_header_pct,
+    );
     let mut aggregator = Aggregator::new(opts.topn);
+    let mut cf_country = 0u64;
+    let mut geoip_country = 0u64;
+    let mut unresolved = 0u64;
     let started = Instant::now();
-    for line in &lines {
+    for (i, line) in lines.iter().enumerate() {
         let event = parse_line(ProxyType::Traefik, line.as_bytes())
             .ok_or("generated Traefik line did not parse")?;
+        let used_cf = line_uses_cf_header(i, opts.cf_header_pct);
         let enriched = enricher.enrich(&event);
+        match (&enriched.country, used_cf) {
+            (Some(_), true) => cf_country += 1,
+            (Some(_), false) => geoip_country += 1,
+            (None, _) => unresolved += 1,
+        }
         aggregator.record(&event, &enriched);
     }
     let ingest_elapsed = started.elapsed();
     println!(
-        "[A] parse+enrich+aggregate: {:.2}ms ({:.0} events/s)",
+        "[A] parse+enrich+aggregate: {:.2}ms ({:.0} events/s) cf_country={} geoip_country={} unresolved={}",
         ingest_elapsed.as_secs_f64() * 1000.0,
-        opts.events as f64 / ingest_elapsed.as_secs_f64().max(1e-9)
+        opts.events as f64 / ingest_elapsed.as_secs_f64().max(1e-9),
+        cf_country,
+        geoip_country,
+        unresolved
     );
+    if opts.require_geoip && opts.cf_header_pct < 100 && geoip_country == 0 && opts.events > 0 {
+        return Err(
+            "expected GeoIP-resolved countries for non-CF lines but got none (--require-geoip)"
+                .into(),
+        );
+    }
 
     let store = AnalyticsStore::open_in_memory()?;
     let rollup = aggregator.take_rollup(now - now % 60_000);
@@ -169,7 +359,13 @@ pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>>
     for minute in 0..opts.minutes.max(60) {
         let bucket = hour - (minute as i64) * 60_000;
         let mut a = Aggregator::new(opts.topn);
-        for line in generate_lines(opts.apps.max(1) * 2, opts.apps, opts.paths, bucket) {
+        for line in generate_lines(
+            opts.apps.max(1) * 2,
+            opts.apps,
+            opts.paths,
+            bucket,
+            opts.cf_header_pct,
+        ) {
             if let Some(event) = parse_line(ProxyType::Traefik, line.as_bytes()) {
                 let enriched = enricher.enrich(&event);
                 a.record(&event, &enriched);
@@ -285,6 +481,7 @@ async fn run_live_stress(
     let writer_written = written.clone();
     let rate = opts.stress_log_rate;
     let profile = opts.stress_profile;
+    let cf_header_pct = opts.cf_header_pct;
     let writer = tokio::spawn(async move {
         let tick = Duration::from_millis(100);
         let mut sequence = 0usize;
@@ -297,7 +494,13 @@ async fn run_live_stress(
             interval.tick().await;
             let factor = stress_factor(profile, stress_started.elapsed(), total_duration);
             let per_tick = lines_per_tick((rate as f64 * factor) as usize, tick);
-            for line in generate_lines(per_tick, 10, 100, 1_700_000_000_000 + sequence as i64) {
+            for line in generate_lines(
+                per_tick,
+                10,
+                100,
+                1_700_000_000_000 + sequence as i64,
+                cf_header_pct,
+            ) {
                 writeln!(file, "{line}")?;
                 sequence += 1;
             }
@@ -428,6 +631,14 @@ async fn run_end_to_end(
         .timeout(Duration::from_secs(opts.timeout_secs))
         .build()?;
     let base = opts.base.trim_end_matches('/');
+
+    if !opts.no_geoip {
+        // GeoIP bootstrap is deferred until after the API is up; wait so the
+        // live mix exercises real lookups rather than racing empty enrichment.
+        let wait = Duration::from_secs(ingestion_wait_secs(opts.timeout_secs).min(90));
+        wait_live_geoip(&client, base, &opts.token, wait, opts.require_geoip).await?;
+    }
+
     let baseline = overview_requests(&client, base, &opts.token)
         .await
         .unwrap_or(0);
@@ -488,7 +699,7 @@ mod tests {
 
     #[test]
     fn generated_traefik_lines_parse_with_requested_cardinality() {
-        let lines = generate_lines(12, 3, 4, 1_700_000_000_000);
+        let lines = generate_lines(12, 3, 4, 1_700_000_000_000, 100);
         assert_eq!(lines.len(), 12);
         let events: Vec<_> = lines
             .iter()
@@ -498,6 +709,48 @@ mod tests {
         let paths: std::collections::HashSet<_> = events.iter().map(|e| e.path.as_ref()).collect();
         assert_eq!(apps.len(), 3);
         assert_eq!(paths.len(), 4);
+    }
+
+    #[test]
+    fn cf_header_mix_is_deterministic() {
+        assert!(line_uses_cf_header(0, 50));
+        assert!(line_uses_cf_header(49, 50));
+        assert!(!line_uses_cf_header(50, 50));
+        assert!(!line_uses_cf_header(99, 50));
+        assert!(line_uses_cf_header(0, 100));
+        assert!(!line_uses_cf_header(0, 0));
+    }
+
+    #[test]
+    fn mixed_lines_include_cf_and_geoip_paths() {
+        let lines = generate_lines(100, 2, 2, 1_700_000_000_000, 50);
+        let mut with_cf = 0;
+        let mut without_cf = 0;
+        for (i, line) in lines.iter().enumerate() {
+            let event = parse_line(ProxyType::Traefik, line.as_bytes()).unwrap();
+            if line_uses_cf_header(i, 50) {
+                assert!(event.cf_country.is_some(), "line {i} should have CF country");
+                with_cf += 1;
+            } else {
+                assert!(
+                    event.cf_country.is_none(),
+                    "line {i} should omit CF country for GeoIP path"
+                );
+                assert!(
+                    event.client_ip.is_some(),
+                    "line {i} needs ClientHost for GeoIP"
+                );
+                // Public IPs, not documentation range.
+                let ip = event.client_ip.as_ref().unwrap();
+                assert!(
+                    !ip.starts_with("203.0.113."),
+                    "GeoIP path should not use TEST-NET IPs"
+                );
+                without_cf += 1;
+            }
+        }
+        assert_eq!(with_cf, 50);
+        assert_eq!(without_cf, 50);
     }
 
     #[test]
@@ -554,19 +807,19 @@ mod tests {
             ),
             0.1
         );
-    }
-
-    #[test]
-    fn live_overview_uses_a_recent_range_that_reads_the_minute_tier() {
         assert_eq!(
-            live_overview_path(3_600_000),
-            "/api/app/bench-app-0/traffic/overview?from=1970-01-01T00:01:00Z&to=1970-01-01T01:59:00Z"
+            stress_factor(
+                AnalyticsStressProfile::Mixed,
+                Duration::from_secs(3),
+                Duration::from_secs(10)
+            ),
+            1.0
         );
     }
 
     #[test]
-    fn stress_wait_covers_the_minute_flush_boundary() {
+    fn ingestion_wait_crosses_a_minute_boundary() {
         assert_eq!(ingestion_wait_secs(5), 70);
-        assert_eq!(ingestion_wait_secs(90), 90);
+        assert_eq!(ingestion_wait_secs(120), 120);
     }
 }

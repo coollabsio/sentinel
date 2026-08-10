@@ -1762,6 +1762,7 @@ version = "1.0.0"
 dependencies = [
  "clap",
  "collector",
+ "config",
  "futures-util",
  "reqwest",
  "serde",

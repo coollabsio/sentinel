@@ -344,19 +344,31 @@ queries the populated 1d tier. An optional live phase appends the same workload 
 of a running traffic-enabled Sentinel and times when the app becomes visible plus all four query
 surfaces.
 
+**Country enrichment is mixed**, matching production: by default **50%** of lines include Cloudflare
+`request_Cf-Ipcountry` (header wins in the enricher); the rest **omit** CF country and use public
+client IPs so enrichment must hit GeoIP. Phase A reports `cf_country` / `geoip_country` /
+`unresolved` counts. The harness downloads the same default GeoIP chain as Sentinel (jsDelivr
+mirror → DB-IP) into `--geoip-dir` unless `--no-geoip` is set. Live phase E polls
+`GET /api/traffic/attribution` so measurements start after the target agent has a database.
+
 ```bash
-# Reproducible in-process pipeline; no running agent required
+# Reproducible in-process pipeline (downloads GeoIP once into the cache dir)
 ./target/release/sentinel-bench analytics
 
-# Smaller smoke run
-./target/release/sentinel-bench analytics \
+# Offline / CF-only smoke (no GeoIP download)
+./target/release/sentinel-bench analytics --no-geoip --cf-header-pct 100 \
   --events 10000 --apps 10 --paths 100 --minutes 60 --query-iterations 20
+
+# Strict GeoIP: fail if bootstrap cannot resolve countries on the non-CF half
+./target/release/sentinel-bench analytics --require-geoip --cf-header-pct 50
 
 # Full pipeline plus live tailer/service/API verification. This must be the exact
 # host path or bind-mounted file that the target Sentinel is tailing.
+# Target should run with GEOIP_ENABLED=true (default) so attribution becomes non-null.
 ./target/release/sentinel-bench analytics \
   --base http://127.0.0.1:18889 --token "$TOKEN" \
-  --access-log /path/to/proxy/access.log
+  --access-log /path/to/proxy/access.log \
+  --require-geoip
 ```
 
 | Flag | Default | Meaning |
@@ -367,6 +379,13 @@ surfaces.
 | `--minutes` | `1440` | Seeded minute buckets; values below 60 use 60 |
 | `--topn` | `50` | Production aggregation/compaction top-N cap |
 | `--query-iterations` | `100` | Repetitions of each store and live HTTP query |
+| `--cf-header-pct` | `50` | Percent of lines with CF country header; remainder need GeoIP |
+| `--no-geoip` | off | Skip GeoIP bootstrap; non-CF lines leave country unresolved |
+| `--require-geoip` | off | Fail if GeoIP does not load / live attribution stays null / non-CF lines never resolve |
+| `--geoip-dir` | `$TMPDIR/sentinel-bench-geoip` | Cache dir for in-process `.mmdb` download |
+| `--geoip-db-url` | unset / `GEOIP_DB_URL` | Same override as Sentinel |
+| `--geoip-maxmind-key` | unset / `GEOIP_MAXMIND_LICENSE_KEY` | Licensed MaxMind download |
+| `--geoip-maxmind-edition` | `GeoLite2-Country` | MaxMind edition when a key is set |
 | `--access-log` | unset | Enables live end-to-end and concurrent stress phases |
 | `--stress-duration` | `30` | Seconds of simultaneous log ingestion and analytics queries; `0` disables |
 | `--stress-profile` | `mixed` | `mixed`, linear `ramp`, alternating `burst`, or steady `soak` |
@@ -375,21 +394,23 @@ surfaces.
 | `--max-error-pct` | `1.0` | Maximum successful-response error percentage |
 | `--max-p99-ms` | `0` | Optional query p99 ceiling; `0` disables |
 
-Reported phases are: **[A]** parse+enrich+aggregate events/s, **[B]** SQLite minute flush rows and
-latency, **[C]** minute→hour and hour→day compaction rows/latency, **[D]** populated store query
-p50/p95/p99, and **[E]** live tail-to-visible latency plus HTTP query p50/p95/p99. Phase E exits
-non-zero if ingestion is not visible before `--timeout-secs` (with a five-second minimum), or if
-an analytics endpoint does not return success. With `--access-log`, **[F]** simultaneously appends
-Traefik records at `--stress-log-rate`, runs a mixed query workload at `--stress-concurrency`, and
+Reported phases are: **[A]** parse+enrich+aggregate events/s plus CF/GeoIP country counts, **[B]**
+SQLite minute flush rows and latency, **[C]** minute→hour and hour→day compaction rows/latency,
+**[D]** populated store query p50/p95/p99, and **[E]** live attribution wait, tail-to-visible
+latency, plus HTTP query p50/p95/p99. Phase E exits non-zero if ingestion is not visible before
+`--timeout-secs` (with a 70-second floor so a minute bucket can flush), or if an analytics endpoint
+does not return success. With `--access-log`, **[F]** simultaneously appends Traefik records at
+`--stress-log-rate` (same CF/GeoIP mix), runs a mixed query workload at `--stress-concurrency`, and
 probes `/api/health` every two seconds. It reports achieved log writes, query RPS, errors, p99,
 health failures, and the observed app request delta. It fails on excess errors/p99, any failed
 health probe, or missing ingested records.
 
 For live comparisons, start Sentinel with `TRAFFIC_ENABLED=true`, a build containing the `traffic`
-feature, and `TRAFFIC_PROXY_TYPE=traefik`. Use a disposable benchmark log: this command appends
-records and does not truncate them. Capture the target Sentinel's CPU, VmRSS/VmHWM, and database
-size immediately before and after phase E. The in-process phase measures the harness process and
-must not be reported as the target agent's resource overhead.
+feature, `TRAFFIC_PROXY_TYPE=traefik`, and leave `GEOIP_ENABLED=true` (default) so the agent
+downloads a country database. Use a disposable benchmark log: this command appends records and
+does not truncate them. Capture the target Sentinel's CPU, VmRSS/VmHWM, and database size
+immediately before and after phase E. The in-process phase measures the harness process and must
+not be reported as the target agent's resource overhead.
 
 The suite keeps its historical behavior unless analytics is requested:
 
@@ -549,8 +570,11 @@ Copy into `docs/benchmark-results/YYYY-MM-DD-<label>.md`:
 (paste `sentinel-bench stress` summary)
 
 ## Traffic analytics
-- workload (`events/apps/paths/minutes/topn`):
+- workload (`events/apps/paths/minutes/topn/cf_header_pct`):
+- GeoIP source (mirror / MaxMind key / `GEOIP_DB_URL` / `--no-geoip`):
+- phase A country path counts (`cf_country` / `geoip_country` / `unresolved`):
 - live access-log source and proxy type:
+- live attribution string (or null):
 - Sentinel CPU/RSS before and after:
 - `analytics.sqlite` bytes before and after:
 (paste `sentinel-bench analytics` output, including skipped phases)

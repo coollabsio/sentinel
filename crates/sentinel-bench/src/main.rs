@@ -118,6 +118,31 @@ struct AnalyticsCli {
     /// Fail phase F above this p99 in milliseconds; 0 disables the ceiling.
     #[arg(long, default_value_t = 0.0)]
     max_p99_ms: f64,
+    /// Percent of synthetic lines with Cloudflare `Cf-Ipcountry` (rest use GeoIP).
+    #[arg(long, default_value_t = 50)]
+    cf_header_pct: u8,
+    /// Skip GeoIP download/lookup; only CF-header lines get a country.
+    #[arg(long, default_value_t = false)]
+    no_geoip: bool,
+    /// Fail if GeoIP cannot load in-process or live attribution stays null.
+    #[arg(long, default_value_t = false)]
+    require_geoip: bool,
+    /// Cache directory for the in-process GeoIP database download.
+    #[arg(long, default_value_os_t = default_geoip_dir())]
+    geoip_dir: std::path::PathBuf,
+    /// Override GeoIP database URL (same as Sentinel `GEOIP_DB_URL`).
+    #[arg(long, env = "GEOIP_DB_URL")]
+    geoip_db_url: Option<String>,
+    /// MaxMind license key (same as Sentinel `GEOIP_MAXMIND_LICENSE_KEY`).
+    #[arg(long, env = "GEOIP_MAXMIND_LICENSE_KEY")]
+    geoip_maxmind_key: Option<String>,
+    /// MaxMind edition when a license key is set.
+    #[arg(long, default_value = "GeoLite2-Country", env = "GEOIP_MAXMIND_EDITION")]
+    geoip_maxmind_edition: String,
+}
+
+fn default_geoip_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("sentinel-bench-geoip")
 }
 
 fn analytics_opts(cli: AnalyticsCli) -> analytics_bench::AnalyticsOpts {
@@ -138,6 +163,13 @@ fn analytics_opts(cli: AnalyticsCli) -> analytics_bench::AnalyticsOpts {
         stress_log_rate: cli.stress_log_rate,
         max_error_pct: cli.max_error_pct,
         max_p99_ms: cli.max_p99_ms,
+        cf_header_pct: cli.cf_header_pct,
+        no_geoip: cli.no_geoip,
+        require_geoip: cli.require_geoip,
+        geoip_dir: cli.geoip_dir,
+        geoip_db_url: cli.geoip_db_url,
+        geoip_maxmind_key: cli.geoip_maxmind_key,
+        geoip_maxmind_edition: cli.geoip_maxmind_edition,
     }
 }
 
@@ -894,6 +926,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stress_log_rate: 1_000,
                     max_error_pct: 1.0,
                     max_p99_ms: 0.0,
+                    cf_header_pct: 50,
+                    no_geoip: false,
+                    require_geoip: false,
+                    geoip_dir: default_geoip_dir(),
+                    geoip_db_url: std::env::var("GEOIP_DB_URL").ok().filter(|s| !s.is_empty()),
+                    geoip_maxmind_key: std::env::var("GEOIP_MAXMIND_LICENSE_KEY")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
+                    geoip_maxmind_edition: std::env::var("GEOIP_MAXMIND_EDITION")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "GeoLite2-Country".into()),
                 })
                 .await?;
             }
