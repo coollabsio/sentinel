@@ -35,6 +35,30 @@ pub enum ConfigError {
     InvalidBool(&'static str),
 }
 
+/// Traffic-analytics subsystem configuration (spec §5). Inert unless
+/// `enabled` (TRAFFIC_ENABLED) is set and the binary is built with the
+/// `traffic` feature. All fields have safe defaults so the zero-config path
+/// is opt-out-clean.
+#[derive(Debug, Clone)]
+pub struct TrafficSettings {
+    pub enabled: bool,
+    pub access_log_path: PathBuf,
+    pub proxy_type: String,
+    pub topn: u32,
+    pub sample_threshold: u32,
+    pub retention_1m_hours: u32,
+    pub retention_1h_days: u32,
+    pub retention_1d_days: u32,
+    pub analytics_file: PathBuf,
+    pub geoip_enabled: bool,
+    /// Explicit source URL override. When `None`, the default resolution chain
+    /// (mirror → DB-IP fallback, or MaxMind if a key is set) applies. See §6.
+    pub geoip_db_url: Option<String>,
+    pub geoip_maxmind_key: Option<String>,
+    pub geoip_maxmind_edition: String,
+    pub geoip_refresh_days: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub version: String,
@@ -55,6 +79,7 @@ pub struct Config {
     pub storage_volumes_enabled: bool,
     pub storage_volumes_refresh_rate_seconds: u64,
     pub host_mount_prefix: String,
+    pub traffic: TrafficSettings,
 }
 
 impl Config {
@@ -79,6 +104,34 @@ impl Config {
         let storage_volumes_refresh_rate_seconds =
             positive_from_env("STORAGE_VOLUMES_REFRESH_RATE_SECONDS", 900)?;
         let host_mount_prefix = non_empty("HOST_MOUNT_PREFIX").unwrap_or_default();
+
+        let analytics_file = if development {
+            PathBuf::from("./db/analytics.sqlite")
+        } else {
+            PathBuf::from("/app/db/analytics.sqlite")
+        };
+        let traffic = TrafficSettings {
+            enabled: bool_from_env("TRAFFIC_ENABLED", false)?,
+            access_log_path: PathBuf::from(
+                non_empty("TRAFFIC_ACCESS_LOG_PATH")
+                    .unwrap_or_else(|| "/data/coolify/proxy/access.log".to_string()),
+            ),
+            proxy_type: non_empty("TRAFFIC_PROXY_TYPE").unwrap_or_else(|| "auto".to_string()),
+            topn: u32_from_env("TRAFFIC_TOPN", 50)?,
+            // Sampling is off by default; 0 is a valid "disabled" sentinel, so it
+            // uses a non-positive-tolerant parse rather than positive_from_env.
+            sample_threshold: u32_nonneg_from_env("TRAFFIC_SAMPLE_THRESHOLD", 0)?,
+            retention_1m_hours: u32_from_env("TRAFFIC_RETENTION_1M_HOURS", 48)?,
+            retention_1h_days: u32_from_env("TRAFFIC_RETENTION_1H_DAYS", 30)?,
+            retention_1d_days: u32_from_env("TRAFFIC_RETENTION_1D_DAYS", 395)?,
+            analytics_file,
+            geoip_enabled: bool_from_env("GEOIP_ENABLED", true)?,
+            geoip_db_url: non_empty("GEOIP_DB_URL"),
+            geoip_maxmind_key: non_empty("GEOIP_MAXMIND_LICENSE_KEY"),
+            geoip_maxmind_edition: non_empty("GEOIP_MAXMIND_EDITION")
+                .unwrap_or_else(|| "GeoLite2-Country".to_string()),
+            geoip_refresh_days: u32_from_env("GEOIP_REFRESH_DAYS", 30)?,
+        };
 
         let port: u16 = match non_empty("PORT") {
             None => 8888,
@@ -129,6 +182,7 @@ impl Config {
             storage_volumes_enabled,
             storage_volumes_refresh_rate_seconds,
             host_mount_prefix,
+            traffic,
         })
     }
 
@@ -153,6 +207,22 @@ impl Config {
             storage_volumes_enabled: false,
             storage_volumes_refresh_rate_seconds: 900,
             host_mount_prefix: String::new(),
+            traffic: TrafficSettings {
+                enabled: false,
+                access_log_path: PathBuf::from("/data/coolify/proxy/access.log"),
+                proxy_type: "auto".to_string(),
+                topn: 50,
+                sample_threshold: 0,
+                retention_1m_hours: 48,
+                retention_1h_days: 30,
+                retention_1d_days: 395,
+                analytics_file: PathBuf::from(":memory:"),
+                geoip_enabled: true,
+                geoip_db_url: None,
+                geoip_maxmind_key: None,
+                geoip_maxmind_edition: "GeoLite2-Country".to_string(),
+                geoip_refresh_days: 30,
+            },
         }
     }
 }
@@ -181,6 +251,24 @@ fn positive_from_env(key: &'static str, fallback: u64) -> Result<u64, ConfigErro
         None => Ok(fallback),
         Some(v) => match v.parse::<i64>() {
             Ok(n) if n > 0 => Ok(n as u64),
+            _ => Err(ConfigError::NotPositive(key)),
+        },
+    }
+}
+
+/// A strictly-positive `u32` env var (rejects 0, negatives, and overflow).
+fn u32_from_env(key: &'static str, fallback: u32) -> Result<u32, ConfigError> {
+    let n = positive_from_env(key, fallback as u64)?;
+    u32::try_from(n).map_err(|_| ConfigError::NotPositive(key))
+}
+
+/// A non-negative `u32` env var: 0 is accepted (it is a valid "disabled"
+/// sentinel, e.g. TRAFFIC_SAMPLE_THRESHOLD=0 means "never sample").
+fn u32_nonneg_from_env(key: &'static str, fallback: u32) -> Result<u32, ConfigError> {
+    match non_empty(key) {
+        None => Ok(fallback),
+        Some(v) => match v.parse::<i64>() {
+            Ok(n) if n >= 0 => u32::try_from(n).map_err(|_| ConfigError::NotPositive(key)),
             _ => Err(ConfigError::NotPositive(key)),
         },
     }
@@ -217,218 +305,4 @@ fn validate_endpoint(endpoint: &str) -> Result<(), ConfigError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Env access is process-global, so these tests must not run concurrently.
-    // Each locks the same mutex and restores the env afterwards.
-    use std::sync::{Mutex, OnceLock};
-    fn env_lock() -> &'static Mutex<()> {
-        static L: OnceLock<Mutex<()>> = OnceLock::new();
-        L.get_or_init(|| Mutex::new(()))
-    }
-
-    struct EnvGuard(Vec<(String, Option<String>)>);
-    impl EnvGuard {
-        #[allow(unsafe_code)]
-        fn set(vars: &[(&str, &str)]) -> Self {
-            let saved = vars
-                .iter()
-                .map(|(k, _)| ((*k).to_string(), std::env::var(k).ok()))
-                .collect();
-            for (k, v) in vars {
-                // SAFETY: test-only process env mutation, serialized by env_lock()
-                // above so no other thread reads/writes these vars concurrently.
-                unsafe { std::env::set_var(k, v) };
-            }
-            Self(saved)
-        }
-    }
-    impl Drop for EnvGuard {
-        #[allow(unsafe_code)]
-        fn drop(&mut self) {
-            for (k, v) in &self.0 {
-                // SAFETY: see EnvGuard::set — same serialization guarantee.
-                match v {
-                    Some(v) => unsafe { std::env::set_var(k, v) },
-                    None => unsafe { std::env::remove_var(k) },
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn requires_token() {
-        let _l = env_lock().lock().unwrap();
-        let _g = EnvGuard::set(&[("TOKEN", ""), ("PUSH_ENDPOINT", "https://example.com")]);
-        assert!(matches!(
-            Config::load(false),
-            Err(ConfigError::MissingToken)
-        ));
-    }
-
-    #[test]
-    fn requires_push_endpoint() {
-        let _l = env_lock().lock().unwrap();
-        let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", "")]);
-        assert!(matches!(
-            Config::load(false),
-            Err(ConfigError::MissingEndpoint)
-        ));
-    }
-
-    #[test]
-    fn builds_push_url_and_trims_trailing_slash() {
-        let _l = env_lock().lock().unwrap();
-        let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", "https://example.com///")]);
-        let c = Config::load(false).unwrap();
-        assert_eq!(c.endpoint, "https://example.com");
-        assert_eq!(c.push_url, "https://example.com/api/v1/sentinel/push");
-    }
-
-    #[test]
-    fn rejects_non_http_endpoint() {
-        let _l = env_lock().lock().unwrap();
-        let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", "ftp://example.com")]);
-        assert!(matches!(
-            Config::load(false),
-            Err(ConfigError::InvalidEndpoint)
-        ));
-    }
-
-    #[test]
-    fn rejects_endpoint_with_userinfo_query_or_fragment() {
-        for bad in [
-            "https://u:p@example.com",
-            "https://example.com?a=1",
-            "https://example.com#f",
-            "https://u:p@example.com/some/path",
-        ] {
-            let _l = env_lock().lock().unwrap();
-            let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", bad)]);
-            assert!(
-                matches!(Config::load(false), Err(ConfigError::InvalidEndpoint)),
-                "expected {bad} to be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn accepts_at_sign_in_path_query_or_fragment_free_urls() {
-        // '@' here is not userinfo (it's not before the host), so this must
-        // NOT be rejected. Matches Go's `parsed.User != nil`, which only
-        // looks at the authority component.
-        let _l = env_lock().lock().unwrap();
-        let _g = EnvGuard::set(&[
-            ("TOKEN", "t"),
-            ("PUSH_ENDPOINT", "https://example.com/path/@handle"),
-        ]);
-        assert!(Config::load(false).is_ok());
-    }
-
-    #[test]
-    fn rejects_zero_and_negative_intervals() {
-        for var in [
-            "PUSH_INTERVAL_SECONDS",
-            "COLLECTOR_REFRESH_RATE_SECONDS",
-            "COLLECTOR_RETENTION_PERIOD_DAYS",
-            "STORAGE_REFRESH_RATE_SECONDS",
-            "STORAGE_VOLUMES_REFRESH_RATE_SECONDS",
-        ] {
-            let _l = env_lock().lock().unwrap();
-            let _g = EnvGuard::set(&[
-                ("TOKEN", "t"),
-                ("PUSH_ENDPOINT", "https://example.com"),
-                (var, "0"),
-            ]);
-            assert!(matches!(
-                Config::load(false),
-                Err(ConfigError::NotPositive(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn rejects_retention_period_above_u32_max() {
-        let _l = env_lock().lock().unwrap();
-        let _g = EnvGuard::set(&[
-            ("TOKEN", "t"),
-            ("PUSH_ENDPOINT", "https://example.com"),
-            ("COLLECTOR_RETENTION_PERIOD_DAYS", "4294967296"),
-        ]);
-        assert!(matches!(
-            Config::load(false),
-            Err(ConfigError::NotPositive("COLLECTOR_RETENTION_PERIOD_DAYS"))
-        ));
-    }
-
-    #[test]
-    fn rejects_endpoint_without_a_host() {
-        for bad in ["http://:443", "https://:8443/path"] {
-            let _l = env_lock().lock().unwrap();
-            let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", bad)]);
-            assert!(matches!(
-                Config::load(false),
-                Err(ConfigError::InvalidEndpoint)
-            ));
-        }
-    }
-
-    #[test]
-    fn rejects_out_of_range_port() {
-        for bad in ["0", "65536", "abc"] {
-            let _l = env_lock().lock().unwrap();
-            let _g = EnvGuard::set(&[
-                ("TOKEN", "t"),
-                ("PUSH_ENDPOINT", "https://example.com"),
-                ("PORT", bad),
-            ]);
-            assert!(matches!(Config::load(false), Err(ConfigError::InvalidPort)));
-        }
-    }
-
-    #[test]
-    fn defaults_match_go_implementation() {
-        let _l = env_lock().lock().unwrap();
-        let _g = EnvGuard::set(&[
-            ("TOKEN", "t"),
-            ("PUSH_ENDPOINT", "https://example.com"),
-            ("PORT", ""),
-            ("DEBUG", ""),
-            ("COLLECTOR_ENABLED", ""),
-            ("PUSH_INTERVAL_SECONDS", ""),
-            ("COLLECTOR_REFRESH_RATE_SECONDS", ""),
-            ("COLLECTOR_RETENTION_PERIOD_DAYS", ""),
-            ("STORAGE_ENABLED", ""),
-            ("STORAGE_REFRESH_RATE_SECONDS", ""),
-            ("STORAGE_VOLUMES_ENABLED", ""),
-            ("STORAGE_VOLUMES_REFRESH_RATE_SECONDS", ""),
-            ("HOST_MOUNT_PREFIX", ""),
-        ]);
-        let c = Config::load(false).unwrap();
-        assert_eq!(c.refresh_rate_seconds, 5);
-        assert_eq!(c.push_interval_seconds, 60);
-        assert_eq!(c.collector_retention_period_days, 7);
-        assert!(!c.collector_enabled);
-        assert!(!c.debug);
-        assert_eq!(c.bind_addr.port(), 8888);
-        assert_eq!(c.metrics_file.to_str().unwrap(), "/app/db/metrics.sqlite");
-        // Storage collection defaults on; the expensive volume walk too, but is
-        // inert until host paths are mounted (see HOST_MOUNT_PREFIX).
-        assert!(c.storage_enabled);
-        assert_eq!(c.storage_refresh_rate_seconds, 300);
-        assert!(c.storage_volumes_enabled);
-        assert_eq!(c.storage_volumes_refresh_rate_seconds, 900);
-        assert_eq!(c.host_mount_prefix, "");
-    }
-
-    #[test]
-    fn development_uses_local_db_path() {
-        let _l = env_lock().lock().unwrap();
-        let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", "")]);
-        let c = Config::load(true).unwrap();
-        // development supplies a default endpoint
-        assert_eq!(c.endpoint, "http://localhost:8000");
-        assert_eq!(c.metrics_file.to_str().unwrap(), "./db/metrics.sqlite");
-    }
-}
+mod tests;

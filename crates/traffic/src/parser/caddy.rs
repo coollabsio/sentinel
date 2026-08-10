@@ -1,0 +1,146 @@
+#![forbid(unsafe_code)]
+
+//! Caddy JSON access-log parser.
+
+use std::borrow::Cow;
+
+use serde::Deserialize;
+
+use crate::event::RequestEvent;
+
+use super::strip_query;
+
+/// Raw shape of the `request.headers` object in a Caddy access-log line.
+/// Caddy stores each header as an array of values; only the first is used.
+/// Only the headers `RequestEvent` needs are declared; serde ignores the rest.
+#[derive(Debug, Deserialize)]
+struct Headers<'a> {
+    #[serde(rename = "User-Agent", borrow, default)]
+    user_agent: Option<Vec<Cow<'a, str>>>,
+    #[serde(rename = "Referer", borrow, default)]
+    referer: Option<Vec<Cow<'a, str>>>,
+    #[serde(rename = "X-Forwarded-For", borrow, default)]
+    xff: Option<Vec<Cow<'a, str>>>,
+    #[serde(rename = "Cf-Connecting-Ip", borrow, default)]
+    cf_connecting_ip: Option<Vec<Cow<'a, str>>>,
+    #[serde(rename = "Cf-Ipcountry", borrow, default)]
+    cf_country: Option<Vec<Cow<'a, str>>>,
+    #[serde(rename = "Cf-Cache-Status", borrow, default)]
+    cf_cache_status: Option<Vec<Cow<'a, str>>>,
+}
+
+/// Raw shape of the `request.tls` object in a Caddy access-log line.
+#[derive(Debug, Deserialize)]
+struct Tls {
+    version: u16,
+}
+
+/// Raw shape of the `request` object in a Caddy access-log line.
+#[derive(Debug, Deserialize)]
+struct Req<'a> {
+    #[serde(borrow)]
+    method: Cow<'a, str>,
+    #[serde(borrow)]
+    uri: Cow<'a, str>,
+    #[serde(borrow)]
+    host: Cow<'a, str>,
+    #[serde(borrow)]
+    proto: Cow<'a, str>,
+    #[serde(borrow, default)]
+    remote_ip: Option<Cow<'a, str>>,
+    #[serde(default)]
+    tls: Option<Tls>,
+    headers: Headers<'a>,
+}
+
+/// Raw shape of a single Caddy JSON access-log line. Only the fields
+/// `RequestEvent` needs are declared; serde ignores any other keys (`level`,
+/// `logger`, `msg`, `resp_headers`, ...). Fields are `Cow`, not `&str` — see
+/// [`RequestEvent`] for why (JSON unescaping) that is load-bearing.
+#[derive(Debug, Deserialize)]
+struct Raw<'a> {
+    ts: f64,
+    status: u16,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    bytes_read: u64,
+    duration: f64,
+    #[serde(borrow)]
+    request: Req<'a>,
+}
+
+/// Map a Caddy/TLS numeric protocol version to its human-readable name.
+fn tls_version_name(version: u16) -> Option<&'static str> {
+    match version {
+        769 => Some("1.0"),
+        770 => Some("1.1"),
+        771 => Some("1.2"),
+        772 => Some("1.3"),
+        _ => None,
+    }
+}
+
+/// Parse a single Caddy JSON access-log line into a [`RequestEvent`].
+///
+/// Returns `None` on any malformed input (invalid JSON or missing required
+/// fields) — callers should skip the line and move on rather than treat this
+/// as fatal. Caddy has no router-name/UUID concept, so attribution is purely
+/// host-based: `app` and `host` both borrow `request.host`.
+pub fn parse(line: &[u8]) -> Option<RequestEvent<'_>> {
+    let raw: Raw = serde_json::from_slice(line).ok()?;
+
+    let ts_ms = (raw.ts * 1000.0) as i64;
+    let duration_ms = raw.duration * 1000.0;
+
+    let path = strip_query(raw.request.uri);
+
+    let scheme = if raw.request.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+
+    let tls_version = raw
+        .request
+        .tls
+        .as_ref()
+        .and_then(|tls| tls_version_name(tls.version))
+        .map(Cow::Borrowed);
+
+    let headers = raw.request.headers;
+
+    Some(RequestEvent {
+        ts_ms,
+        app: raw.request.host.clone(),
+        host: raw.request.host,
+        method: raw.request.method,
+        path,
+        status: raw.status,
+        bytes_in: raw.bytes_read,
+        bytes_out: raw.size,
+        duration_ms,
+        protocol: raw.request.proto,
+        scheme: Cow::Borrowed(scheme),
+        tls_version,
+        client_ip: raw.request.remote_ip,
+        xff: first_value(headers.xff),
+        user_agent: first_value(headers.user_agent),
+        referer: first_value(headers.referer),
+        cf_connecting_ip: first_value(headers.cf_connecting_ip),
+        cf_country: first_value(headers.cf_country),
+        cf_cache_status: first_value(headers.cf_cache_status),
+        cf_verified_bot: None,
+    })
+}
+
+/// Takes ownership of a header's first value, if it has one.
+///
+/// Consumes the `Vec` rather than borrowing from it, so an owned (unescaped)
+/// value survives past the end of `parse` instead of being tied to a local.
+fn first_value(values: Option<Vec<Cow<'_, str>>>) -> Option<Cow<'_, str>> {
+    values?.into_iter().next()
+}
+
+#[cfg(test)]
+mod tests;

@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+mod analytics_bench;
 mod storage_bench;
 mod sysinfo_report;
 
@@ -50,6 +51,8 @@ enum Command {
     Stress(StressOpts),
     /// Storage-feature micro-bench: du-walk, disk sampling, store writes, downsample.
     Storage(StorageCli),
+    /// Traffic pipeline: ingest, flush, compact, query, and optional live end-to-end.
+    Analytics(AnalyticsCli),
     /// Run latency + load + stress with shared target options.
     Suite {
         #[command(flatten)]
@@ -63,7 +66,115 @@ enum Command {
         /// Duration (seconds) for the suite stress phase.
         #[arg(long, default_value_t = 30)]
         stress_duration: u64,
+        /// Include the traffic-analytics pipeline benchmark.
+        #[arg(long, default_value_t = false)]
+        analytics: bool,
+        /// Live Sentinel access log; enables the analytics end-to-end phase.
+        #[arg(long)]
+        analytics_access_log: Option<String>,
     },
+}
+
+#[derive(Parser, Debug)]
+struct AnalyticsCli {
+    #[command(flatten)]
+    target: TargetOpts,
+    /// Synthetic requests processed in the parse/enrich/aggregate phase.
+    #[arg(long, default_value_t = 100_000)]
+    events: usize,
+    /// Distinct application UUIDs in the generated workload.
+    #[arg(long, default_value_t = 10)]
+    apps: usize,
+    /// Distinct request paths in the generated workload.
+    #[arg(long, default_value_t = 100)]
+    paths: usize,
+    /// Minute buckets seeded before compaction (minimum effective value: 60).
+    #[arg(long, default_value_t = 1_440)]
+    minutes: usize,
+    /// Top-N aggregation cap.
+    #[arg(long, default_value_t = 50)]
+    topn: usize,
+    /// Repetitions for each store and HTTP query.
+    #[arg(long, default_value_t = 100)]
+    query_iterations: usize,
+    /// Live Sentinel access log; omit to skip the end-to-end phase.
+    #[arg(long)]
+    access_log: Option<String>,
+    /// Concurrent live analytics stress duration; 0 disables phase F.
+    #[arg(long, default_value_t = 30)]
+    stress_duration: u64,
+    /// Live analytics load shape.
+    #[arg(long, value_enum, default_value_t = analytics_bench::AnalyticsStressProfile::Mixed)]
+    stress_profile: analytics_bench::AnalyticsStressProfile,
+    /// Concurrent analytics query workers in phase F.
+    #[arg(long, default_value_t = 64)]
+    stress_concurrency: usize,
+    /// Target synthetic access-log records appended per second in phase F.
+    #[arg(long, default_value_t = 1_000)]
+    stress_log_rate: usize,
+    /// Fail phase F above this query error percentage.
+    #[arg(long, default_value_t = 1.0)]
+    max_error_pct: f64,
+    /// Fail phase F above this p99 in milliseconds; 0 disables the ceiling.
+    #[arg(long, default_value_t = 0.0)]
+    max_p99_ms: f64,
+    /// Percent of synthetic lines with Cloudflare `Cf-Ipcountry` (rest use GeoIP).
+    #[arg(long, default_value_t = 50)]
+    cf_header_pct: u8,
+    /// Skip GeoIP download/lookup; only CF-header lines get a country.
+    #[arg(long, default_value_t = false)]
+    no_geoip: bool,
+    /// Fail if GeoIP cannot load in-process or live attribution stays null.
+    #[arg(long, default_value_t = false)]
+    require_geoip: bool,
+    /// Cache directory for the in-process GeoIP database download.
+    #[arg(long, default_value_os_t = default_geoip_dir())]
+    geoip_dir: std::path::PathBuf,
+    /// Override GeoIP database URL (same as Sentinel `GEOIP_DB_URL`).
+    #[arg(long, env = "GEOIP_DB_URL")]
+    geoip_db_url: Option<String>,
+    /// MaxMind license key (same as Sentinel `GEOIP_MAXMIND_LICENSE_KEY`).
+    #[arg(long, env = "GEOIP_MAXMIND_LICENSE_KEY")]
+    geoip_maxmind_key: Option<String>,
+    /// MaxMind edition when a license key is set.
+    #[arg(
+        long,
+        default_value = "GeoLite2-Country",
+        env = "GEOIP_MAXMIND_EDITION"
+    )]
+    geoip_maxmind_edition: String,
+}
+
+fn default_geoip_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("sentinel-bench-geoip")
+}
+
+fn analytics_opts(cli: AnalyticsCli) -> analytics_bench::AnalyticsOpts {
+    analytics_bench::AnalyticsOpts {
+        events: cli.events,
+        apps: cli.apps,
+        paths: cli.paths,
+        minutes: cli.minutes,
+        topn: cli.topn,
+        query_iterations: cli.query_iterations,
+        base: cli.target.base,
+        token: cli.target.token,
+        timeout_secs: cli.target.timeout_secs,
+        access_log: cli.access_log.map(Into::into),
+        stress_duration: cli.stress_duration,
+        stress_profile: cli.stress_profile,
+        stress_concurrency: cli.stress_concurrency,
+        stress_log_rate: cli.stress_log_rate,
+        max_error_pct: cli.max_error_pct,
+        max_p99_ms: cli.max_p99_ms,
+        cf_header_pct: cli.cf_header_pct,
+        no_geoip: cli.no_geoip,
+        require_geoip: cli.require_geoip,
+        geoip_dir: cli.geoip_dir,
+        geoip_db_url: cli.geoip_db_url,
+        geoip_maxmind_key: cli.geoip_maxmind_key,
+        geoip_maxmind_edition: cli.geoip_maxmind_edition,
+    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -770,11 +881,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // this one-shot tool, so a direct call is fine.
             storage_bench::run(&opts)?;
         }
+        Command::Analytics(a) => analytics_bench::run(&analytics_opts(a)).await?,
         Command::Suite {
             target,
             stress_profile,
             stress_concurrency,
             stress_duration,
+            analytics,
+            analytics_access_log,
         } => {
             run_latency(&target).await?;
             println!();
@@ -787,7 +901,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
             println!();
             stress_pass = run_stress(&StressOpts {
-                target,
+                target: target.clone(),
                 concurrency: stress_concurrency,
                 duration: stress_duration,
                 warmup: 50,
@@ -797,6 +911,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 health_every_secs: 2,
             })
             .await?;
+            if analytics {
+                println!();
+                analytics_bench::run(&analytics_bench::AnalyticsOpts {
+                    events: 100_000,
+                    apps: 10,
+                    paths: 100,
+                    minutes: 1_440,
+                    topn: 50,
+                    query_iterations: 100,
+                    base: target.base,
+                    token: target.token,
+                    timeout_secs: target.timeout_secs,
+                    access_log: analytics_access_log.map(Into::into),
+                    stress_duration: 30,
+                    stress_profile: analytics_bench::AnalyticsStressProfile::Mixed,
+                    stress_concurrency: 64,
+                    stress_log_rate: 1_000,
+                    max_error_pct: 1.0,
+                    max_p99_ms: 0.0,
+                    cf_header_pct: 50,
+                    no_geoip: false,
+                    require_geoip: false,
+                    geoip_dir: default_geoip_dir(),
+                    geoip_db_url: std::env::var("GEOIP_DB_URL").ok().filter(|s| !s.is_empty()),
+                    geoip_maxmind_key: std::env::var("GEOIP_MAXMIND_LICENSE_KEY")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
+                    geoip_maxmind_edition: std::env::var("GEOIP_MAXMIND_EDITION")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "GeoLite2-Country".into()),
+                })
+                .await?;
+            }
         }
     }
 

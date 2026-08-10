@@ -36,6 +36,11 @@ fn state(debug: bool) -> Arc<AppState> {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_ANALYTICS_QUERIES,
+        )),
+        analytics: None,
+        geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     })
 }
 
@@ -173,6 +178,11 @@ async fn cpu_history_returns_empty_array_not_null() {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_ANALYTICS_QUERIES,
+        )),
+        analytics: None,
+        geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     });
     let (s, j) = get(router(st), "/api/cpu/history", Some("secret")).await;
     assert_eq!(s, StatusCode::OK);

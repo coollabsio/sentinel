@@ -33,6 +33,13 @@ tags:
     description: CPU and memory metrics for the host system
   - name: Container Metrics
     description: Metrics for Docker containers
+  - name: Traffic Analytics
+    description: |
+      On-box, aggregate-only web/traffic analytics computed from the
+      reverse-proxy access log. Only present when Sentinel is built with the
+      `traffic` Cargo feature and `TRAFFIC_ENABLED=true` at runtime; see
+      README.md for the full feature description and Coolify handoff
+      requirements.
   - name: Debug
     description: Debug-only endpoints (available when DEBUG=true)
 
@@ -332,6 +339,158 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/traffic/apps:
+    get:
+      summary: Get recorded apps
+      description: |
+        List every app UUID (or host, for Caddy) that traffic analytics has
+        recorded data for.
+      tags:
+        - Traffic Analytics
+      responses:
+        '200':
+          description: Recorded app identifiers
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+              example: ["jc4wsgs", "another-app-uuid"]
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/app/{uuid}/traffic/overview:
+    get:
+      summary: Get app traffic overview
+      description: |
+        Request/bandwidth totals, status-class counts, latency percentiles,
+        and estimated unique visitors for one app, merged across every host
+        it was served on. An app with no data in range returns 200 with
+        every counter zeroed, not 404.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/AppUuid'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: App traffic overview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrafficOverview'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/app/{uuid}/traffic/paths:
+    get:
+      summary: Get app top paths
+      description: |
+        Busiest request paths for one app, summed across every bucket in
+        range, with per-path latency. A synthetic `__other__` entry absorbs
+        the long tail past the server's top-N cap (TRAFFIC_TOPN).
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/AppUuid'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Top paths for the app
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TrafficPath'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/app/{uuid}/traffic/breakdown/{dimension}:
+    get:
+      summary: Get app dimension breakdown
+      description: |
+        Top values of one dimension for one app, summed across every bucket
+        in range. A synthetic `__other__` entry absorbs the long tail past
+        the server's top-N cap (TRAFFIC_TOPN). An unrecognized dimension
+        returns an empty array, not an error.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/AppUuid'
+        - name: dimension
+          in: path
+          required: true
+          description: |
+            One of: status, method, country, referer, browser, os, device,
+            protocol, scheme, tls, cache, bot.
+          schema:
+            type: string
+          example: country
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Top values of the dimension for the app
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TrafficBreakdownEntry'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/traffic/attribution:
+    get:
+      summary: Get GeoIP attribution
+      description: |
+        License attribution string for whichever GeoIP data source is
+        currently active (resolved at runtime — see README.md's GeoIP
+        licensing section).
+      tags:
+        - Traffic Analytics
+      responses:
+        '200':
+          description: Active GeoIP source's attribution string, or null
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrafficAttribution'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /api/stats:
     get:
       summary: Get database statistics
@@ -387,6 +546,29 @@ components:
         type: string
         format: date-time
       example: 2024-01-15T23:59:59Z
+
+    AppUuid:
+      name: uuid
+      in: path
+      required: true
+      description: Coolify app UUID (or host, for Caddy — see README.md)
+      schema:
+        type: string
+      example: jc4wsgs
+
+    Limit:
+      name: limit
+      in: query
+      description: |
+        Number of ranked entries to return, applied after summing across
+        buckets. Defaults to 50, capped at 1000.
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 50
+      example: 20
 
   schemas:
     CurrentCPUUsage:
@@ -605,6 +787,124 @@ components:
           description: ISO 8601 formatted timestamp (only in debug mode)
           example: "2024-01-15T10:00:00Z"
 
+    TrafficStatusBreakdown:
+      type: object
+      properties:
+        s2xx:
+          type: integer
+          format: int64
+          example: 124000
+        s3xx:
+          type: integer
+          format: int64
+          example: 3200
+        s4xx:
+          type: integer
+          format: int64
+          example: 1100
+        s5xx:
+          type: integer
+          format: int64
+          example: 40
+
+    TrafficLatency:
+      type: object
+      description: |
+        Approximate latency quantiles in milliseconds (t-digest estimate).
+        0.0 on every field when the range holds no decodable latency sketch.
+      properties:
+        p50:
+          type: number
+          format: float
+          example: 42.0
+        p95:
+          type: number
+          format: float
+          example: 210.5
+        p99:
+          type: number
+          format: float
+          example: 480.0
+
+    TrafficOverview:
+      type: object
+      properties:
+        requests:
+          type: integer
+          format: int64
+          example: 128340
+        bytes_in:
+          type: integer
+          format: int64
+          example: 15200000
+        bytes_out:
+          type: integer
+          format: int64
+          example: 981000000
+        status:
+          $ref: '#/components/schemas/TrafficStatusBreakdown'
+        latency:
+          $ref: '#/components/schemas/TrafficLatency'
+        unique_visitors:
+          type: integer
+          format: int64
+          description: Approximate distinct client IPs (HyperLogLog++ estimate, ~1-2% error)
+          example: 8421
+
+    TrafficPath:
+      type: object
+      description: |
+        One row of the top-paths table, summed over every bucket in the
+        range. p99 is deliberately omitted to keep large responses small.
+      properties:
+        path:
+          type: string
+          example: /api/checkout
+        requests:
+          type: integer
+          format: int64
+          example: 5210
+        bytes_out:
+          type: integer
+          format: int64
+          example: 41200000
+        p50:
+          type: number
+          format: float
+          example: 38.0
+        p95:
+          type: number
+          format: float
+          example: 190.0
+
+    TrafficBreakdownEntry:
+      type: object
+      description: One value of a breakdown dimension, summed over every bucket in the range.
+      properties:
+        value:
+          type: string
+          example: US
+        requests:
+          type: integer
+          format: int64
+          example: 42000
+        bytes_out:
+          type: integer
+          format: int64
+          example: 320000000
+
+    TrafficAttribution:
+      type: object
+      properties:
+        attribution:
+          type: string
+          nullable: true
+          description: |
+            The active GeoIP source's required attribution string, or null
+            when GeoIP is disabled, not yet resolved, or the active source
+            is an unrecognized GEOIP_DB_URL override.
+          example: "This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com"
+
     DatabaseStats:
       type: object
       properties:
@@ -679,6 +979,18 @@ components:
             $ref: '#/components/schemas/Error'
           example:
             error: Container not found
+
+    TrafficNotEnabledError:
+      description: |
+        Traffic analytics isn't enabled — the binary lacks the `traffic`
+        Cargo feature, TRAFFIC_ENABLED isn't true, or the analytics database
+        failed to open.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: traffic analytics not enabled
 
     InternalServerError:
       description: Internal server error

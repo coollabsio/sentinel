@@ -1,0 +1,36 @@
+[package]
+name = "traffic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+store = { path = "../store" }
+config = { path = "../config" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+maxminddb = { workspace = true }
+arc-swap = { workspace = true }
+foldhash = { workspace = true }
+postcard = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+woothee = { workspace = true }
+lru = { workspace = true }
+# Uses `tdigests` (andylokandy), not `tdigest` (MnO2): the latter's manifest
+# hard-pins `syn = "=2.0.81"`, which conflicts with thiserror-impl 2.x's
+# `syn ^2.0.87` requirement (already used by store/config). `tdigests` has no
+# such conflict and no `serde` feature — sketches.rs defines its own small
+# serializable CentroidData mirror for the postcard codec.
+tdigests = { workspace = true }
+hyperloglogplus = { workspace = true }
+siphasher = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

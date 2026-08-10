@@ -22,6 +22,21 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# Traffic analytics subsystem (feature-gated). Versions verified 2026-08 against
+# crates.io; all build on rust 1.97 / edition 2024. See
+# docs/superpowers/specs/2026-08-09-traffic-analytics-design.md §8.
+maxminddb = { version = "0.30", features = ["mmap"] }
+arc-swap = "1.9"
+foldhash = "0.2"
+postcard = { version = "1.1", features = ["use-std"] }
+flate2 = "1.1"
+tar = "0.4"
+woothee = "0.13"
+lru = "0.18"
+tdigests = "1"
+hyperloglogplus = "0.4"
+siphasher = "1"
+traffic = { path = "crates/traffic" }
 
 [package]
 name = "sentinel"
@@ -35,6 +50,7 @@ config = { path = "crates/config" }
 docker = { path = "crates/docker" }
 push = { path = "crates/push" }
 store = { path = "crates/store" }
+traffic = { workspace = true, optional = true }
 axum.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -45,6 +61,12 @@ dotenvy = "0.15"
 serde_json.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+[features]
+default = []
+# `api/traffic` is what mounts the query endpoints; without it the binary
+# would collect traffic data it never exposed.
+traffic = ["dep:traffic", "api/traffic"]
 
 # `panic` is deliberately left at its default (`unwind`), not set to "abort":
 # a collection cycle failure, a single container's stats call failing, or a

@@ -50,6 +50,11 @@ async fn fetch(uri: &str) -> serde_json::Value {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_ANALYTICS_QUERIES,
+        )),
+        analytics: None,
+        geoip_attribution: Arc::new(std::sync::RwLock::new(None)),
     });
 
     let res = api::router(state)

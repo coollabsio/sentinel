@@ -4,6 +4,7 @@ pub mod metrics;
 pub mod retention;
 pub mod schema;
 pub mod stats;
+pub mod traffic;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -12,6 +13,7 @@ pub use metrics::{
     ContainerDiskRow, ContainerDiskSample, ContainerSample, CpuRow, DiskRow, DiskSample, MemRow,
 };
 pub use stats::{DbStats, TableStat};
+pub use traffic::{AnalyticsStore, BreakdownRow, PathRow, StatsRow, Tier};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

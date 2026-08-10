@@ -56,3 +56,72 @@ pub struct ContainerDiskUsage {
 pub struct ErrorBody {
     pub error: String,
 }
+
+// --- Traffic analytics (design spec §7) -------------------------------------
+//
+// These four types are NEW wire format — nothing in the frozen Go API
+// corresponds to them — so they use plain snake_case and numeric fields
+// throughout rather than inheriting `CpuUsage`/`MemUsage`'s stringified and
+// camelCase quirks. They are declared unconditionally (not behind the
+// `traffic` feature), like `AppState::analytics`, to keep the module shape
+// stable across builds.
+
+/// App-level traffic totals for a query range, merged across *every* host
+/// that served the app (per-host detail is deliberately not exposed here).
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficOverview {
+    pub requests: i64,
+    pub bytes_in: i64,
+    pub bytes_out: i64,
+    pub status: TrafficStatusBreakdown,
+    pub latency: TrafficLatency,
+    /// Approximate distinct client IPs (HyperLogLog++ estimate, ~1-2% error).
+    pub unique_visitors: u64,
+}
+
+/// Request counts by HTTP status class.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficStatusBreakdown {
+    pub s2xx: i64,
+    pub s3xx: i64,
+    pub s4xx: i64,
+    pub s5xx: i64,
+}
+
+/// Approximate latency quantiles in milliseconds (t-digest estimate). `0.0`
+/// on every field when the range holds no decodable latency sketch.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficLatency {
+    pub p50: f64,
+    pub p95: f64,
+    pub p99: f64,
+}
+
+/// One row of the top-paths table, summed over every bucket in the range.
+/// Carries only p50/p95 — p99 is omitted deliberately to keep a 50-row
+/// payload small, and the app-level p99 is available from the overview.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficPath {
+    pub path: String,
+    pub requests: i64,
+    pub bytes_out: i64,
+    pub p50: f64,
+    pub p95: f64,
+}
+
+/// One value of a breakdown dimension (country, device, status class, ...),
+/// summed over every bucket in the range.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficBreakdownEntry {
+    pub value: String,
+    pub requests: i64,
+    pub bytes_out: i64,
+}
+
+/// The attribution string required by the license of whichever GeoIP source
+/// is currently active (design spec §6), or `null` when none applies (GeoIP
+/// disabled, not yet resolved, or an unrecognized `GEOIP_DB_URL` override).
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficAttribution {
+    pub attribution: Option<String>,
+}

@@ -36,6 +36,11 @@ fn state() -> Arc<AppState> {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_ANALYTICS_QUERIES,
+        )),
+        analytics: None,
+        geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     })
 }
 
@@ -121,6 +126,11 @@ async fn distinct_punctuated_container_names_keep_separate_histories() {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_ANALYTICS_QUERIES,
+        )),
+        analytics: None,
+        geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     });
     for (name, expected) in [("postgres-db", "7.00"), ("postgres_db", "9.00")] {
         let res = router(st.clone())
@@ -193,6 +203,11 @@ async fn container_history_default_from_is_one_second_not_zero() {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_ANALYTICS_QUERIES,
+        )),
+        analytics: None,
+        geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     });
 
     let get_st = |uri: &'static str, st: Arc<AppState>| async move {
@@ -255,6 +270,11 @@ async fn stats_route_reports_row_counts_and_live_memory_when_debug() {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_ANALYTICS_QUERIES,
+        )),
+        analytics: None,
+        geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     });
 
     let res = router(st)

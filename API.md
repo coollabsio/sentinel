@@ -12,6 +12,7 @@ Sentinel provides a REST API for retrieving system and Docker container metrics.
   - [CPU Metrics](#cpu-metrics)
   - [Memory Metrics](#memory-metrics)
 - [Docker Container Metrics](#docker-container-metrics)
+- [Traffic Analytics](#traffic-analytics)
 - [Debug Endpoints](#debug-endpoints)
 - [Error Responses](#error-responses)
 
@@ -444,6 +445,200 @@ Response items use the same shape as `/api/container/:containerId/disk/current`.
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
   "http://localhost:8888/api/container/postgres-db/disk/history?from=2024-01-15T00:00:00Z"
+```
+
+---
+
+## Traffic Analytics
+
+On-box, aggregate-only web/traffic analytics computed from the reverse-proxy access log (Traefik/Caddy JSON logs). No raw request rows are stored — only per-minute rollups, compacted to hourly and daily tiers over time.
+
+**These endpoints only exist when Sentinel is built with the `traffic` Cargo feature *and* `TRAFFIC_ENABLED=true` at runtime.** A build without the feature never registers the routes (`404` from the router's fallback). A build with the feature but the subsystem disabled (or its database failed to open) returns a `404` with `{"error": "traffic analytics not enabled"}` from every endpoint below.
+
+A query reads **every** storage tier its range touches and sums them: the current hour from the `1m` tier, earlier hours of the day from `1h`, and older days from `1d`. Because compaction *moves* data between tiers rather than copying it, each moment lives in exactly one tier, so the sum counts every request once. This means recent traffic (still only in `1m`) and the default `from`-omitted "all of history" query both return complete, up-to-the-minute results — there is no waiting for compaction and no empty window on a fresh agent. The only caveat is granularity: once data has been rolled up, a range whose `from` falls partway through an hour or day is answered from that whole bucket, so the very start of a wide range effectively snaps to its bucket boundary.
+
+### Get Recorded Apps
+
+List every app UUID (or host, for Caddy — see the [Coolify integration requirements](./README.md#coolify-integration-requirements)) that traffic analytics has recorded data for.
+
+**Endpoint:** `GET /api/traffic/apps`
+
+**Response:**
+```json
+["jc4wsgs", "another-app-uuid"]
+```
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  http://localhost:8888/api/traffic/apps
+```
+
+---
+
+### Get App Traffic Overview
+
+Retrieve request/bandwidth totals, status-class counts, latency percentiles, and estimated unique visitors for one app, merged across every host it was served on.
+
+**Endpoint:** `GET /api/app/:uuid/traffic/overview`
+
+**Path Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `uuid` | string | Yes | Coolify app UUID (or host, for Caddy) |
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from` | string | No | `1970-01-01T00:00:00Z` | Start date in ISO 8601 format |
+| `to` | string | No | Current time | End date in ISO 8601 format |
+
+**Response:**
+```json
+{
+  "requests": 128340,
+  "bytes_in": 15200000,
+  "bytes_out": 981000000,
+  "status": {
+    "s2xx": 124000,
+    "s3xx": 3200,
+    "s4xx": 1100,
+    "s5xx": 40
+  },
+  "latency": {
+    "p50": 42.0,
+    "p95": 210.5,
+    "p99": 480.0
+  },
+  "unique_visitors": 8421
+}
+```
+
+**Fields:**
+- `requests` (number): Total request count in range
+- `bytes_in` / `bytes_out` (number): Total request/response bytes in range
+- `status.s2xx` / `s3xx` / `s4xx` / `s5xx` (number): Request counts by HTTP status class
+- `latency.p50` / `p95` / `p99` (number): Approximate latency percentiles in milliseconds (t-digest estimate); `0.0` when the range has no decodable latency data
+- `unique_visitors` (number): Approximate distinct client IPs (HyperLogLog++ estimate, ~1-2% error)
+
+An app with no data in the requested range returns a `200` with every counter zeroed, not a `404` — `404` is reserved for "traffic analytics isn't enabled at all".
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/app/jc4wsgs/traffic/overview?from=2024-01-15T00:00:00Z&to=2024-01-16T00:00:00Z"
+```
+
+---
+
+### Get App Top Paths
+
+Retrieve the busiest request paths for one app, summed across every bucket in range, with per-path latency.
+
+**Endpoint:** `GET /api/app/:uuid/traffic/paths`
+
+**Path Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `uuid` | string | Yes | Coolify app UUID (or host, for Caddy) |
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from` | string | No | `1970-01-01T00:00:00Z` | Start date in ISO 8601 format |
+| `to` | string | No | Current time | End date in ISO 8601 format |
+| `limit` | integer | No | `50` | Number of paths to return (max `1000`), applied after summing across buckets |
+
+**Response:**
+```json
+[
+  {
+    "path": "/api/checkout",
+    "requests": 5210,
+    "bytes_out": 41200000,
+    "p50": 38.0,
+    "p95": 190.0
+  }
+]
+```
+
+**Fields:**
+- `path` (string): Request path. A synthetic `__other__` entry absorbs the long tail past the server's top-N cap (`TRAFFIC_TOPN`)
+- `requests` (number): Total request count for this path in range
+- `bytes_out` (number): Total response bytes for this path in range
+- `p50` / `p95` (number): Approximate per-path latency percentiles in milliseconds (`p99` is deliberately omitted here to keep large responses small; use the overview endpoint for app-level `p99`)
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/app/jc4wsgs/traffic/paths?from=2024-01-15T00:00:00Z&limit=10"
+```
+
+---
+
+### Get App Dimension Breakdown
+
+Retrieve the top values of one dimension (status, method, country, referer, browser, OS, device, protocol, scheme, TLS version, cache status, or bot classification) for one app, summed across every bucket in range.
+
+**Endpoint:** `GET /api/app/:uuid/traffic/breakdown/:dimension`
+
+**Path Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `uuid` | string | Yes | Coolify app UUID (or host, for Caddy) |
+| `dimension` | string | Yes | One of `status`, `method`, `country`, `referer`, `browser`, `os`, `device`, `protocol`, `scheme`, `tls`, `cache`, `bot`. An unrecognized dimension returns an empty array, not an error |
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from` | string | No | `1970-01-01T00:00:00Z` | Start date in ISO 8601 format |
+| `to` | string | No | Current time | End date in ISO 8601 format |
+| `limit` | integer | No | `50` | Number of values to return (max `1000`), applied after summing across buckets |
+
+**Response:**
+```json
+[
+  {
+    "value": "US",
+    "requests": 42000,
+    "bytes_out": 320000000
+  }
+]
+```
+
+**Fields:**
+- `value` (string): The dimension's value (e.g. a country ISO code, a browser name, `true`/`false` for `bot`). A synthetic `__other__` entry absorbs the long tail past the server's top-N cap (`TRAFFIC_TOPN`)
+- `requests` (number): Total request count for this value in range
+- `bytes_out` (number): Total response bytes for this value in range
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/app/jc4wsgs/traffic/breakdown/country?from=2024-01-15T00:00:00Z&limit=20"
+```
+
+---
+
+### Get GeoIP Attribution
+
+Retrieve the license attribution string for whichever GeoIP data source is currently active. See [GeoIP licensing](./README.md#geoip-licensing) in the README for why this matters and when it applies.
+
+**Endpoint:** `GET /api/traffic/attribution`
+
+**Response:**
+```json
+{
+  "attribution": "This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com"
+}
+```
+
+**Fields:**
+- `attribution` (string or null): The active source's required attribution string, or `null` when GeoIP is disabled, hasn't finished resolving a database yet, or the active source is an operator-supplied `GEOIP_DB_URL` override this endpoint doesn't recognize
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  http://localhost:8888/api/traffic/attribution
 ```
 
 ---

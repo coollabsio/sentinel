@@ -13,6 +13,7 @@ An API for gathering Linux server / Docker Engine metrics.
 - Configurable data retention
 - Push metrics to external endpoints
 - Debug mode with verbose logging and a database statistics endpoint
+- Optional on-box web/traffic analytics computed from the reverse-proxy access log (see [Traffic Analytics](#traffic-analytics))
 
 ## Quick Start
 
@@ -83,6 +84,28 @@ Sentinel is configured using environment variables:
 | `DEBUG` | `false` | Enable verbose logging, `human_friendly_time` fields, and the `/api/stats` route |
 | `PORT` | `8888` | HTTP server port |
 
+#### Traffic Analytics Variables
+
+Inert unless Sentinel is built with the `traffic` Cargo feature. See [Traffic Analytics](#traffic-analytics) below for the full feature description.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRAFFIC_ENABLED` | `false` | Opt-in toggle for the whole subsystem (mirrors `COLLECTOR_ENABLED`) |
+| `TRAFFIC_ACCESS_LOG_PATH` | `/data/coolify/proxy/access.log` | Reverse-proxy JSON access log to tail |
+| `TRAFFIC_PROXY_TYPE` | `auto` | `traefik`, `caddy`, or `auto` (sniffs the format; Nginx is deferred) |
+| `TRAFFIC_TOPN` | `50` | Top-N cap per dimension (paths, countries, browsers, ...); overflow folds into a `__other__` row |
+| `TRAFFIC_SAMPLE_THRESHOLD` | `0` (off) | Events/sec above which to sample, as a graceful-degradation valve under extreme load |
+| `TRAFFIC_RETENTION_1M_HOURS` | `48` | Safety net, **not** a queryable window — see note below |
+| `TRAFFIC_RETENTION_1H_DAYS` | `30` | How long hourly rollups are kept; this is your real fine-grained history |
+| `TRAFFIC_RETENTION_1D_DAYS` | `395` | How long daily rollups are kept before deletion (~13 months) |
+
+> **What `TRAFFIC_RETENTION_1M_HOURS` actually does.** Compaction runs hourly and *deletes* the per-minute rows for each hour it folds into the hourly tier — that delete is what stops a repeated compaction pass from double-counting. So the per-minute table normally holds only the last hour or two, never 48. This variable bounds how long *un-compacted* per-minute rows may pile up if compaction ever falls behind (a stuck sweep, a long outage), so a backlog cannot grow without limit; it is not a 48-hour minute-resolution history you can query. Queries spanning more than ~2 hours are answered from the hourly tier, and anything from 30 days out from the daily tier.
+| `GEOIP_ENABLED` | `true` | Enable/disable country enrichment |
+| `GEOIP_DB_URL` | *(unset)* | Explicit GeoIP database URL override. When set, that URL is used with no fallback. When unset, the default resolution chain applies (see [GeoIP licensing](#geoip-licensing)) |
+| `GEOIP_MAXMIND_LICENSE_KEY` | *(unset)* | A MaxMind account's license key. When set, GeoLite2 is downloaded directly from MaxMind (properly licensed), taking priority over `GEOIP_DB_URL` and the default chain |
+| `GEOIP_MAXMIND_EDITION` | `GeoLite2-Country` | MaxMind edition ID used when `GEOIP_MAXMIND_LICENSE_KEY` is set |
+| `GEOIP_REFRESH_DAYS` | `30` | How often to re-check the GeoIP database for updates (a conditional request; cheap even when unchanged) |
+
 In development mode (`cargo run`/`cargo build` debug profile, or `SENTINEL_DEVELOPMENT=1`), `PUSH_ENDPOINT` defaults to `http://localhost:8000`.
 
 > **Storage collection & host paths.** Server disk stats reflect the filesystems Sentinel's own container can see. To size container **volumes/bind mounts**, the host paths must be mounted (read-only is fine) into Sentinel's container — typically `/var/lib/docker/volumes` plus any bind-mount roots — and `HOST_MOUNT_PREFIX` set to where they are mounted (e.g. `/host`). Paths that aren't accessible contribute `0` and log a warning rather than failing. Note that a container bind-mounting a large host tree (e.g. `/`, `/var`, or a home directory) has that whole tree walked on every volume cycle, which can be slow; the walk is capped and records a partial size past the cap, but set `STORAGE_VOLUMES_ENABLED=false` to skip the walk entirely if that's a concern.
@@ -130,6 +153,43 @@ For detailed API documentation including request/response examples, query parame
 ### OpenAPI Specification
 
 An OpenAPI 3.0 specification is available at [openapi.yaml](./openapi.yaml) for use with Swagger UI and other API tools.
+
+## Traffic Analytics
+
+Sentinel can optionally compute Cloudflare-style web/traffic analytics (requests, bandwidth, status classes, latency percentiles, unique visitors, geo, browser/OS/device, bot classification, referers, top paths) directly on the server, from the reverse-proxy's JSON access log (Traefik or Caddy).
+
+This follows the same "agent-local, disposable, regenerable data" principle as the rest of Sentinel: **only per-minute aggregate rollups are stored, never raw request rows.** Each one-minute window is folded in memory (counters + t-digest/HyperLogLog sketches) and flushed once, so storage volume doesn't grow with traffic volume. Rollups compact from minute → hourly → daily tiers over time, with configurable retention per tier (see [Traffic Analytics Variables](#traffic-analytics-variables) above). Coolify pulls the aggregates over the same `docker exec … curl` pattern used for CPU/memory metrics; see [API.md's Traffic Analytics section](./API.md#traffic-analytics) for the query endpoints.
+
+The feature is entirely opt-in at runtime, and gated at compile time by the `traffic` Cargo feature. The published Docker images are built with `--features traffic` (see the `Dockerfile`), so on those images `TRAFFIC_ENABLED=true` is all you need. If you build Sentinel yourself, the workspace default leaves the feature **off** — pass `cargo build --features traffic`, or `TRAFFIC_ENABLED=true` will do nothing and every traffic endpoint will 404 (the agent logs a warning at startup when it detects this combination). Either way, a build or config without it costs nothing at runtime: the query endpoints simply don't exist (feature off) or 404 (feature on, but disabled).
+
+### GeoIP licensing
+
+Country-level enrichment uses a MaxMind GeoLite2-Country-compatible `.mmdb` database, resolved at startup and refreshed on a timer (`GEOIP_REFRESH_DAYS`). **Both of Sentinel's default data sources carry a licensing obligation:**
+
+- **By default** (no `GEOIP_MAXMIND_LICENSE_KEY`, no `GEOIP_DB_URL`), Sentinel downloads a jsDelivr-hosted mirror of MaxMind's GeoLite2-Country data. This is a convenient, key-less, zero-config source, but it redistributes MaxMind data through a third party — MaxMind's position is that bundling GeoLite2 into a product shipped to users can require a paid Commercial Redistribution License, so this default is a knowingly-accepted gray area chosen for zero-config UX.
+- If the mirror is unreachable (or its data is corrupt), Sentinel automatically falls back to **DB-IP Lite Country** (CC-BY 4.0, first-party, license-clean).
+
+Operators who want a license-clean-by-default install should either:
+- Set `GEOIP_MAXMIND_LICENSE_KEY` to their own MaxMind account's license key (Sentinel then downloads GeoLite2 directly from MaxMind under that license), or
+- Set `GEOIP_DB_URL` to point at DB-IP (or another source of the operator's choosing) directly.
+
+Whichever source ends up active, Sentinel prints the license's required attribution string once at boot (`geoip attribution` log line) and exposes it at [`GET /api/traffic/attribution`](./API.md#get-geoip-attribution) so it can be surfaced in a UI:
+- MaxMind GeoLite2 (mirror or licensed direct): *"This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com"*
+- DB-IP: *"IP Geolocation by DB-IP (https://db-ip.com)"*
+
+### Coolify integration requirements
+
+This repository implements the agent side only. Making traffic analytics work end-to-end requires changes on the Coolify side (tracked separately, not enforced by this repo):
+
+1. **Enable JSON access logs on the reverse proxy**, in production:
+   - **Traefik** (Coolify's default): `--accesslog.filepath=/traefik/access.log --accesslog.format=json`, plus configuring which fields are logged.
+   - **Caddy**: a JSON `log` block.
+   - **Nginx**: deferred — Coolify's Nginx support doesn't have a JSON access log path to validate against yet.
+2. **Retain the Cloudflare request headers** in the access log (`CF-Connecting-IP`, `CF-IPCountry`, `cf-cache-status`, `cf-verified-bot`, `CF-Ray`) — proxies don't log arbitrary request headers by default, and when present these headers are authoritative over Sentinel's own IP/geo/bot/cache derivation.
+3. **Mount the proxy's log directory** into the Sentinel container, and point `TRAFFIC_ACCESS_LOG_PATH` at the access log file inside it.
+4. **Pass the new `TRAFFIC_*`/`GEOIP_*` environment variables** through in `StartSentinel.php` (or wherever Sentinel's container env is assembled).
+5. **Attribution mapping:** CPU/memory metrics key on the container's `coolify.name` label, but traffic attribution comes from a different source per proxy — for Traefik, the app UUID is parsed from the router name (`RouterName`, formatted as `https-<index>-<uuid>@docker`); Caddy's access log carries no router/service name, so it falls back to `request.host` (the domain) as both the `app` and `host` key. Coolify's pull/render side needs to know both mappings.
+6. Add the pull/render UI component, mirroring the existing CPU/memory chart pattern, against the endpoints documented in [API.md](./API.md#traffic-analytics).
 
 ## Architecture
 
