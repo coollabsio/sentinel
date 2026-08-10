@@ -25,6 +25,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use store::traffic::{BreakdownRow, PathRow, StatsRow, Tier};
+use traffic::compaction::effective_topn;
 use traffic::sketches::{LatencyDigest, Uniques};
 
 use crate::AppState;
@@ -75,25 +76,38 @@ const MAX_SCAN_ROWS: usize = 1_000_000;
 /// is bounded by this budget purely as a memory guard, and the caller's limit
 /// is applied after grouping.
 ///
-/// The budget is therefore sized to what the aggregator can *legitimately*
+/// The budget is therefore sized to what the writers can *legitimately*
 /// produce for the queried span at the resolved tier, rather than to a guess
-/// at typical usage: `TopN` emits at most `topn` keys plus one `__other__`
+/// at typical usage: `TopN` emits at most `cap` keys plus one `__other__`
 /// roll-up row per (bucket, app, key-space), so a full-depth window is
-/// `buckets × (topn + 1)` rows. A fixed constant instead truncates real
+/// `buckets × (cap + 1)` rows. A fixed constant instead truncates real
 /// queries — at `topn = 50` a 100_000-row cap covers only ~1961 of the `1m`
 /// tier's 2880 buckets, and since these queries order by bucket ascending the
 /// rows it drops are the *newest* ones.
+///
+/// `cap` is *not* the same across tiers. `1m` rows come straight from
+/// `flush_window` and are capped at the configured `topn` by the aggregator.
+/// `1h`/`1d` rows are produced only by compaction, which re-caps at
+/// [`traffic::compaction::effective_topn`] — deliberately wider, because a
+/// coarse bucket unions up to 60 (or 24) finer ones and so legitimately holds
+/// more distinct keys than any single one of them. Budgeting the coarse tiers
+/// at `topn + 1` would truncate them: at `topn = 50` a 7-day path query gets
+/// 168 × 51 = 8568 rows against up to 168 × 201 = 33_768 real ones.
 fn scan_budget(tier: Tier, from: i64, to: i64, topn: u32) -> usize {
     let bucket_ms = match tier {
         Tier::M1 => MINUTE_MS,
         Tier::H1 => HOUR_MS,
         Tier::D1 => DAY_MS,
     } as u128;
+    let cap = match tier {
+        Tier::M1 => topn as usize,
+        Tier::H1 | Tier::D1 => effective_topn(topn as usize),
+    } as u128;
     let span = to.saturating_sub(from).max(0) as u128;
     // A partial bucket is still a bucket, and a zero-width span still admits
     // the one bucket its bound falls in.
     let buckets = span.div_ceil(bucket_ms).max(1);
-    let budget = buckets.saturating_mul(u128::from(topn) + 1);
+    let budget = buckets.saturating_mul(cap + 1);
     budget.min(MAX_SCAN_ROWS as u128) as usize
 }
 
@@ -924,6 +938,63 @@ mod tests {
         }
     }
 
+    /// 7 days — over the `1m` tier's 48h ceiling and under the `1h` tier's
+    /// 30d one, so this resolves to `Tier::H1`: 168 one-hour buckets.
+    const COARSE_BUCKETS: i64 = 7 * 24;
+    const COARSE_RANGE: &str = "from=2023-11-14T00:00:00Z&to=2023-11-21T00:00:00Z";
+    /// Distinct paths per *coarse* bucket. Above the configured `topn` (50)
+    /// and below the compaction floor (200), i.e. squarely in the band a
+    /// `buckets × (topn + 1)` budget wrongly rules out. 150 × 168 = 25,200
+    /// rows, versus a `topn`-sized budget of 168 × 51 = 8,568.
+    const COARSE_PATHS: i64 = 150;
+
+    /// Compaction re-caps each coarse `(bucket, app)` group at
+    /// `effective_topn(topn)`, not at `topn` — a 1h bucket unions up to 60
+    /// minute buckets, so it legitimately holds more distinct paths than any
+    /// one of them. A budget of `buckets × (topn + 1)` therefore undersizes
+    /// the `1h`/`1d` tiers, and since `paths_range` orders by bucket ascending
+    /// the rows the SQL LIMIT drops are the *newest* ones.
+    #[tokio::test]
+    async fn a_compacted_1h_window_is_not_truncated_by_the_scan_budget() {
+        let a = AnalyticsStore::open_in_memory().unwrap();
+        let latency = digest_bytes(&[5.0]);
+        let mut rows = Vec::with_capacity((COARSE_BUCKETS * COARSE_PATHS) as usize);
+        for b in 0..COARSE_BUCKETS {
+            for p in 0..COARSE_PATHS {
+                rows.push(path_row(
+                    WIDE_FROM + b * HOUR_MS,
+                    "app-a",
+                    &format!("/p{p}"),
+                    1,
+                    latency.clone(),
+                ));
+            }
+        }
+        // These are compaction's output, so they go straight into the `1h`
+        // tier — `flush_window` only ever writes `1m`.
+        a.write_rows(Tier::H1, &[], &rows, &[]).unwrap();
+        assert!(
+            rows.len() as i64 > COARSE_BUCKETS * 51,
+            "the fixture must exceed a topn-sized budget to be a regression test"
+        );
+
+        let (s, j) = get_with(
+            state(Some(a)),
+            &format!("/api/app/app-a/traffic/paths?{COARSE_RANGE}&limit=1000"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let out = j.as_array().unwrap();
+        assert_eq!(out.len(), COARSE_PATHS as usize, "every path must survive");
+        for row in out {
+            assert_eq!(
+                row["requests"], COARSE_BUCKETS,
+                "{} lost buckets to truncation",
+                row["path"]
+            );
+        }
+    }
+
     /// The scan budget is derived from what the resolved tier can legitimately
     /// emit for the queried span, not from a fixed guess.
     #[test]
@@ -933,15 +1004,21 @@ mod tests {
             scan_budget(Tier::M1, WIDE_FROM, WIDE_FROM + 47 * HOUR_MS, 50),
             2820 * 51
         );
-        // Same span read at coarser resolution needs proportionally less.
-        assert_eq!(scan_budget(Tier::H1, 0, 47 * HOUR_MS, 50), 47 * 51);
-        assert_eq!(scan_budget(Tier::D1, 0, 47 * HOUR_MS, 50), 2 * 51);
+        // The coarse tiers have fewer buckets but a *wider* per-bucket cap:
+        // compaction re-caps at `effective_topn(topn)`, not at `topn`.
+        assert_eq!(scan_budget(Tier::H1, 0, 47 * HOUR_MS, 50), 47 * 201);
+        assert_eq!(scan_budget(Tier::D1, 0, 47 * HOUR_MS, 50), 2 * 201);
         // Partial buckets round up, and a zero-width span still admits one.
         assert_eq!(scan_budget(Tier::M1, 0, 1, 50), 51);
         assert_eq!(scan_budget(Tier::M1, 0, 0, 50), 51);
         assert_eq!(scan_budget(Tier::M1, 10, 0, 50), 51);
         // A configured top-N is honoured rather than assumed.
         assert_eq!(scan_budget(Tier::M1, 0, 10 * 60_000, 200), 10 * 201);
+        // …and a configured top-N *above* the compaction floor widens the
+        // coarse tiers too, exactly as `effective_topn` widens the cap.
+        assert_eq!(scan_budget(Tier::M1, 0, 10 * HOUR_MS, 500), 600 * 501);
+        assert_eq!(scan_budget(Tier::H1, 0, 10 * HOUR_MS, 500), 10 * 501);
+        assert_eq!(scan_budget(Tier::D1, 0, 10 * DAY_MS, 500), 10 * 501);
         // The backstop caps a pathological span/top-N combination.
         assert_eq!(scan_budget(Tier::D1, 0, i64::MAX, 1_000_000), MAX_SCAN_ROWS);
     }

@@ -69,9 +69,22 @@ const DAY_MS: i64 = 86_400_000;
 /// legitimately wider than any single one of them.
 const COMPACTION_TOPN: usize = 200;
 
+/// The top-N cap a compacted (`1h`/`1d`) group is actually held to, given the
+/// configured `TRAFFIC_TOPN`: the floor above, widened — never narrowed — by
+/// a larger configured value.
+///
+/// Public because it is not only compaction's business: a coarse row is
+/// capped here, so anything reasoning about how many rows a `1h`/`1d` bucket
+/// can legitimately hold — the query endpoints' scan budget, notably — has to
+/// use this same number. Importing it beats a second hand-copied `200` that
+/// can drift out of sync with this one.
+pub fn effective_topn(configured: usize) -> usize {
+    configured.max(COMPACTION_TOPN)
+}
+
 /// Rolls every *closed* `1h`-aligned window of `1m` rows up into the `1h`
 /// tier. `topn` is the configured `TRAFFIC_TOPN`; the cap actually applied is
-/// `topn.max(COMPACTION_TOPN)`. Returns the number of coarser rows written
+/// [`effective_topn`] of it. Returns the number of coarser rows written
 /// (stats + paths + breakdown).
 pub fn compact_1m_to_1h(
     store: &AnalyticsStore,
@@ -84,7 +97,7 @@ pub fn compact_1m_to_1h(
         Tier::H1,
         HOUR_MS,
         now,
-        topn.max(COMPACTION_TOPN),
+        effective_topn(topn),
     )
 }
 
@@ -95,14 +108,7 @@ pub fn compact_1h_to_1d(
     now: i64,
     topn: usize,
 ) -> Result<usize, TrafficError> {
-    compact_tier(
-        store,
-        Tier::H1,
-        Tier::D1,
-        DAY_MS,
-        now,
-        topn.max(COMPACTION_TOPN),
-    )
+    compact_tier(store, Tier::H1, Tier::D1, DAY_MS, now, effective_topn(topn))
 }
 
 /// Floors a millisecond timestamp to the start of its containing `width`-wide
