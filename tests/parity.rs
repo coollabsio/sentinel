@@ -51,6 +51,7 @@ async fn fetch(uri: &str) -> serde_json::Value {
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
         analytics: None,
+        geoip_attribution: Arc::new(std::sync::OnceLock::new()),
     });
 
     let res = api::router(state)

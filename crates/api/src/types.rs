@@ -118,3 +118,11 @@ pub struct TrafficBreakdownEntry {
     pub requests: i64,
     pub bytes_out: i64,
 }
+
+/// The attribution string required by the license of whichever GeoIP source
+/// is currently active (design spec §6), or `null` when none applies (GeoIP
+/// disabled, not yet resolved, or an unrecognized `GEOIP_DB_URL` override).
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficAttribution {
+    pub attribution: Option<String>,
+}

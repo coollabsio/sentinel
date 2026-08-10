@@ -475,6 +475,47 @@ impl GeoIp {
     }
 }
 
+/// MaxMind's required GeoLite2 attribution string (MaxMind's EULA — see
+/// spec §6). Applies whether the data came via the licensed-direct path or
+/// the jsDelivr mirror, since the mirror redistributes the same data.
+const MAXMIND_ATTRIBUTION: &str = "This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com";
+
+/// DB-IP's required attribution string for its CC-BY 4.0 licensed Lite data.
+const DBIP_ATTRIBUTION: &str = "IP Geolocation by DB-IP (https://db-ip.com)";
+
+/// Classifies a resolved source URL into the attribution string its license
+/// requires, or `None` if the URL isn't one of the two recognized,
+/// license-obligated sources (e.g. an operator-supplied `GEOIP_DB_URL`
+/// pointing somewhere else entirely — the operator is responsible for
+/// whatever they pointed at).
+fn classify_attribution(source_url: &str) -> Option<String> {
+    if source_url == MIRROR_URL || source_url.starts_with("https://cdn.jsdelivr.net/") {
+        // The mirror redistributes MaxMind GeoLite2-Country data.
+        Some(MAXMIND_ATTRIBUTION.to_string())
+    } else if source_url.starts_with("https://download.maxmind.com") {
+        Some(MAXMIND_ATTRIBUTION.to_string())
+    } else if source_url.starts_with("https://download.db-ip.com") {
+        Some(DBIP_ATTRIBUTION.to_string())
+    } else {
+        None
+    }
+}
+
+impl GeoIp {
+    /// The attribution string required by the license of whichever source is
+    /// *actually active* right now (spec §6). Since the winning source is
+    /// resolved at runtime — it can be the jsDelivr mirror, the licensed
+    /// MaxMind path, or the DB-IP fallback, depending on configuration and
+    /// source availability — this reads the URL recorded in `meta` rather
+    /// than assuming a fixed source. Total and panic-free: a poisoned mutex
+    /// still yields its last-written value, and an unrecognized URL yields
+    /// `None` rather than a guess.
+    pub fn attribution(&self) -> Option<String> {
+        let meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
+        classify_attribution(&meta.source_url)
+    }
+}
+
 impl CountryLookup for GeoIp {
     fn country(&self, ip: IpAddr) -> Option<String> {
         let guard = self.db.load();
@@ -727,6 +768,51 @@ mod tests {
         assert!(dir.path().join("unrelated.sqlite").exists());
     }
 
+    #[test]
+    fn attribution_recognizes_the_mirror_as_maxmind() {
+        assert_eq!(
+            classify_attribution(MIRROR_URL),
+            Some(MAXMIND_ATTRIBUTION.to_string())
+        );
+        // Any jsDelivr-hosted path, not just the exact constant, since the
+        // mirror's package could gain a versioned path over time.
+        assert_eq!(
+            classify_attribution(
+                "https://cdn.jsdelivr.net/npm/geolite2-country@1/GeoLite2-Country.mmdb.gz"
+            ),
+            Some(MAXMIND_ATTRIBUTION.to_string())
+        );
+    }
+
+    #[test]
+    fn attribution_recognizes_licensed_maxmind_direct() {
+        assert_eq!(
+            classify_attribution(&maxmind_url("KEY", "GeoLite2-Country")),
+            Some(MAXMIND_ATTRIBUTION.to_string())
+        );
+    }
+
+    #[test]
+    fn attribution_recognizes_dbip() {
+        assert_eq!(
+            classify_attribution(&dbip_url(2026, 8)),
+            Some(DBIP_ATTRIBUTION.to_string())
+        );
+    }
+
+    #[test]
+    fn attribution_is_none_for_an_unrecognized_override() {
+        assert_eq!(
+            classify_attribution("https://internal.example.com/custom.mmdb"),
+            None
+        );
+    }
+
+    /// `GeoIp::attribution` is a thin wrapper over `classify_attribution`
+    /// applied to `meta.source_url` (see the tests above for the
+    /// classification cases); building a full `GeoIp` needs a real mmap'd
+    /// `.mmdb`, which the network-gated test below covers end to end.
+    ///
     /// Network-gated: actually downloads from the default source chain.
     /// Run manually with `cargo test -p traffic geoip -- --ignored`.
     #[tokio::test]
@@ -740,6 +826,10 @@ mod tests {
         assert!(
             country.is_some(),
             "expected a country for a known public IP"
+        );
+        assert!(
+            geo.attribution().is_some(),
+            "the default source chain always resolves to an attributable source"
         );
 
         // A second pass either 304s (Ok(false)) or re-downloads (Ok(true));

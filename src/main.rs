@@ -133,6 +133,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let memory = Arc::new(api::CachedMemory::new(host_sampler.sample_memory()));
     let sampler = Arc::new(Mutex::new(host_sampler));
 
+    // Filled in once `GeoIp::bootstrap` resolves, well after the router below
+    // is built and serving — see the traffic-analytics block near the bottom
+    // of this function for why that has to happen late. Created here,
+    // unconditionally, so `AppState` doesn't need `#[cfg(feature = "traffic")]`
+    // on this field (it holds a plain string, not a `traffic` crate type).
+    let geoip_attribution: Arc<std::sync::OnceLock<Option<String>>> =
+        Arc::new(std::sync::OnceLock::new());
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut services = tokio::task::JoinSet::new();
 
@@ -165,6 +173,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             analytics: analytics.clone(),
             #[cfg(not(feature = "traffic"))]
             analytics: None,
+            geoip_attribution: geoip_attribution.clone(),
         });
         let app = api::router(state);
         let mut rx = shutdown_rx.clone();
@@ -313,6 +322,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Some(geoip) => geoip.clone(),
             None => Arc::new(traffic::enrich::NoGeo),
         };
+
+        // License attribution (spec §6): both DB-IP (CC-BY 4.0) and MaxMind
+        // (their EULA) require it when their data is in use, and the winning
+        // source is only known at runtime. Logged once here, and published to
+        // `AppState` so `/api/traffic/attribution` can answer it too. `None`
+        // (no source resolved, or an unrecognized `GEOIP_DB_URL` override)
+        // means nothing to log or publish.
+        if let Some(geoip) = &geoip
+            && let Some(attribution) = geoip.attribution()
+        {
+            tracing::info!(attribution = %attribution, "geoip attribution");
+            let _ = geoip_attribution.set(Some(attribution));
+        }
 
         // Ingest. A build failure here is nearly always "the access log isn't
         // there": the proxy's log directory isn't mounted into this container,

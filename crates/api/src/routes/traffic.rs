@@ -31,8 +31,8 @@ use traffic::sketches::{LatencyDigest, Uniques};
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
 use crate::types::{
-    ErrorBody, TrafficBreakdownEntry, TrafficLatency, TrafficOverview, TrafficPath,
-    TrafficStatusBreakdown,
+    ErrorBody, TrafficAttribution, TrafficBreakdownEntry, TrafficLatency, TrafficOverview,
+    TrafficPath, TrafficStatusBreakdown,
 };
 
 const MINUTE_MS: i64 = 60_000;
@@ -136,6 +136,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/app/{uuid}/traffic/breakdown/{dimension}",
             get(breakdown),
         )
+        .route("/api/traffic/attribution", get(attribution))
 }
 
 /// `from`/`to` plus a top-N cap, for the two ranked endpoints.
@@ -226,6 +227,19 @@ async fn apps(State(state): State<Arc<AppState>>) -> Response {
         Ok(Err(e)) => internal_error(e),
         Err(e) => internal_error(e),
     }
+}
+
+/// Reports the license attribution string for whichever GeoIP source is
+/// currently active (design spec §6), so operators/UIs can surface it
+/// without grepping the boot log. Gated on `analytics` like every other
+/// route here, even though the value technically lives outside the
+/// analytics store, because GeoIP is part of the same opt-in subsystem.
+async fn attribution(State(state): State<Arc<AppState>>) -> Response {
+    if state.analytics.is_none() {
+        return analytics_disabled();
+    }
+    let attribution = state.geoip_attribution.get().cloned().flatten();
+    Json(TrafficAttribution { attribution }).into_response()
 }
 
 async fn overview(
@@ -651,6 +665,7 @@ mod tests {
                 crate::MAX_CONCURRENT_HISTORY_QUERIES,
             )),
             analytics,
+            geoip_attribution: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -695,6 +710,32 @@ mod tests {
         let (s, j) = get("/api/traffic/apps").await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(j, serde_json::json!(["app-a", "app-b"]));
+    }
+
+    #[tokio::test]
+    async fn attribution_is_null_when_geoip_has_not_resolved_yet() {
+        // Mirrors real startup: the OnceLock is created empty and only ever
+        // filled in once GeoIp::bootstrap succeeds, which can take a while
+        // (or never happen, e.g. GEOIP_ENABLED=false).
+        let (s, j) = get("/api/traffic/attribution").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(j["attribution"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn attribution_reports_the_resolved_string() {
+        let st = state(Some(seeded()));
+        st.geoip_attribution
+            .set(Some(
+                "IP Geolocation by DB-IP (https://db-ip.com)".to_string(),
+            ))
+            .unwrap();
+        let (s, j) = get_with(st, "/api/traffic/attribution").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            j["attribution"],
+            "IP Geolocation by DB-IP (https://db-ip.com)"
+        );
     }
 
     #[tokio::test]
@@ -846,6 +887,7 @@ mod tests {
             "/api/app/app-a/traffic/overview",
             "/api/app/app-a/traffic/paths",
             "/api/app/app-a/traffic/breakdown/country",
+            "/api/traffic/attribution",
         ] {
             let (s, j) = get_with(state(None), uri).await;
             assert_eq!(s, StatusCode::NOT_FOUND, "{uri}");

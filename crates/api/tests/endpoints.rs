@@ -37,6 +37,7 @@ fn state(debug: bool) -> Arc<AppState> {
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
         analytics: None,
+        geoip_attribution: std::sync::Arc::new(std::sync::OnceLock::new()),
     })
 }
 
@@ -175,6 +176,7 @@ async fn cpu_history_returns_empty_array_not_null() {
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
         analytics: None,
+        geoip_attribution: std::sync::Arc::new(std::sync::OnceLock::new()),
     });
     let (s, j) = get(router(st), "/api/cpu/history", Some("secret")).await;
     assert_eq!(s, StatusCode::OK);

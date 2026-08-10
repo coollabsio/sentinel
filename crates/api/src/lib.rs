@@ -62,6 +62,21 @@ pub struct AppState {
     /// would only fracture this struct's shape across builds for no saving.
     /// `main.rs` owns the decision of what to put in it.
     pub analytics: Option<store::traffic::AnalyticsStore>,
+    /// Attribution string for whichever GeoIP source is actually active
+    /// (design spec §6; required by MaxMind's and DB-IP's licenses), filled
+    /// in once `traffic::geoip::GeoIp::bootstrap` resolves — which happens
+    /// well after the router is built, since the API must not wait on a
+    /// network download to start answering requests. Deliberately typed as
+    /// `Arc<OnceLock<Option<String>>>` rather than holding the `GeoIp`
+    /// itself, so this crate doesn't need the optional `traffic` dependency
+    /// just to expose the one string an HTTP client actually wants.
+    ///
+    /// Empty (`.get()` returns `None`) whenever traffic analytics or GeoIP
+    /// is disabled, the build lacks the `traffic` feature, bootstrap hasn't
+    /// completed yet, or the resolved source has no attribution obligation —
+    /// all of which the `/api/traffic/attribution` endpoint reports the same
+    /// way: `{"attribution": null}`.
+    pub geoip_attribution: Arc<std::sync::OnceLock<Option<String>>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
