@@ -453,13 +453,13 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 On-box, aggregate-only web/traffic analytics computed from the reverse-proxy access log (Traefik/Caddy JSON logs). No raw request rows are stored — only per-minute rollups, compacted to hourly and daily tiers over time.
 
-**These endpoints only exist when Sentinel is built with the `traffic` Cargo feature *and* `TRAFFIC_ENABLED=true` at runtime.** A build without the feature never registers the routes (`404` from the router's fallback). A build with the feature but the subsystem disabled (or its database failed to open) returns a `404` with `{"error": "traffic analytics not enabled"}` from every endpoint below.
+**These endpoints only exist when Sentinel is built with the `traffic` Cargo feature *and* `TRAFFIC_ENABLED=true` at runtime.** Otherwise every endpoint below returns `404` (with `{"error": "traffic analytics not enabled"}` when the feature is built but disabled).
 
-A query reads **every** storage tier its range touches and sums them: the current hour from the `1m` tier, earlier hours of the day from `1h`, and older days from `1d`. Because compaction *moves* data between tiers rather than copying it, each moment lives in exactly one tier, so the sum counts every request once. This means recent traffic (still only in `1m`) and the default `from`-omitted "all of history" query both return complete, up-to-the-minute results — there is no waiting for compaction and no empty window on a fresh agent. The only caveat is granularity: once data has been rolled up, a range whose `from` falls partway through an hour or day is answered from that whole bucket, so the very start of a wide range effectively snaps to its bucket boundary.
+Queries sum across every tier the range touches, so results are always complete and up-to-the-minute. The only caveat is granularity: once data is rolled up, a `from` partway through an hour or day snaps to that bucket's boundary.
 
 ### Get Recorded Apps
 
-List every app UUID (or host, for Caddy — see the [Coolify integration requirements](./README.md#coolify-integration-requirements)) that traffic analytics has recorded data for.
+List every app UUID (or host, for Caddy — see [Coolify integration](./README.md#coolify-integration)) that traffic analytics has recorded data for.
 
 **Endpoint:** `GET /api/traffic/apps`
 
@@ -566,7 +566,7 @@ Retrieve the busiest request paths for one app, summed across every bucket in ra
 - `path` (string): Request path. A synthetic `__other__` entry absorbs the long tail past the server's top-N cap (`TRAFFIC_TOPN`)
 - `requests` (number): Total request count for this path in range
 - `bytes_out` (number): Total response bytes for this path in range
-- `p50` / `p95` (number): Approximate per-path latency percentiles in milliseconds (`p99` is deliberately omitted here to keep large responses small; use the overview endpoint for app-level `p99`)
+- `p50` / `p95` (number): Approximate per-path latency percentiles in milliseconds (`p99` is available from the overview endpoint)
 
 **Example:**
 ```bash
@@ -621,7 +621,7 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ### Get GeoIP Attribution
 
-Retrieve the license attribution string for whichever GeoIP data source is currently active. See [GeoIP licensing](./README.md#geoip-licensing) in the README for why this matters and when it applies.
+Retrieve the license attribution string for whichever GeoIP data source is currently active, so it can be surfaced in a UI.
 
 **Endpoint:** `GET /api/traffic/attribution`
 
@@ -633,7 +633,7 @@ Retrieve the license attribution string for whichever GeoIP data source is curre
 ```
 
 **Fields:**
-- `attribution` (string or null): The active source's required attribution string, or `null` when GeoIP is disabled, hasn't finished resolving a database yet, or the active source is an operator-supplied `GEOIP_DB_URL` override this endpoint doesn't recognize
+- `attribution` (string or null): The active source's required attribution string, or `null` when GeoIP is disabled, still resolving, or using an unrecognized `GEOIP_DB_URL` override
 
 **Example:**
 ```bash
