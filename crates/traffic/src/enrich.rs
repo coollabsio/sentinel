@@ -1,15 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! Event enrichment with geolocation and metadata.
-//!
-//! Applies the Cloudflare-header precedence rules from spec §2:
-//! - `client_ip` = `cf_connecting_ip` → first token of `xff` → `client_ip`.
-//! - `country` = `cf_country` → `geo.country(client_ip)`.
-//! - `bot` = `cf_verified_bot` present → true, else `ua.is_bot` (woothee crawler category).
-//! - `cache` = `cf_cache_status`.
-//!
-//! User-Agent parsing (via `woothee`) is memoized in a bounded LRU cache keyed
-//! on the raw UA string.
+//! Enriches events using Cloudflare headers, GeoIP, and a bounded User-Agent
+//! parse cache. Header values take precedence over derived values.
 
 use std::net::IpAddr;
 use std::num::NonZeroUsize;

@@ -1,34 +1,9 @@
-//! `analytics.sqlite`: traffic-analytics time series (Coolify traffic
-//! dashboard), kept in a store separate from `metrics.sqlite`'s [`Store`] so
-//! the once-a-minute flush's WAL churn never contends with the collector's
-//! 5s metrics inserts (design spec §3/§4).
-//!
-//! Three roll-up tiers share one shape per table family:
-//! - `traffic_stats_<tier>`: one row per (bucket, app, host) — request
-//!   counts, byte counters, status-class counters, and two pre-merged
-//!   sketches (t-digest for latency, HyperLogLog++ for unique visitors).
-//! - `traffic_paths_<tier>`: one row per (bucket, app, path) — top-N path
-//!   traffic with its own latency t-digest.
-//! - `traffic_breakdown_<tier>`: one tall table per (bucket, app, dimension,
-//!   value) for every other cardinality-bound dimension (country, device,
-//!   status class, ...), instead of a wide table per dimension.
-//!
-//! [`AnalyticsStore::flush_window`] only ever writes the `1m` tier. Rolling
-//! `1m` up into `1h`/`1d` is compaction's job, and it lives in the `traffic`
-//! crate (`traffic::compaction`) because merging the persisted sketch BLOBs
-//! needs that crate's sketch types — a `store → traffic` dependency would be
-//! a cycle. This module therefore exposes only the raw primitives compaction
-//! drives: [`AnalyticsStore::distinct_buckets_before`] to enumerate the
-//! coarse buckets that have finer-tier data waiting, and
-//! [`AnalyticsStore::compact_window`] to move one such bucket up a tier
-//! atomically — it reads the finer rows *and* whatever the coarse bucket
-//! already holds, calls back into the `traffic` crate to merge them (the one
-//! step that needs the sketch types), replaces the coarse bucket with the
-//! result, and deletes what it consumed, all inside one transaction on the
-//! writer connection. [`AnalyticsStore::stats_rows_between`] and friends
-//! remain for read-only inspection (and tests).
-//! [`AnalyticsStore::retention`] is pure SQL deletion with no sketch
-//! involvement, so it does live here.
+//! `analytics.sqlite`: traffic time series, kept separate from `metrics.sqlite`
+//! so the minute flush's WAL churn never contends with the 5s metrics collector.
+//! Three roll-up tiers (`_1m`/`_1h`/`_1d`) share one shape per table family
+//! (stats, paths, breakdown). `flush_window` writes only `1m`; rolling up lives
+//! in `traffic::compaction` (merging sketch BLOBs needs its types — `store →
+//! traffic` would be a cycle), driven via `compact_window`, which moves one bucket up atomically.
 
 use rusqlite::Connection;
 use std::path::Path;
@@ -320,18 +295,9 @@ impl AnalyticsStore {
         self.write_rows(Tier::M1, stats, paths, breakdown)
     }
 
-    /// Writes a batch of aggregated rows into `tier`'s three tables in a
-    /// single transaction. The minute-flush uses [`Tier::M1`] (via
-    /// [`Self::flush_window`]); compaction reaches the same upsert through
-    /// [`Self::compact_window`], which additionally deletes the consumed
-    /// finer tier inside the same transaction.
-    ///
-    /// `ON CONFLICT` sums the count/byte columns but *replaces* the sketch
-    /// blobs (`latency_tdigest`, `uniques_hll`) with the incoming value:
-    /// callers already hand over fully-merged sketches for the window, so
-    /// summing raw bytes would be meaningless. Compaction never relies on
-    /// either rule — it clears the destination window first, so its rows
-    /// cannot conflict with a previous pass's; see [`Self::compact_window`].
+    /// Upserts a batch into `tier`'s three tables in one transaction. On
+    /// conflict counters sum but sketch blobs replace (callers hand fully-merged
+    /// sketches). Compaction clears its window first, so it relies on neither.
     pub fn write_rows(
         &self,
         tier: Tier,
@@ -347,31 +313,9 @@ impl AnalyticsStore {
         })
     }
 
-    /// Rolls one coarse bucket up a tier, atomically. In a single transaction
-    /// on the *writer* connection: read every `from_tier` row in
-    /// `[from_bucket, to_bucket)` and whatever the `to_tier` bucket already
-    /// holds, hand both to `merge(finer, coarse)` (the sketch-aware roll-up
-    /// that must live in the `traffic` crate to avoid a dependency cycle),
-    /// replace the destination window with the result, and delete the consumed
-    /// finer rows. Returns the coarse rows written (0 for an empty window,
-    /// which is left unread and untouched).
-    ///
-    /// The merge is a *recompute, not an increment*, and the destination's
-    /// current state is fed back in: a late finer row can arrive after its
-    /// coarse bucket was already rolled up, and since the sketch columns
-    /// *replace* on conflict (see [`insert_rows`]), handing `merge` only that
-    /// row would silently overwrite the bucket's real latency/HLL distribution.
-    /// Recompute + wholesale replace keeps both counters and sketches correct.
-    ///
-    /// The single transaction is load-bearing: any failure rolls back *both*
-    /// the write and the delete, so the retry re-reads the same finer rows and
-    /// redoes the roll-up instead of double-counting. Reading inside the
-    /// transaction closes the lost-update window between the `1m → 1h` writer
-    /// and the `1h → 1d` reader of the `1h` tier (independent tickers).
-    ///
-    /// Callers pass a window aligned to (and no wider than) one `to_tier`
-    /// bucket, already closed, with two *distinct* tiers — see
-    /// `traffic::compaction`.
+    /// Rolls one coarse bucket up a tier atomically. `merge(finer, coarse)` feeds
+    /// the destination back in and *recomputes* (never increments), so a late finer
+    /// row can't clobber sketches; the single transaction rolls back write+delete together, so a retry can't double-count.
     pub fn compact_window<F>(
         &self,
         from_tier: Tier,
@@ -431,14 +375,9 @@ impl AnalyticsStore {
         })
     }
 
-    /// Every distinct bucket timestamp present anywhere in `tier` (stats ∪
-    /// paths ∪ breakdown) strictly before `cutoff`, ascending.
-    ///
-    /// Compaction uses this to enumerate the work waiting for it without
-    /// loading a single row of it: flooring these to the coarse width yields
-    /// exactly the set of coarse buckets that need a [`Self::compact_window`]
-    /// pass, so a long backlog is processed one bounded transaction at a
-    /// time rather than in one unbounded read.
+    /// Every distinct bucket in `tier` (stats ∪ paths ∪ breakdown) before
+    /// `cutoff`, ascending. Lets compaction enumerate waiting work and drain a
+    /// backlog one bounded transaction at a time rather than in one unbounded read.
     pub fn distinct_buckets_before(&self, tier: Tier, cutoff: i64) -> Result<Vec<i64>, StoreError> {
         self.with_reader(|c| {
             let sfx = suffix(tier);
@@ -571,13 +510,9 @@ impl AnalyticsStore {
         Ok(total)
     }
 
-    /// Applies the per-tier retention windows (spec defaults: 48h / 30d /
-    /// 395d), deleting everything older than `now - window` in each tier;
-    /// returns the total number of rows removed.
-    ///
-    /// Pure deletion — no sketch merging happens here (that lives in the
-    /// `traffic` crate's compaction, which is what *produces* the `1h`/`1d`
-    /// rows this method later expires).
+    /// Applies the per-tier retention windows (48h / 30d / 395d), deleting
+    /// everything older than `now - window` in each tier; returns rows removed.
+    /// Pure SQL deletion — no sketch merging (that lives in `traffic::compaction`).
     pub fn retention(
         &self,
         now: i64,
@@ -621,19 +556,9 @@ impl AnalyticsStore {
         self.with_conn(|c| Ok(c.execute_batch(sql)?))
     }
 
-    /// Distinct app UUIDs with recorded traffic, across every tier.
-    ///
-    /// The `UNION` is required, not defensive. `1h`/`1d` rows are indeed
-    /// derived from `1m` data, but compaction *deletes* the finer rows it
-    /// consumes (that delete is its watermark against double-counting), so
-    /// `traffic_stats_1m` only ever holds the window compaction has not swept
-    /// yet — roughly the last hour or two. Querying it alone would hide any
-    /// app idle for longer than that, even though its full 30-day/395-day
-    /// history is still there and still queryable through every other
-    /// endpoint.
-    ///
-    /// `UNION` (not `UNION ALL`) already de-duplicates, so the per-branch
-    /// `DISTINCT`s only shrink what each branch feeds it.
+    /// Distinct app UUIDs with traffic, across every tier. The `UNION` is
+    /// required: compaction deletes the `1m` rows it consumes, so `1m` alone
+    /// would hide any app idle longer than an hour whose history lives in `1h`/`1d`.
     pub fn apps(&self) -> Result<Vec<String>, StoreError> {
         self.with_reader(|c| {
             let mut stmt = c.prepare_cached(
@@ -650,20 +575,9 @@ impl AnalyticsStore {
     }
 }
 
-/// Upserts a batch into `tier`'s three tables on an existing connection (in
-/// practice a `Transaction`, which derefs to `Connection`). Shared by
-/// [`AnalyticsStore::write_rows`] and [`AnalyticsStore::compact_window`] so
-/// the minute flush and compaction cannot drift apart on conflict resolution.
-///
-/// On conflict, counters *sum* and sketch blobs *replace*. Summing is right
-/// for the flush (a delayed flush onto an already-written `1m` bucket is new
-/// information to add, not discard); replacing is right for sketches (summing
-/// raw sketch bytes is meaningless — callers hand over an already-merged
-/// sketch per key). Compaction never relies on either rule: it clears the
-/// destination window and deletes the finer rows it consumed in the same
-/// transaction, so its rows never collide with a previous pass's (see
-/// [`AnalyticsStore::compact_window`] — the merge it drives recomputes the
-/// whole coarse bucket rather than incrementing it).
+/// Upserts a batch into `tier`'s three tables on an existing connection. Shared
+/// by `write_rows` and `compact_window` so flush/compaction can't drift: on
+/// conflict counters *sum*, sketch blobs *replace* (compaction recomputes, so relies on neither).
 fn insert_rows(
     conn: &Connection,
     tier: Tier,
@@ -756,8 +670,7 @@ fn insert_rows(
 // queries ([`AnalyticsStore::stats_range`] et al.) and the unfiltered
 // connection-scoped selects below, so a schema column can only be read one
 // way. The `?N` order in every SELECT must match the `r.get(N)` order here.
-const STATS_COLS: &str =
-    "bucket, app, host, requests, bytes_in, bytes_out, s2xx, s3xx, s4xx, s5xx, latency_tdigest, uniques_hll";
+const STATS_COLS: &str = "bucket, app, host, requests, bytes_in, bytes_out, s2xx, s3xx, s4xx, s5xx, latency_tdigest, uniques_hll";
 const PATHS_COLS: &str = "bucket, app, path, requests, bytes_out, latency_tdigest";
 const BREAKDOWN_COLS: &str = "bucket, app, dimension, value, requests, bytes_out";
 

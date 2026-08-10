@@ -7,14 +7,9 @@ use tokio::sync::{Mutex, Semaphore, watch};
 
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Ceiling on the whole GeoIP bootstrap, across every candidate source.
-///
-/// `GeoIp::bootstrap` walks up to three sources with a 180s timeout each, so
-/// on its own it can block startup for ~9 minutes on a host with restricted
-/// outbound network — during which the access-log tailer has not opened yet
-/// and, because it seeks to EOF, every line written in the meantime is lost.
-/// A minute is comfortable for a healthy network and cheap to lose otherwise:
-/// country enrichment simply stays off until the periodic refresh retries.
+/// Ceiling on the whole GeoIP bootstrap: `bootstrap` tries up to three sources
+/// at 180s each (~9min), during which the tailer hasn't opened and every
+/// appended line is lost. On timeout, enrichment stays off until the next refresh.
 #[cfg(feature = "traffic")]
 const GEOIP_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -29,11 +24,9 @@ fn unexpected_service_exit(
     }
 }
 
-/// Bind the API listener. `addr` is the dual-stack `[::]` address from config;
-/// on hosts where IPv6 is disabled that bind fails (EAFNOSUPPORT /
-/// EADDRNOTAVAIL), so fall back to the equivalent IPv4 `0.0.0.0` address. This
-/// mirrors Go's `net.Listen("tcp", ":PORT")`, which is dual-stack when IPv6 is
-/// available and IPv4-only when it isn't.
+/// Bind the API listener. `addr` is config's dual-stack `[::]`; if IPv6 is
+/// disabled the bind fails, so fall back to `0.0.0.0` (mirrors Go's dual-stack
+/// `net.Listen`).
 async fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => Ok(listener),
@@ -58,14 +51,8 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Mirrors the Go implementation's Execute(): load a ".env" file from the
-    // exact current working directory if present. Uses dotenvy::from_path
-    // rather than dotenvy::dotenv() deliberately — the latter walks up
-    // parent directories looking for ".env", which Go's plain
-    // os.Stat(".env") + godotenv.Load() never did. tracing isn't initialized
-    // yet at this point (config.debug, read a few lines below, decides the
-    // log level), so this uses eprintln!/println! directly, matching Go's
-    // use of the always-available standard `log` package here.
+    // Load ".env" from the exact cwd if present (from_path, not dotenv() which
+    // walks parents) — matching Go. tracing isn't up yet, so use eprintln/println.
     if std::path::Path::new(".env").exists() {
         if let Err(e) = dotenvy::from_path(".env") {
             eprintln!("sentinel: error loading .env file: {e}");
@@ -74,17 +61,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("sentinel: no .env file found, skipping load");
     }
 
-    // Mirrors the Go implementation's `gin.Mode() == gin.DebugMode` check,
-    // which is a RUNTIME env-var signal (GIN_MODE, defaulting to DebugMode
-    // unless explicitly set to "release" — the Dockerfile does exactly
-    // that). Deriving this from cfg!(debug_assertions) instead would tie it
-    // to the BUILD PROFILE, not runtime intent: a `cargo test` binary is
-    // always a debug build, so any integration test spawning the compiled
-    // binary would silently get the development PUSH_ENDPOINT fallback and
-    // could never exercise the "PUSH_ENDPOINT required" failure path.
-    // SENTINEL_DEVELOPMENT lets that be forced explicitly either way; it
-    // still defaults to the build profile when unset, so plain `cargo run`/
-    // `cargo build --release` behave the same as before.
+    // Runtime signal, not cfg!(debug_assertions): a build-profile tie would make
+    // every `cargo test` binary silently take the dev PUSH_ENDPOINT fallback.
+    // SENTINEL_DEVELOPMENT overrides; unset, it defaults to the build profile.
     let development = match std::env::var("SENTINEL_DEVELOPMENT") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => cfg!(debug_assertions),
@@ -110,24 +89,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // keeping the path to `/api/health` as short as possible.
     let store = store::Store::open(&config.metrics_file)?;
 
-    // Traffic analytics database. Opened here, next to the metrics store and
-    // ahead of the listener, for the same reason that one is: `AppState`
-    // carries it, so it has to exist before the router is built. This is only
-    // a local SQLite open — everything actually expensive about the traffic
-    // subsystem (the GeoIP download, the access-log tail) is deferred to the
-    // bottom of this function, well after the API is answering.
+    // Traffic analytics DB, opened early (AppState carries it) but cheap — the
+    // GeoIP download and log tail are deferred to the end of this function. A
+    // failure here degrades traffic to "off", not the whole agent.
     //
-    // A failure here degrades traffic analytics to "off" rather than taking
-    // the agent down. `AnalyticsStore::open` already moves an unreadable
-    // database aside and starts fresh, so reaching this arm means something
-    // like a permissions or disk problem — which CPU/memory collection has no
-    // stake in and must not be killed by.
-    // Deliberately NOT inside `#[cfg(feature = "traffic")]`: this warning only
-    // exists for the build that lacks the feature. `config.traffic.enabled` is
-    // parsed unconditionally (`TrafficSettings` is not feature-gated), so an
-    // operator can set `TRAFFIC_ENABLED=true` on a stock binary and get total
-    // silence — no service, and a 404 from every traffic endpoint, with
-    // nothing in the log to explain why. Say so once, at startup.
+    // The warning below is not cfg-gated: `config.traffic.enabled` is parsed
+    // unconditionally, so a stock (no-`traffic`-feature) binary with
+    // TRAFFIC_ENABLED=true would otherwise be silent. Say so once, at startup.
     if !cfg!(feature = "traffic") && config.traffic.enabled {
         tracing::warn!(
             "TRAFFIC_ENABLED=true but this binary was built without the `traffic` \
@@ -159,32 +127,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let memory = Arc::new(api::CachedMemory::new(host_sampler.sample_memory()));
     let sampler = Arc::new(Mutex::new(host_sampler));
 
-    // Filled in once `GeoIp::bootstrap` resolves, well after the router below
-    // is built and serving — see the traffic-analytics block near the bottom
-    // of this function for why that has to happen late. Re-published on every
-    // `GeoIp::refresh` swap thereafter, so it's an `RwLock`, not a write-once
-    // cell. Created here, unconditionally, so `AppState` doesn't need
-    // `#[cfg(feature = "traffic")]` on this field (it holds a plain string,
-    // not a `traffic` crate type).
+    // Published once `GeoIp::bootstrap` resolves (late; see the traffic block
+    // below) and re-published on every refresh swap. Unconditional so `AppState`
+    // needs no cfg gate — it holds a plain string, not a `traffic` type.
     let geoip_attribution: Arc<std::sync::RwLock<Option<String>>> =
         Arc::new(std::sync::RwLock::new(None));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut services = tokio::task::JoinSet::new();
 
-    // HTTP API
-    //
-    // Bind eagerly, before spawning: Go's implementation ran ListenAndServe
-    // in a goroutine and propagated a bind failure through errgroup, tearing
-    // down every other service and exiting the process non-zero. Binding
-    // here, in run()'s own body, gets the same outcome more directly — a
-    // bind failure surfaces via `?` immediately, before any other service is
-    // even started, rather than needing extra coordination to cascade a
-    // failure out of a spawned task after the fact.
-    //
-    // Also bind before DockerClient::new and before any collector/push work
-    // so orchestration healthchecks (Coolify, Docker HEALTHCHECK) succeed as
-    // soon as the process can answer /api/health.
+    // HTTP API. Bind eagerly, before spawning: a bind failure surfaces via `?`
+    // here rather than having to cascade out of a spawned task, and health
+    // checks answer as soon as the process is up (before Docker/collectors).
     {
         let listener = bind_listener(config.bind_addr).await?;
         let addr = listener.local_addr().unwrap_or(config.bind_addr);

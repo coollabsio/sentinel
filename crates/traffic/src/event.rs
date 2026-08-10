@@ -2,15 +2,8 @@
 
 use std::borrow::Cow;
 
-/// A single HTTP request event with traffic analytics data.
-///
-/// Canonical note (parsers point here): every string field is a [`Cow`], not
-/// `&'a str`, and that is load-bearing. `serde_json` can only borrow a `&str`
-/// from a JSON string that needs no unescaping, so a line containing `\"`,
-/// `\\`, or an HTML-escaped `&` in a query string (Traefik via Go's
-/// `encoding/json`) would otherwise fail to deserialize as a whole and
-/// silently drop the request. `Cow` borrows on the unescaped fast path and
-/// allocates only for escaped lines.
+/// A single HTTP request event. Strings use [`Cow`] so parsers borrow the
+/// common unescaped path while still accepting escaped JSON values.
 pub struct RequestEvent<'a> {
     /// Timestamp in milliseconds since UNIX epoch.
     pub ts_ms: i64,

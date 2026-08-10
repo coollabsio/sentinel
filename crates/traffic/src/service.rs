@@ -1,21 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! Main traffic analytics service orchestrator: the tail -> parse -> enrich
-//! -> aggregate -> flush loop.
-//!
-//! [`TrafficService::run`] owns two tickers and a shutdown watch:
-//! - a **poll** tick (250ms) drains complete [`Tailer`] lines and folds each
-//!   through `detect`/`parse_line` -> [`Enricher`] -> [`Aggregator`];
-//! - a **flush-check** tick (1s) drains and writes the just-closed window (via
-//!   [`Aggregator::take_rollup`] / [`AnalyticsStore::flush_window`]) whenever
-//!   the wall clock crosses into a new window;
-//! - a **shutdown** change drains once more, flushes the partial window, and
-//!   awaits that flush (the last chance to persist inside `main.rs`'s 5s grace).
-//!
-//! Nothing in the loop panics: every failure (tailer I/O, unparseable or
-//! undetectable line, sampled-away event, failed flush) is logged/counted and
-//! stepped over. A panic would abort the task, which `main.rs` turns into
-//! process termination — traffic analytics must never take the agent down.
+//! Main traffic loop: tail, parse, enrich, aggregate, and flush. Polling and
+//! flush run on separate timers; shutdown drains and awaits one final flush.
+//! Input and storage failures are logged and skipped so traffic analytics
+//! cannot take down the agent.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,13 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! Rotation-aware access-log tailer.
-//!
-//! Follows a proxy access-log file at a fixed path, yielding complete lines as
-//! raw bytes. It survives rotation (the path is renamed away and recreated) and
-//! `copytruncate`-style in-place truncation without losing or duplicating
-//! yielded lines, and never blocks or panics. `open()` seeks to EOF so only
-//! lines appended after startup are yielded; `poll_lines()` is called
-//! repeatedly on a timer by a caller that owns the loop.
+//! Rotation-aware access-log tailer. It yields complete raw-byte lines,
+//! handles rename/recreate and copytruncate rotation, and starts at EOF.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};

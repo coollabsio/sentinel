@@ -1,15 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! Time-bucketed aggregation of traffic events (1m, 1h, 1d).
-//!
-//! [`Aggregator`] folds [`RequestEvent`]/[`Enriched`] pairs into an
-//! in-memory 1-minute window: exact per-`(app, host)` counters plus
-//! mergeable sketches (t-digest latency, HyperLogLog++ uniques), a
-//! per-app top-N of paths (each with its own per-path latency digest),
-//! and a per-`(app, dimension)` top-N breakdown across twelve
-//! cardinality-bound dimensions. [`Aggregator::take_rollup`] drains the
-//! window into [`store::traffic`] row types, capping every top-N into an
-//! `__other__` bucket, and resets internal state for the next minute.
+//! Time-bucketed aggregation of traffic events. `Aggregator` folds events into
+//! one-minute counters and mergeable sketches, caps top-N groups, then drains
+//! the window into `store::traffic` rows.
 
 use std::collections::HashMap;
 

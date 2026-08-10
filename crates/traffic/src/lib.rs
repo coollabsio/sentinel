@@ -1,8 +1,5 @@
-// `deny`, not `forbid`, at the crate root: `geoip` needs exactly one scoped
-// `#[allow(unsafe_code)]` for `maxminddb::Reader::open_mmap`, and a crate-level
-// `forbid` cannot be lifted by an inner `allow`. Every other module in this
-// crate keeps its own module-level `#![forbid(unsafe_code)]`, so `geoip.rs` is
-// the only file where an `unsafe` block can compile at all.
+// `geoip` needs one scoped unsafe allow for `maxminddb::Reader::open_mmap`;
+// every other module has its own `#![forbid(unsafe_code)]`.
 #![deny(unsafe_code)]
 
 pub mod aggregator;

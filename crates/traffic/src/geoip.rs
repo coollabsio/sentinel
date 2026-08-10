@@ -3,21 +3,10 @@
 // `forbid` could not lift.
 #![deny(unsafe_code)]
 
-//! GeoIP database management and lookup.
-//!
-//! Resolves candidate database sources (spec §6), downloads the first that
-//! works, decompresses it, memory-maps it, and publishes it through an
-//! [`ArcSwap`] so lookups stay lock-free across hot reloads.
-//!
-//! Source resolution, in priority order:
-//! 1. `geoip_maxmind_key` — the licensed MaxMind tarball only (no fallback).
-//! 2. `geoip_db_url` — that URL only (explicit override, no fallback).
-//! 3. Otherwise — the jsDelivr mirror, then DB-IP Lite for the current month,
-//!    then the previous month (the current month's build may not be published
-//!    yet early in the month).
-//!
-//! Every refresh writes a new dated file and removes the previous one only
-//! after the new mapping is live; see the `SAFETY` note on [`GeoIp::install`].
+//! GeoIP database management and lookup. Sources are tried in configured
+//! priority order, then decompressed, memory-mapped, and published through
+//! [`ArcSwap`] for lock-free lookups during refresh. The old file is removed
+//! only after the new mapping is live.
 
 use std::borrow::Cow;
 use std::io::{Read, Write};

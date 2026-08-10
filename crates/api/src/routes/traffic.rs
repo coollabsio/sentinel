@@ -1,12 +1,5 @@
-//! Traffic-analytics query endpoints (design spec §7).
-//!
-//! Structurally these mirror `routes::container`. Two module-specific points:
-//! the whole module is `#[cfg(feature = "traffic")]` (the only user of the
-//! `traffic` crate's sketch types), while `AppState::analytics` is not gated,
-//! so a missing database is a runtime 404 rather than a compile-time absence.
-//! And rows come back per (bucket, key), so summing across buckets and merging
-//! each key's sketches happens here in [`summarize_stats`] / [`top_paths`] /
-//! [`top_breakdown`], not in SQL.
+//! Traffic-analytics query endpoints. Rows are merged across buckets here,
+//! including sketch values, rather than in SQL.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,16 +23,8 @@ use crate::types::{
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
 
-/// Matches the *host* endpoints' default (`routes::cpu`), not `container`'s
-/// `…:01Z`. That one-second asymmetry only exists to preserve the Go
-/// implementation's behaviour, and these endpoints are new.
-///
-/// Note the interaction with [`tier_for_span`]: an unbounded `from` makes the
-/// span ~56 years, which selects the `1d` tier. That is the intended
-/// behaviour — "all of history" is a daily-resolution question — but it does
-/// mean a caller who omits `from` on a fresh install sees nothing until
-/// compaction has produced `1d` rows. Callers wanting recent, fine-grained
-/// data are expected to pass a `from`.
+/// Matches the host endpoints' default and intentionally selects daily-tier
+/// history when `from` is omitted.
 const DEFAULT_FROM: &str = "1970-01-01T00:00:00Z";
 
 const DEFAULT_LIMIT: usize = 50;
