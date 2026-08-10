@@ -55,6 +55,30 @@ fn json_escaped_fields_still_parse_and_decode() {
     assert_eq!(ev.status, 200);
 }
 
+/// A Coolify-injected `coolify_app_id` keys attribution by UUID (mirroring
+/// Traefik), while `host` stays the served hostname.
+#[test]
+fn coolify_app_id_overrides_host_attribution() {
+    let line = include_bytes!("../../../tests/fixtures/caddy.jsonl")
+        .split(|b| *b == b'\n')
+        .nth(3)
+        .unwrap();
+    let ev = super::parse(line).unwrap();
+    assert_eq!(ev.host, "app.example.com");
+    assert_eq!(ev.app, "jc4wsgs", "coolify_app_id must key attribution");
+    assert_ne!(ev.app, ev.host);
+}
+
+/// An empty `coolify_app_id` counts as absent — attribution falls back to host,
+/// exactly as a hand-configured Caddy site (no such field) does.
+#[test]
+fn empty_coolify_app_id_falls_back_to_host() {
+    let line = br#"{"ts":1.0,"status":200,"duration":0.001,"coolify_app_id":"","request":{"method":"GET","uri":"/","host":"h.example.com","proto":"HTTP/1.1","headers":{}}}"#;
+    let ev = super::parse(line).unwrap();
+    assert_eq!(ev.app, "h.example.com");
+    assert_eq!(ev.app, ev.host);
+}
+
 #[test]
 fn detect_distinguishes_proxies() {
     let t = include_bytes!("../../../tests/fixtures/traefik.jsonl")

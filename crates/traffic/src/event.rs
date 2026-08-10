@@ -7,7 +7,8 @@ use std::borrow::Cow;
 pub struct RequestEvent<'a> {
     /// Timestamp in milliseconds since UNIX epoch.
     pub ts_ms: i64,
-    /// Coolify app UUID (Traefik) or host (Caddy).
+    /// Coolify app UUID (Traefik, or Caddy when a `coolify_app_id` log field is
+    /// present) — otherwise the host (Caddy fallback).
     pub app: Cow<'a, str>,
     /// Request host header.
     pub host: Cow<'a, str>,

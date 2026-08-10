@@ -166,6 +166,8 @@ The feature is opt-in at runtime (`TRAFFIC_ENABLED=true`) and gated at compile t
 
 This repo implements the agent side only. Wiring it into Coolify — JSON access logs on the proxy, retaining Cloudflare headers, mounting the log into the container, passing the `TRAFFIC_*`/`GEOIP_*` env vars, and the pull/render UI — is tracked separately.
 
+**App attribution.** Traffic is keyed per app. For Traefik the app UUID is parsed from the router name. For Caddy, if the access-log entry carries a `coolify_app_id` field (a custom log field Coolify can inject), that UUID is used — identical semantics to Traefik; otherwise attribution falls back to the request host, so hand-configured Caddy sites still work.
+
 ## Architecture
 
 Sentinel follows a service-oriented architecture with these components:

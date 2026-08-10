@@ -115,12 +115,16 @@ fn seeded() -> AnalyticsStore {
             path_row(BUCKET, "app-a", "/b", 2, digest_bytes(&ramp(1, 10))),
             path_row(NEXT_BUCKET, "app-a", "/a", 3, digest_bytes(&ramp(1, 10))),
             path_row(NEXT_BUCKET, "app-a", "/b", 20, digest_bytes(&ramp(1, 10))),
+            // app-b shares path `/a`, so server-wide grouping must merge it.
+            path_row(BUCKET, "app-b", "/a", 4, digest_bytes(&ramp(1, 10))),
         ],
         &[
             bd(BUCKET, "app-a", "US", 5),
             bd(BUCKET, "app-a", "DE", 3),
             bd(NEXT_BUCKET, "app-a", "US", 4),
             bd(NEXT_BUCKET, "app-a", "FR", 10),
+            // app-b shares dimension value `US`, merged server-wide.
+            bd(BUCKET, "app-b", "US", 6),
         ],
     )
     .unwrap();
@@ -456,12 +460,68 @@ async fn unknown_dimension_returns_an_empty_array() {
 }
 
 #[tokio::test]
+async fn server_overview_merges_across_all_apps() {
+    let (s, j) = get(&format!("/api/traffic/overview?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+    // app-a: 10 + 30 = 40, app-b: 7 → 47 across every app/host.
+    assert_eq!(j["requests"], 47);
+    assert_eq!(j["bytes_in"], 470);
+    assert_eq!(j["bytes_out"], 4700);
+    assert_eq!(j["status"]["s2xx"], 41, "36 (app-a) + 5 (app-b)");
+    assert_eq!(j["status"]["s3xx"], 3);
+    assert_eq!(j["status"]["s4xx"], 3);
+    assert_eq!(j["status"]["s5xx"], 0);
+    // app-a hosts cover IPs 0..750; app-b's 0..10 is a subset, so the union is
+    // still ~750 distinct visitors.
+    let uniq = j["unique_visitors"].as_u64().unwrap();
+    assert!((712..=788).contains(&uniq), "unique_visitors was {uniq}");
+}
+
+#[tokio::test]
+async fn server_paths_merge_the_same_path_across_apps() {
+    let (s, j) = get(&format!("/api/traffic/paths?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+    let rows = j.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["path"], "/b", "app-a's 22 still leads");
+    assert_eq!(rows[0]["requests"], 22);
+    assert_eq!(rows[1]["path"], "/a");
+    assert_eq!(
+        rows[1]["requests"], 12,
+        "/a is app-a's 8 + app-b's 4 merged across apps"
+    );
+}
+
+#[tokio::test]
+async fn server_breakdown_merges_a_dimension_across_apps() {
+    let (s, j) = get(&format!("/api/traffic/breakdown/country?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+    let rows = j.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["value"], "US", "9 (app-a) + 6 (app-b) = 15 leads");
+    assert_eq!(rows[0]["requests"], 15);
+    assert_eq!(rows[1]["value"], "FR");
+    assert_eq!(rows[1]["requests"], 10);
+    assert_eq!(rows[2]["value"], "DE");
+}
+
+#[tokio::test]
+async fn server_breakdown_unknown_dimension_is_empty() {
+    let (s, j) = get(&format!("/api/traffic/breakdown/nosuch?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j, serde_json::json!([]));
+}
+
+#[tokio::test]
 async fn every_endpoint_404s_when_analytics_is_disabled() {
     for uri in [
         "/api/traffic/apps",
         "/api/app/app-a/traffic/overview",
         "/api/app/app-a/traffic/paths",
         "/api/app/app-a/traffic/breakdown/country",
+        "/api/traffic/overview",
+        "/api/traffic/paths",
+        "/api/traffic/breakdown/country",
         "/api/traffic/attribution",
     ] {
         let (s, j) = get_with(state(None), uri).await;
