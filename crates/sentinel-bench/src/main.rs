@@ -137,7 +137,11 @@ struct AnalyticsCli {
     #[arg(long, env = "GEOIP_MAXMIND_LICENSE_KEY")]
     geoip_maxmind_key: Option<String>,
     /// MaxMind edition when a license key is set.
-    #[arg(long, default_value = "GeoLite2-Country", env = "GEOIP_MAXMIND_EDITION")]
+    #[arg(
+        long,
+        default_value = "GeoLite2-Country",
+        env = "GEOIP_MAXMIND_EDITION"
+    )]
     geoip_maxmind_edition: String,
 }
 

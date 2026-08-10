@@ -224,7 +224,9 @@ async fn load_geoip(
     );
     match GeoIp::bootstrap(&cfg, &opts.geoip_dir).await {
         Ok(geo) => {
-            let attribution = geo.attribution().unwrap_or_else(|| "(unrecognized source)".into());
+            let attribution = geo
+                .attribution()
+                .unwrap_or_else(|| "(unrecognized source)".into());
             println!("[geoip] loaded: {attribution}");
             Ok(geo)
         }
@@ -304,13 +306,7 @@ pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>>
     let enricher = Enricher::new(lookup, 1024);
 
     let now = 1_700_000_000_000i64;
-    let lines = generate_lines(
-        opts.events,
-        opts.apps,
-        opts.paths,
-        now,
-        opts.cf_header_pct,
-    );
+    let lines = generate_lines(opts.events, opts.apps, opts.paths, now, opts.cf_header_pct);
     let mut aggregator = Aggregator::new(opts.topn);
     let mut cf_country = 0u64;
     let mut geoip_country = 0u64;
@@ -729,7 +725,10 @@ mod tests {
         for (i, line) in lines.iter().enumerate() {
             let event = parse_line(ProxyType::Traefik, line.as_bytes()).unwrap();
             if line_uses_cf_header(i, 50) {
-                assert!(event.cf_country.is_some(), "line {i} should have CF country");
+                assert!(
+                    event.cf_country.is_some(),
+                    "line {i} should have CF country"
+                );
                 with_cf += 1;
             } else {
                 assert!(
