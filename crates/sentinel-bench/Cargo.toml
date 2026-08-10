@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 collector = { path = "../collector" }
 store = { path = "../store" }
+traffic = { path = "../traffic" }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util.workspace = true
 reqwest.workspace = true

@@ -1768,6 +1768,7 @@ dependencies = [
  "serde_json",
  "store",
  "tokio",
+ "traffic",
 ]
 
 [[package]]

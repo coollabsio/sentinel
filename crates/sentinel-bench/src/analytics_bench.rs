@@ -1,0 +1,535 @@
+//! Traffic-analytics pipeline and query benchmark.
+
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use clap::ValueEnum;
+use reqwest::Client;
+use store::traffic::{AnalyticsStore, Tier};
+use traffic::aggregator::Aggregator;
+use traffic::compaction::{compact_1h_to_1d, compact_1m_to_1h};
+use traffic::enrich::{Enricher, NoGeo};
+use traffic::parser::{ProxyType, parse_line};
+
+#[derive(Debug, Clone)]
+pub struct AnalyticsOpts {
+    pub events: usize,
+    pub apps: usize,
+    pub paths: usize,
+    pub minutes: usize,
+    pub topn: usize,
+    pub query_iterations: usize,
+    pub base: String,
+    pub token: String,
+    pub timeout_secs: u64,
+    pub access_log: Option<PathBuf>,
+    pub stress_duration: u64,
+    pub stress_concurrency: usize,
+    pub stress_log_rate: usize,
+    pub max_error_pct: f64,
+    pub max_p99_ms: f64,
+    pub stress_profile: AnalyticsStressProfile,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum AnalyticsStressProfile {
+    Mixed,
+    Ramp,
+    Burst,
+    Soak,
+}
+
+pub fn generate_lines(count: usize, apps: usize, paths: usize, ts_ms: i64) -> Vec<String> {
+    let apps = apps.max(1);
+    let paths = paths.max(1);
+    (0..count)
+        .map(|i| {
+            let app = format!("bench-app-{}", i % apps);
+            let path = format!("/bench/path/{}", i % paths);
+            let status = [200, 200, 200, 302, 404, 500][i % 6];
+            let ip = format!("203.0.113.{}", i % 250 + 1);
+            format!(
+                r#"{{"ClientHost":"{ip}","DownstreamContentSize":{},"DownstreamStatus":{status},"Duration":{},"RequestContentSize":{},"RequestHost":"app{}.example.test","RequestMethod":"GET","RequestPath":"{path}?n={i}","RequestProtocol":"HTTP/1.1","RequestScheme":"https","RouterName":"https-0-{app}@docker","StartUTC":"2026-08-10T00:00:00Z","TLSVersion":"1.3","request_Cf-Connecting-Ip":"{ip}","request_Cf-Ipcountry":"US","request_User-Agent":"Mozilla/5.0 Chrome/120.0","time":"2026-08-10T00:00:00Z","bench_ts_ms":{ts_ms}}}"#,
+                512 + i % 4096,
+                1_000_000 + (i % 100) * 10_000,
+                i % 1024,
+                i % apps,
+            )
+        })
+        .collect()
+}
+
+pub fn analytics_paths(app: &str) -> [String; 4] {
+    [
+        "/api/traffic/apps".into(),
+        format!("/api/app/{app}/traffic/overview"),
+        format!("/api/app/{app}/traffic/paths?limit=50"),
+        format!("/api/app/{app}/traffic/breakdown/country?limit=50"),
+    ]
+}
+
+fn stress_path(app: &str, tick: usize) -> String {
+    analytics_paths(app)[tick % 4].clone()
+}
+
+fn lines_per_tick(rate: usize, tick: Duration) -> usize {
+    if rate == 0 {
+        0
+    } else {
+        ((rate as f64 * tick.as_secs_f64()).ceil() as usize).max(1)
+    }
+}
+
+fn stress_factor(profile: AnalyticsStressProfile, elapsed: Duration, total: Duration) -> f64 {
+    match profile {
+        AnalyticsStressProfile::Mixed | AnalyticsStressProfile::Soak => 1.0,
+        AnalyticsStressProfile::Ramp => {
+            (elapsed.as_secs_f64() / total.as_secs_f64().max(0.001)).clamp(0.01, 1.0)
+        }
+        AnalyticsStressProfile::Burst => {
+            if elapsed.as_secs() % 4 < 2 {
+                1.0
+            } else {
+                0.1
+            }
+        }
+    }
+}
+
+fn percentile_ms(samples: &mut [Duration], pct: usize) -> f64 {
+    samples.sort_unstable();
+    let index = (samples.len().saturating_sub(1) * pct) / 100;
+    samples
+        .get(index)
+        .copied()
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1000.0
+}
+
+pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== Traffic analytics benchmark ===");
+    println!(
+        "events={} apps={} paths={} minutes={} topn={} query_iterations={}",
+        opts.events, opts.apps, opts.paths, opts.minutes, opts.topn, opts.query_iterations
+    );
+
+    let now = 1_700_000_000_000i64;
+    let lines = generate_lines(opts.events, opts.apps, opts.paths, now);
+    let enricher = Enricher::new(Arc::new(NoGeo), 1024);
+    let mut aggregator = Aggregator::new(opts.topn);
+    let started = Instant::now();
+    for line in &lines {
+        let event = parse_line(ProxyType::Traefik, line.as_bytes())
+            .ok_or("generated Traefik line did not parse")?;
+        let enriched = enricher.enrich(&event);
+        aggregator.record(&event, &enriched);
+    }
+    let ingest_elapsed = started.elapsed();
+    println!(
+        "[A] parse+enrich+aggregate: {:.2}ms ({:.0} events/s)",
+        ingest_elapsed.as_secs_f64() * 1000.0,
+        opts.events as f64 / ingest_elapsed.as_secs_f64().max(1e-9)
+    );
+
+    let store = AnalyticsStore::open_in_memory()?;
+    let rollup = aggregator.take_rollup(now - now % 60_000);
+    let started = Instant::now();
+    store.flush_window(&rollup.stats, &rollup.paths, &rollup.breakdown)?;
+    println!(
+        "[B] flush: rows={} elapsed={:.2}ms",
+        rollup.stats.len() + rollup.paths.len() + rollup.breakdown.len(),
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // Seed closed minute buckets using the same real parser/aggregator/store path.
+    let hour = 1_699_999_200_000i64; // aligned and safely before `now`
+    for minute in 0..opts.minutes.max(60) {
+        let bucket = hour - (minute as i64) * 60_000;
+        let mut a = Aggregator::new(opts.topn);
+        for line in generate_lines(opts.apps.max(1) * 2, opts.apps, opts.paths, bucket) {
+            if let Some(event) = parse_line(ProxyType::Traefik, line.as_bytes()) {
+                let enriched = enricher.enrich(&event);
+                a.record(&event, &enriched);
+            }
+        }
+        let r = a.take_rollup(bucket);
+        store.flush_window(&r.stats, &r.paths, &r.breakdown)?;
+    }
+    let started = Instant::now();
+    let h_rows = compact_1m_to_1h(&store, now, opts.topn)?;
+    let h_elapsed = started.elapsed();
+    let started = Instant::now();
+    let d_rows = compact_1h_to_1d(&store, now + 86_400_000, opts.topn)?;
+    let d_elapsed = started.elapsed();
+    println!(
+        "[C] compaction: 1m->1h rows={h_rows} {:.2}ms; 1h->1d rows={d_rows} {:.2}ms",
+        h_elapsed.as_secs_f64() * 1000.0,
+        d_elapsed.as_secs_f64() * 1000.0
+    );
+
+    let app = "bench-app-0";
+    let mut samples = Vec::with_capacity(opts.query_iterations * 4);
+    let started = Instant::now();
+    for _ in 0..opts.query_iterations {
+        for query in 0..4 {
+            let t = Instant::now();
+            match query {
+                0 => {
+                    store.stats_range(Tier::D1, app, 0, now + 2 * 86_400_000)?;
+                }
+                1 => {
+                    store.paths_range(Tier::D1, app, 0, now + 2 * 86_400_000, 1_000_000)?;
+                }
+                2 => {
+                    store.breakdown_range(
+                        Tier::D1,
+                        app,
+                        "country",
+                        0,
+                        now + 2 * 86_400_000,
+                        1_000_000,
+                    )?;
+                }
+                _ => {
+                    store.apps()?;
+                }
+            }
+            samples.push(t.elapsed());
+        }
+    }
+    let query_elapsed = started.elapsed();
+    println!(
+        "[D] store queries: n={} total={:.2}ms p50={:.3}ms p95={:.3}ms p99={:.3}ms",
+        samples.len(),
+        query_elapsed.as_secs_f64() * 1000.0,
+        percentile_ms(&mut samples, 50),
+        percentile_ms(&mut samples.clone(), 95),
+        percentile_ms(&mut samples.clone(), 99)
+    );
+
+    if let Some(path) = &opts.access_log {
+        run_end_to_end(opts, path, &lines).await?;
+        if opts.stress_duration > 0 {
+            run_live_stress(opts, path).await?;
+        }
+    } else {
+        println!(
+            "[E] end-to-end: SKIPPED (pass --access-log for a running traffic-enabled Sentinel)"
+        );
+    }
+    Ok(())
+}
+
+async fn overview_requests(client: &Client, base: &str, token: &str) -> Option<u64> {
+    client
+        .get(format!("{base}/api/app/bench-app-0/traffic/overview"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?
+        .get("requests")?
+        .as_u64()
+}
+
+async fn run_live_stress(
+    opts: &AnalyticsOpts,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(opts.timeout_secs))
+        .build()?;
+    let base = opts.base.trim_end_matches('/').to_string();
+    let baseline = overview_requests(&client, &base, &opts.token)
+        .await
+        .unwrap_or(0);
+    let stress_started = Instant::now();
+    let total_duration = Duration::from_secs(opts.stress_duration);
+    let deadline = stress_started + total_duration;
+    let ok = Arc::new(AtomicU64::new(0));
+    let failed = Arc::new(AtomicU64::new(0));
+    let written = Arc::new(AtomicU64::new(0));
+    let health_failed = Arc::new(AtomicU64::new(0));
+    let latencies = Arc::new(std::sync::Mutex::new(Vec::<Duration>::new()));
+
+    let writer_path = path.to_path_buf();
+    let writer_written = written.clone();
+    let rate = opts.stress_log_rate;
+    let profile = opts.stress_profile;
+    let writer = tokio::spawn(async move {
+        let tick = Duration::from_millis(100);
+        let mut sequence = 0usize;
+        let mut interval = tokio::time::interval(tick);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(writer_path)?;
+        while Instant::now() < deadline {
+            interval.tick().await;
+            let factor = stress_factor(profile, stress_started.elapsed(), total_duration);
+            let per_tick = lines_per_tick((rate as f64 * factor) as usize, tick);
+            for line in generate_lines(per_tick, 10, 100, 1_700_000_000_000 + sequence as i64) {
+                writeln!(file, "{line}")?;
+                sequence += 1;
+            }
+            file.flush()?;
+            writer_written.fetch_add(per_tick as u64, Ordering::Relaxed);
+        }
+        Ok::<(), std::io::Error>(())
+    });
+
+    let mut workers = Vec::new();
+    for worker in 0..opts.stress_concurrency.max(1) {
+        let client = client.clone();
+        let base = base.clone();
+        let token = opts.token.clone();
+        let ok = ok.clone();
+        let failed = failed.clone();
+        let latencies = latencies.clone();
+        let profile = opts.stress_profile;
+        let peak = opts.stress_concurrency.max(1);
+        workers.push(tokio::spawn(async move {
+            let mut tick = worker;
+            while Instant::now() < deadline {
+                let active = ((peak as f64
+                    * stress_factor(profile, stress_started.elapsed(), total_duration))
+                .ceil() as usize)
+                    .max(1);
+                if worker >= active {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                let started = Instant::now();
+                let success = client
+                    .get(format!("{base}{}", stress_path("bench-app-0", tick)))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false);
+                if success {
+                    ok.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(mut samples) = latencies.lock()
+                        && samples.len() < 1_000_000
+                    {
+                        samples.push(started.elapsed());
+                    }
+                } else {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                }
+                tick += 1;
+            }
+        }));
+    }
+
+    let health_client = client.clone();
+    let health_base = base.clone();
+    let health = health_failed.clone();
+    let probe = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        while Instant::now() < deadline {
+            interval.tick().await;
+            let healthy = health_client
+                .get(format!("{health_base}/api/health"))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            if !healthy {
+                health.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+    writer.await??;
+    for worker in workers {
+        worker.await?;
+    }
+    probe.await?;
+
+    let ok = ok.load(Ordering::Relaxed);
+    let failed = failed.load(Ordering::Relaxed);
+    let total = ok + failed;
+    let error_pct = failed as f64 * 100.0 / total.max(1) as f64;
+    let written = written.load(Ordering::Relaxed);
+    let mut samples = latencies.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let p99 = percentile_ms(&mut samples, 99);
+    let ingestion_deadline = Instant::now() + Duration::from_secs(opts.timeout_secs.max(5));
+    let mut observed = 0;
+    while Instant::now() < ingestion_deadline {
+        observed = overview_requests(&client, &base, &opts.token)
+            .await
+            .unwrap_or(0);
+        if observed >= baseline.saturating_add(written / 10) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let health_failures = health_failed.load(Ordering::Relaxed);
+    println!(
+        "[F] live stress: profile={:?} duration={}s concurrency={} target_log_rate={}/s written={} queries={} query_rps={:.0} errors={:.2}% p99={:.2}ms health_failures={} observed_app0_delta={}",
+        opts.stress_profile,
+        opts.stress_duration,
+        opts.stress_concurrency,
+        opts.stress_log_rate,
+        written,
+        total,
+        total as f64 / opts.stress_duration.max(1) as f64,
+        error_pct,
+        p99,
+        health_failures,
+        observed.saturating_sub(baseline)
+    );
+    if error_pct > opts.max_error_pct
+        || (opts.max_p99_ms > 0.0 && p99 > opts.max_p99_ms)
+        || health_failures > 0
+        || observed < baseline.saturating_add(written / 10)
+    {
+        return Err("analytics stress thresholds failed".into());
+    }
+    Ok(())
+}
+
+async fn run_end_to_end(
+    opts: &AnalyticsOpts,
+    path: &Path,
+    lines: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    for line in lines {
+        writeln!(file, "{line}")?;
+    }
+    file.flush()?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(opts.timeout_secs))
+        .build()?;
+    let base = opts.base.trim_end_matches('/');
+    let deadline = Instant::now() + Duration::from_secs(opts.timeout_secs.max(5));
+    loop {
+        let response = client
+            .get(format!("{base}/api/traffic/apps"))
+            .bearer_auth(&opts.token)
+            .send()
+            .await?;
+        if response.status().is_success() {
+            let apps: Vec<String> = response.json().await.unwrap_or_default();
+            if apps.iter().any(|a| a == "bench-app-0") {
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("analytics ingestion was not visible before timeout".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!(
+        "[E] end-to-end ingestion visible after {:.2}ms",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    for path in analytics_paths("bench-app-0") {
+        let mut durations = Vec::with_capacity(opts.query_iterations);
+        for _ in 0..opts.query_iterations {
+            let t = Instant::now();
+            let status = client
+                .get(format!("{base}{path}"))
+                .bearer_auth(&opts.token)
+                .send()
+                .await?
+                .status();
+            if !status.is_success() {
+                return Err(format!("analytics endpoint {path} returned {status}").into());
+            }
+            durations.push(t.elapsed());
+        }
+        println!(
+            "    {path}: p50={:.3}ms p95={:.3}ms p99={:.3}ms",
+            percentile_ms(&mut durations, 50),
+            percentile_ms(&mut durations.clone(), 95),
+            percentile_ms(&mut durations.clone(), 99)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_traefik_lines_parse_with_requested_cardinality() {
+        let lines = generate_lines(12, 3, 4, 1_700_000_000_000);
+        assert_eq!(lines.len(), 12);
+        let events: Vec<_> = lines
+            .iter()
+            .map(|line| parse_line(ProxyType::Traefik, line.as_bytes()).unwrap())
+            .collect();
+        let apps: std::collections::HashSet<_> = events.iter().map(|e| e.app.as_ref()).collect();
+        let paths: std::collections::HashSet<_> = events.iter().map(|e| e.path.as_ref()).collect();
+        assert_eq!(apps.len(), 3);
+        assert_eq!(paths.len(), 4);
+    }
+
+    #[test]
+    fn analytics_urls_cover_each_query_surface() {
+        assert_eq!(
+            analytics_paths("app-1"),
+            [
+                "/api/traffic/apps",
+                "/api/app/app-1/traffic/overview",
+                "/api/app/app-1/traffic/paths?limit=50",
+                "/api/app/app-1/traffic/breakdown/country?limit=50"
+            ]
+        );
+    }
+
+    #[test]
+    fn stress_query_mix_cycles_across_all_analytics_endpoints() {
+        let expected = analytics_paths("app-1");
+        let actual: Vec<_> = (0..8).map(|i| stress_path("app-1", i)).collect();
+        let repeated: Vec<_> = expected.iter().cycle().take(8).cloned().collect();
+        assert_eq!(actual, repeated);
+    }
+
+    #[test]
+    fn stress_rate_budget_distributes_lines_over_ticks() {
+        assert_eq!(lines_per_tick(1_000, Duration::from_millis(100)), 100);
+        assert_eq!(lines_per_tick(1, Duration::from_millis(100)), 1);
+        assert_eq!(lines_per_tick(0, Duration::from_millis(100)), 0);
+    }
+
+    #[test]
+    fn stress_profiles_scale_the_active_load() {
+        assert_eq!(
+            stress_factor(
+                AnalyticsStressProfile::Ramp,
+                Duration::from_secs(5),
+                Duration::from_secs(10)
+            ),
+            0.5
+        );
+        assert_eq!(
+            stress_factor(
+                AnalyticsStressProfile::Burst,
+                Duration::from_secs(1),
+                Duration::from_secs(10)
+            ),
+            1.0
+        );
+        assert_eq!(
+            stress_factor(
+                AnalyticsStressProfile::Burst,
+                Duration::from_secs(3),
+                Duration::from_secs(10)
+            ),
+            0.1
+        );
+    }
+}
