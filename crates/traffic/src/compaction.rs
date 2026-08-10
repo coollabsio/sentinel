@@ -2,48 +2,29 @@
 
 //! Tier compaction: rolls `1m` rows up into `1h`, and `1h` into `1d`.
 //!
-//! Lives in this crate rather than on `AnalyticsStore` because merging the
-//! persisted sketch BLOBs needs [`crate::sketches`] — and `traffic` already
-//! depends on `store`, so the reverse edge would be a dependency cycle. The
-//! store side owns the transaction and calls back in here to merge, via
-//! [`AnalyticsStore::compact_window`].
+//! Lives here rather than on `AnalyticsStore` because merging the persisted
+//! sketch BLOBs needs [`crate::sketches`], and `traffic` already depends on
+//! `store` (the reverse edge would be a cycle). The store owns the transaction
+//! and calls back in via [`AnalyticsStore::compact_window`].
 //!
-//! Three rules make a sweep safe to run on any cadence, and they are the
-//! whole design:
+//! Three rules make a sweep safe on any cadence:
+//! 1. **Only closed coarse buckets are touched** — the window bound is
+//!    `floor(now)`, never raw `now`, so the bucket `now` sits in is left alone.
+//! 2. **One coarse bucket, one transaction** — each is read, merged, written,
+//!    and has its finer rows deleted atomically, bounding memory to one bucket.
+//! 3. **A coarse bucket is recomputed, never appended to** — the merge is fed
+//!    both the finer rows and the coarse bucket's current contents and returns
+//!    the complete replacement.
 //!
-//! 1. **Only closed coarse buckets are touched.** The window bound is
-//!    `floor(now)`, never the raw `now`. An hourly caller that fires at
-//!    `H+5min` therefore compacts up to (not including) hour `H` and leaves
-//!    every `1m` row belonging to `H` alone, instead of assembling a coarse
-//!    row out of the five minutes it happens to have seen so far.
-//! 2. **One coarse bucket, one transaction.** Each closed coarse bucket is
-//!    read, merged, written, and has its finer rows deleted inside a single
-//!    store transaction. So a coarse row is only ever assembled from finer
-//!    data that unambiguously belongs to it, memory is bounded by the widest
-//!    single coarse bucket rather than by the whole backlog, and there is no
-//!    window in which the coarse row exists while its finer sources also
-//!    still do.
-//! 3. **A coarse bucket is recomputed, never appended to.** The merge is fed
-//!    both the finer rows and the coarse bucket's *current* contents, and
-//!    returns the complete new contents, which
-//!    [`AnalyticsStore::compact_window`] writes in place of the old.
-//!
-//! There is still no watermark — the delete *is* the watermark, and rule 3 is
-//! what makes that sufficient. A finer row can arrive after its coarse bucket
-//! has already been rolled up: the last minute of hour `H` is flushed at
-//! `H+1h`, which is exactly when an hourly sweep first becomes eligible to
-//! compact `H`, so this is structural at every boundary rather than
-//! exceptional. The next sweep re-compacts `H`, and because it merges the
-//! late row *into* the existing `1h` row's decoded digest and HLL rather than
-//! over them, the result covers the whole hour — counters, quantiles and
-//! unique counts alike. (Before rule 3, only the counters survived: the
-//! sketch columns replace on conflict, so the second pass overwrote the
-//! hour's distribution with the late minute's.)
-//!
-//! Scheduling a sweep at an offset past the flush interval is therefore an
-//! efficiency choice — it keeps the re-compaction path from firing every
-//! hour, and each re-compaction costs an extra digest merge and a little
-//! t-digest accuracy — not a correctness requirement.
+//! There is no watermark: the delete is the watermark, and rule 3 makes that
+//! sufficient. A finer row that arrives after its bucket was rolled up (the
+//! last minute of hour `H` flushes at `H+1h`, exactly when an hourly sweep
+//! first becomes eligible to compact `H`) is merged *into* the existing `1h`
+//! digest and HLL on the next sweep, so counters, quantiles and unique counts
+//! all stay whole. (Before rule 3 the sketch columns replaced on conflict, so
+//! only the counters survived.) Scheduling a sweep past the flush interval is
+//! therefore an efficiency choice — it avoids the re-compaction cost — not a
+//! correctness requirement.
 
 use std::collections::HashMap;
 
@@ -56,36 +37,24 @@ use crate::sketches::{LatencyDigest, TopN, Uniques};
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
 
-/// Floor on the top-N cap re-applied to every `(bucket, app, dimension)`
-/// breakdown group and every `(bucket, app)` path group after a compaction
-/// merge. The effective cap is `topn.max(COMPACTION_TOPN)`, where `topn` is
-/// the configured `TRAFFIC_TOPN` — compaction widens a small ingestion cap
-/// but never narrows a large one.
-///
-/// Deliberately larger than the ingestion-side default (`TRAFFIC_TOPN`, 50):
-/// compaction must never be the narrower funnel, or a value that survived in
-/// every contributing finer bucket could still be discarded on the way up. A
-/// coarse bucket unions up to 60 finer buckets, so its key set is
-/// legitimately wider than any single one of them.
+/// Floor on the top-N cap re-applied to every breakdown and path group after a
+/// compaction merge; the effective cap is `topn.max(COMPACTION_TOPN)`.
+/// Deliberately larger than the ingestion default (50): a coarse bucket unions
+/// up to 60 finer buckets, so compaction must never be the narrower funnel and
+/// discard a value that survived in every contributing bucket.
 const COMPACTION_TOPN: usize = 200;
 
-/// The top-N cap a compacted (`1h`/`1d`) group is actually held to, given the
-/// configured `TRAFFIC_TOPN`: the floor above, widened — never narrowed — by
-/// a larger configured value.
-///
-/// Public because it is not only compaction's business: a coarse row is
-/// capped here, so anything reasoning about how many rows a `1h`/`1d` bucket
-/// can legitimately hold — the query endpoints' scan budget, notably — has to
-/// use this same number. Importing it beats a second hand-copied `200` that
-/// can drift out of sync with this one.
+/// The top-N cap a compacted (`1h`/`1d`) group is held to: [`COMPACTION_TOPN`]
+/// widened by any larger configured `TRAFFIC_TOPN`, never narrowed. Public
+/// because the query endpoints size their scan budget off the same number;
+/// importing it beats a hand-copied `200` that can drift.
 pub fn effective_topn(configured: usize) -> usize {
     configured.max(COMPACTION_TOPN)
 }
 
 /// Rolls every *closed* `1h`-aligned window of `1m` rows up into the `1h`
-/// tier. `topn` is the configured `TRAFFIC_TOPN`; the cap actually applied is
-/// [`effective_topn`] of it. Returns the number of coarser rows written
-/// (stats + paths + breakdown).
+/// tier. The cap applied is [`effective_topn`] of `topn` (the configured
+/// `TRAFFIC_TOPN`). Returns the number of coarser rows written.
 pub fn compact_1m_to_1h(
     store: &AnalyticsStore,
     now: i64,
@@ -112,10 +81,8 @@ pub fn compact_1h_to_1d(
 }
 
 /// Floors a millisecond timestamp to the start of its containing `width`-wide
-/// bucket.
-///
-/// `div_euclid`, not `/`: truncating division rounds negative (pre-epoch)
-/// timestamps *towards* zero, i.e. into the following bucket.
+/// bucket. `div_euclid`, not `/`: truncating division rounds negative
+/// (pre-epoch) timestamps *towards* zero, i.e. into the following bucket.
 fn floor_to(bucket: i64, width: i64) -> i64 {
     bucket.div_euclid(width) * width
 }
@@ -145,15 +112,10 @@ struct PathAcc {
 /// Rolls every closed `width`-wide bucket of `from_tier` up into `to_tier`,
 /// one bucket per transaction. Returns the number of coarser rows written.
 ///
-/// The upper bound is `floor_to(now, width)`, so the coarse bucket `now`
-/// currently falls inside is never touched: it is still open, and rolling up
-/// the part of it that exists so far would produce a coarse row that has to
-/// be revised later. Everything strictly below that bound is, by definition
-/// of the flooring, complete as far as this sweep can tell.
-///
-/// `cap` is the *effective* top-N, already reconciled against
-/// [`COMPACTION_TOPN`] by the public entry points — this function applies it
-/// as given so tests can exercise the eviction path at small values.
+/// The upper bound is `floor_to(now, width)`, so the still-open bucket `now`
+/// falls inside is never touched. `cap` is the *effective* top-N — the public
+/// entry points reconcile it against [`COMPACTION_TOPN`]; this applies it as
+/// given so tests can exercise eviction at small values.
 fn compact_tier(
     store: &AnalyticsStore,
     from_tier: Tier,
@@ -164,10 +126,9 @@ fn compact_tier(
 ) -> Result<usize, TrafficError> {
     let cutoff = floor_to(now, width);
 
-    // Enumerate the work before loading any of it: the distinct finer-tier
-    // bucket timestamps below the cutoff, floored and deduped, are exactly
-    // the closed coarse buckets with something waiting in them. Ascending
-    // order keeps a backlog draining oldest-first.
+    // The distinct finer-tier buckets below the cutoff, floored and deduped,
+    // are exactly the closed coarse buckets with work waiting; ascending order
+    // drains a backlog oldest-first.
     let mut coarse: Vec<i64> = store
         .distinct_buckets_before(from_tier, cutoff)?
         .into_iter()
@@ -177,14 +138,12 @@ fn compact_tier(
 
     let mut written = 0;
     for start in coarse {
-        // `start` is aligned and strictly below the (also aligned) cutoff, so
-        // `start + width <= cutoff` and this window can never reach into the
-        // still-open coarse bucket. `saturating_add` only guards the absurd.
+        // `start` is aligned and below the aligned cutoff, so the window never
+        // reaches the still-open bucket; `saturating_add` only guards the absurd.
         let end = start.saturating_add(width);
-        // `dst` is what a previous pass already wrote for this coarse
-        // bucket — empty the first time round, non-empty when a finer row
-        // turned up after the roll-up. It is folded in as just more input, so
-        // the callback's result is always the bucket's full picture.
+        // `dst` is what a previous pass wrote for this bucket (empty first time,
+        // non-empty on re-compaction); it is folded in as just more input, so
+        // the callback returns the bucket's full picture. See rule 3.
         written += store.compact_window(from_tier, to_tier, start, end, |src, dst| TierRows {
             stats: merge_stats(src.stats, dst.stats, start),
             paths: merge_paths(src.paths, dst.paths, start, cap),
@@ -196,17 +155,10 @@ fn compact_tier(
 }
 
 /// Groups one coarse bucket's rows by `(app, host)`: counters sum, latency
-/// digests are pooled into a single [`LatencyDigest::merge`], and the HLLs
-/// are unioned. Every input row belongs to `bucket` by construction — the
-/// caller reads exactly one coarse window at a time — so the output bucket is
-/// `bucket`, not something re-derived per row.
-///
-/// `existing` is the coarse tier's own current row set for the same bucket
-/// (see the module docs' rule 3). It is merged on exactly the same footing as
-/// a finer row: its already-merged digest and HLL decode and fold into the
-/// pool, its counters add in. That makes the returned row the bucket's whole
-/// picture, which is what the store writes in place of `existing`. Normally
-/// empty.
+/// digests pool into one [`LatencyDigest::merge`], HLLs union. `existing` is
+/// the coarse tier's current rows for this bucket (rule 3; normally empty),
+/// folded in on the same footing as a finer row so the result is the bucket's
+/// whole picture, written in its place.
 fn merge_stats(rows: Vec<StatsRow>, existing: Vec<StatsRow>, bucket: i64) -> Vec<StatsRow> {
     let mut groups: HashMap<(String, String), StatsAcc, RandomState> = HashMap::default();
 
@@ -245,34 +197,23 @@ fn merge_stats(rows: Vec<StatsRow>, existing: Vec<StatsRow>, bucket: i64) -> Vec
             s4xx: acc.s4xx,
             s5xx: acc.s5xx,
             latency_tdigest: LatencyDigest::merge(&acc.digests).to_bytes(),
-            // Both columns are NOT NULL: a group whose every sketch failed to
-            // decode still writes an empty-but-valid sketch, so the next tier
-            // up can decode it.
+            // NOT NULL: write an empty-but-valid sketch even if none decoded,
+            // so the next tier up can still decode it.
             uniques_hll: acc.uniques.unwrap_or_default().to_bytes(),
         })
         .collect()
 }
 
 /// Groups one coarse bucket's rows by `(app, path)`, then re-caps each app's
-/// path set to `topn`.
-///
-/// The re-cap is what keeps the coarse tiers from growing without bound: a
-/// merge alone would give an hour the *union* of its 60 minutes' path sets,
-/// and a day the union of its 24 hours', so the longest-lived tier (`1d`,
-/// retained ~395 days) would accumulate every path ever seen. Capping here
-/// mirrors what `aggregator::take_rollup` does per minute, down to the
-/// `__other__` overflow row carrying an empty digest — there is no
-/// meaningful latency distribution for "everything else", and the column is
-/// `NOT NULL`.
+/// path set to `topn`. The re-cap keeps the coarse tiers bounded: without it an
+/// hour would hold the union of its 60 minutes' path sets, growing without
+/// bound in the 395-day `1d` tier. The `__other__` overflow row carries an
+/// empty (but `NOT NULL`) digest, mirroring `aggregator::take_rollup`.
 ///
 /// As in [`merge_breakdown`], an incoming `__other__` row goes straight to
-/// [`TopN::other`] rather than through [`TopN::add`], so it can neither
-/// evict a real path nor be emitted twice.
-///
-/// `existing` — the coarse tier's current rows for this bucket, normally
-/// empty — is merged on the same footing as a finer row; see [`merge_stats`].
-/// Its `__other__` row is one of the finer tier's overflows by another name,
-/// and lands in [`TopN::other`] like any other.
+/// [`TopN::other`], never through [`TopN::add`], so it can neither evict a real
+/// path nor be emitted twice. `existing` (rule 3; normally empty) is folded in
+/// on the same footing as a finer row; see [`merge_stats`].
 fn merge_paths(
     rows: Vec<PathRow>,
     existing: Vec<PathRow>,
@@ -280,8 +221,7 @@ fn merge_paths(
     topn: usize,
 ) -> Vec<PathRow> {
     let mut groups: HashMap<(String, String), PathAcc, RandomState> = HashMap::default();
-    // Per-app top-N, ranked (like every other cap in this crate) on request
-    // count. Kept alongside `groups` rather than inside it because the
+    // Per-app top-N by request count, kept alongside `groups` because the
     // surviving rows still need their merged per-path digest, which `TopN`
     // does not carry.
     let mut tops: HashMap<String, TopN, RandomState> = HashMap::default();
@@ -339,27 +279,20 @@ fn merge_paths(
     out
 }
 
-/// Groups one coarse bucket's rows by `(app, dimension)` — deliberately *not*
-/// by `value`: each group rebuilds a full-resolution [`TopN`] from its rows
-/// and is re-capped once, so a value just outside the cut in every
-/// contributing finer bucket can still be reunited above it here.
+/// Groups one coarse bucket's rows by `(app, dimension)` — not by `value`:
+/// each group rebuilds a full-resolution [`TopN`] and is re-capped once, so a
+/// value just outside the cut in every finer bucket can be reunited above it.
 ///
-/// An incoming `value == "__other__"` row is the previous tier's overflow
-/// bucket, so it is added to [`TopN::other`] directly. Routing it through
-/// [`TopN::add`] would instead create a literal `"__other__"` key in
-/// `counts`, where it would compete for a top-N slot against real values
-/// (possibly evicting one) and could then be emitted twice — once from
-/// `counts` and once from `other` — colliding on the coarser table's primary
-/// key.
+/// An incoming `value == "__other__"` row is the previous tier's overflow, so
+/// it is added to [`TopN::other`] directly. Through [`TopN::add`] it would
+/// instead become a literal `"__other__"` key that competes for a slot (maybe
+/// evicting a real value) and could then be emitted twice, colliding on the
+/// coarser primary key.
 ///
-/// `existing` is the coarse tier's current rows for this bucket (normally
-/// empty). Breakdown rows carry no sketch, so re-compaction never destroyed
-/// data here the way it did for stats and paths — the store's upsert summed
-/// the counters correctly. It still has to be folded in, for two reasons: the
-/// store now replaces the coarse window wholesale rather than upserting into
-/// it, and re-deriving the top-N from the union re-ranks the *whole* group,
-/// where an incremental second pass could push the bucket past `topn` with a
-/// late value that should have been demoted into `__other__`.
+/// `existing` (rule 3; normally empty) is folded in so the window is rewritten
+/// wholesale and the top-N re-ranked over the union — an incremental second
+/// pass could otherwise push the bucket past `topn` with a late value that
+/// should have been demoted into `__other__`.
 fn merge_breakdown(
     rows: Vec<BreakdownRow>,
     existing: Vec<BreakdownRow>,
@@ -412,9 +345,9 @@ fn merge_breakdown(
 const OTHER: &str = "__other__";
 
 /// Decodes a persisted latency digest, degrading to "no contribution" on a
-/// corrupt BLOB. Failing the whole sweep instead would be worse than lossy:
-/// compaction deletes what it consumes, so an undecodable row would block
-/// every later sweep forever.
+/// corrupt BLOB. Failing the sweep would be worse than lossy: compaction
+/// deletes what it consumes, so an undecodable row would block every later
+/// sweep forever.
 fn decode_digest(bytes: &[u8]) -> Option<LatencyDigest> {
     match LatencyDigest::from_bytes(bytes) {
         Ok(digest) => Some(digest),
@@ -485,6 +418,17 @@ mod tests {
             value: value.into(),
             requests,
             bytes_out: requests * 10,
+        }
+    }
+
+    fn path_row(bucket: i64, path: &str, requests: i64, bytes_out: i64, latency: &[f64]) -> PathRow {
+        PathRow {
+            bucket,
+            app: "a".into(),
+            path: path.into(),
+            requests,
+            bytes_out,
+            latency_tdigest: digest_bytes(latency),
         }
     }
 
@@ -566,30 +510,9 @@ mod tests {
         s.flush_window(
             &[],
             &[
-                PathRow {
-                    bucket: hour,
-                    app: "a".into(),
-                    path: "/x".into(),
-                    requests: 2,
-                    bytes_out: 100,
-                    latency_tdigest: digest_bytes(&[1.0, 2.0, 3.0]),
-                },
-                PathRow {
-                    bucket: hour + MIN,
-                    app: "a".into(),
-                    path: "/x".into(),
-                    requests: 3,
-                    bytes_out: 200,
-                    latency_tdigest: digest_bytes(&[8.0, 9.0, 10.0]),
-                },
-                PathRow {
-                    bucket: hour + MIN,
-                    app: "a".into(),
-                    path: "/y".into(),
-                    requests: 1,
-                    bytes_out: 5,
-                    latency_tdigest: digest_bytes(&[4.0]),
-                },
+                path_row(hour, "/x", 2, 100, &[1.0, 2.0, 3.0]),
+                path_row(hour + MIN, "/x", 3, 200, &[8.0, 9.0, 10.0]),
+                path_row(hour + MIN, "/y", 1, 5, &[4.0]),
             ],
             &[],
         )
@@ -815,18 +738,9 @@ mod tests {
         assert!(Uniques::from_bytes(&rows[0].uniques_hll).is_ok());
     }
 
-    /// The regression this whole redesign exists for.
-    ///
-    /// A caller on a non-boundary-aligned cadence (hourly, but firing at
-    /// `H+3min`) must not compact the hour it is *standing in*. The old code
-    /// used the raw `now` as the window bound, so this first sweep would
-    /// write an `H` row out of the three minutes it happened to see, and the
-    /// next sweep would upsert the remaining minutes onto it — replacing the
-    /// sketch blobs and silently destroying the first three minutes' latency
-    /// distribution while the request count stayed (misleadingly) correct.
-    ///
-    /// With the floored bound, sweep one compacts nothing, and sweep two
-    /// takes the whole closed hour in a single window.
+    /// A caller on a non-aligned cadence (hourly, firing at `H+3min`) must not
+    /// compact the hour it is standing in (rule 1). With the floored bound,
+    /// sweep one compacts nothing and sweep two takes the whole closed hour.
     #[test]
     fn non_aligned_cadence_never_compacts_a_half_open_hour() {
         let s = AnalyticsStore::open_in_memory().unwrap();
@@ -942,14 +856,7 @@ mod tests {
         let hour = 100 * HOUR;
         s.flush_window(
             &[stats_row(hour, "a", "h", 3, &[1.0])],
-            &[PathRow {
-                bucket: hour,
-                app: "a".into(),
-                path: "/x".into(),
-                requests: 3,
-                bytes_out: 30,
-                latency_tdigest: digest_bytes(&[1.0]),
-            }],
+            &[path_row(hour, "/x", 3, 30, &[1.0])],
             &[breakdown_row(hour, "US", 3)],
         )
         .unwrap();
@@ -981,16 +888,9 @@ mod tests {
     fn paths_are_recapped_with_an_other_row() {
         let s = AnalyticsStore::open_in_memory().unwrap();
         let hour = 100 * HOUR;
+        // Descending requests, so the cap keeps /p0 and /p1.
         let rows: Vec<PathRow> = (0..5)
-            .map(|i| PathRow {
-                bucket: hour + i * MIN,
-                app: "a".into(),
-                path: format!("/p{i}"),
-                // Descending, so the cap keeps /p0 and /p1.
-                requests: 100 - i,
-                bytes_out: 10,
-                latency_tdigest: digest_bytes(&[1.0]),
-            })
+            .map(|i| path_row(hour + i * MIN, &format!("/p{i}"), 100 - i, 10, &[1.0]))
             .collect();
         s.flush_window(&[], &rows, &[]).unwrap();
 
@@ -1030,14 +930,7 @@ mod tests {
     fn incoming_other_path_rows_do_not_compete_for_a_slot() {
         let s = AnalyticsStore::open_in_memory().unwrap();
         let hour = 100 * HOUR;
-        let mk = |path: &str, requests: i64| PathRow {
-            bucket: hour,
-            app: "a".into(),
-            path: path.into(),
-            requests,
-            bytes_out: requests,
-            latency_tdigest: digest_bytes(&[1.0]),
-        };
+        let mk = |path: &str, requests: i64| path_row(hour, path, requests, requests, &[1.0]);
         s.flush_window(&[], &[mk("/a", 10), mk("/b", 8), mk("__other__", 9)], &[])
             .unwrap();
 
@@ -1107,24 +1000,14 @@ mod tests {
         assert_eq!(rows.iter().filter(|r| r.value == "__other__").count(), 1);
     }
 
-    /// The late-arrival regression, and the reason [`compact_window`] reads
-    /// its destination tier.
+    /// The late-arrival regression (rule 3), and why [`compact_window`] reads
+    /// its destination tier. Hour `H` is compacted at `H+1h`; then a late `1m`
+    /// row for `H` lands and the next sweep re-compacts it. That second pass
+    /// must merge into the existing coarse digest/HLL, not replace them with
+    /// the straggler's — the old upsert summed counters but replaced the sketch
+    /// columns, silently discarding 59 minutes of distribution.
     ///
     /// [`AnalyticsStore::compact_window`]: store::traffic::AnalyticsStore::compact_window
-    ///
-    /// Hour `H` is fully compacted at `H+1h`. Then a `1m` row for `H` lands
-    /// *after* that — which is not exotic: the aggregator flushes `H`'s last
-    /// minute at `H+1h`, exactly when the hourly sweep first becomes eligible
-    /// to roll `H` up, so the two race at every hour boundary. The next sweep
-    /// picks the straggler up and compacts bucket `H` a second time.
-    ///
-    /// That second pass must recompute the hour, not describe the straggler.
-    /// When the merge only saw the finer tier, it produced a coarse row built
-    /// from the one late minute; the store's upsert then summed the counters
-    /// (so `requests` stayed right and a dashboard looked healthy) but
-    /// *replaced* `latency_tdigest` and `uniques_hll`, silently discarding
-    /// 59 minutes of latency distribution and unique visitors — and the
-    /// wreckage propagated on into the `1d` tier at the next roll-up.
     #[test]
     fn a_late_finer_row_merges_into_the_existing_coarse_row() {
         let s = AnalyticsStore::open_in_memory().unwrap();
@@ -1139,14 +1022,7 @@ mod tests {
         early[2].uniques_hll = uniques_bytes(&["1.1.1.3"]);
         s.flush_window(
             &early,
-            &[PathRow {
-                bucket: hour,
-                app: "a".into(),
-                path: "/x".into(),
-                requests: 3,
-                bytes_out: 30,
-                latency_tdigest: digest_bytes(&[1.0, 1.0, 1.0]),
-            }],
+            &[path_row(hour, "/x", 3, 30, &[1.0, 1.0, 1.0])],
             &[breakdown_row(hour, "US", 3)],
         )
         .unwrap();
@@ -1159,14 +1035,7 @@ mod tests {
         late.uniques_hll = uniques_bytes(&["1.1.1.4"]);
         s.flush_window(
             &[late],
-            &[PathRow {
-                bucket: hour + 59 * MIN,
-                app: "a".into(),
-                path: "/x".into(),
-                requests: 1,
-                bytes_out: 10,
-                latency_tdigest: digest_bytes(&[100.0]),
-            }],
+            &[path_row(hour + 59 * MIN, "/x", 1, 10, &[100.0])],
             &[breakdown_row(hour + 59 * MIN, "US", 1)],
         )
         .unwrap();

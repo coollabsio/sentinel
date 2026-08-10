@@ -65,12 +65,9 @@ pub fn parse_line(proxy: ProxyType, line: &[u8]) -> Option<RequestEvent<'_>> {
     }
 }
 
-/// Strip a URI's query string, keeping the value borrowed when it already was.
-///
-/// A `Cow` in / `Cow` out so neither branch allocates unnecessarily: a
-/// borrowed URI yields a borrowed sub-slice, and an owned one (produced when
-/// `serde_json` had to unescape the source string) is truncated in place
-/// rather than re-copied.
+/// Strip a URI's query string. `Cow` in / `Cow` out so neither branch
+/// allocates: a borrowed URI yields a borrowed sub-slice, an owned one is
+/// truncated in place.
 pub(crate) fn strip_query(uri: Cow<'_, str>) -> Cow<'_, str> {
     match uri {
         Cow::Borrowed(s) => Cow::Borrowed(s.split_once('?').map_or(s, |(p, _)| p)),

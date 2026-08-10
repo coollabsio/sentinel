@@ -2,17 +2,15 @@
 
 use std::borrow::Cow;
 
-/// Represents a single HTTP request event with traffic analytics data.
+/// A single HTTP request event with traffic analytics data.
 ///
-/// Every string field is a [`Cow`], not a plain `&'a str`, and that is
-/// load-bearing rather than stylistic. `serde_json` can only fill a borrowed
-/// `&str` when the JSON string needs *no* unescaping — the moment a log line
-/// contains `&` (Go's `encoding/json`, and therefore Traefik's
-/// `logrus.JSONFormatter`, HTML-escapes `&` in every query string by
-/// default), `\"` or `\\`, deserializing into `&str` fails for the *whole*
-/// struct and the request would be dropped entirely. With `Cow` serde still
-/// borrows on the common unescaped fast path and only allocates for the
-/// lines that genuinely need decoding.
+/// Canonical note (parsers point here): every string field is a [`Cow`], not
+/// `&'a str`, and that is load-bearing. `serde_json` can only borrow a `&str`
+/// from a JSON string that needs no unescaping, so a line containing `\"`,
+/// `\\`, or an HTML-escaped `&` in a query string (Traefik via Go's
+/// `encoding/json`) would otherwise fail to deserialize as a whole and
+/// silently drop the request. `Cow` borrows on the unescaped fast path and
+/// allocates only for escaped lines.
 pub struct RequestEvent<'a> {
     /// Timestamp in milliseconds since UNIX epoch.
     pub ts_ms: i64,

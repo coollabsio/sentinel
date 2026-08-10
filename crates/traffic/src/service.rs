@@ -3,28 +3,19 @@
 //! Main traffic analytics service orchestrator: the tail -> parse -> enrich
 //! -> aggregate -> flush loop.
 //!
-//! [`TrafficService::run`] owns two tickers and a shutdown watch, in the same
-//! `tokio::select!` shape every other long-running service in this repo uses
-//! (see `src/main.rs`):
+//! [`TrafficService::run`] owns two tickers and a shutdown watch:
+//! - a **poll** tick (250ms) drains complete [`Tailer`] lines and folds each
+//!   through `detect`/`parse_line` -> [`Enricher`] -> [`Aggregator`];
+//! - a **flush-check** tick (1s) drains and writes the just-closed window (via
+//!   [`Aggregator::take_rollup`] / [`AnalyticsStore::flush_window`]) whenever
+//!   the wall clock crosses into a new window;
+//! - a **shutdown** change drains once more, flushes the partial window, and
+//!   awaits that flush (the last chance to persist inside `main.rs`'s 5s grace).
 //!
-//! - a **poll** tick (250ms) drains whatever complete lines the [`Tailer`]
-//!   has, and folds each one through `detect`/`parse_line` -> [`Enricher`] ->
-//!   [`Aggregator`];
-//! - a **flush-check** tick (1s) asks whether the wall clock has crossed into
-//!   a new window; if so the just-closed window is drained with
-//!   [`Aggregator::take_rollup`] and written via
-//!   [`AnalyticsStore::flush_window`] on a blocking thread;
-//! - a **shutdown** change drains the tailer one last time, flushes the
-//!   partial window, and only then returns -- the flush is awaited, not
-//!   fire-and-forget, because this is the last chance to persist in-flight
-//!   data inside the 5s grace window `main.rs` allows.
-//!
-//! Nothing in the loop panics. A tailer I/O error, an unparseable line, a
-//! line whose format can't be detected, a sampled-away event, a failed flush:
-//! each is logged and/or counted in `dropped`, and the loop continues. A
-//! panic here would abort the service task, and `main.rs`'s
-//! `unexpected_service_exit` turns any service task ending into process
-//! termination -- traffic analytics must never be able to take the agent down.
+//! Nothing in the loop panics: every failure (tailer I/O, unparseable or
+//! undetectable line, sampled-away event, failed flush) is logged/counted and
+//! stepped over. A panic would abort the task, which `main.rs` turns into
+//! process termination — traffic analytics must never take the agent down.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,12 +60,9 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Resolves the configured `TRAFFIC_PROXY_TYPE` string.
-///
-/// An unrecognized value degrades to [`ProxyType::Auto`] rather than being a
-/// startup error: `Auto` detects the format from the log content anyway, so a
-/// typo costs nothing, whereas refusing to start would take the whole agent
-/// down over a cosmetic misconfiguration.
+/// Resolves the configured `TRAFFIC_PROXY_TYPE` string. An unrecognized value
+/// degrades to [`ProxyType::Auto`] (which detects the format from content
+/// anyway) rather than failing startup over a cosmetic misconfiguration.
 fn parse_proxy_type(s: &str) -> ProxyType {
     if s.eq_ignore_ascii_case("traefik") {
         ProxyType::Traefik
@@ -272,16 +260,12 @@ impl TrafficService {
     /// If the clock has moved into a different window, adopt it and return the
     /// bucket that was open until now (which the caller must then flush).
     ///
-    /// The comparison is `!=`, not `>`, and that difference is the whole point
-    /// of this being a named method. A backward wall-clock step — an NTP
-    /// correction, a VM restored from a snapshot, a manual `date` — leaves
-    /// `bucket_now` below `current_bucket`, and a `>` test would then never
-    /// fire again: no window would ever close, no flush would ever run, and
-    /// the aggregator's in-memory window (the only thing bounding its own
-    /// growth) would accumulate forever. Treating *any* change as a close
-    /// resynchronizes instead: whatever was open is written under its own
-    /// bucket, and the clock's current window takes over. Forward progress,
-    /// the overwhelmingly common case, is unchanged.
+    /// The comparison is `!=`, not `>`: a backward wall-clock step (NTP
+    /// correction, snapshot restore, manual `date`) leaves `bucket_now` below
+    /// `current_bucket`, and a `>` test would then never fire again — no window
+    /// would ever close and the aggregator would grow unbounded. Treating any
+    /// change as a close resynchronizes onto the clock's window instead;
+    /// forward progress, the common case, is unchanged.
     fn take_closed_bucket(&mut self, bucket_now: i64) -> Option<i64> {
         if bucket_now == self.current_bucket {
             return None;
@@ -325,9 +309,8 @@ impl TrafficService {
     }
 
     /// Graceful-degradation valve: a hard cap of `sample_threshold` recorded
-    /// events per wall-clock second (`0` disables it). Deliberately a plain
-    /// cap rather than probabilistic sampling -- it bounds the per-second
-    /// work with no extra state and no RNG.
+    /// events per wall-clock second (`0` disables it). A plain cap, not
+    /// probabilistic sampling, so it bounds per-second work with no RNG.
     fn admit_sample(&mut self) -> bool {
         if self.sample_threshold == 0 {
             return true;

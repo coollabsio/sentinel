@@ -18,28 +18,20 @@ use tdigests::{Centroid, TDigest};
 
 use crate::TrafficError;
 
-/// Maximum number of centroids a [`LatencyDigest`] retains after compression.
-///
-/// Bounds the digest's memory footprint / serialized size independent of how
-/// many raw values have been folded in.
+/// Max centroids a [`LatencyDigest`] retains after compression, bounding its
+/// memory/serialized size independent of how many values were folded in.
 const MAX_CENTROIDS: usize = 100;
 
 /// HyperLogLog++ precision (number of register-index bits). Must be identical
 /// across every [`Uniques`] instance that might ever be merged together.
 const HLL_PRECISION: u8 = 14;
 
-/// Deterministic hasher-builder for [`Uniques`]: always seeds `SipHasher13`
-/// with the same (zero) key via `BuildHasherDefault`, so serialized sketches
-/// are stable across process restarts and mergeable across instances —
-/// unlike `std::collections::hash_map::RandomState`, which reseeds every
-/// process and has no serde impl at all.
-///
-/// This thin wrapper exists only because `hyperloglogplus::HyperLogLogPlus`
-/// derives `Serialize`/`Deserialize` with a `B: Serialize + Deserialize`
-/// bound on its hasher-builder field, and the plain
-/// `std::hash::BuildHasherDefault<SipHasher13>` has no serde impl in this
-/// serde version. Since a default-seeded builder carries no actual state,
-/// serializing/deserializing it is a no-op (encoded as `()`).
+/// Deterministic hasher-builder for [`Uniques`]: seeds `SipHasher13` with a
+/// fixed key via `BuildHasherDefault`, so serialized sketches are stable across
+/// restarts and mergeable across instances (unlike `RandomState`, which
+/// reseeds and has no serde impl). This wrapper exists only to supply the serde
+/// impl `HyperLogLogPlus` requires on its hasher-builder field; a default-seeded
+/// builder is stateless, so it (de)serializes as a no-op `()`.
 #[derive(Clone, Debug, Default)]
 struct HllHasherBuilder(BuildHasherDefault<SipHasher13>);
 
@@ -66,11 +58,9 @@ impl<'de> Deserialize<'de> for HllHasherBuilder {
 
 type HllType = HyperLogLogPlus<[u8; 16], HllHasherBuilder>;
 
-/// Mergeable approximate-quantile sketch over non-negative, finite latency values.
-///
-/// `None` means "no values have ever been added" — this avoids ever calling
-/// the underlying `tdigests` crate's `from_values`/`from_centroids`, both of
-/// which panic on empty input.
+/// Mergeable approximate-quantile sketch over non-negative, finite latencies.
+/// `None` means "no values added", avoiding the `tdigests` crate's
+/// `from_values`/`from_centroids`, which both panic on empty input.
 pub struct LatencyDigest(Option<TDigest>);
 
 /// Local serializable mirror of `tdigests::Centroid`, which has no serde impl.
@@ -108,10 +98,8 @@ impl LatencyDigest {
         self.0 = Some(combined);
     }
 
-    /// Merges multiple digests into one by pooling all centroids and building
-    /// a single fresh digest from them (cheaper and more accurate than
-    /// repeated pairwise merges). Returns an empty digest if every input is
-    /// empty.
+    /// Merges digests by pooling all centroids into one fresh digest (cheaper
+    /// and more accurate than repeated pairwise merges). Empty if all inputs are.
     pub fn merge(sketches: &[LatencyDigest]) -> LatencyDigest {
         let all_centroids: Vec<Centroid> = sketches
             .iter()
@@ -154,18 +142,12 @@ impl LatencyDigest {
         postcard::to_stdvec(&data).unwrap_or_default()
     }
 
-    /// Decodes a digest previously produced by [`Self::to_bytes`]. An empty
-    /// payload decodes to an empty digest (`Self(None)`), never calling
-    /// `TDigest::from_centroids` with zero centroids.
-    ///
-    /// Also guards against corrupted/malformed blobs (e.g. a partially
-    /// overwritten SQLite page) that decode to a structurally valid but
-    /// semantically empty `Vec<CentroidData>` — every entry with
-    /// `weight <= 0.0` or a NaN `mean`. `tdigests::TDigest::from_centroids`
-    /// filters those out internally with the *same* predicate used below and
-    /// then `assert!`s the remainder is non-empty, which would panic on such
-    /// input. Filtering here first lets us fall back to the empty
-    /// representation instead of crashing.
+    /// Decodes a digest from [`Self::to_bytes`]. An empty payload decodes to an
+    /// empty digest, never calling `TDigest::from_centroids` with zero
+    /// centroids. Also filters out `weight <= 0.0`/NaN-`mean` centroids first:
+    /// `from_centroids` drops those with the same predicate and then `assert!`s
+    /// the remainder is non-empty, so a corrupt-but-structurally-valid blob
+    /// (all-invalid centroids) would panic — filtering here degrades to empty.
     pub fn from_bytes(b: &[u8]) -> Result<Self, TrafficError> {
         let data: Vec<CentroidData> =
             postcard::from_bytes(b).map_err(|e| TrafficError::Codec(e.to_string()))?;
@@ -194,11 +176,9 @@ impl Default for LatencyDigest {
     }
 }
 
-/// Mergeable approximate distinct-count sketch over client IP addresses.
-///
-/// Uses HyperLogLog++ with a deterministic hasher (`SipHasher13` via
-/// `BuildHasherDefault`, never `RandomState`) so serialized sketches are
-/// stable across process restarts and mergeable across instances.
+/// Mergeable approximate distinct-count sketch over client IPs. HyperLogLog++
+/// with a deterministic hasher (see [`HllHasherBuilder`]) so serialized
+/// sketches are stable across restarts and mergeable across instances.
 pub struct Uniques(HllType);
 
 impl Uniques {
@@ -220,18 +200,11 @@ impl Uniques {
         self.0.insert(&bytes);
     }
 
-    /// Merges `other`'s multiset into `self`. Both sketches are expected to
-    /// share the same precision (guaranteed in the happy path, since
-    /// `HLL_PRECISION` is a single crate-wide constant); merge is exact (a
-    /// true set union), not approximate on top of the estimate.
-    ///
-    /// `HyperLogLogPlus`'s derived `Deserialize` does not validate the
-    /// `precision` field, so a corrupted blob (or a future `HLL_PRECISION`
-    /// change mixing old and new persisted rows) can produce a sketch whose
-    /// precision genuinely differs from `self`'s. [`Self::from_bytes`]
-    /// rejects that at decode time, but this is defense-in-depth: if an
-    /// incompatible sketch ever gets here anyway, degrade gracefully (log
-    /// and skip incorporating `other`'s data) instead of panicking.
+    /// Merges `other`'s multiset into `self` (an exact set union, not an
+    /// estimate). Both share `HLL_PRECISION` on the happy path. Defense in
+    /// depth: an incompatible-precision sketch (which [`Self::from_bytes`]
+    /// already rejects) that reaches here anyway is logged and skipped rather
+    /// than panicking.
     pub fn merge_from(&mut self, other: &Uniques) {
         if let Err(err) = self.0.merge(&other.0) {
             tracing::warn!(
@@ -251,18 +224,13 @@ impl Uniques {
         postcard::to_stdvec(&self.0).unwrap_or_default()
     }
 
-    /// Decodes a sketch previously produced by [`Self::to_bytes`].
+    /// Decodes a sketch from [`Self::to_bytes`].
     ///
-    /// `HyperLogLogPlus`'s derived `Deserialize` does not validate the
-    /// `precision` field against the crate's valid range (4..=18), nor
-    /// against `HLL_PRECISION` — only its `new()` constructor checks that. A
-    /// corrupted blob (or stale data from a since-changed `HLL_PRECISION`)
-    /// could otherwise carry a precision that later makes `merge`,
-    /// `add_ip`/`insert`, or `count` panic or behave unsoundly (e.g.
-    /// register-index overflow). Guard against that here by probing a merge
-    /// against a freshly-constructed, known-good sketch: `merge` is the one
-    /// operation that explicitly validates precision compatibility, so a
-    /// successful probe proves the decoded sketch is safe to use.
+    /// `HyperLogLogPlus`'s derived `Deserialize` does not validate `precision`
+    /// (only `new()` does), so a corrupt or stale-`HLL_PRECISION` blob could
+    /// otherwise later panic or misbehave in `merge`/`add_ip`/`count`. Guard by
+    /// probing a merge against a fresh known-good sketch: `merge` is the one op
+    /// that validates precision, so a successful probe proves it safe to use.
     pub fn from_bytes(b: &[u8]) -> Result<Self, TrafficError> {
         let hll: HllType =
             postcard::from_bytes(b).map_err(|e| TrafficError::Codec(e.to_string()))?;
@@ -283,14 +251,10 @@ impl Default for Uniques {
     }
 }
 
-/// Longest aggregation key retained, in bytes.
-///
-/// Keys are attacker-controlled — a path, a `Referer`, a Cloudflare header
-/// value — and nothing upstream bounds their length, so without this a
-/// request can pin an arbitrarily large `String` in the aggregator's map for
-/// a whole window. 512 bytes is generously above any path or header worth
-/// distinguishing in a top-N; two URLs identical for their first 512 bytes
-/// are the same line item for reporting purposes.
+/// Longest aggregation key retained, in bytes. Keys are attacker-controlled
+/// (a path, `Referer`, or CF header) with no upstream length bound, so without
+/// this a request could pin an arbitrarily large `String` in the map for a
+/// window. 512 is well above any path/header worth distinguishing in a top-N.
 pub const MAX_KEY_BYTES: usize = 512;
 
 /// Multiple of `topn` at which [`TopN::add_bounded`] trims mid-window.
@@ -300,11 +264,9 @@ const SOFT_CAP_TRIGGER: usize = 8;
 /// [`TopN::add_bounded`] for why this is wider than `topn` itself.
 const SOFT_CAP_KEEP: usize = 4;
 
-/// Truncate `key` to at most [`MAX_KEY_BYTES`], on a UTF-8 character boundary.
-///
-/// Slicing a `&str` at a byte offset that lands mid-codepoint panics, and
-/// these keys are arbitrary bytes from the wire, so the cut has to be found
-/// rather than assumed. Borrows unchanged in the overwhelmingly common case.
+/// Truncate `key` to at most [`MAX_KEY_BYTES`], on a UTF-8 char boundary
+/// (slicing mid-codepoint panics, and these keys are arbitrary wire bytes).
+/// Borrows unchanged in the common case.
 pub fn truncate_key(key: &str) -> &str {
     if key.len() <= MAX_KEY_BYTES {
         return key;
@@ -331,11 +293,8 @@ pub struct TopN {
 }
 
 impl TopN {
-    /// Adds `reqs` requests and `bytes` bytes-out to `key`'s running totals.
-    ///
-    /// `key` is truncated to [`MAX_KEY_BYTES`] first: paths, referers and
-    /// Cloudflare header values all come straight off the wire, and nothing
-    /// upstream bounds their length.
+    /// Adds `reqs`/`bytes` to `key`'s running totals, truncating `key` to
+    /// [`MAX_KEY_BYTES`] first (wire values have no upstream length bound).
     pub fn add(&mut self, key: &str, reqs: u64, bytes: u64) {
         let entry = self
             .counts
@@ -345,19 +304,12 @@ impl TopN {
         entry.1 += bytes;
     }
 
-    /// [`Self::add`], plus a soft cap that bounds the map *within* the window
-    /// instead of only at its end.
-    ///
-    /// `cap` normally runs once, at drain time — once a minute. Until then the
-    /// map is unbounded, so a flood of requests carrying distinct attacker-
-    /// chosen paths or headers can grow it freely for a whole window. This
-    /// keeps `counts.len()` under `topn × `[`SOFT_CAP_TRIGGER`].
-    ///
-    /// It trims down to `topn × `[`SOFT_CAP_KEEP`], not to `topn`: bounding
-    /// memory to the same order either way, but retaining a far wider set of
-    /// candidates, so a key that is mid-table now and a leader by the end of
-    /// the window can still get there. Under any normal cardinality the
-    /// trigger is never reached and this is exactly [`Self::add`].
+    /// [`Self::add`], plus a soft cap that bounds the map *within* the window,
+    /// not only at drain time — otherwise a flood of distinct attacker-chosen
+    /// keys grows it unbounded for a whole minute. Keeps `counts.len()` under
+    /// `topn ×`[`SOFT_CAP_TRIGGER`], trimming to `topn ×`[`SOFT_CAP_KEEP`] (not
+    /// `topn`) so a mid-table key that leads by end-of-window can still get
+    /// there. Below the trigger this is exactly [`Self::add`].
     pub fn add_bounded(&mut self, key: &str, reqs: u64, bytes: u64, topn: usize) {
         self.add(key, reqs, bytes);
 
@@ -417,6 +369,22 @@ impl TopN {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    /// Postcard-encodes `(mean, weight)` centroids and decodes them back
+    /// through [`LatencyDigest::from_bytes`], exercising the corrupt-blob guard.
+    fn decode_centroids(centroids: &[(f64, f64)]) -> LatencyDigest {
+        let data: Vec<CentroidData> = centroids
+            .iter()
+            .map(|&(mean, weight)| CentroidData { mean, weight })
+            .collect();
+        LatencyDigest::from_bytes(&postcard::to_stdvec(&data).unwrap()).unwrap()
+    }
+
+    /// A sketch built one precision step above `HLL_PRECISION`.
+    fn other_precision_hll() -> HllType {
+        HyperLogLogPlus::new(HLL_PRECISION + 1, HllHasherBuilder::default())
+            .expect("valid precision within 4..=18")
+    }
 
     #[test]
     fn latency_merge_matches_union() {
@@ -588,19 +556,7 @@ mod tests {
     /// representation.
     #[test]
     fn latency_from_bytes_all_zero_weight_centroids_does_not_panic() {
-        let bad_data = vec![
-            CentroidData {
-                mean: 1.0,
-                weight: 0.0,
-            },
-            CentroidData {
-                mean: 2.0,
-                weight: 0.0,
-            },
-        ];
-        let bad_bytes = postcard::to_stdvec(&bad_data).unwrap();
-
-        let restored = LatencyDigest::from_bytes(&bad_bytes).unwrap();
+        let restored = decode_centroids(&[(1.0, 0.0), (2.0, 0.0)]);
         assert!(restored.0.is_none());
         assert_eq!(restored.quantile(0.5), 0.0);
     }
@@ -609,13 +565,7 @@ mod tests {
     /// `!c.mean.is_nan()` predicate), independent of weight validity.
     #[test]
     fn latency_from_bytes_nan_mean_centroid_does_not_panic() {
-        let bad_data = vec![CentroidData {
-            mean: f64::NAN,
-            weight: 1.0,
-        }];
-        let bad_bytes = postcard::to_stdvec(&bad_data).unwrap();
-
-        let restored = LatencyDigest::from_bytes(&bad_bytes).unwrap();
+        let restored = decode_centroids(&[(f64::NAN, 1.0)]);
         assert!(restored.0.is_none());
     }
 
@@ -623,19 +573,8 @@ mod tests {
     /// instead of failing the whole decode.
     #[test]
     fn latency_from_bytes_filters_invalid_keeps_valid() {
-        let data = vec![
-            CentroidData {
-                mean: 5.0,
-                weight: 0.0, // invalid, dropped
-            },
-            CentroidData {
-                mean: 10.0,
-                weight: 1.0, // valid, kept
-            },
-        ];
-        let bytes = postcard::to_stdvec(&data).unwrap();
-
-        let restored = LatencyDigest::from_bytes(&bytes).unwrap();
+        // (5.0, 0.0) invalid and dropped; (10.0, 1.0) valid and kept.
+        let restored = decode_centroids(&[(5.0, 0.0), (10.0, 1.0)]);
         assert!(restored.0.is_some());
         assert!((restored.quantile(0.5) - 10.0).abs() < 1e-9);
     }
@@ -647,10 +586,7 @@ mod tests {
     /// `.expect` (now removed) or misbehave in `add_ip`/`count`.
     #[test]
     fn uniques_from_bytes_rejects_incompatible_precision() {
-        let other_precision_hll: HllType =
-            HyperLogLogPlus::new(HLL_PRECISION + 1, HllHasherBuilder::default())
-                .expect("valid precision within 4..=18");
-        let bytes = postcard::to_stdvec(&other_precision_hll).unwrap();
+        let bytes = postcard::to_stdvec(&other_precision_hll()).unwrap();
 
         let result = Uniques::from_bytes(&bytes);
         assert!(
@@ -668,10 +604,7 @@ mod tests {
         a.add_ip(IpAddr::V4(Ipv4Addr::from(1u32)));
         let before = a.count();
 
-        let other_precision_hll: HllType =
-            HyperLogLogPlus::new(HLL_PRECISION + 1, HllHasherBuilder::default())
-                .expect("valid precision within 4..=18");
-        let incompatible = Uniques(other_precision_hll);
+        let incompatible = Uniques(other_precision_hll());
 
         // Must not panic.
         a.merge_from(&incompatible);

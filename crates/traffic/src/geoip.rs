@@ -1,25 +1,22 @@
-// `deny`, not `forbid`: this module contains the crate's only `unsafe` block
-// (`Reader::open_mmap`), which needs a scoped `#[allow(unsafe_code)]`. `forbid`
-// cannot be lifted by an inner `allow`, so it would make that impossible.
+// `deny`, not `forbid`: this module has the crate's only `unsafe` block
+// (`Reader::open_mmap`), which needs a scoped `#[allow(unsafe_code)]` that
+// `forbid` could not lift.
 #![deny(unsafe_code)]
 
 //! GeoIP database management and lookup.
 //!
-//! Resolves an ordered list of candidate database sources (spec §6), downloads
-//! the first one that works, decompresses it, memory-maps it, and publishes it
-//! through an [`ArcSwap`] so lookups stay lock-free across hot reloads.
+//! Resolves candidate database sources (spec §6), downloads the first that
+//! works, decompresses it, memory-maps it, and publishes it through an
+//! [`ArcSwap`] so lookups stay lock-free across hot reloads.
 //!
 //! Source resolution, in priority order:
-//! 1. `geoip_maxmind_key` set — the licensed MaxMind tarball, no fallback (an
-//!    explicit credential means the operator wants *that* database).
-//! 2. `geoip_db_url` set — that URL only, no fallback (explicit override).
+//! 1. `geoip_maxmind_key` — the licensed MaxMind tarball only (no fallback).
+//! 2. `geoip_db_url` — that URL only (explicit override, no fallback).
 //! 3. Otherwise — the jsDelivr mirror, then DB-IP Lite for the current month,
-//!    then DB-IP Lite for the previous month. DB-IP's URLs are date-derived and
-//!    the current month's build is not published until some point into the
-//!    month, so the previous month is carried as a third candidate rather than
-//!    special-cased inside the DB-IP attempt.
+//!    then the previous month (the current month's build may not be published
+//!    yet early in the month).
 //!
-//! Every refresh writes a *new* dated file and only removes the previous one
+//! Every refresh writes a new dated file and removes the previous one only
 //! after the new mapping is live; see the `SAFETY` note on [`GeoIp::install`].
 
 use std::borrow::Cow;
@@ -51,13 +48,10 @@ const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 /// GeoLite2-City tarball) is well under 100 MiB.
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Refuse *decompressed* payloads larger than this.
-///
-/// [`MAX_DOWNLOAD_BYTES`] bounds only the compressed body, which says nothing
-/// about what it expands to — a hostile or compromised `GEOIP_DB_URL` can
-/// serve a few kilobytes that inflate to gigabytes and OOM the agent or fill
-/// its disk. Real GeoLite2/DB-IP *country* databases are a few MiB, so 64 MiB
-/// is a wide safety margin rather than an operational limit.
+/// Refuse *decompressed* payloads larger than this. [`MAX_DOWNLOAD_BYTES`]
+/// bounds only the compressed body — a hostile `GEOIP_DB_URL` can serve a few
+/// KiB that inflate to gigabytes and OOM the agent. Real country databases are
+/// a few MiB, so 64 MiB is a wide margin, not an operational limit.
 const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How the bytes at a source URL are packaged.
@@ -88,15 +82,11 @@ impl Source {
     }
 }
 
-/// Mask the value of a `license_key` query parameter.
-///
-/// [`maxmind_url`] embeds the operator's MaxMind credential directly in the
-/// download URL. That URL is logged on every successful load and refresh and
-/// is interpolated into every [`TrafficError::Download`] message, so without
-/// this the key ends up in `docker logs`, in whatever aggregator scrapes
-/// them, and in any support-bundle paste. URLs with no key (the jsDelivr
-/// mirror, DB-IP, a custom `GEOIP_DB_URL`) pass through untouched and
-/// unallocated.
+/// Mask the value of a `license_key` query parameter. [`maxmind_url`] embeds
+/// the operator's MaxMind credential in the download URL, which is logged on
+/// every load/refresh and interpolated into every [`TrafficError::Download`],
+/// so it must never reach a log line unmasked. Key-less URLs (mirror, DB-IP,
+/// custom `GEOIP_DB_URL`) pass through untouched and unallocated.
 pub fn redact_url(url: &str) -> Cow<'_, str> {
     const KEY: &str = "license_key=";
 
@@ -195,10 +185,9 @@ fn reconcile_archive(archive: &Archive, bytes: &[u8]) -> Archive {
 }
 
 /// Read `reader` to EOF, refusing anything past [`MAX_DECOMPRESSED_BYTES`].
-///
-/// Reads one byte past the limit precisely so hitting it can be distinguished
-/// from legitimately ending there: an over-long payload is a
-/// [`TrafficError::Decompress`], never a silent truncation that would hand a
+/// Reads one byte past the limit so hitting it is distinguishable from
+/// legitimately ending there: an over-long payload is a
+/// [`TrafficError::Decompress`], never a silent truncation handing a
 /// half-written `.mmdb` to the parser.
 fn read_bounded<R: Read>(reader: R, what: &str) -> Result<Vec<u8>, TrafficError> {
     let mut out = Vec::new();
@@ -280,12 +269,10 @@ pub struct GeoIp {
 }
 
 impl GeoIp {
-    /// Download and map a database, trying each candidate from
-    /// [`resolve_sources`] in order.
-    ///
-    /// Returns `Err` only when *every* candidate fails; the caller is expected
-    /// to fall back to [`crate::enrich::NoGeo`] rather than treat that as
-    /// fatal. On success the returned `GeoIp` always has a live mapping.
+    /// Download and map a database, trying each [`resolve_sources`] candidate
+    /// in order. Returns `Err` only when *every* candidate fails (the caller
+    /// falls back to [`crate::enrich::NoGeo`]); on success the `GeoIp` always
+    /// has a live mapping.
     pub async fn bootstrap(
         cfg: &TrafficSettings,
         db_dir: &Path,
@@ -347,11 +334,9 @@ impl GeoIp {
         }))
     }
 
-    /// Re-check the configured sources and hot-swap in a newer database.
-    ///
-    /// Returns `Ok(true)` if a new database was mapped and swapped in,
-    /// `Ok(false)` if the active source answered `304 Not Modified` (nothing to
-    /// do), and `Err` if every candidate failed. The currently-mapped database
+    /// Re-check the sources and hot-swap in a newer database. `Ok(true)` if a
+    /// new database was swapped in, `Ok(false)` if the active source answered
+    /// `304 Not Modified`, `Err` if every candidate failed. The live database
     /// is never disturbed on `Ok(false)` or `Err`.
     pub async fn refresh(
         self: &Arc<Self>,
@@ -540,10 +525,8 @@ const MAXMIND_ATTRIBUTION: &str = "This product includes GeoLite2 data created b
 const DBIP_ATTRIBUTION: &str = "IP Geolocation by DB-IP (https://db-ip.com)";
 
 /// Classifies a resolved source URL into the attribution string its license
-/// requires, or `None` if the URL isn't one of the two recognized,
-/// license-obligated sources (e.g. an operator-supplied `GEOIP_DB_URL`
-/// pointing somewhere else entirely — the operator is responsible for
-/// whatever they pointed at).
+/// requires, or `None` for an unrecognized source (e.g. an operator-supplied
+/// `GEOIP_DB_URL` — their responsibility, not ours).
 fn classify_attribution(source_url: &str) -> Option<String> {
     if source_url == MIRROR_URL || source_url.starts_with("https://cdn.jsdelivr.net/") {
         // The mirror redistributes MaxMind GeoLite2-Country data.
@@ -559,13 +542,9 @@ fn classify_attribution(source_url: &str) -> Option<String> {
 
 impl GeoIp {
     /// The attribution string required by the license of whichever source is
-    /// *actually active* right now (spec §6). Since the winning source is
-    /// resolved at runtime — it can be the jsDelivr mirror, the licensed
-    /// MaxMind path, or the DB-IP fallback, depending on configuration and
-    /// source availability — this reads the URL recorded in `meta` rather
-    /// than assuming a fixed source. Total and panic-free: a poisoned mutex
-    /// still yields its last-written value, and an unrecognized URL yields
-    /// `None` rather than a guess.
+    /// *actually active* now (spec §6). Reads the runtime-resolved URL from
+    /// `meta` rather than assuming a fixed source. Panic-free: a poisoned mutex
+    /// still yields its last value, an unrecognized URL yields `None`.
     pub fn attribution(&self) -> Option<String> {
         let meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
         classify_attribution(&meta.source_url)
@@ -598,9 +577,8 @@ fn write_fresh(db_dir: &Path, mmdb: &[u8]) -> Result<PathBuf, TrafficError> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
 
-    // `create_new` makes the "never write over a mapped file" invariant an
-    // enforced property rather than a convention; the counter only exists so a
-    // freak nanosecond collision degrades to a retry instead of an error.
+    // `create_new` enforces the "never write over a mapped file" invariant;
+    // the counter only lets a freak nanosecond collision retry instead of erroring.
     for attempt in 0..16u32 {
         let path = if attempt == 0 {
             db_dir.join(format!("geoip-{stamp}.mmdb"))
@@ -672,6 +650,19 @@ mod tests {
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(bytes).unwrap();
         enc.finish().unwrap()
+    }
+
+    /// Builds a `.tar.gz` from `(path, contents)` members, in order.
+    fn targz(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+        for (name, data) in members {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
     }
 
     /// The MaxMind URL carries the operator's credential in a query
@@ -793,35 +784,12 @@ mod tests {
     #[test]
     fn extract_targz_finds_mmdb_member() {
         let payload = b"nested mmdb bytes".repeat(32);
-
-        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
         // A README member that must be skipped, then the real .mmdb, nested a
         // directory deep exactly like MaxMind's tarball layout.
-        let mut header = tar::Header::new_gnu();
-        header.set_size(5);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(
-                &mut header,
-                "GeoLite2-Country_20260801/README",
-                &b"hello"[..],
-            )
-            .unwrap();
-
-        let mut header = tar::Header::new_gnu();
-        header.set_size(payload.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(
-                &mut header,
-                "GeoLite2-Country_20260801/GeoLite2-Country.mmdb",
-                &payload[..],
-            )
-            .unwrap();
-
-        let archive = builder.into_inner().unwrap().finish().unwrap();
+        let archive = targz(&[
+            ("GeoLite2-Country_20260801/README", b"hello"),
+            ("GeoLite2-Country_20260801/GeoLite2-Country.mmdb", &payload),
+        ]);
 
         let out = extract_mmdb(&archive, &Archive::TarGz).unwrap();
         assert_eq!(out, payload);
@@ -867,15 +835,7 @@ mod tests {
     #[test]
     fn extract_targz_refuses_an_oversized_member() {
         let payload = vec![0u8; (MAX_DECOMPRESSED_BYTES + 4096) as usize];
-        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
-        let mut header = tar::Header::new_gnu();
-        header.set_size(payload.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "x/GeoLite2-Country.mmdb", &payload[..])
-            .unwrap();
-        let archive = builder.into_inner().unwrap().finish().unwrap();
+        let archive = targz(&[("x/GeoLite2-Country.mmdb", &payload)]);
 
         let err = extract_mmdb(&archive, &Archive::TarGz)
             .expect_err("an oversized member must be refused");

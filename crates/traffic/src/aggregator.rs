@@ -123,112 +123,33 @@ impl Aggregator {
                 .add(&[ev.duration_ms]);
         }
 
-        // Breakdown dimensions.
+        // Breakdown dimensions. `skip_empty=false` for the always-recorded
+        // dimensions (required fields), `true` for the optional ones.
+        let bytes = ev.bytes_out;
+        let topn = self.topn;
+        let map = &mut self.breakdown;
         let status_str = ev.status.to_string();
-        record_breakdown(
-            &mut self.breakdown,
-            &app,
-            "status",
-            &status_str,
-            ev.bytes_out,
-            self.topn,
-        );
-        record_breakdown(
-            &mut self.breakdown,
-            &app,
-            "method",
-            &ev.method,
-            ev.bytes_out,
-            self.topn,
-        );
+        record_breakdown(map, &app, "status", &status_str, bytes, topn, false);
+        record_breakdown(map, &app, "method", &ev.method, bytes, topn, false);
         if let Some(country) = &en.country {
-            add_breakdown(
-                &mut self.breakdown,
-                &app,
-                "country",
-                country,
-                ev.bytes_out,
-                self.topn,
-            );
+            record_breakdown(map, &app, "country", country, bytes, topn, true);
         }
         if let Some(referer) = ev.referer.as_deref() {
-            add_breakdown(
-                &mut self.breakdown,
-                &app,
-                "referer",
-                referer,
-                ev.bytes_out,
-                self.topn,
-            );
+            record_breakdown(map, &app, "referer", referer, bytes, topn, true);
         }
-        add_breakdown(
-            &mut self.breakdown,
-            &app,
-            "browser",
-            &en.ua.browser,
-            ev.bytes_out,
-            self.topn,
-        );
-        add_breakdown(
-            &mut self.breakdown,
-            &app,
-            "os",
-            &en.ua.os,
-            ev.bytes_out,
-            self.topn,
-        );
-        add_breakdown(
-            &mut self.breakdown,
-            &app,
-            "device",
-            &en.ua.device,
-            ev.bytes_out,
-            self.topn,
-        );
-        record_breakdown(
-            &mut self.breakdown,
-            &app,
-            "protocol",
-            &ev.protocol,
-            ev.bytes_out,
-            self.topn,
-        );
-        record_breakdown(
-            &mut self.breakdown,
-            &app,
-            "scheme",
-            &ev.scheme,
-            ev.bytes_out,
-            self.topn,
-        );
+        record_breakdown(map, &app, "browser", &en.ua.browser, bytes, topn, true);
+        record_breakdown(map, &app, "os", &en.ua.os, bytes, topn, true);
+        record_breakdown(map, &app, "device", &en.ua.device, bytes, topn, true);
+        record_breakdown(map, &app, "protocol", &ev.protocol, bytes, topn, false);
+        record_breakdown(map, &app, "scheme", &ev.scheme, bytes, topn, false);
         if let Some(tls) = &ev.tls_version {
-            add_breakdown(
-                &mut self.breakdown,
-                &app,
-                "tls",
-                tls,
-                ev.bytes_out,
-                self.topn,
-            );
+            record_breakdown(map, &app, "tls", tls, bytes, topn, true);
         }
         if let Some(cache) = &en.cache {
-            add_breakdown(
-                &mut self.breakdown,
-                &app,
-                "cache",
-                cache,
-                ev.bytes_out,
-                self.topn,
-            );
+            record_breakdown(map, &app, "cache", cache, bytes, topn, true);
         }
-        record_breakdown(
-            &mut self.breakdown,
-            &app,
-            "bot",
-            if en.bot { "true" } else { "false" },
-            ev.bytes_out,
-            self.topn,
-        );
+        let bot = if en.bot { "true" } else { "false" };
+        record_breakdown(map, &app, "bot", bot, bytes, topn, false);
     }
 
     /// Drains the current window into row types for `bucket`, capping
@@ -320,31 +241,13 @@ impl Aggregator {
     }
 }
 
-/// Adds one `(app, dimension)` top-N entry, skipping empty values (a
-/// woothee UA-parse fallback, or an event field that was simply absent)
-/// rather than inventing a placeholder. Used by the seven dimensions that
-/// are legitimately optional: `country`, `referer`, `browser`, `os`,
-/// `device`, `tls`, `cache`.
-fn add_breakdown(
-    map: &mut HashMap<(String, String), TopN, RandomState>,
-    app: &str,
-    dim: &str,
-    value: &str,
-    bytes_out: u64,
-    topn: usize,
-) {
-    if value.is_empty() {
-        return;
-    }
-    record_breakdown(map, app, dim, value, bytes_out, topn);
-}
-
-/// Adds one `(app, dimension)` top-N entry unconditionally, even if
-/// `value` happens to be empty. Used by the five dimensions documented as
-/// "always recorded": `status`, `method`, `protocol`, `scheme`, `bot`.
-/// These are drawn from required `RequestEvent` fields (or computed, like
-/// `bot`), so they must never be silently dropped the way an optional
-/// enrichment field would be.
+/// Adds one `(app, dimension)` top-N entry. With `skip_empty`, an empty
+/// `value` (a woothee UA-parse fallback, or an absent event field) is dropped
+/// rather than recorded — used by the seven optional dimensions (`country`,
+/// `referer`, `browser`, `os`, `device`, `tls`, `cache`). The five
+/// always-recorded dimensions (`status`, `method`, `protocol`, `scheme`,
+/// `bot`), drawn from required fields, pass `skip_empty=false` so an empty
+/// value is never silently dropped.
 fn record_breakdown(
     map: &mut HashMap<(String, String), TopN, RandomState>,
     app: &str,
@@ -352,7 +255,11 @@ fn record_breakdown(
     value: &str,
     bytes_out: u64,
     topn: usize,
+    skip_empty: bool,
 ) {
+    if skip_empty && value.is_empty() {
+        return;
+    }
     map.entry((app.to_string(), dim.to_string()))
         .or_default()
         .add_bounded(value, 1, bytes_out, topn);

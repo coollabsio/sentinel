@@ -11,13 +11,8 @@ use crate::event::RequestEvent;
 use super::strip_query;
 
 /// Raw shape of the `request.headers` object in a Caddy access-log line.
-///
-/// Caddy represents each header as an array of values; only the first value
-/// is used. Only the headers `RequestEvent` needs are declared here — serde's
-/// derived `Deserialize` silently ignores any other headers present in the
-/// real log line.
-///
-/// See [`Raw`] for why every string is a `Cow`, not a `&'a str`.
+/// Caddy stores each header as an array of values; only the first is used.
+/// Only the headers `RequestEvent` needs are declared; serde ignores the rest.
 #[derive(Debug, Deserialize)]
 struct Headers<'a> {
     #[serde(rename = "User-Agent", borrow, default)]
@@ -58,19 +53,10 @@ struct Req<'a> {
     headers: Headers<'a>,
 }
 
-/// Raw shape of a single Caddy JSON access-log line.
-///
-/// Only the fields `RequestEvent` needs are declared here; serde's derived
-/// `Deserialize` silently ignores any other keys present in the real Caddy
-/// log line (e.g. `level`, `logger`, `msg`, `user_id`, `resp_headers`, ...).
-///
-/// Every string field is `Cow<'a, str>` rather than `&'a str` because
-/// `serde_json` cannot produce a borrowed `&str` for a JSON string that needs
-/// unescaping — and a `uri` query string, a `Referer` header, or any header
-/// value may legitimately contain `\"`, `\\` or a `\uXXXX` escape. With
-/// `&'a str` fields such a line fails to deserialize *as a whole* and the
-/// request is dropped silently; with `Cow` the common unescaped case still
-/// borrows and only the escaped minority allocates.
+/// Raw shape of a single Caddy JSON access-log line. Only the fields
+/// `RequestEvent` needs are declared; serde ignores any other keys (`level`,
+/// `logger`, `msg`, `resp_headers`, ...). Fields are `Cow`, not `&str` — see
+/// [`RequestEvent`] for why (JSON unescaping) that is load-bearing.
 #[derive(Debug, Deserialize)]
 struct Raw<'a> {
     ts: f64,
@@ -193,12 +179,9 @@ mod tests {
         assert_eq!(ev.path, "/webhook");
     }
 
-    /// Same class of bug as the Traefik one: a `uri` or header value that
-    /// needs unescaping cannot fill a borrowed `&str`, so with `&'a str`
-    /// fields the whole line failed to deserialize and the request was
-    /// dropped. Caddy does not HTML-escape by default the way Go's
-    /// `encoding/json` does for logrus, but a quote or backslash anywhere in
-    /// a URI or `Referer` reaches the same failure.
+    /// A `uri` or `Referer` carrying a quote/backslash escape must still parse
+    /// and decode — the same regression the `Cow` fields exist for. See
+    /// `event::RequestEvent`.
     #[test]
     fn json_escaped_fields_still_parse_and_decode() {
         let line = include_bytes!("../../tests/fixtures/caddy.jsonl")

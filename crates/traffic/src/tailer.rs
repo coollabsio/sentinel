@@ -2,20 +2,12 @@
 
 //! Rotation-aware access-log tailer.
 //!
-//! Follows a proxy access-log file (e.g. Traefik's `access.log`) at a fixed
-//! path, yielding complete lines as raw bytes for a parser to consume. It
-//! survives log rotation (the file at `path` gets renamed away and a new
-//! file appears at the same path) and truncation (some `copytruncate`
-//! logrotate configs truncate the file in place instead of renaming it)
-//! without losing or duplicating already-yielded lines, and without ever
-//! blocking indefinitely or panicking.
-//!
-//! `open()` seeks to the END of the file: on startup we only want new
-//! lines going forward, not to replay the file's entire history.
-//!
-//! `poll_lines()` is expected to be called repeatedly on a timer by a
-//! caller (a later task owns the polling loop / parsing dispatch). This
-//! module is purely the file-following primitive.
+//! Follows a proxy access-log file at a fixed path, yielding complete lines as
+//! raw bytes. It survives rotation (the path is renamed away and recreated) and
+//! `copytruncate`-style in-place truncation without losing or duplicating
+//! yielded lines, and never blocks or panics. `open()` seeks to EOF so only
+//! lines appended after startup are yielded; `poll_lines()` is called
+//! repeatedly on a timer by a caller that owns the loop.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -121,13 +113,19 @@ mod tests {
         f.flush().unwrap();
     }
 
-    #[test]
-    fn yields_complete_lines_appended_after_open() {
+    /// Fresh temp dir with an empty `access.log` and a `Tailer` opened on it.
+    /// The `TempDir` is returned so the caller keeps it alive.
+    fn open_tailer() -> (tempfile::TempDir, PathBuf, Tailer) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("access.log");
         File::create(&path).unwrap();
+        let tailer = Tailer::open(&path).unwrap();
+        (dir, path, tailer)
+    }
 
-        let mut tailer = Tailer::open(&path).unwrap();
+    #[test]
+    fn yields_complete_lines_appended_after_open() {
+        let (_dir, path, mut tailer) = open_tailer();
 
         append(&path, b"line one\nline two\n");
 
@@ -139,11 +137,7 @@ mod tests {
 
     #[test]
     fn buffers_partial_line_until_newline_arrives() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("access.log");
-        File::create(&path).unwrap();
-
-        let mut tailer = Tailer::open(&path).unwrap();
+        let (_dir, path, mut tailer) = open_tailer();
 
         append(&path, b"incomplete line without newline yet");
 
@@ -159,11 +153,7 @@ mod tests {
 
     #[test]
     fn survives_rotation_and_reads_new_file_from_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("access.log");
-        File::create(&path).unwrap();
-
-        let mut tailer = Tailer::open(&path).unwrap();
+        let (dir, path, mut tailer) = open_tailer();
 
         append(&path, b"old file line\n");
         let mut out = Vec::new();
@@ -191,11 +181,7 @@ mod tests {
 
     #[test]
     fn survives_truncation_and_reads_from_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("access.log");
-        File::create(&path).unwrap();
-
-        let mut tailer = Tailer::open(&path).unwrap();
+        let (_dir, path, mut tailer) = open_tailer();
 
         append(&path, b"a long line that will be truncated away\n");
         let mut out = Vec::new();

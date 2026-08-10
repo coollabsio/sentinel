@@ -11,23 +11,10 @@ use crate::event::RequestEvent;
 
 use super::{parse_app_uuid, strip_query};
 
-/// Raw shape of a single Traefik JSON access-log line.
-///
-/// Only the fields `RequestEvent` needs are declared here; serde's derived
-/// `Deserialize` silently ignores any other keys present in the real
-/// Traefik log line (e.g. `ClientAddr`, `OriginStatus`, `ServiceName`,
-/// `entryPointName`, `level`, `msg`, `time`, ...).
-///
-/// Every string field is `Cow<'a, str>` rather than `&'a str`, and that is
-/// required for correctness, not just ergonomics: `serde_json` can only
-/// populate a plain borrowed `&str` when the JSON string needs no unescaping.
-/// Traefik logs through `logrus.JSONFormatter`, which uses Go's
-/// `encoding/json` with HTML escaping on, so `&` in a `RequestPath` query
-/// string is written as `&` and any `"`/`\` in a header is written
-/// escaped. With `&'a str` fields, *deserialization of the entire struct*
-/// fails for those lines and the request is silently dropped — which is most
-/// requests carrying two or more query parameters. `Cow` keeps the zero-copy
-/// path for unescaped strings and allocates only for the rest.
+/// Raw shape of a single Traefik JSON access-log line. Only the fields
+/// `RequestEvent` needs are declared; serde ignores the rest (`ClientAddr`,
+/// `OriginStatus`, `level`, `time`, ...). Fields are `Cow`, not `&str` — see
+/// [`RequestEvent`] for why that is load-bearing for correctness.
 #[derive(Debug, Deserialize)]
 struct Raw<'a> {
     #[serde(rename = "StartUTC", borrow)]
@@ -164,16 +151,9 @@ mod tests {
         assert!(super::parse(b"not json").is_none());
     }
 
-    /// Traefik logs via `logrus.JSONFormatter`, i.e. Go's `encoding/json`
-    /// with `SetEscapeHTML(true)`, which writes `&` as `&`. Any request
-    /// with two or more query parameters therefore has an *escaped*
-    /// `RequestPath`, and a `Referer` carrying UTM params (or a quote /
-    /// backslash) is escaped too.
-    ///
-    /// With `&'a str` fields on `Raw`, `serde_json` cannot borrow such a
-    /// string and fails to deserialize the *whole* struct — every one of
-    /// those requests used to vanish from analytics as a `dropped` line. The
-    /// fields are `Cow<'a, str>` precisely so this line parses.
+    /// A `RequestPath`/`Referer` carrying HTML-escaped `&` (Traefik via Go's
+    /// `encoding/json`) or a quote/backslash must still parse and decode — the
+    /// regression the `Cow` fields exist for. See `event::RequestEvent`.
     #[test]
     fn json_escaped_fields_still_parse_and_decode() {
         let line = include_bytes!("../../tests/fixtures/traefik.jsonl")
@@ -194,30 +174,6 @@ mod tests {
         );
         assert_eq!(ev.method, "GET");
         assert_eq!(ev.status, 200);
-    }
-
-    /// Pins the *reason* the fields above must be `Cow`: proves that a
-    /// borrowed `&str` genuinely cannot be deserialized from the same line,
-    /// so the previous shape really did drop it. Without this, a future
-    /// "simplification" back to `&'a str` would look harmless.
-    #[test]
-    fn borrowed_str_cannot_deserialize_an_escaped_line() {
-        #[derive(serde::Deserialize)]
-        struct Borrowed<'a> {
-            #[serde(rename = "RequestPath", borrow)]
-            #[allow(dead_code)]
-            request_path: &'a str,
-        }
-
-        let line = include_bytes!("../../tests/fixtures/traefik.jsonl")
-            .split(|b| *b == b'\n')
-            .nth(2)
-            .unwrap();
-
-        assert!(
-            serde_json::from_slice::<Borrowed>(line).is_err(),
-            "an escaped JSON string cannot be borrowed; this is why Raw uses Cow"
-        );
     }
 
     #[test]
