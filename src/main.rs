@@ -151,6 +151,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             sampler: sampler.clone(),
             memory: memory.clone(),
             history_queries: Arc::new(Semaphore::new(api::MAX_CONCURRENT_HISTORY_QUERIES)),
+            analytics_queries: Arc::new(Semaphore::new(api::MAX_CONCURRENT_ANALYTICS_QUERIES)),
             #[cfg(feature = "traffic")]
             analytics: analytics.clone(),
             #[cfg(not(feature = "traffic"))]

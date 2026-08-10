@@ -97,6 +97,9 @@ fn test_state() -> std::sync::Arc<api::AppState> {
         history_queries: std::sync::Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics_queries: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_ANALYTICS_QUERIES,
+        )),
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     })

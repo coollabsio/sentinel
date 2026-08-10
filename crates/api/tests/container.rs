@@ -36,6 +36,9 @@ fn state() -> Arc<AppState> {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_ANALYTICS_QUERIES,
+        )),
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     })
@@ -123,6 +126,9 @@ async fn distinct_punctuated_container_names_keep_separate_histories() {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_ANALYTICS_QUERIES,
+        )),
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     });
@@ -197,6 +203,9 @@ async fn container_history_default_from_is_one_second_not_zero() {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_ANALYTICS_QUERIES,
+        )),
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     });
@@ -260,6 +269,9 @@ async fn stats_route_reports_row_counts_and_live_memory_when_debug() {
         )),
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             api::MAX_CONCURRENT_HISTORY_QUERIES,
+        )),
+        analytics_queries: Arc::new(tokio::sync::Semaphore::new(
+            api::MAX_CONCURRENT_ANALYTICS_QUERIES,
         )),
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),

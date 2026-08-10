@@ -15,6 +15,7 @@ use store::{MemRow, Store};
 use tokio::sync::{Mutex, Semaphore};
 
 pub const MAX_CONCURRENT_HISTORY_QUERIES: usize = 8;
+pub const MAX_CONCURRENT_ANALYTICS_QUERIES: usize = 8;
 
 pub struct CachedMemory(RwLock<MemRow>);
 
@@ -52,6 +53,12 @@ pub struct AppState {
     /// Bounds admission to SQLite's blocking history path. The store has one
     /// reader, so more blocking tasks only consume threads while waiting.
     pub history_queries: Arc<Semaphore>,
+    /// Bounds admission to the analytics SQLite blocking path. Separate from
+    /// `history_queries` because traffic hits an independent database
+    /// (`analytics.sqlite`) with far heavier queries (million-row scans,
+    /// t-digest/HLL decode+merge); sharing one semaphore let heavy analytics
+    /// scans starve unrelated metric-history responses.
+    pub analytics_queries: Arc<Semaphore>,
     /// Traffic-analytics database, when the subsystem is both compiled in
     /// (the binary's `traffic` feature) and enabled (`TRAFFIC_ENABLED`) and
     /// its database opened successfully. `None` in every other case,

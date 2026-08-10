@@ -159,7 +159,7 @@ async fn apps(State(state): State<Arc<AppState>>) -> Response {
         return analytics_disabled();
     };
 
-    let permit = match state.history_queries.clone().acquire_owned().await {
+    let permit = match state.analytics_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => return internal_error(e),
     };
@@ -203,7 +203,7 @@ async fn overview(
     };
     let tier = tier_for_span(from, to);
 
-    let permit = match state.history_queries.clone().acquire_owned().await {
+    let permit = match state.analytics_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => return internal_error(e),
     };
@@ -243,7 +243,7 @@ async fn paths(
     let tier = tier_for_span(from, to);
     let budget = MAX_SCAN_ROWS;
 
-    let permit = match state.history_queries.clone().acquire_owned().await {
+    let permit = match state.analytics_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => return internal_error(e),
     };
@@ -283,7 +283,7 @@ async fn breakdown(
     let tier = tier_for_span(from, to);
     let budget = MAX_SCAN_ROWS;
 
-    let permit = match state.history_queries.clone().acquire_owned().await {
+    let permit = match state.analytics_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => return internal_error(e),
     };

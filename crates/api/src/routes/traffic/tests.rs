@@ -141,6 +141,9 @@ fn state(analytics: Option<AnalyticsStore>) -> Arc<AppState> {
         history_queries: Arc::new(tokio::sync::Semaphore::new(
             crate::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
+        analytics_queries: Arc::new(tokio::sync::Semaphore::new(
+            crate::MAX_CONCURRENT_ANALYTICS_QUERIES,
+        )),
         analytics,
         geoip_attribution: Arc::new(std::sync::RwLock::new(None)),
     })
