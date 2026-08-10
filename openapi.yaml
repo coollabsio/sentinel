@@ -468,6 +468,108 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/traffic/overview:
+    get:
+      summary: Get server-wide traffic overview
+      description: |
+        Request/bandwidth totals, status-class counts, latency percentiles,
+        and estimated unique visitors merged across every app and host on the
+        box. Sketches (t-digest, HyperLogLog) are merged server-side, so the
+        percentiles and visitor estimate are a true cross-app merge, not a sum
+        of per-app estimates. Same shape as the per-app overview.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Server-wide traffic overview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrafficOverview'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/traffic/paths:
+    get:
+      summary: Get server-wide top paths
+      description: |
+        Busiest request paths across every app on the box, summed over the
+        range with per-path latency. The same path served by multiple apps is
+        merged into one entry, giving a correct top-N across all apps rather
+        than a merge of per-app top-N lists.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Server-wide top paths
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TrafficPath'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/traffic/breakdown/{dimension}:
+    get:
+      summary: Get server-wide dimension breakdown
+      description: |
+        Top values of one dimension across every app on the box, summed over
+        the range. An unrecognized dimension returns an empty array, not an
+        error.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - name: dimension
+          in: path
+          required: true
+          description: |
+            One of: status, method, country, referer, browser, os, device,
+            protocol, scheme, tls, cache, bot.
+          schema:
+            type: string
+          example: country
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Top values of the dimension across all apps
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TrafficBreakdownEntry'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /api/traffic/attribution:
     get:
       summary: Get GeoIP attribution

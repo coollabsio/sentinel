@@ -519,6 +519,34 @@ impl AnalyticsStore {
         self.with_reader(|c| select_breakdown(c, tier, from, to))
     }
 
+    /// Every `tier` breakdown row for one `dim` in the half-open bucket window
+    /// `[from, to)`, across *all* apps. The server-wide sibling of
+    /// [`Self::breakdown_range`]: same shape minus the `app = ?` filter, so the
+    /// caller can merge one dimension across every app without scanning the
+    /// other dimensions.
+    pub fn breakdown_dim_rows_between(
+        &self,
+        tier: Tier,
+        dim: &str,
+        from: i64,
+        to: i64,
+        limit: usize,
+    ) -> Result<Vec<BreakdownRow>, StoreError> {
+        self.with_reader(|c| {
+            let sql = format!(
+                "SELECT {BREAKDOWN_COLS} FROM traffic_breakdown_{} \
+                 WHERE bucket >= ?1 AND bucket < ?2 AND dimension = ?3 \
+                 ORDER BY requests DESC LIMIT ?4",
+                suffix(tier)
+            );
+            let mut stmt = c.prepare_cached(&sql)?;
+            let rows = stmt
+                .query_map((from, to, dim, limit as i64), map_breakdown_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
     /// Deletes every `tier` row (stats + paths + breakdown) strictly older
     /// than `cutoff`; returns the total number of rows removed.
     pub fn delete_before(&self, tier: Tier, cutoff: i64) -> Result<usize, StoreError> {

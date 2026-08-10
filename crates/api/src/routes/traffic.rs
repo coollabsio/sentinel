@@ -65,6 +65,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/app/{uuid}/traffic/breakdown/{dimension}",
             get(breakdown),
         )
+        // Server-wide variants: same shapes, merged across every app/host.
+        .route("/api/traffic/overview", get(server_overview))
+        .route("/api/traffic/paths", get(server_paths))
+        .route("/api/traffic/breakdown/{dimension}", get(server_breakdown))
         .route("/api/traffic/attribution", get(attribution))
 }
 
@@ -298,6 +302,119 @@ async fn breakdown(
         for (tier, lo, hi) in tier_reads(from, to) {
             let r = analytics.breakdown_range(tier, &app, &dimension, lo, hi, budget)?;
             warn_if_truncated("breakdown", &app, r.len(), budget);
+            rows.extend(r);
+        }
+        Ok::<_, store::StoreError>(top_breakdown(rows, limit))
+    })
+    .await;
+    drop(permit);
+    match result {
+        Ok(Ok(out)) => Json(out).into_response(),
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Server-wide overview: [`overview`] over every app/host on the box. Uses the
+/// un-app-filtered `stats_rows_between` scan (the same one compaction reads),
+/// then the identical `summarize_stats` merge — so the percentiles and visitor
+/// count are a true sketch merge across all apps, not a sum of per-app estimates.
+async fn server_overview(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
+    let Some(analytics) = state.analytics.clone() else {
+        return analytics_disabled();
+    };
+    let (from, to) = match resolve_range(&q, DEFAULT_FROM) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let permit = match state.analytics_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let mut rows = Vec::new();
+        for (tier, lo, hi) in tier_reads(from, to) {
+            rows.extend(analytics.stats_rows_between(tier, lo, hi)?);
+        }
+        Ok::<_, store::StoreError>(summarize_stats(rows))
+    })
+    .await;
+    drop(permit);
+    match result {
+        Ok(Ok(out)) => Json(out).into_response(),
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Server-wide top paths: [`paths`] across every app. `top_paths` groups by path
+/// string, so the same path served by different apps (e.g. `/`) merges into one
+/// server-wide row — a correct top-N over all apps, not a merge of per-app lists.
+async fn server_paths(State(state): State<Arc<AppState>>, Query(q): Query<TopQuery>) -> Response {
+    let Some(analytics) = state.analytics.clone() else {
+        return analytics_disabled();
+    };
+    let (from, to) = match resolve_range(&q.range(), DEFAULT_FROM) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let limit = match resolve_limit(q.limit.as_deref()) {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+
+    let permit = match state.analytics_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let mut rows = Vec::new();
+        for (tier, lo, hi) in tier_reads(from, to) {
+            rows.extend(analytics.paths_rows_between(tier, lo, hi)?);
+        }
+        Ok::<_, store::StoreError>(top_paths(rows, limit))
+    })
+    .await;
+    drop(permit);
+    match result {
+        Ok(Ok(out)) => Json(out).into_response(),
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Server-wide breakdown: [`breakdown`] for one dimension across every app.
+async fn server_breakdown(
+    Path(dimension): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<TopQuery>,
+) -> Response {
+    let Some(analytics) = state.analytics.clone() else {
+        return analytics_disabled();
+    };
+    let (from, to) = match resolve_range(&q.range(), DEFAULT_FROM) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let limit = match resolve_limit(q.limit.as_deref()) {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    let budget = MAX_SCAN_ROWS;
+
+    let permit = match state.analytics_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let mut rows = Vec::new();
+        for (tier, lo, hi) in tier_reads(from, to) {
+            let r = analytics.breakdown_dim_rows_between(tier, &dimension, lo, hi, budget)?;
+            warn_if_truncated("server_breakdown", "*", r.len(), budget);
             rows.extend(r);
         }
         Ok::<_, store::StoreError>(top_breakdown(rows, limit))

@@ -66,6 +66,11 @@ struct Raw<'a> {
     #[serde(default)]
     bytes_read: u64,
     duration: f64,
+    /// Optional Coolify-injected custom log field carrying the app UUID. When
+    /// present it keys attribution (matching Traefik); absent → fall back to
+    /// host.
+    #[serde(borrow, default)]
+    coolify_app_id: Option<Cow<'a, str>>,
     #[serde(borrow)]
     request: Req<'a>,
 }
@@ -85,13 +90,20 @@ fn tls_version_name(version: u16) -> Option<&'static str> {
 ///
 /// Returns `None` on any malformed input (invalid JSON or missing required
 /// fields) — callers should skip the line and move on rather than treat this
-/// as fatal. Caddy has no router-name/UUID concept, so attribution is purely
-/// host-based: `app` and `host` both borrow `request.host`.
+/// as fatal. Attribution: if Coolify injected a `coolify_app_id` custom log
+/// field, `app` is that UUID (matching Traefik's UUID attribution); otherwise
+/// it falls back to `host`, so hand-configured Caddy sites keep working.
 pub fn parse(line: &[u8]) -> Option<RequestEvent<'_>> {
     let raw: Raw = serde_json::from_slice(line).ok()?;
 
     let ts_ms = (raw.ts * 1000.0) as i64;
     let duration_ms = raw.duration * 1000.0;
+
+    // Prefer the Coolify-injected UUID; empty string counts as absent.
+    let app = match raw.coolify_app_id {
+        Some(id) if !id.is_empty() => id,
+        _ => raw.request.host.clone(),
+    };
 
     let path = strip_query(raw.request.uri);
 
@@ -112,7 +124,7 @@ pub fn parse(line: &[u8]) -> Option<RequestEvent<'_>> {
 
     Some(RequestEvent {
         ts_ms,
-        app: raw.request.host.clone(),
+        app,
         host: raw.request.host,
         method: raw.request.method,
         path,

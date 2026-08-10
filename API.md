@@ -619,6 +619,79 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ---
 
+### Get Server-Wide Traffic Overview
+
+Same shape as [Get App Traffic Overview](#get-app-traffic-overview), but merged across **every app and host** on the box. Latency percentiles (t-digest) and unique visitors (HyperLogLog++) are merged server-side from the stored sketches, so they are a true cross-app merge — not a sum of per-app estimates.
+
+**Endpoint:** `GET /api/traffic/overview`
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from` | string | No | `1970-01-01T00:00:00Z` | Start date in ISO 8601 format |
+| `to` | string | No | Current time | End date in ISO 8601 format |
+
+Response body is identical to the per-app overview. An empty range returns a `200` with every counter zeroed, not a `404`.
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/traffic/overview?from=2024-01-15T00:00:00Z&to=2024-01-16T00:00:00Z"
+```
+
+---
+
+### Get Server-Wide Top Paths
+
+Busiest request paths across **every app** on the box, summed over the range with per-path latency. The same path served by multiple apps is merged into a single entry, giving a correct top-N across all apps rather than a merge of per-app top-N lists.
+
+**Endpoint:** `GET /api/traffic/paths`
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from` | string | No | `1970-01-01T00:00:00Z` | Start date in ISO 8601 format |
+| `to` | string | No | Current time | End date in ISO 8601 format |
+| `limit` | integer | No | `50` | Number of paths to return (max `1000`), applied after summing across apps and buckets |
+
+Response body is identical to the per-app top-paths endpoint.
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/traffic/paths?from=2024-01-15T00:00:00Z&limit=10"
+```
+
+---
+
+### Get Server-Wide Dimension Breakdown
+
+Top values of one dimension across **every app** on the box, summed over the range.
+
+**Endpoint:** `GET /api/traffic/breakdown/:dimension`
+
+**Path Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `dimension` | string | Yes | One of `status`, `method`, `country`, `referer`, `browser`, `os`, `device`, `protocol`, `scheme`, `tls`, `cache`, `bot`. An unrecognized dimension returns an empty array, not an error |
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from` | string | No | `1970-01-01T00:00:00Z` | Start date in ISO 8601 format |
+| `to` | string | No | Current time | End date in ISO 8601 format |
+| `limit` | integer | No | `50` | Number of values to return (max `1000`), applied after summing across apps and buckets |
+
+Response body is identical to the per-app breakdown endpoint.
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/traffic/breakdown/country?from=2024-01-15T00:00:00Z&limit=20"
+```
+
+---
+
 ### Get GeoIP Attribution
 
 Retrieve the license attribution string for whichever GeoIP data source is currently active, so it can be surfaced in a UI.
