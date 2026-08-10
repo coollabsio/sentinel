@@ -64,7 +64,9 @@ http-body-util = "0.1"
 
 [features]
 default = []
-traffic = ["dep:traffic"]
+# `api/traffic` is what mounts the query endpoints; without it the binary
+# would collect traffic data it never exposed.
+traffic = ["dep:traffic", "api/traffic"]
 
 # `panic` is deliberately left at its default (`unwind`), not set to "abort":
 # a collection cycle failure, a single container's stats call failing, or a

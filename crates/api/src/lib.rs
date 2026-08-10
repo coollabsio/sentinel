@@ -81,6 +81,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(routes::disk::routes())
         .merge(routes::container::routes());
 
+    // Compile-time gate only. Whether the routes have anything to serve is a
+    // runtime question (`AppState::analytics`), which each handler answers
+    // with a 404 when the subsystem is compiled in but disabled.
+    #[cfg(feature = "traffic")]
+    {
+        app = app.merge(routes::traffic::routes());
+    }
+
     if debug {
         app = app.merge(routes::stats::routes());
     }

@@ -14,6 +14,16 @@ thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# Only the query endpoints need this: they decode and merge the persisted
+# t-digest / HyperLogLog BLOBs, which only this crate knows how to read.
+traffic = { workspace = true, optional = true }
+
+[features]
+default = []
+# Compiles in `routes::traffic`. `AppState::analytics` is deliberately NOT
+# gated (see `crate::AppState`), so this only decides whether the routes
+# exist — whether they have data is a runtime question the handlers answer.
+traffic = ["dep:traffic"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -89,6 +89,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "traffic",
 ]
 
 [[package]]
