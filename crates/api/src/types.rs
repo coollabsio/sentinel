@@ -63,9 +63,8 @@ pub struct ErrorBody {
 // corresponds to them — so they use plain snake_case and numeric fields
 // throughout rather than inheriting `CpuUsage`/`MemUsage`'s stringified and
 // camelCase quirks. They are declared unconditionally (not behind the
-// `traffic` feature) for the same reason `AppState::analytics` is: gating a
-// handful of plain data structs would only fracture this module's shape
-// across builds for no saving.
+// `traffic` feature), like `AppState::analytics`, to keep the module shape
+// stable across builds.
 
 /// App-level traffic totals for a query range, merged across *every* host
 /// that served the app (per-host detail is deliberately not exposed here).

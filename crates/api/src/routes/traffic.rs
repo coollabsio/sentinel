@@ -1,19 +1,12 @@
 //! Traffic-analytics query endpoints (design spec §7).
 //!
-//! Structurally these mirror `routes::container`: path param + `Query`,
-//! `resolve_range`, the `history_queries` semaphore, and `spawn_blocking`
-//! around the SQLite call. Two things are specific to this module:
-//!
-//! 1. **The whole module is `#[cfg(feature = "traffic")]`.** It is the only
-//!    place in `api` that needs the `traffic` crate, because merging the
-//!    persisted t-digest / HyperLogLog BLOBs requires those sketch types.
-//!    `AppState::analytics` is *not* gated, so the compile-time gate only
-//!    decides whether the routes exist; whether they have a database behind
-//!    them is a runtime question every handler answers first (404).
-//! 2. **Rows come back per bucket, not pre-aggregated.** `stats_range`,
-//!    `paths_range` and `breakdown_range` return one row per (bucket, key),
-//!    so summing across buckets — and merging each key's sketches — happens
-//!    here, in [`summarize_stats`] / [`top_paths`] / [`top_breakdown`].
+//! Structurally these mirror `routes::container`. Two module-specific points:
+//! the whole module is `#[cfg(feature = "traffic")]` (the only user of the
+//! `traffic` crate's sketch types), while `AppState::analytics` is not gated,
+//! so a missing database is a runtime 404 rather than a compile-time absence.
+//! And rows come back per (bucket, key), so summing across buckets and merging
+//! each key's sketches happens here in [`summarize_stats`] / [`top_paths`] /
+//! [`top_breakdown`], not in SQL.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,7 +18,6 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use store::traffic::{BreakdownRow, PathRow, StatsRow, Tier};
-use traffic::compaction::effective_topn;
 use traffic::sketches::{LatencyDigest, Uniques};
 
 use crate::AppState;
@@ -35,7 +27,6 @@ use crate::types::{
     TrafficPath, TrafficStatusBreakdown,
 };
 
-const MINUTE_MS: i64 = 60_000;
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
 
@@ -56,67 +47,14 @@ const DEFAULT_LIMIT: usize = 50;
 /// handler to materialize an unbounded result set.
 const MAX_LIMIT: usize = 1_000;
 
-/// Last-resort ceiling on the row budget computed by [`scan_budget`], purely
-/// as a memory backstop against a pathological span/top-N combination (an
-/// unbounded `from` at the `1d` tier with a huge `TRAFFIC_TOPN`, say). It is
-/// deliberately far above what any tier can legitimately emit for a sane
-/// configuration — the budget is meant to be governed by [`scan_budget`]'s
-/// arithmetic, not by this number. Hitting it is logged, so truncation is
-/// observable rather than silent.
+/// SQL `LIMIT` on `paths_range`/`breakdown_range`, purely a memory backstop
+/// against a pathological span. Real queries fall far below it; hitting it is
+/// logged, so any truncation is observable rather than silent.
 const MAX_SCAN_ROWS: usize = 1_000_000;
 
-/// Row budget handed to `paths_range`/`breakdown_range`, deliberately *not*
-/// the caller's `limit`.
-///
-/// Those queries limit raw per-bucket rows, but the caller's `limit` means
-/// "top N keys after summing across buckets" — applying it in SQL would
-/// truncate the input to the grouping and can pick the wrong keys entirely
-/// (a value with 4+5 requests across two buckets outranks one with 6 in a
-/// single bucket, but only the grouped view can see that). So the store call
-/// is bounded by this budget purely as a memory guard, and the caller's limit
-/// is applied after grouping.
-///
-/// The budget is therefore sized to what the writers can *legitimately*
-/// produce for the queried span at the resolved tier, rather than to a guess
-/// at typical usage: `TopN` emits at most `cap` keys plus one `__other__`
-/// roll-up row per (bucket, app, key-space), so a full-depth window is
-/// `buckets × (cap + 1)` rows. A fixed constant instead truncates real
-/// queries — at `topn = 50` a 100_000-row cap covers only ~1961 buckets,
-/// short of what a wide `1h` query spans, and since these queries order by
-/// bucket ascending the rows it drops are the *newest* ones. (The `1m` tier
-/// is now only ever reached for spans under [`M1_TRUSTED_SPAN_MS`], so its
-/// own worst case is 120 buckets, but the arithmetic here is tier-generic and
-/// must stay correct if that ceiling moves.)
-///
-/// `cap` is *not* the same across tiers. `1m` rows come straight from
-/// `flush_window` and are capped at the configured `topn` by the aggregator.
-/// `1h`/`1d` rows are produced only by compaction, which re-caps at
-/// [`traffic::compaction::effective_topn`] — deliberately wider, because a
-/// coarse bucket unions up to 60 (or 24) finer ones and so legitimately holds
-/// more distinct keys than any single one of them. Budgeting the coarse tiers
-/// at `topn + 1` would truncate them: at `topn = 50` a 7-day path query gets
-/// 168 × 51 = 8568 rows against up to 168 × 201 = 33_768 real ones.
-fn scan_budget(tier: Tier, from: i64, to: i64, topn: u32) -> usize {
-    let bucket_ms = match tier {
-        Tier::M1 => MINUTE_MS,
-        Tier::H1 => HOUR_MS,
-        Tier::D1 => DAY_MS,
-    } as u128;
-    let cap = match tier {
-        Tier::M1 => topn as usize,
-        Tier::H1 | Tier::D1 => effective_topn(topn as usize),
-    } as u128;
-    let span = to.saturating_sub(from).max(0) as u128;
-    // A partial bucket is still a bucket, and a zero-width span still admits
-    // the one bucket its bound falls in.
-    let buckets = span.div_ceil(bucket_ms).max(1);
-    let budget = buckets.saturating_mul(cap + 1);
-    budget.min(MAX_SCAN_ROWS as u128) as usize
-}
-
-/// Logs when a scan came back exactly at its budget, i.e. the SQL `LIMIT`
-/// may have cut rows out of the grouping. With a tier-aware [`scan_budget`]
-/// this should only ever happen when [`MAX_SCAN_ROWS`] clamped the budget.
+/// Logs when a scan came back exactly at its budget, i.e. the SQL `LIMIT` may
+/// have cut rows out of the grouping — which should only happen at the
+/// [`MAX_SCAN_ROWS`] ceiling.
 fn warn_if_truncated(query: &str, app: &str, rows: usize, budget: usize) {
     if rows >= budget {
         tracing::warn!(
@@ -177,33 +115,15 @@ impl TopQuery {
 /// cadence of slack for a delayed or missed sweep.
 const M1_TRUSTED_SPAN_MS: i64 = 2 * HOUR_MS;
 
-/// Finest tier that actually still holds data for the requested span.
-///
-/// This is *not* the same as each tier's configured retention, and the
-/// difference matters:
-///
-/// - **`1m`** only ever holds what compaction has not yet consumed —
-///   [`M1_TRUSTED_SPAN_MS`], i.e. ~1–2 hours, regardless of what
-///   `TRAFFIC_RETENTION_1M_HOURS` says. That variable is a safety net
-///   bounding how far un-compacted rows may pile up if compaction falls
-///   behind; it is not a queryable minute-resolution history window.
-/// - **`1h`** holds real, undeleted history for its full 30-day retention.
-///   The same delete-as-watermark applies one tier up (`1h` → `1d`), but at
-///   a *daily* cadence, so it only ever affects the current day.
-/// - **`1d`** holds real history for its full 395-day retention.
-///
-/// Routing a 24h query at `1m` — as an "`1m` is kept 48h" reading of the
-/// config would — reads a table holding roughly one hour of data and reports
-/// ~1/24th of the traffic as if it were the whole picture, silently. So
-/// anything wider than the `1m` tier's trusted span reads `1h`, which is
-/// where that data has actually landed.
-///
-/// One known consequence, accepted deliberately: a query that resolves to a
-/// coarser tier does not see the *currently-open* finer window, because
-/// compaction has not folded it up yet. A 24h query therefore trails real
-/// time by up to an hour. Closing that gap means unioning tiers per query,
-/// which risks double-counting against compaction's delete-as-watermark
-/// invariant, so it is not worth trading a bounded, predictable lag for.
+/// Finest tier that actually still holds data for the requested span — which
+/// is *not* each tier's configured retention. `1m` only ever holds what
+/// compaction has not yet consumed ([`M1_TRUSTED_SPAN_MS`], ~1–2h), so a span
+/// wider than that must read `1h` (real history for its 30d retention) or `1d`
+/// (395d), where compaction has actually landed the data. Routing a 24h query
+/// at `1m` would read a near-empty table and silently report ~1/24th of the
+/// traffic. The tradeoff: a coarser-tier query trails real time by up to one
+/// compaction cadence, since the currently-open finer window is not folded up
+/// yet — accepted over unioning tiers, which risks double-counting.
 fn tier_for_span(from: i64, to: i64) -> Tier {
     let span = to.saturating_sub(from);
     if span < M1_TRUSTED_SPAN_MS {
@@ -336,7 +256,7 @@ async fn paths(
         Err(resp) => return resp,
     };
     let tier = tier_for_span(from, to);
-    let budget = scan_budget(tier, from, to, state.config.traffic.topn);
+    let budget = MAX_SCAN_ROWS;
 
     let permit = match state.history_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
@@ -376,7 +296,7 @@ async fn breakdown(
         Err(resp) => return resp,
     };
     let tier = tier_for_span(from, to);
-    let budget = scan_budget(tier, from, to, state.config.traffic.topn);
+    let budget = MAX_SCAN_ROWS;
 
     let permit = match state.history_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
@@ -472,15 +392,11 @@ fn summarize_stats(rows: Vec<StatsRow>) -> TrafficOverview {
 /// Groups per-bucket path rows by path, summing counters and merging each
 /// path's latency digests, then returns the `limit` busiest paths.
 ///
-/// Each path's digests are folded *incrementally*, one row at a time, rather
-/// than collected into a `Vec` and merged once at the end. Accumulating them
-/// would hold one decoded digest per (path, bucket) resident simultaneously —
-/// at the `1m` tier's full depth that is hundreds of thousands of ≤100-centroid
-/// digests, tens to hundreds of MB, times up to `MAX_CONCURRENT_HISTORY_QUERIES`
-/// in flight. Folding as we go bounds resident sketch memory by the number of
-/// *distinct paths* instead. `LatencyDigest::merge` re-compresses to its
-/// centroid cap on every call, so repeated pairwise folding costs a little
-/// accuracy drift and no memory.
+/// Digests are folded *incrementally*, one row at a time, so resident sketch
+/// memory is bounded by the number of distinct paths rather than by (path,
+/// bucket) pairs — the latter is tens to hundreds of MB at the `1m` tier's
+/// full depth. `LatencyDigest::merge` re-compresses on every call, so this
+/// costs a little accuracy drift and no memory.
 fn top_paths(rows: Vec<PathRow>, limit: usize) -> Vec<TrafficPath> {
     struct Acc {
         requests: i64,
@@ -1066,7 +982,7 @@ mod tests {
     /// LIMIT discards is the *most recent* data — truncation here would be
     /// both silent and biased towards losing the newest buckets.
     #[tokio::test]
-    async fn a_full_width_1m_window_is_not_truncated_by_the_scan_budget() {
+    async fn a_full_width_1m_window_is_not_truncated_by_the_scan_limit() {
         let a = AnalyticsStore::open_in_memory().unwrap();
         let latency = digest_bytes(&[5.0]);
         let mut rows = Vec::with_capacity((WIDE_BUCKETS * WIDE_PATHS) as usize);
@@ -1118,7 +1034,7 @@ mod tests {
     /// the `1h`/`1d` tiers, and since `paths_range` orders by bucket ascending
     /// the rows the SQL LIMIT drops are the *newest* ones.
     #[tokio::test]
-    async fn a_compacted_1h_window_is_not_truncated_by_the_scan_budget() {
+    async fn a_compacted_1h_window_is_not_truncated_by_the_scan_limit() {
         let a = AnalyticsStore::open_in_memory().unwrap();
         let latency = digest_bytes(&[5.0]);
         let mut rows = Vec::with_capacity((COARSE_BUCKETS * COARSE_PATHS) as usize);
@@ -1160,34 +1076,6 @@ mod tests {
                 row["path"]
             );
         }
-    }
-
-    /// The scan budget is derived from what the resolved tier can legitimately
-    /// emit for the queried span, not from a fixed guess.
-    #[test]
-    fn scan_budget_covers_what_the_tier_can_emit() {
-        // 47h of 1m buckets at topn=50 (+1 `__other__` row) = 143_820.
-        assert_eq!(
-            scan_budget(Tier::M1, WIDE_FROM, WIDE_FROM + 47 * HOUR_MS, 50),
-            2820 * 51
-        );
-        // The coarse tiers have fewer buckets but a *wider* per-bucket cap:
-        // compaction re-caps at `effective_topn(topn)`, not at `topn`.
-        assert_eq!(scan_budget(Tier::H1, 0, 47 * HOUR_MS, 50), 47 * 201);
-        assert_eq!(scan_budget(Tier::D1, 0, 47 * HOUR_MS, 50), 2 * 201);
-        // Partial buckets round up, and a zero-width span still admits one.
-        assert_eq!(scan_budget(Tier::M1, 0, 1, 50), 51);
-        assert_eq!(scan_budget(Tier::M1, 0, 0, 50), 51);
-        assert_eq!(scan_budget(Tier::M1, 10, 0, 50), 51);
-        // A configured top-N is honoured rather than assumed.
-        assert_eq!(scan_budget(Tier::M1, 0, 10 * 60_000, 200), 10 * 201);
-        // …and a configured top-N *above* the compaction floor widens the
-        // coarse tiers too, exactly as `effective_topn` widens the cap.
-        assert_eq!(scan_budget(Tier::M1, 0, 10 * HOUR_MS, 500), 600 * 501);
-        assert_eq!(scan_budget(Tier::H1, 0, 10 * HOUR_MS, 500), 10 * 501);
-        assert_eq!(scan_budget(Tier::D1, 0, 10 * DAY_MS, 500), 10 * 501);
-        // The backstop caps a pathological span/top-N combination.
-        assert_eq!(scan_budget(Tier::D1, 0, i64::MAX, 1_000_000), MAX_SCAN_ROWS);
     }
 
     /// Proves the incremental fold in [`top_paths`] is behaviourally identical

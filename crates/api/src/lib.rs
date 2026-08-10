@@ -68,9 +68,7 @@ pub struct AppState {
     /// well after the router is built, since the API must not wait on a
     /// network download to start answering requests. Deliberately typed as
     /// a plain `Arc<RwLock<Option<String>>>` rather than holding the
-    /// `GeoIp` itself, so this field doesn't need `#[cfg(feature =
-    /// "traffic")]` gating — that would fracture `AppState`'s shape across
-    /// builds, same as `analytics` above.
+    /// `GeoIp` itself, so it needs no `#[cfg]` gating (see `analytics` above).
     ///
     /// Re-writable, not write-once: `GeoIp::refresh` can swap which source
     /// is active (the mirror can fail at boot and succeed on a later
