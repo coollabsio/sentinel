@@ -36,11 +36,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::StoreError;
 
-/// Typed, STRICT schema for all three roll-up tiers. `1h`/`1d` tables are
-/// written by compaction (via `write_rows`), while `flush_window` only ever
-/// inserts into the `1m` tables.
-pub const DDL: &str = r#"
-CREATE TABLE IF NOT EXISTS traffic_stats_1m (
+/// Per-family typed, STRICT table+index templates. All three roll-up tiers
+/// (`_1m`/`_1h`/`_1d`) are byte-identical bar the suffix, so [`apply`] builds
+/// the nine tables and nine indexes by substituting `{sfx}` per tier rather
+/// than spelling each out. `1h`/`1d` tables are written by compaction (via
+/// `write_rows`); `flush_window` only ever inserts into the `1m` tables.
+const STATS_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS traffic_stats_{sfx} (
     bucket          INTEGER NOT NULL,
     app             TEXT    NOT NULL,
     host            TEXT    NOT NULL,
@@ -55,40 +57,11 @@ CREATE TABLE IF NOT EXISTS traffic_stats_1m (
     uniques_hll     BLOB    NOT NULL,
     PRIMARY KEY (bucket, app, host)
 ) STRICT;
+CREATE INDEX IF NOT EXISTS idx_ts_{sfx}_app_bucket ON traffic_stats_{sfx} (app, bucket);
+";
 
-CREATE TABLE IF NOT EXISTS traffic_stats_1h (
-    bucket          INTEGER NOT NULL,
-    app             TEXT    NOT NULL,
-    host            TEXT    NOT NULL,
-    requests        INTEGER NOT NULL,
-    bytes_in        INTEGER NOT NULL,
-    bytes_out       INTEGER NOT NULL,
-    s2xx            INTEGER NOT NULL,
-    s3xx            INTEGER NOT NULL,
-    s4xx            INTEGER NOT NULL,
-    s5xx            INTEGER NOT NULL,
-    latency_tdigest BLOB    NOT NULL,
-    uniques_hll     BLOB    NOT NULL,
-    PRIMARY KEY (bucket, app, host)
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS traffic_stats_1d (
-    bucket          INTEGER NOT NULL,
-    app             TEXT    NOT NULL,
-    host            TEXT    NOT NULL,
-    requests        INTEGER NOT NULL,
-    bytes_in        INTEGER NOT NULL,
-    bytes_out       INTEGER NOT NULL,
-    s2xx            INTEGER NOT NULL,
-    s3xx            INTEGER NOT NULL,
-    s4xx            INTEGER NOT NULL,
-    s5xx            INTEGER NOT NULL,
-    latency_tdigest BLOB    NOT NULL,
-    uniques_hll     BLOB    NOT NULL,
-    PRIMARY KEY (bucket, app, host)
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS traffic_paths_1m (
+const PATHS_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS traffic_paths_{sfx} (
     bucket          INTEGER NOT NULL,
     app             TEXT    NOT NULL,
     path            TEXT    NOT NULL,
@@ -97,28 +70,11 @@ CREATE TABLE IF NOT EXISTS traffic_paths_1m (
     latency_tdigest BLOB    NOT NULL,
     PRIMARY KEY (bucket, app, path)
 ) STRICT;
+CREATE INDEX IF NOT EXISTS idx_tp_{sfx}_app_bucket ON traffic_paths_{sfx} (app, bucket);
+";
 
-CREATE TABLE IF NOT EXISTS traffic_paths_1h (
-    bucket          INTEGER NOT NULL,
-    app             TEXT    NOT NULL,
-    path            TEXT    NOT NULL,
-    requests        INTEGER NOT NULL,
-    bytes_out       INTEGER NOT NULL,
-    latency_tdigest BLOB    NOT NULL,
-    PRIMARY KEY (bucket, app, path)
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS traffic_paths_1d (
-    bucket          INTEGER NOT NULL,
-    app             TEXT    NOT NULL,
-    path            TEXT    NOT NULL,
-    requests        INTEGER NOT NULL,
-    bytes_out       INTEGER NOT NULL,
-    latency_tdigest BLOB    NOT NULL,
-    PRIMARY KEY (bucket, app, path)
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS traffic_breakdown_1m (
+const BREAKDOWN_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS traffic_breakdown_{sfx} (
     bucket    INTEGER NOT NULL,
     app       TEXT    NOT NULL,
     dimension TEXT    NOT NULL,
@@ -127,40 +83,18 @@ CREATE TABLE IF NOT EXISTS traffic_breakdown_1m (
     bytes_out INTEGER NOT NULL,
     PRIMARY KEY (bucket, app, dimension, value)
 ) STRICT;
-
-CREATE TABLE IF NOT EXISTS traffic_breakdown_1h (
-    bucket    INTEGER NOT NULL,
-    app       TEXT    NOT NULL,
-    dimension TEXT    NOT NULL,
-    value     TEXT    NOT NULL,
-    requests  INTEGER NOT NULL,
-    bytes_out INTEGER NOT NULL,
-    PRIMARY KEY (bucket, app, dimension, value)
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS traffic_breakdown_1d (
-    bucket    INTEGER NOT NULL,
-    app       TEXT    NOT NULL,
-    dimension TEXT    NOT NULL,
-    value     TEXT    NOT NULL,
-    requests  INTEGER NOT NULL,
-    bytes_out INTEGER NOT NULL,
-    PRIMARY KEY (bucket, app, dimension, value)
-) STRICT;
-
-CREATE INDEX IF NOT EXISTS idx_ts_1m_app_bucket ON traffic_stats_1m     (app, bucket);
-CREATE INDEX IF NOT EXISTS idx_ts_1h_app_bucket ON traffic_stats_1h     (app, bucket);
-CREATE INDEX IF NOT EXISTS idx_ts_1d_app_bucket ON traffic_stats_1d     (app, bucket);
-CREATE INDEX IF NOT EXISTS idx_tp_1m_app_bucket ON traffic_paths_1m     (app, bucket);
-CREATE INDEX IF NOT EXISTS idx_tp_1h_app_bucket ON traffic_paths_1h     (app, bucket);
-CREATE INDEX IF NOT EXISTS idx_tp_1d_app_bucket ON traffic_paths_1d     (app, bucket);
-CREATE INDEX IF NOT EXISTS idx_tb_1m_app_bucket ON traffic_breakdown_1m (app, bucket, dimension);
-CREATE INDEX IF NOT EXISTS idx_tb_1h_app_bucket ON traffic_breakdown_1h (app, bucket, dimension);
-CREATE INDEX IF NOT EXISTS idx_tb_1d_app_bucket ON traffic_breakdown_1d (app, bucket, dimension);
-"#;
+CREATE INDEX IF NOT EXISTS idx_tb_{sfx}_app_bucket ON traffic_breakdown_{sfx} (app, bucket, dimension);
+";
 
 pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(DDL)
+    let mut ddl = String::new();
+    for tier in [Tier::M1, Tier::H1, Tier::D1] {
+        let sfx = suffix(tier);
+        for template in [STATS_SCHEMA, PATHS_SCHEMA, BREAKDOWN_SCHEMA] {
+            ddl.push_str(&template.replace("{sfx}", sfx));
+        }
+    }
+    conn.execute_batch(&ddl)
 }
 
 /// Roll-up tier; maps to the `_1m`/`_1h`/`_1d` table-name suffix.
@@ -413,60 +347,30 @@ impl AnalyticsStore {
         })
     }
 
-    /// Rolls one coarse bucket up a tier, atomically.
+    /// Rolls one coarse bucket up a tier, atomically. In a single transaction
+    /// on the *writer* connection: read every `from_tier` row in
+    /// `[from_bucket, to_bucket)` and whatever the `to_tier` bucket already
+    /// holds, hand both to `merge(finer, coarse)` (the sketch-aware roll-up
+    /// that must live in the `traffic` crate to avoid a dependency cycle),
+    /// replace the destination window with the result, and delete the consumed
+    /// finer rows. Returns the coarse rows written (0 for an empty window,
+    /// which is left unread and untouched).
     ///
-    /// Inside a single transaction on the *writer* connection (so no other
-    /// writer — another compaction pass, the minute flush, retention — can
-    /// interleave):
+    /// The merge is a *recompute, not an increment*, and the destination's
+    /// current state is fed back in: a late finer row can arrive after its
+    /// coarse bucket was already rolled up, and since the sketch columns
+    /// *replace* on conflict (see [`insert_rows`]), handing `merge` only that
+    /// row would silently overwrite the bucket's real latency/HLL distribution.
+    /// Recompute + wholesale replace keeps both counters and sketches correct.
     ///
-    /// 1. reads every `from_tier` row whose bucket is in `[from_bucket,
-    ///    to_bucket)`, across all three tables and all apps;
-    /// 2. reads the `to_tier` rows in the *same* window — whatever an earlier
-    ///    pass already left in the destination bucket;
-    /// 3. hands both to `merge(finer, coarse)`, which is the `traffic`
-    ///    crate's sketch-aware roll-up (the one step that cannot live in this
-    ///    crate without a dependency cycle) and which returns the *complete*
-    ///    new content of the destination window;
-    /// 4. deletes the destination window and writes the merged rows in its
-    ///    place;
-    /// 5. deletes the consumed `from_tier` rows in the same window;
-    /// 6. commits.
+    /// The single transaction is load-bearing: any failure rolls back *both*
+    /// the write and the delete, so the retry re-reads the same finer rows and
+    /// redoes the roll-up instead of double-counting. Reading inside the
+    /// transaction closes the lost-update window between the `1m → 1h` writer
+    /// and the `1h → 1d` reader of the `1h` tier (independent tickers).
     ///
-    /// Returns the number of coarser rows written (0 if the window held no
-    /// finer rows at all, in which case the destination is not even read and
-    /// nothing is written or deleted).
-    ///
-    /// **The merge is a recompute, not an increment.** Step 2 is what makes a
-    /// second pass over an already-compacted bucket safe. A finer row can
-    /// legitimately arrive after its coarse bucket was rolled up — the last
-    /// minute of hour `H` is flushed at `H+1h`, exactly when the hourly sweep
-    /// becomes eligible — and the next sweep then compacts bucket `H` a
-    /// second time. Handing `merge` only the one late row would produce a
-    /// coarse row describing only that row; because the sketch columns
-    /// *replace* on conflict (see [`insert_rows`]), that fragment would
-    /// silently overwrite the hour's real latency distribution and HLL while
-    /// the summed counters stayed plausible. Feeding the destination's
-    /// current state back in instead makes the callback's output the full
-    /// picture, so replacing the window wholesale is correct — and it is a
-    /// wholesale replace, not an upsert, so the counters are not added on top
-    /// of themselves and a value the re-cap demotes into `__other__` does not
-    /// linger as a stale row.
-    ///
-    /// The atomicity is the point: a crash, or a failure on any one of the
-    /// statements, leaves *both* the write and the delete undone, so the
-    /// next sweep re-reads exactly the same finer rows and redoes the same
-    /// roll-up. Without it, a crash between the write and the delete would
-    /// leave the finer rows in place for the next sweep to add a second time
-    /// into a coarse row that already counted them.
-    ///
-    /// Reading inside the transaction (rather than through the read-only
-    /// connection beforehand) closes the matching lost-update window: the
-    /// `1h` tier is written by the `1m → 1h` pass *and* read-then-deleted by
-    /// the `1h → 1d` pass, and those two run off independent tickers.
-    ///
-    /// Callers are expected to pass a window that is aligned to (and no
-    /// wider than) one `to_tier` bucket, to only pass windows that are
-    /// already closed, and to pass two *distinct* tiers — see
+    /// Callers pass a window aligned to (and no wider than) one `to_tier`
+    /// bucket, already closed, with two *distinct* tiers — see
     /// `traffic::compaction`.
     pub fn compact_window<F>(
         &self,
@@ -563,28 +467,13 @@ impl AnalyticsStore {
     ) -> Result<Vec<StatsRow>, StoreError> {
         self.with_reader(|c| {
             let sql = format!(
-                "SELECT bucket, app, host, requests, bytes_in, bytes_out, s2xx, s3xx, s4xx, s5xx, latency_tdigest, uniques_hll
-                 FROM traffic_stats_{} WHERE app = ?1 AND bucket >= ?2 AND bucket < ?3 ORDER BY bucket",
+                "SELECT {STATS_COLS} FROM traffic_stats_{} \
+                 WHERE app = ?1 AND bucket >= ?2 AND bucket < ?3 ORDER BY bucket",
                 suffix(tier)
             );
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
-                .query_map((app, from, to), |r| {
-                    Ok(StatsRow {
-                        bucket: r.get(0)?,
-                        app: r.get(1)?,
-                        host: r.get(2)?,
-                        requests: r.get(3)?,
-                        bytes_in: r.get(4)?,
-                        bytes_out: r.get(5)?,
-                        s2xx: r.get(6)?,
-                        s3xx: r.get(7)?,
-                        s4xx: r.get(8)?,
-                        s5xx: r.get(9)?,
-                        latency_tdigest: r.get(10)?,
-                        uniques_hll: r.get(11)?,
-                    })
-                })?
+                .query_map((app, from, to), map_stats_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -600,23 +489,13 @@ impl AnalyticsStore {
     ) -> Result<Vec<PathRow>, StoreError> {
         self.with_reader(|c| {
             let sql = format!(
-                "SELECT bucket, app, path, requests, bytes_out, latency_tdigest
-                 FROM traffic_paths_{} WHERE app = ?1 AND bucket >= ?2 AND bucket < ?3
-                 ORDER BY bucket LIMIT ?4",
+                "SELECT {PATHS_COLS} FROM traffic_paths_{} \
+                 WHERE app = ?1 AND bucket >= ?2 AND bucket < ?3 ORDER BY bucket LIMIT ?4",
                 suffix(tier)
             );
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
-                .query_map((app, from, to, limit as i64), |r| {
-                    Ok(PathRow {
-                        bucket: r.get(0)?,
-                        app: r.get(1)?,
-                        path: r.get(2)?,
-                        requests: r.get(3)?,
-                        bytes_out: r.get(4)?,
-                        latency_tdigest: r.get(5)?,
-                    })
-                })?
+                .query_map((app, from, to, limit as i64), map_path_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -633,23 +512,14 @@ impl AnalyticsStore {
     ) -> Result<Vec<BreakdownRow>, StoreError> {
         self.with_reader(|c| {
             let sql = format!(
-                "SELECT bucket, app, dimension, value, requests, bytes_out
-                 FROM traffic_breakdown_{} WHERE app = ?1 AND bucket >= ?2 AND bucket < ?3 AND dimension = ?4
+                "SELECT {BREAKDOWN_COLS} FROM traffic_breakdown_{} \
+                 WHERE app = ?1 AND bucket >= ?2 AND bucket < ?3 AND dimension = ?4 \
                  ORDER BY requests DESC LIMIT ?5",
                 suffix(tier)
             );
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
-                .query_map((app, from, to, dim, limit as i64), |r| {
-                    Ok(BreakdownRow {
-                        bucket: r.get(0)?,
-                        app: r.get(1)?,
-                        dimension: r.get(2)?,
-                        value: r.get(3)?,
-                        requests: r.get(4)?,
-                        bytes_out: r.get(5)?,
-                    })
-                })?
+                .query_map((app, from, to, dim, limit as i64), map_breakdown_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -691,30 +561,14 @@ impl AnalyticsStore {
         self.with_reader(|c| select_breakdown(c, tier, from, to))
     }
 
-    /// Deletes `tier` stats rows strictly older than `cutoff`; returns the
-    /// number of rows removed.
-    pub fn delete_stats_before(&self, tier: Tier, cutoff: i64) -> Result<usize, StoreError> {
-        self.delete_table_before("traffic_stats", tier, cutoff)
-    }
-
-    /// Deletes `tier` path rows strictly older than `cutoff`; returns the
-    /// number of rows removed.
-    pub fn delete_paths_before(&self, tier: Tier, cutoff: i64) -> Result<usize, StoreError> {
-        self.delete_table_before("traffic_paths", tier, cutoff)
-    }
-
-    /// Deletes `tier` breakdown rows strictly older than `cutoff`; returns
-    /// the number of rows removed.
-    pub fn delete_breakdown_before(&self, tier: Tier, cutoff: i64) -> Result<usize, StoreError> {
-        self.delete_table_before("traffic_breakdown", tier, cutoff)
-    }
-
     /// Deletes every `tier` row (stats + paths + breakdown) strictly older
     /// than `cutoff`; returns the total number of rows removed.
     pub fn delete_before(&self, tier: Tier, cutoff: i64) -> Result<usize, StoreError> {
-        Ok(self.delete_stats_before(tier, cutoff)?
-            + self.delete_paths_before(tier, cutoff)?
-            + self.delete_breakdown_before(tier, cutoff)?)
+        let mut total = 0;
+        for table in ["traffic_stats", "traffic_paths", "traffic_breakdown"] {
+            total += self.delete_table_before(table, tier, cutoff)?;
+        }
+        Ok(total)
     }
 
     /// Applies the per-tier retention windows (spec defaults: 48h / 30d /
@@ -799,24 +653,17 @@ impl AnalyticsStore {
 /// Upserts a batch into `tier`'s three tables on an existing connection (in
 /// practice a `Transaction`, which derefs to `Connection`). Shared by
 /// [`AnalyticsStore::write_rows`] and [`AnalyticsStore::compact_window`] so
-/// the minute flush and compaction cannot drift apart on conflict
-/// resolution.
+/// the minute flush and compaction cannot drift apart on conflict resolution.
 ///
-/// Counters sum on conflict; sketch blobs are replaced. Both are safe here
-/// because every row that reaches this function contributes exactly once:
-/// the flush owns a minute window that is closed before it writes, and
-/// compaction clears the destination window and deletes the finer rows it
-/// consumed in the same transaction as the write, so its rows never collide
-/// with a previous pass's at all (see
-/// [`AnalyticsStore::compact_window`] — the merge it drives is a recompute
-/// of the whole coarse bucket, not an increment on top of it).
-///
-/// Summing is still the right conflict rule for the flush: a delayed flush
-/// landing on a `1m` bucket that was already written is genuinely new
-/// information, and adding it keeps the counters right, where replacing
-/// would throw the bucket's existing counters away. Replacing is the right
-/// rule for the sketches, since summing raw sketch bytes is meaningless —
-/// callers hand over an already-merged sketch for the whole key.
+/// On conflict, counters *sum* and sketch blobs *replace*. Summing is right
+/// for the flush (a delayed flush onto an already-written `1m` bucket is new
+/// information to add, not discard); replacing is right for sketches (summing
+/// raw sketch bytes is meaningless — callers hand over an already-merged
+/// sketch per key). Compaction never relies on either rule: it clears the
+/// destination window and deletes the finer rows it consumed in the same
+/// transaction, so its rows never collide with a previous pass's (see
+/// [`AnalyticsStore::compact_window`] — the merge it drives recomputes the
+/// whole coarse bucket rather than incrementing it).
 fn insert_rows(
     conn: &Connection,
     tier: Tier,
@@ -905,6 +752,54 @@ fn insert_rows(
     Ok(())
 }
 
+// Column lists and row-mapping fns are shared between the app-filtered range
+// queries ([`AnalyticsStore::stats_range`] et al.) and the unfiltered
+// connection-scoped selects below, so a schema column can only be read one
+// way. The `?N` order in every SELECT must match the `r.get(N)` order here.
+const STATS_COLS: &str =
+    "bucket, app, host, requests, bytes_in, bytes_out, s2xx, s3xx, s4xx, s5xx, latency_tdigest, uniques_hll";
+const PATHS_COLS: &str = "bucket, app, path, requests, bytes_out, latency_tdigest";
+const BREAKDOWN_COLS: &str = "bucket, app, dimension, value, requests, bytes_out";
+
+fn map_stats_row(r: &rusqlite::Row) -> rusqlite::Result<StatsRow> {
+    Ok(StatsRow {
+        bucket: r.get(0)?,
+        app: r.get(1)?,
+        host: r.get(2)?,
+        requests: r.get(3)?,
+        bytes_in: r.get(4)?,
+        bytes_out: r.get(5)?,
+        s2xx: r.get(6)?,
+        s3xx: r.get(7)?,
+        s4xx: r.get(8)?,
+        s5xx: r.get(9)?,
+        latency_tdigest: r.get(10)?,
+        uniques_hll: r.get(11)?,
+    })
+}
+
+fn map_path_row(r: &rusqlite::Row) -> rusqlite::Result<PathRow> {
+    Ok(PathRow {
+        bucket: r.get(0)?,
+        app: r.get(1)?,
+        path: r.get(2)?,
+        requests: r.get(3)?,
+        bytes_out: r.get(4)?,
+        latency_tdigest: r.get(5)?,
+    })
+}
+
+fn map_breakdown_row(r: &rusqlite::Row) -> rusqlite::Result<BreakdownRow> {
+    Ok(BreakdownRow {
+        bucket: r.get(0)?,
+        app: r.get(1)?,
+        dimension: r.get(2)?,
+        value: r.get(3)?,
+        requests: r.get(4)?,
+        bytes_out: r.get(5)?,
+    })
+}
+
 /// `tier` stats rows in the half-open bucket window `[from, to)`, all apps.
 /// Connection-scoped so the same query can run on the read-only connection
 /// ([`AnalyticsStore::stats_rows_between`]) or inside a writer transaction
@@ -916,28 +811,13 @@ fn select_stats(
     to: i64,
 ) -> Result<Vec<StatsRow>, StoreError> {
     let sql = format!(
-        "SELECT bucket, app, host, requests, bytes_in, bytes_out, s2xx, s3xx, s4xx, s5xx, latency_tdigest, uniques_hll
-         FROM traffic_stats_{} WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
+        "SELECT {STATS_COLS} FROM traffic_stats_{} \
+         WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
         suffix(tier)
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
-        .query_map((from, to), |r| {
-            Ok(StatsRow {
-                bucket: r.get(0)?,
-                app: r.get(1)?,
-                host: r.get(2)?,
-                requests: r.get(3)?,
-                bytes_in: r.get(4)?,
-                bytes_out: r.get(5)?,
-                s2xx: r.get(6)?,
-                s3xx: r.get(7)?,
-                s4xx: r.get(8)?,
-                s5xx: r.get(9)?,
-                latency_tdigest: r.get(10)?,
-                uniques_hll: r.get(11)?,
-            })
-        })?
+        .query_map((from, to), map_stats_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -950,22 +830,13 @@ fn select_paths(
     to: i64,
 ) -> Result<Vec<PathRow>, StoreError> {
     let sql = format!(
-        "SELECT bucket, app, path, requests, bytes_out, latency_tdigest
-         FROM traffic_paths_{} WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
+        "SELECT {PATHS_COLS} FROM traffic_paths_{} \
+         WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
         suffix(tier)
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
-        .query_map((from, to), |r| {
-            Ok(PathRow {
-                bucket: r.get(0)?,
-                app: r.get(1)?,
-                path: r.get(2)?,
-                requests: r.get(3)?,
-                bytes_out: r.get(4)?,
-                latency_tdigest: r.get(5)?,
-            })
-        })?
+        .query_map((from, to), map_path_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -978,22 +849,13 @@ fn select_breakdown(
     to: i64,
 ) -> Result<Vec<BreakdownRow>, StoreError> {
     let sql = format!(
-        "SELECT bucket, app, dimension, value, requests, bytes_out
-         FROM traffic_breakdown_{} WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
+        "SELECT {BREAKDOWN_COLS} FROM traffic_breakdown_{} \
+         WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket",
         suffix(tier)
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
-        .query_map((from, to), |r| {
-            Ok(BreakdownRow {
-                bucket: r.get(0)?,
-                app: r.get(1)?,
-                dimension: r.get(2)?,
-                value: r.get(3)?,
-                requests: r.get(4)?,
-                bytes_out: r.get(5)?,
-            })
-        })?
+        .query_map((from, to), map_breakdown_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -1078,20 +940,7 @@ mod tests {
     #[test]
     fn flush_and_read_back() {
         let s = AnalyticsStore::open_in_memory().unwrap();
-        let stats = vec![StatsRow {
-            bucket: 60_000,
-            app: "a".into(),
-            host: "h".into(),
-            requests: 5,
-            bytes_in: 100,
-            bytes_out: 200,
-            s2xx: 5,
-            s3xx: 0,
-            s4xx: 0,
-            s5xx: 0,
-            latency_tdigest: vec![1, 2],
-            uniques_hll: vec![3, 4],
-        }];
+        let stats = vec![stats_row(60_000, "a", "h", 5, vec![1, 2], vec![3, 4])];
         s.flush_window(&stats, &[], &[]).unwrap();
         let got = s.stats_range(Tier::M1, "a", 0, 120_000).unwrap();
         assert_eq!(got.len(), 1);
@@ -1405,9 +1254,11 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(s.delete_stats_before(Tier::M1, 200).unwrap(), 1);
-        assert_eq!(s.delete_paths_before(Tier::M1, 200).unwrap(), 1);
-        assert_eq!(s.delete_breakdown_before(Tier::M1, 200).unwrap(), 1);
+        assert_eq!(
+            s.delete_before(Tier::M1, 200).unwrap(),
+            3,
+            "one row per table (stats + paths + breakdown), all in the 1m tier"
+        );
 
         assert!(
             s.stats_rows_between(Tier::M1, i64::MIN, i64::MAX)
@@ -1742,22 +1593,8 @@ mod tests {
     #[test]
     fn paths_and_breakdown_flush_and_range() {
         let s = AnalyticsStore::open_in_memory().unwrap();
-        let paths = vec![PathRow {
-            bucket: 60_000,
-            app: "a".into(),
-            path: "/x".into(),
-            requests: 2,
-            bytes_out: 50,
-            latency_tdigest: vec![1],
-        }];
-        let breakdown = vec![BreakdownRow {
-            bucket: 60_000,
-            app: "a".into(),
-            dimension: "country".into(),
-            value: "US".into(),
-            requests: 2,
-            bytes_out: 50,
-        }];
+        let paths = vec![path_row(60_000, "a", "/x", 2)];
+        let breakdown = vec![breakdown_row(60_000, "a", "country", "US", 2)];
         s.flush_window(&[], &paths, &breakdown).unwrap();
 
         let got_paths = s.paths_range(Tier::M1, "a", 0, 120_000, 10).unwrap();
