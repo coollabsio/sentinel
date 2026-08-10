@@ -7,6 +7,17 @@ use tokio::sync::{Mutex, Semaphore, watch};
 
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Ceiling on the whole GeoIP bootstrap, across every candidate source.
+///
+/// `GeoIp::bootstrap` walks up to three sources with a 180s timeout each, so
+/// on its own it can block startup for ~9 minutes on a host with restricted
+/// outbound network — during which the access-log tailer has not opened yet
+/// and, because it seeks to EOF, every line written in the meantime is lost.
+/// A minute is comfortable for a healthy network and cheap to lose otherwise:
+/// country enrichment simply stays off until the periodic refresh retries.
+#[cfg(feature = "traffic")]
+const GEOIP_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn unexpected_service_exit(
     result: Option<Result<Result<(), String>, tokio::task::JoinError>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -320,13 +331,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Country enrichment is optional: if every candidate source is
         // unreachable the country breakdown is simply empty, which is not a
         // reason to run without traffic analytics altogether.
+        // The outer timeout is not redundant with `bootstrap`'s internal
+        // per-source one: it tries up to three candidates at 180s each, so a
+        // host with blackholed outbound network can sit here for ~9 minutes.
+        // That blocks `TrafficService::build`, and the tailer seeks to EOF
+        // when it finally opens — every log line written during the stall is
+        // lost. Bound the whole bootstrap instead, and treat exhausting it
+        // exactly like a bootstrap error: no country enrichment, everything
+        // else runs.
         let geoip = if config.traffic.geoip_enabled {
-            match traffic::geoip::GeoIp::bootstrap(&config.traffic, &db_dir).await {
-                Ok(geoip) => Some(geoip),
-                Err(e) => {
+            let bootstrap = traffic::geoip::GeoIp::bootstrap(&config.traffic, &db_dir);
+            match tokio::time::timeout(GEOIP_BOOTSTRAP_TIMEOUT, bootstrap).await {
+                Ok(Ok(geoip)) => Some(geoip),
+                Ok(Err(e)) => {
                     tracing::warn!(
                         error = %e,
                         "geoip bootstrap failed, continuing without country enrichment"
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = GEOIP_BOOTSTRAP_TIMEOUT.as_secs(),
+                        "geoip bootstrap timed out, continuing without country enrichment; \
+                         the next scheduled refresh will retry"
                     );
                     None
                 }

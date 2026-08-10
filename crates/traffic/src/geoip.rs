@@ -22,6 +22,7 @@
 //! Every refresh writes a *new* dated file and only removes the previous one
 //! after the new mapping is live; see the `SAFETY` note on [`GeoIp::install`].
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -50,6 +51,15 @@ const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 /// GeoLite2-City tarball) is well under 100 MiB.
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Refuse *decompressed* payloads larger than this.
+///
+/// [`MAX_DOWNLOAD_BYTES`] bounds only the compressed body, which says nothing
+/// about what it expands to — a hostile or compromised `GEOIP_DB_URL` can
+/// serve a few kilobytes that inflate to gigabytes and OOM the agent or fill
+/// its disk. Real GeoLite2/DB-IP *country* databases are a few MiB, so 64 MiB
+/// is a wide safety margin rather than an operational limit.
+const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+
 /// How the bytes at a source URL are packaged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Archive {
@@ -68,6 +78,42 @@ pub struct Source {
     pub url: String,
     /// How to unpack the response body.
     pub archive: Archive,
+}
+
+impl Source {
+    /// This source's URL with any credential masked — the *only* form that
+    /// may reach a log line or an error message. See [`redact_url`].
+    pub fn redacted_url(&self) -> Cow<'_, str> {
+        redact_url(&self.url)
+    }
+}
+
+/// Mask the value of a `license_key` query parameter.
+///
+/// [`maxmind_url`] embeds the operator's MaxMind credential directly in the
+/// download URL. That URL is logged on every successful load and refresh and
+/// is interpolated into every [`TrafficError::Download`] message, so without
+/// this the key ends up in `docker logs`, in whatever aggregator scrapes
+/// them, and in any support-bundle paste. URLs with no key (the jsDelivr
+/// mirror, DB-IP, a custom `GEOIP_DB_URL`) pass through untouched and
+/// unallocated.
+pub fn redact_url(url: &str) -> Cow<'_, str> {
+    const KEY: &str = "license_key=";
+
+    let Some(at) = url.find(KEY) else {
+        return Cow::Borrowed(url);
+    };
+    let value_start = at + KEY.len();
+    // The credential runs to the next parameter separator, or to the end.
+    let value_end = url[value_start..]
+        .find('&')
+        .map_or(url.len(), |i| value_start + i);
+
+    let mut out = String::with_capacity(url.len());
+    out.push_str(&url[..value_start]);
+    out.push_str("REDACTED");
+    out.push_str(&url[value_end..]);
+    Cow::Owned(out)
 }
 
 /// Build the ordered list of candidate sources for `cfg`. Callers try them in
@@ -148,24 +194,38 @@ fn reconcile_archive(archive: &Archive, bytes: &[u8]) -> Archive {
     }
 }
 
+/// Read `reader` to EOF, refusing anything past [`MAX_DECOMPRESSED_BYTES`].
+///
+/// Reads one byte past the limit precisely so hitting it can be distinguished
+/// from legitimately ending there: an over-long payload is a
+/// [`TrafficError::Decompress`], never a silent truncation that would hand a
+/// half-written `.mmdb` to the parser.
+fn read_bounded<R: Read>(reader: R, what: &str) -> Result<Vec<u8>, TrafficError> {
+    let mut out = Vec::new();
+    let read = reader
+        .take(MAX_DECOMPRESSED_BYTES + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| TrafficError::Decompress(format!("{what}: {e}")))? as u64;
+    if read > MAX_DECOMPRESSED_BYTES {
+        return Err(TrafficError::Decompress(format!(
+            "{what}: decompressed size exceeds {MAX_DECOMPRESSED_BYTES} bytes"
+        )));
+    }
+    Ok(out)
+}
+
 /// Unpack a downloaded body into raw `.mmdb` bytes.
 fn extract_mmdb(bytes: &[u8], archive: &Archive) -> Result<Vec<u8>, TrafficError> {
     match reconcile_archive(archive, bytes) {
         Archive::Raw => Ok(bytes.to_vec()),
-        Archive::Gz => {
-            let mut out = Vec::new();
-            GzDecoder::new(bytes)
-                .read_to_end(&mut out)
-                .map_err(|e| TrafficError::Decompress(format!("gunzip: {e}")))?;
-            Ok(out)
-        }
+        Archive::Gz => read_bounded(GzDecoder::new(bytes), "gunzip"),
         Archive::TarGz => {
             let mut tar = tar::Archive::new(GzDecoder::new(bytes));
             let entries = tar
                 .entries()
                 .map_err(|e| TrafficError::Decompress(format!("tar entries: {e}")))?;
             for entry in entries {
-                let mut entry =
+                let entry =
                     entry.map_err(|e| TrafficError::Decompress(format!("tar entry: {e}")))?;
                 let is_mmdb = entry
                     .path()
@@ -177,11 +237,7 @@ fn extract_mmdb(bytes: &[u8], archive: &Archive) -> Result<Vec<u8>, TrafficError
                 if !is_mmdb {
                     continue;
                 }
-                let mut out = Vec::new();
-                entry
-                    .read_to_end(&mut out)
-                    .map_err(|e| TrafficError::Decompress(format!("tar member: {e}")))?;
-                return Ok(out);
+                return read_bounded(entry, "tar member");
             }
             Err(TrafficError::Decompress(
                 "no .mmdb member in tar.gz".to_string(),
@@ -251,12 +307,12 @@ impl GeoIp {
                 Ok(Fetched::NotModified) => {
                     last_err = Some(TrafficError::Download(format!(
                         "{}: unexpected 304 without conditional request",
-                        source.url
+                        source.redacted_url()
                     )));
                     continue;
                 }
                 Err(e) => {
-                    tracing::debug!(url = %source.url, error = %e, "geoip source failed");
+                    tracing::debug!(url = %source.redacted_url(), error = %e, "geoip source failed");
                     last_err = Some(e);
                     continue;
                 }
@@ -264,7 +320,7 @@ impl GeoIp {
 
             match Self::install(&bytes, &source, db_dir) {
                 Ok((reader, path)) => {
-                    tracing::info!(url = %source.url, path = %path.display(), "geoip database loaded");
+                    tracing::info!(url = %source.redacted_url(), path = %path.display(), "geoip database loaded");
                     let geo = Arc::new(GeoIp {
                         db: ArcSwap::new(Arc::new(reader)),
                         meta: Mutex::new(Meta {
@@ -280,7 +336,7 @@ impl GeoIp {
                     return Ok(geo);
                 }
                 Err(e) => {
-                    tracing::debug!(url = %source.url, error = %e, "geoip source unusable");
+                    tracing::debug!(url = %source.redacted_url(), error = %e, "geoip source unusable");
                     last_err = Some(e);
                 }
             }
@@ -332,11 +388,11 @@ impl GeoIp {
                     last_modified,
                 }) => (bytes, etag, last_modified),
                 Ok(Fetched::NotModified) => {
-                    tracing::debug!(url = %source.url, "geoip database unchanged");
+                    tracing::debug!(url = %source.redacted_url(), "geoip database unchanged");
                     return Ok(false);
                 }
                 Err(e) => {
-                    tracing::debug!(url = %source.url, error = %e, "geoip refresh source failed");
+                    tracing::debug!(url = %source.redacted_url(), error = %e, "geoip refresh source failed");
                     last_err = Some(e);
                     continue;
                 }
@@ -345,7 +401,7 @@ impl GeoIp {
             let (reader, path) = match Self::install(&bytes, &source, db_dir) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::debug!(url = %source.url, error = %e, "geoip refresh source unusable");
+                    tracing::debug!(url = %source.redacted_url(), error = %e, "geoip refresh source unusable");
                     last_err = Some(e);
                     continue;
                 }
@@ -361,7 +417,7 @@ impl GeoIp {
                 meta.last_modified = new_lm;
                 meta.source_url = source.url.clone();
             }
-            tracing::info!(url = %source.url, path = %path.display(), "geoip database refreshed");
+            tracing::info!(url = %source.redacted_url(), path = %path.display(), "geoip database refreshed");
             // Only now: the superseded file is unlinked strictly after the new
             // one is mapped and published. Readers still holding the old
             // mapping are unaffected — unlinking a mapped file does not
@@ -394,7 +450,7 @@ impl GeoIp {
         let resp = req
             .send()
             .await
-            .map_err(|e| TrafficError::Download(format!("{}: {e}", source.url)))?;
+            .map_err(|e| TrafficError::Download(format!("{}: {e}", source.redacted_url())))?;
 
         if resp.status() == StatusCode::NOT_MODIFIED {
             return Ok(Fetched::NotModified);
@@ -402,7 +458,7 @@ impl GeoIp {
         if !resp.status().is_success() {
             return Err(TrafficError::Download(format!(
                 "{}: http {}",
-                source.url,
+                source.redacted_url(),
                 resp.status()
             )));
         }
@@ -411,7 +467,7 @@ impl GeoIp {
         {
             return Err(TrafficError::Download(format!(
                 "{}: content-length {len} exceeds {MAX_DOWNLOAD_BYTES}",
-                source.url
+                source.redacted_url()
             )));
         }
 
@@ -427,11 +483,11 @@ impl GeoIp {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| TrafficError::Download(format!("{}: body: {e}", source.url)))?;
+            .map_err(|e| TrafficError::Download(format!("{}: body: {e}", source.redacted_url())))?;
         if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
             return Err(TrafficError::Download(format!(
                 "{}: body of {} bytes exceeds {MAX_DOWNLOAD_BYTES}",
-                source.url,
+                source.redacted_url(),
                 bytes.len()
             )));
         }
@@ -618,6 +674,53 @@ mod tests {
         enc.finish().unwrap()
     }
 
+    /// The MaxMind URL carries the operator's credential in a query
+    /// parameter, and that URL is logged on every load/refresh and embedded in
+    /// every `TrafficError::Download`. Nothing but the redacted form may reach
+    /// a log line.
+    #[test]
+    fn redact_url_masks_a_maxmind_license_key() {
+        let url = maxmind_url("SUPERSECRET", "GeoLite2-Country");
+        let redacted = redact_url(&url);
+
+        assert!(
+            !redacted.contains("SUPERSECRET"),
+            "the credential leaked: {redacted}"
+        );
+        assert_eq!(
+            redacted,
+            "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=REDACTED&suffix=tar.gz",
+            "every other parameter must survive so the log stays diagnostic"
+        );
+
+        // A key in trailing position (no following `&`) is masked too.
+        assert_eq!(
+            redact_url("https://example.com/db?license_key=SUPERSECRET"),
+            "https://example.com/db?license_key=REDACTED"
+        );
+
+        // …and `Source` exposes only that form.
+        let source = Source {
+            url,
+            archive: Archive::TarGz,
+        };
+        assert!(!source.redacted_url().contains("SUPERSECRET"));
+    }
+
+    /// Key-less URLs — the mirror, DB-IP, a custom `GEOIP_DB_URL` — must be
+    /// untouched, and borrowed rather than needlessly re-allocated.
+    #[test]
+    fn redact_url_leaves_keyless_urls_alone() {
+        for url in [MIRROR_URL, &dbip_url(2026, 8), "https://example.com/x.mmdb"] {
+            let redacted = redact_url(url);
+            assert_eq!(redacted, url);
+            assert!(
+                matches!(redacted, Cow::Borrowed(_)),
+                "a URL with no credential should not allocate: {url}"
+            );
+        }
+    }
+
     #[test]
     fn maxmind_url_format() {
         assert_eq!(
@@ -727,6 +830,56 @@ mod tests {
     #[test]
     fn extract_raw_is_passthrough() {
         assert_eq!(extract_mmdb(b"abc", &Archive::Raw).unwrap(), b"abc");
+    }
+
+    /// `MAX_DOWNLOAD_BYTES` bounds the *compressed* body only. A gzip bomb —
+    /// a tiny body that expands to far more than the agent has memory for —
+    /// slips straight past it, so the decompressed side needs its own bound.
+    /// Zeroes compress to roughly nothing, which is the whole point.
+    #[test]
+    fn extract_gz_refuses_a_decompression_bomb() {
+        let bomb = gz(&vec![0u8; (MAX_DECOMPRESSED_BYTES + 4096) as usize]);
+        assert!(
+            (bomb.len() as u64) < MAX_DOWNLOAD_BYTES,
+            "the fixture must pass the compressed-size check to test the decompressed one"
+        );
+
+        let err = extract_mmdb(&bomb, &Archive::Gz).expect_err("a gzip bomb must be refused");
+
+        assert!(
+            matches!(err, TrafficError::Decompress(_)),
+            "must fail as a decompression error, not truncate silently: {err}"
+        );
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    /// A payload right at the limit is legitimate and must still be accepted —
+    /// the guard rejects, it does not merely truncate at the boundary.
+    #[test]
+    fn extract_gz_accepts_a_payload_exactly_at_the_limit() {
+        let original = vec![7u8; MAX_DECOMPRESSED_BYTES as usize];
+        let out = extract_mmdb(&gz(&original), &Archive::Gz).unwrap();
+        assert_eq!(out.len(), original.len());
+    }
+
+    /// The tar branch reads its member separately, so it needs the same guard:
+    /// a tar header can claim any size at all.
+    #[test]
+    fn extract_targz_refuses_an_oversized_member() {
+        let payload = vec![0u8; (MAX_DECOMPRESSED_BYTES + 4096) as usize];
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "x/GeoLite2-Country.mmdb", &payload[..])
+            .unwrap();
+        let archive = builder.into_inner().unwrap().finish().unwrap();
+
+        let err = extract_mmdb(&archive, &Archive::TarGz)
+            .expect_err("an oversized member must be refused");
+        assert!(matches!(err, TrafficError::Decompress(_)), "{err}");
     }
 
     #[test]
