@@ -22,9 +22,17 @@ ARG VERSION
 ENV SENTINEL_BUILD_VERSION=$VERSION
 # Build only the agent binary. Workspace also contains `sentinel-bench` (a
 # host-side harness from BENCHMARK.md) which must not ship in the image.
+#
+# `--features traffic` is required for the traffic-analytics subsystem to
+# exist in the shipped image at all: the workspace default is `default = []`,
+# so without it the binary has no traffic routes and no traffic service, and
+# setting `TRAFFIC_ENABLED=true` silently 404s every endpoint. Compiling it in
+# and leaving the runtime gate to `TRAFFIC_ENABLED` (default false) matches
+# how every other optional subsystem ships here — `STORAGE_ENABLED` and
+# friends are plain runtime booleans, always compiled in.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --locked -p sentinel && \
+    cargo build --release --locked -p sentinel --features traffic && \
     cp /app/target/release/sentinel /app/sentinel
 
 # Final stage

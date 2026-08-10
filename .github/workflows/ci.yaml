@@ -40,6 +40,21 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      # The default-feature steps above do build the `traffic` *crate* (it is a
+      # workspace member), but `crates/api/src/routes/traffic.rs` and the whole
+      # traffic-wiring block in `src/main.rs` sit behind the `api`/binary
+      # `traffic` feature and never compile without these steps — while the
+      # published Docker image is built with the feature on. Without them a
+      # refactor can break what actually ships while CI stays green.
+      - name: Clippy (traffic feature)
+        run: cargo clippy --workspace --all-targets --features traffic -- -D warnings
+
+      - name: Test (traffic feature)
+        run: cargo test --workspace --features traffic
+
+      - name: Build (traffic feature)
+        run: cargo build --release --locked --features traffic
+
       # Prebuilt-binary install (not `cargo install`) so this doesn't compile
       # cargo-audit from source on every run. Checks Cargo.lock against the
       # RustSec Advisory Database; fails the job on any known vulnerability.

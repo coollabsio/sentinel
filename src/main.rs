@@ -111,6 +111,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // database aside and starts fresh, so reaching this arm means something
     // like a permissions or disk problem — which CPU/memory collection has no
     // stake in and must not be killed by.
+    // Deliberately NOT inside `#[cfg(feature = "traffic")]`: this warning only
+    // exists for the build that lacks the feature. `config.traffic.enabled` is
+    // parsed unconditionally (`TrafficSettings` is not feature-gated), so an
+    // operator can set `TRAFFIC_ENABLED=true` on a stock binary and get total
+    // silence — no service, and a 404 from every traffic endpoint, with
+    // nothing in the log to explain why. Say so once, at startup.
+    if !cfg!(feature = "traffic") && config.traffic.enabled {
+        tracing::warn!(
+            "TRAFFIC_ENABLED=true but this binary was built without the `traffic` \
+             Cargo feature: no traffic will be collected and every /api/traffic \
+             endpoint will return 404. Rebuild with `cargo build --features traffic` \
+             (the published Docker images already do)."
+        );
+    }
+
     #[cfg(feature = "traffic")]
     let analytics: Option<store::traffic::AnalyticsStore> = if config.traffic.enabled {
         match store::traffic::AnalyticsStore::open(&config.traffic.analytics_file) {
