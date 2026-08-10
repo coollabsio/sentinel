@@ -135,11 +135,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Filled in once `GeoIp::bootstrap` resolves, well after the router below
     // is built and serving — see the traffic-analytics block near the bottom
-    // of this function for why that has to happen late. Created here,
-    // unconditionally, so `AppState` doesn't need `#[cfg(feature = "traffic")]`
-    // on this field (it holds a plain string, not a `traffic` crate type).
-    let geoip_attribution: Arc<std::sync::OnceLock<Option<String>>> =
-        Arc::new(std::sync::OnceLock::new());
+    // of this function for why that has to happen late. Re-published on every
+    // `GeoIp::refresh` swap thereafter, so it's an `RwLock`, not a write-once
+    // cell. Created here, unconditionally, so `AppState` doesn't need
+    // `#[cfg(feature = "traffic")]` on this field (it holds a plain string,
+    // not a `traffic` crate type).
+    let geoip_attribution: Arc<std::sync::RwLock<Option<String>>> =
+        Arc::new(std::sync::RwLock::new(None));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut services = tokio::task::JoinSet::new();
@@ -333,7 +335,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             && let Some(attribution) = geoip.attribution()
         {
             tracing::info!(attribution = %attribution, "geoip attribution");
-            let _ = geoip_attribution.set(Some(attribution));
+            *geoip_attribution.write().unwrap_or_else(|e| e.into_inner()) = Some(attribution);
         }
 
         // Ingest. A build failure here is nearly always "the access log isn't
@@ -434,6 +436,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let period = std::time::Duration::from_secs(
                 config.traffic.geoip_refresh_days as u64 * 24 * 60 * 60,
             );
+            let geoip_attribution = geoip_attribution.clone();
             let mut rx = shutdown_rx.clone();
             services.spawn(async move {
                 let mut ticker = tokio::time::interval(period);
@@ -450,7 +453,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             // and take the whole agent down over a failed
                             // background download.
                             match geoip.refresh(&settings, &db_dir).await {
-                                Ok(true) => tracing::info!("geoip database refreshed"),
+                                Ok(true) => {
+                                    tracing::info!("geoip database refreshed");
+                                    // A refresh can swap which source is
+                                    // active (e.g. the mirror recovering
+                                    // after having fallen back to DB-IP at
+                                    // boot, or vice versa), so republish
+                                    // attribution to match — otherwise the
+                                    // API would keep answering with whatever
+                                    // license string was true at startup.
+                                    let attribution = geoip.attribution();
+                                    *geoip_attribution
+                                        .write()
+                                        .unwrap_or_else(|e| e.into_inner()) = attribution;
+                                }
                                 Ok(false) => tracing::debug!("geoip database already current"),
                                 Err(e) => tracing::warn!(
                                     error = %e,

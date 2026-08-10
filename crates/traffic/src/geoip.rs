@@ -492,9 +492,9 @@ fn classify_attribution(source_url: &str) -> Option<String> {
     if source_url == MIRROR_URL || source_url.starts_with("https://cdn.jsdelivr.net/") {
         // The mirror redistributes MaxMind GeoLite2-Country data.
         Some(MAXMIND_ATTRIBUTION.to_string())
-    } else if source_url.starts_with("https://download.maxmind.com") {
+    } else if source_url.starts_with("https://download.maxmind.com/") {
         Some(MAXMIND_ATTRIBUTION.to_string())
-    } else if source_url.starts_with("https://download.db-ip.com") {
+    } else if source_url.starts_with("https://download.db-ip.com/") {
         Some(DBIP_ATTRIBUTION.to_string())
     } else {
         None

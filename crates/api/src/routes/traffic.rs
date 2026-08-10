@@ -238,7 +238,11 @@ async fn attribution(State(state): State<Arc<AppState>>) -> Response {
     if state.analytics.is_none() {
         return analytics_disabled();
     }
-    let attribution = state.geoip_attribution.get().cloned().flatten();
+    let attribution = state
+        .geoip_attribution
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     Json(TrafficAttribution { attribution }).into_response()
 }
 
@@ -665,7 +669,7 @@ mod tests {
                 crate::MAX_CONCURRENT_HISTORY_QUERIES,
             )),
             analytics,
-            geoip_attribution: Arc::new(std::sync::OnceLock::new()),
+            geoip_attribution: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -714,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn attribution_is_null_when_geoip_has_not_resolved_yet() {
-        // Mirrors real startup: the OnceLock is created empty and only ever
+        // Mirrors real startup: the cell is created empty and only ever
         // filled in once GeoIp::bootstrap succeeds, which can take a while
         // (or never happen, e.g. GEOIP_ENABLED=false).
         let (s, j) = get("/api/traffic/attribution").await;
@@ -725,16 +729,35 @@ mod tests {
     #[tokio::test]
     async fn attribution_reports_the_resolved_string() {
         let st = state(Some(seeded()));
-        st.geoip_attribution
-            .set(Some(
-                "IP Geolocation by DB-IP (https://db-ip.com)".to_string(),
-            ))
-            .unwrap();
+        *st.geoip_attribution.write().unwrap() =
+            Some("IP Geolocation by DB-IP (https://db-ip.com)".to_string());
         let (s, j) = get_with(st, "/api/traffic/attribution").await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(
             j["attribution"],
             "IP Geolocation by DB-IP (https://db-ip.com)"
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_reflects_a_later_source_swap_not_the_boot_value() {
+        // Regression test for the write-once `OnceLock` design: a GeoIP
+        // refresh can swap which source is active (mirror <-> DB-IP
+        // fallback) well after boot, and `AppState::geoip_attribution` must
+        // be re-writable so the endpoint tracks the *current* source rather
+        // than freezing whatever was true at startup. Writing twice with
+        // different values, as a real bootstrap-then-refresh-swap sequence
+        // would, proves the cell picks up the second write.
+        let st = state(Some(seeded()));
+        *st.geoip_attribution.write().unwrap() =
+            Some("This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com".to_string());
+        *st.geoip_attribution.write().unwrap() =
+            Some("IP Geolocation by DB-IP (https://db-ip.com)".to_string());
+        let (s, j) = get_with(st, "/api/traffic/attribution").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            j["attribution"], "IP Geolocation by DB-IP (https://db-ip.com)",
+            "the endpoint must report the latest write, not the first"
         );
     }
 

@@ -98,7 +98,7 @@ fn test_state() -> std::sync::Arc<api::AppState> {
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
         analytics: None,
-        geoip_attribution: std::sync::Arc::new(std::sync::OnceLock::new()),
+        geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     })
 }
 

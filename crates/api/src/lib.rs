@@ -67,16 +67,23 @@ pub struct AppState {
     /// in once `traffic::geoip::GeoIp::bootstrap` resolves — which happens
     /// well after the router is built, since the API must not wait on a
     /// network download to start answering requests. Deliberately typed as
-    /// `Arc<OnceLock<Option<String>>>` rather than holding the `GeoIp`
-    /// itself, so this crate doesn't need the optional `traffic` dependency
-    /// just to expose the one string an HTTP client actually wants.
+    /// a plain `Arc<RwLock<Option<String>>>` rather than holding the
+    /// `GeoIp` itself, so this field doesn't need `#[cfg(feature =
+    /// "traffic")]` gating — that would fracture `AppState`'s shape across
+    /// builds, same as `analytics` above.
     ///
-    /// Empty (`.get()` returns `None`) whenever traffic analytics or GeoIP
+    /// Re-writable, not write-once: `GeoIp::refresh` can swap which source
+    /// is active (the mirror can fail at boot and succeed on a later
+    /// refresh, or vice versa), and each swap must be republished here so
+    /// this stays in sync with `GeoIp`'s own `meta.source_url` rather than
+    /// freezing whatever was true at startup.
+    ///
+    /// Empty (`.read()` yields `None`) whenever traffic analytics or GeoIP
     /// is disabled, the build lacks the `traffic` feature, bootstrap hasn't
     /// completed yet, or the resolved source has no attribution obligation —
     /// all of which the `/api/traffic/attribution` endpoint reports the same
     /// way: `{"attribution": null}`.
-    pub geoip_attribution: Arc<std::sync::OnceLock<Option<String>>>,
+    pub geoip_attribution: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {

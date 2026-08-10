@@ -37,7 +37,7 @@ fn state() -> Arc<AppState> {
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
         analytics: None,
-        geoip_attribution: std::sync::Arc::new(std::sync::OnceLock::new()),
+        geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     })
 }
 
@@ -124,7 +124,7 @@ async fn distinct_punctuated_container_names_keep_separate_histories() {
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
         analytics: None,
-        geoip_attribution: std::sync::Arc::new(std::sync::OnceLock::new()),
+        geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     });
     for (name, expected) in [("postgres-db", "7.00"), ("postgres_db", "9.00")] {
         let res = router(st.clone())
@@ -198,7 +198,7 @@ async fn container_history_default_from_is_one_second_not_zero() {
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
         analytics: None,
-        geoip_attribution: std::sync::Arc::new(std::sync::OnceLock::new()),
+        geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     });
 
     let get_st = |uri: &'static str, st: Arc<AppState>| async move {
@@ -262,7 +262,7 @@ async fn stats_route_reports_row_counts_and_live_memory_when_debug() {
             api::MAX_CONCURRENT_HISTORY_QUERIES,
         )),
         analytics: None,
-        geoip_attribution: std::sync::Arc::new(std::sync::OnceLock::new()),
+        geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
     });
 
     let res = router(st)
