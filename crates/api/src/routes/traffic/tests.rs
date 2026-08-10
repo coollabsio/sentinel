@@ -221,7 +221,14 @@ async fn a_range_split_across_tiers_is_summed_not_dropped() {
     .unwrap();
     a.write_rows(
         Tier::H1,
-        &[stats(DAY_MS, "app-a", "h", 20, digest_bytes(&[1.0]), vec![])],
+        &[stats(
+            DAY_MS,
+            "app-a",
+            "h",
+            20,
+            digest_bytes(&[1.0]),
+            vec![],
+        )],
         &[],
         &[],
     )
