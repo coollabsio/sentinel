@@ -84,6 +84,10 @@ fn lines_per_tick(rate: usize, tick: Duration) -> usize {
     }
 }
 
+fn ingestion_wait_secs(configured: u64) -> u64 {
+    configured.max(70)
+}
+
 fn stress_factor(profile: AnalyticsStressProfile, elapsed: Duration, total: Duration) -> f64 {
     match profile {
         AnalyticsStressProfile::Mixed | AnalyticsStressProfile::Soak => 1.0,
@@ -98,6 +102,20 @@ fn stress_factor(profile: AnalyticsStressProfile, elapsed: Duration, total: Dura
             }
         }
     }
+}
+
+fn live_overview_path(now_ms: i64) -> String {
+    use time::format_description::well_known::Rfc3339;
+    use time::{Duration as TimeDuration, OffsetDateTime};
+    let now = OffsetDateTime::from_unix_timestamp_nanos(now_ms as i128 * 1_000_000)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    let from = (now - TimeDuration::minutes(59))
+        .format(&Rfc3339)
+        .unwrap_or_default();
+    let to = (now + TimeDuration::minutes(59))
+        .format(&Rfc3339)
+        .unwrap_or_default();
+    format!("/api/app/bench-app-0/traffic/overview?from={from}&to={to}")
 }
 
 fn percentile_ms(samples: &mut [Duration], pct: usize) -> f64 {
@@ -226,8 +244,12 @@ pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>>
 }
 
 async fn overview_requests(client: &Client, base: &str, token: &str) -> Option<u64> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
     client
-        .get(format!("{base}/api/app/bench-app-0/traffic/overview"))
+        .get(format!("{base}{}", live_overview_path(now_ms)))
         .bearer_auth(token)
         .send()
         .await
@@ -360,7 +382,8 @@ async fn run_live_stress(
     let written = written.load(Ordering::Relaxed);
     let mut samples = latencies.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let p99 = percentile_ms(&mut samples, 99);
-    let ingestion_deadline = Instant::now() + Duration::from_secs(opts.timeout_secs.max(5));
+    let ingestion_deadline =
+        Instant::now() + Duration::from_secs(ingestion_wait_secs(opts.timeout_secs));
     let mut observed = 0;
     while Instant::now() < ingestion_deadline {
         observed = overview_requests(&client, &base, &opts.token)
@@ -401,6 +424,13 @@ async fn run_end_to_end(
     path: &Path,
     lines: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(opts.timeout_secs))
+        .build()?;
+    let base = opts.base.trim_end_matches('/');
+    let baseline = overview_requests(&client, base, &opts.token)
+        .await
+        .unwrap_or(0);
     let started = Instant::now();
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     for line in lines {
@@ -408,22 +438,15 @@ async fn run_end_to_end(
     }
     file.flush()?;
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(opts.timeout_secs))
-        .build()?;
-    let base = opts.base.trim_end_matches('/');
-    let deadline = Instant::now() + Duration::from_secs(opts.timeout_secs.max(5));
+    let expected = baseline.saturating_add((lines.len() / opts.apps.max(1)) as u64);
+    let deadline = Instant::now() + Duration::from_secs(ingestion_wait_secs(opts.timeout_secs));
     loop {
-        let response = client
-            .get(format!("{base}/api/traffic/apps"))
-            .bearer_auth(&opts.token)
-            .send()
-            .await?;
-        if response.status().is_success() {
-            let apps: Vec<String> = response.json().await.unwrap_or_default();
-            if apps.iter().any(|a| a == "bench-app-0") {
-                break;
-            }
+        if overview_requests(&client, base, &opts.token)
+            .await
+            .unwrap_or(0)
+            >= expected
+        {
+            break;
         }
         if Instant::now() >= deadline {
             return Err("analytics ingestion was not visible before timeout".into());
@@ -531,5 +554,19 @@ mod tests {
             ),
             0.1
         );
+    }
+
+    #[test]
+    fn live_overview_uses_a_recent_range_that_reads_the_minute_tier() {
+        assert_eq!(
+            live_overview_path(3_600_000),
+            "/api/app/bench-app-0/traffic/overview?from=1970-01-01T00:01:00Z&to=1970-01-01T01:59:00Z"
+        );
+    }
+
+    #[test]
+    fn stress_wait_covers_the_minute_flush_boundary() {
+        assert_eq!(ingestion_wait_secs(5), 70);
+        assert_eq!(ingestion_wait_secs(90), 90);
     }
 }
