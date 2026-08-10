@@ -8,26 +8,30 @@ use serde::Deserialize;
 
 use crate::event::RequestEvent;
 
+use super::strip_query;
+
 /// Raw shape of the `request.headers` object in a Caddy access-log line.
 ///
 /// Caddy represents each header as an array of values; only the first value
 /// is used. Only the headers `RequestEvent` needs are declared here — serde's
 /// derived `Deserialize` silently ignores any other headers present in the
 /// real log line.
+///
+/// See [`Raw`] for why every string is a `Cow`, not a `&'a str`.
 #[derive(Debug, Deserialize)]
 struct Headers<'a> {
     #[serde(rename = "User-Agent", borrow, default)]
-    user_agent: Option<Vec<&'a str>>,
+    user_agent: Option<Vec<Cow<'a, str>>>,
     #[serde(rename = "Referer", borrow, default)]
-    referer: Option<Vec<&'a str>>,
+    referer: Option<Vec<Cow<'a, str>>>,
     #[serde(rename = "X-Forwarded-For", borrow, default)]
-    xff: Option<Vec<&'a str>>,
+    xff: Option<Vec<Cow<'a, str>>>,
     #[serde(rename = "Cf-Connecting-Ip", borrow, default)]
-    cf_connecting_ip: Option<Vec<&'a str>>,
+    cf_connecting_ip: Option<Vec<Cow<'a, str>>>,
     #[serde(rename = "Cf-Ipcountry", borrow, default)]
-    cf_country: Option<Vec<&'a str>>,
+    cf_country: Option<Vec<Cow<'a, str>>>,
     #[serde(rename = "Cf-Cache-Status", borrow, default)]
-    cf_cache_status: Option<Vec<&'a str>>,
+    cf_cache_status: Option<Vec<Cow<'a, str>>>,
 }
 
 /// Raw shape of the `request.tls` object in a Caddy access-log line.
@@ -40,15 +44,15 @@ struct Tls {
 #[derive(Debug, Deserialize)]
 struct Req<'a> {
     #[serde(borrow)]
-    method: &'a str,
+    method: Cow<'a, str>,
     #[serde(borrow)]
-    uri: &'a str,
+    uri: Cow<'a, str>,
     #[serde(borrow)]
-    host: &'a str,
+    host: Cow<'a, str>,
     #[serde(borrow)]
-    proto: &'a str,
+    proto: Cow<'a, str>,
     #[serde(borrow, default)]
-    remote_ip: Option<&'a str>,
+    remote_ip: Option<Cow<'a, str>>,
     #[serde(default)]
     tls: Option<Tls>,
     headers: Headers<'a>,
@@ -59,6 +63,14 @@ struct Req<'a> {
 /// Only the fields `RequestEvent` needs are declared here; serde's derived
 /// `Deserialize` silently ignores any other keys present in the real Caddy
 /// log line (e.g. `level`, `logger`, `msg`, `user_id`, `resp_headers`, ...).
+///
+/// Every string field is `Cow<'a, str>` rather than `&'a str` because
+/// `serde_json` cannot produce a borrowed `&str` for a JSON string that needs
+/// unescaping — and a `uri` query string, a `Referer` header, or any header
+/// value may legitimately contain `\"`, `\\` or a `\uXXXX` escape. With
+/// `&'a str` fields such a line fails to deserialize *as a whole* and the
+/// request is dropped silently; with `Cow` the common unescaped case still
+/// borrows and only the escaped minority allocates.
 #[derive(Debug, Deserialize)]
 struct Raw<'a> {
     ts: f64,
@@ -95,12 +107,7 @@ pub fn parse(line: &[u8]) -> Option<RequestEvent<'_>> {
     let ts_ms = (raw.ts * 1000.0) as i64;
     let duration_ms = raw.duration * 1000.0;
 
-    let path = raw
-        .request
-        .uri
-        .split_once('?')
-        .map(|(p, _)| p)
-        .unwrap_or(raw.request.uri);
+    let path = strip_query(raw.request.uri);
 
     let scheme = if raw.request.tls.is_some() {
         "https"
@@ -115,10 +122,12 @@ pub fn parse(line: &[u8]) -> Option<RequestEvent<'_>> {
         .and_then(|tls| tls_version_name(tls.version))
         .map(Cow::Borrowed);
 
+    let headers = raw.request.headers;
+
     Some(RequestEvent {
         ts_ms,
-        app: Cow::Borrowed(raw.request.host),
-        host: Cow::Borrowed(raw.request.host),
+        app: raw.request.host.clone(),
+        host: raw.request.host,
         method: raw.request.method,
         path,
         status: raw.status,
@@ -126,33 +135,25 @@ pub fn parse(line: &[u8]) -> Option<RequestEvent<'_>> {
         bytes_out: raw.size,
         duration_ms,
         protocol: raw.request.proto,
-        scheme,
+        scheme: Cow::Borrowed(scheme),
         tls_version,
         client_ip: raw.request.remote_ip,
-        xff: raw.request.headers.xff.and_then(|v| v.first().copied()),
-        user_agent: raw
-            .request
-            .headers
-            .user_agent
-            .and_then(|v| v.first().copied()),
-        referer: raw.request.headers.referer.and_then(|v| v.first().copied()),
-        cf_connecting_ip: raw
-            .request
-            .headers
-            .cf_connecting_ip
-            .and_then(|v| v.first().copied()),
-        cf_country: raw
-            .request
-            .headers
-            .cf_country
-            .and_then(|v| v.first().copied()),
-        cf_cache_status: raw
-            .request
-            .headers
-            .cf_cache_status
-            .and_then(|v| v.first().copied()),
+        xff: first_value(headers.xff),
+        user_agent: first_value(headers.user_agent),
+        referer: first_value(headers.referer),
+        cf_connecting_ip: first_value(headers.cf_connecting_ip),
+        cf_country: first_value(headers.cf_country),
+        cf_cache_status: first_value(headers.cf_cache_status),
         cf_verified_bot: None,
     })
+}
+
+/// Takes ownership of a header's first value, if it has one.
+///
+/// Consumes the `Vec` rather than borrowing from it, so an owned (unescaped)
+/// value survives past the end of `parse` instead of being tied to a local.
+fn first_value(values: Option<Vec<Cow<'_, str>>>) -> Option<Cow<'_, str>> {
+    values?.into_iter().next()
 }
 
 #[cfg(test)]
@@ -174,7 +175,7 @@ mod tests {
         assert!(ev.duration_ms > 0.0);
         assert_eq!(ev.path, "/api/status");
         assert_eq!(ev.status, 200);
-        assert_eq!(ev.cf_country, Some("DE"));
+        assert_eq!(ev.cf_country.as_deref(), Some("DE"));
         assert!((ev.duration_ms - 1.234).abs() < 0.001);
     }
 
@@ -190,6 +191,31 @@ mod tests {
         assert_eq!(ev.method, "POST");
         assert_eq!(ev.status, 500);
         assert_eq!(ev.path, "/webhook");
+    }
+
+    /// Same class of bug as the Traefik one: a `uri` or header value that
+    /// needs unescaping cannot fill a borrowed `&str`, so with `&'a str`
+    /// fields the whole line failed to deserialize and the request was
+    /// dropped. Caddy does not HTML-escape by default the way Go's
+    /// `encoding/json` does for logrus, but a quote or backslash anywhere in
+    /// a URI or `Referer` reaches the same failure.
+    #[test]
+    fn json_escaped_fields_still_parse_and_decode() {
+        let line = include_bytes!("../../tests/fixtures/caddy.jsonl")
+            .split(|b| *b == b'\n')
+            .nth(2)
+            .unwrap();
+
+        let ev = super::parse(line).expect("a JSON-escaped Caddy line must still parse");
+
+        assert_eq!(ev.path, "/search");
+        assert_eq!(ev.host, "app.example.com");
+        assert_eq!(
+            ev.referer.as_deref(),
+            Some(r#"https://ref.example.com/a?x=1&y=2 "quoted" back\slash"#),
+            "escapes must be decoded, not passed through verbatim"
+        );
+        assert_eq!(ev.status, 200);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::event::RequestEvent;
 
-use super::parse_app_uuid;
+use super::{parse_app_uuid, strip_query};
 
 /// Raw shape of a single Traefik JSON access-log line.
 ///
@@ -17,16 +17,27 @@ use super::parse_app_uuid;
 /// `Deserialize` silently ignores any other keys present in the real
 /// Traefik log line (e.g. `ClientAddr`, `OriginStatus`, `ServiceName`,
 /// `entryPointName`, `level`, `msg`, `time`, ...).
+///
+/// Every string field is `Cow<'a, str>` rather than `&'a str`, and that is
+/// required for correctness, not just ergonomics: `serde_json` can only
+/// populate a plain borrowed `&str` when the JSON string needs no unescaping.
+/// Traefik logs through `logrus.JSONFormatter`, which uses Go's
+/// `encoding/json` with HTML escaping on, so `&` in a `RequestPath` query
+/// string is written as `&` and any `"`/`\` in a header is written
+/// escaped. With `&'a str` fields, *deserialization of the entire struct*
+/// fails for those lines and the request is silently dropped — which is most
+/// requests carrying two or more query parameters. `Cow` keeps the zero-copy
+/// path for unescaped strings and allocates only for the rest.
 #[derive(Debug, Deserialize)]
 struct Raw<'a> {
     #[serde(rename = "StartUTC", borrow)]
-    start_utc: &'a str,
+    start_utc: Cow<'a, str>,
     #[serde(rename = "RequestMethod", borrow)]
-    request_method: &'a str,
+    request_method: Cow<'a, str>,
     #[serde(rename = "RequestPath", borrow)]
-    request_path: &'a str,
+    request_path: Cow<'a, str>,
     #[serde(rename = "RequestHost", borrow)]
-    request_host: &'a str,
+    request_host: Cow<'a, str>,
     #[serde(rename = "DownstreamStatus")]
     downstream_status: u16,
     #[serde(rename = "RequestContentSize", default)]
@@ -36,27 +47,27 @@ struct Raw<'a> {
     #[serde(rename = "Duration")]
     duration: i64,
     #[serde(rename = "RequestProtocol", borrow)]
-    request_protocol: &'a str,
+    request_protocol: Cow<'a, str>,
     #[serde(rename = "RequestScheme", borrow)]
-    request_scheme: &'a str,
+    request_scheme: Cow<'a, str>,
     #[serde(rename = "TLSVersion", borrow, default)]
-    tls_version: Option<&'a str>,
+    tls_version: Option<Cow<'a, str>>,
     #[serde(rename = "ClientHost", borrow, default)]
-    client_host: Option<&'a str>,
+    client_host: Option<Cow<'a, str>>,
     #[serde(rename = "RouterName", borrow)]
-    router_name: &'a str,
+    router_name: Cow<'a, str>,
     #[serde(rename = "request_User-Agent", borrow, default)]
-    user_agent: Option<&'a str>,
+    user_agent: Option<Cow<'a, str>>,
     #[serde(rename = "request_Referer", borrow, default)]
-    referer: Option<&'a str>,
+    referer: Option<Cow<'a, str>>,
     #[serde(rename = "request_X-Forwarded-For", borrow, default)]
-    xff: Option<&'a str>,
+    xff: Option<Cow<'a, str>>,
     #[serde(rename = "request_Cf-Connecting-Ip", borrow, default)]
-    cf_connecting_ip: Option<&'a str>,
+    cf_connecting_ip: Option<Cow<'a, str>>,
     #[serde(rename = "request_Cf-Ipcountry", borrow, default)]
-    cf_country: Option<&'a str>,
+    cf_country: Option<Cow<'a, str>>,
     #[serde(rename = "request_Cf-Cache-Status", borrow, default)]
-    cf_cache_status: Option<&'a str>,
+    cf_cache_status: Option<Cow<'a, str>>,
 }
 
 /// Parse a single Traefik JSON access-log line into a [`RequestEvent`].
@@ -70,21 +81,23 @@ struct Raw<'a> {
 pub fn parse(line: &[u8]) -> Option<RequestEvent<'_>> {
     let raw: Raw = serde_json::from_slice(line).ok()?;
 
-    let ts = OffsetDateTime::parse(raw.start_utc, &Rfc3339).ok()?;
+    let ts = OffsetDateTime::parse(&raw.start_utc, &Rfc3339).ok()?;
     let ts_ms = (ts.unix_timestamp_nanos() / 1_000_000) as i64;
 
-    let path = raw
-        .request_path
-        .split_once('?')
-        .map(|(p, _)| p)
-        .unwrap_or(raw.request_path);
+    let path = strip_query(raw.request_path);
 
-    let app = parse_app_uuid(raw.router_name)?;
+    // Keep the UUID borrowed from the source buffer when the router name was
+    // borrowable, and only copy the (short) UUID substring when serde had to
+    // unescape the router name into an owned `String` that dies with `raw`.
+    let app = match raw.router_name {
+        Cow::Borrowed(name) => Cow::Borrowed(parse_app_uuid(name)?),
+        Cow::Owned(ref name) => Cow::Owned(parse_app_uuid(name)?.to_string()),
+    };
 
     Some(RequestEvent {
         ts_ms,
-        app: Cow::Borrowed(app),
-        host: Cow::Borrowed(raw.request_host),
+        app,
+        host: raw.request_host,
         method: raw.request_method,
         path,
         status: raw.downstream_status,
@@ -93,7 +106,7 @@ pub fn parse(line: &[u8]) -> Option<RequestEvent<'_>> {
         duration_ms: raw.duration as f64 / 1_000_000.0,
         protocol: raw.request_protocol,
         scheme: raw.request_scheme,
-        tls_version: raw.tls_version.map(Cow::Borrowed),
+        tls_version: raw.tls_version,
         client_ip: raw.client_host,
         xff: raw.xff,
         user_agent: raw.user_agent,
@@ -118,7 +131,7 @@ mod tests {
         assert_eq!(ev.status, 200);
         assert_eq!(ev.app, "jc4wsgs"); // stripped from https-0-jc4wsgs@docker
         assert!((ev.duration_ms - 12.5).abs() < 0.01); // 12_500_000 ns
-        assert_eq!(ev.cf_country, Some("US"));
+        assert_eq!(ev.cf_country.as_deref(), Some("US"));
     }
 
     #[test]
@@ -149,6 +162,62 @@ mod tests {
     #[test]
     fn malformed_line_returns_none() {
         assert!(super::parse(b"not json").is_none());
+    }
+
+    /// Traefik logs via `logrus.JSONFormatter`, i.e. Go's `encoding/json`
+    /// with `SetEscapeHTML(true)`, which writes `&` as `&`. Any request
+    /// with two or more query parameters therefore has an *escaped*
+    /// `RequestPath`, and a `Referer` carrying UTM params (or a quote /
+    /// backslash) is escaped too.
+    ///
+    /// With `&'a str` fields on `Raw`, `serde_json` cannot borrow such a
+    /// string and fails to deserialize the *whole* struct — every one of
+    /// those requests used to vanish from analytics as a `dropped` line. The
+    /// fields are `Cow<'a, str>` precisely so this line parses.
+    #[test]
+    fn json_escaped_fields_still_parse_and_decode() {
+        let line = include_bytes!("../../tests/fixtures/traefik.jsonl")
+            .split(|b| *b == b'\n')
+            .nth(2)
+            .unwrap();
+
+        let ev = super::parse(line).expect("a JSON-escaped Traefik line must still parse");
+
+        // The query string is stripped, but only after `&` decoded to a
+        // real `&` — a failure to unescape would have dropped the line.
+        assert_eq!(ev.path, "/search");
+        assert_eq!(ev.app, "jc4wsgs");
+        assert_eq!(
+            ev.referer.as_deref(),
+            Some(r#"https://ref.example.com/a?x=1&y=2<b> "quoted" back\slash"#),
+            "escapes must be decoded, not passed through verbatim"
+        );
+        assert_eq!(ev.method, "GET");
+        assert_eq!(ev.status, 200);
+    }
+
+    /// Pins the *reason* the fields above must be `Cow`: proves that a
+    /// borrowed `&str` genuinely cannot be deserialized from the same line,
+    /// so the previous shape really did drop it. Without this, a future
+    /// "simplification" back to `&'a str` would look harmless.
+    #[test]
+    fn borrowed_str_cannot_deserialize_an_escaped_line() {
+        #[derive(serde::Deserialize)]
+        struct Borrowed<'a> {
+            #[serde(rename = "RequestPath", borrow)]
+            #[allow(dead_code)]
+            request_path: &'a str,
+        }
+
+        let line = include_bytes!("../../tests/fixtures/traefik.jsonl")
+            .split(|b| *b == b'\n')
+            .nth(2)
+            .unwrap();
+
+        assert!(
+            serde_json::from_slice::<Borrowed>(line).is_err(),
+            "an escaped JSON string cannot be borrowed; this is why Raw uses Cow"
+        );
     }
 
     #[test]

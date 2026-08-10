@@ -3,6 +3,16 @@
 use std::borrow::Cow;
 
 /// Represents a single HTTP request event with traffic analytics data.
+///
+/// Every string field is a [`Cow`], not a plain `&'a str`, and that is
+/// load-bearing rather than stylistic. `serde_json` can only fill a borrowed
+/// `&str` when the JSON string needs *no* unescaping — the moment a log line
+/// contains `&` (Go's `encoding/json`, and therefore Traefik's
+/// `logrus.JSONFormatter`, HTML-escapes `&` in every query string by
+/// default), `\"` or `\\`, deserializing into `&str` fails for the *whole*
+/// struct and the request would be dropped entirely. With `Cow` serde still
+/// borrows on the common unescaped fast path and only allocates for the
+/// lines that genuinely need decoding.
 pub struct RequestEvent<'a> {
     /// Timestamp in milliseconds since UNIX epoch.
     pub ts_ms: i64,
@@ -11,9 +21,9 @@ pub struct RequestEvent<'a> {
     /// Request host header.
     pub host: Cow<'a, str>,
     /// HTTP method (GET, POST, etc).
-    pub method: &'a str,
+    pub method: Cow<'a, str>,
     /// Request path with query string stripped.
-    pub path: &'a str,
+    pub path: Cow<'a, str>,
     /// HTTP status code.
     pub status: u16,
     /// Request body size in bytes.
@@ -23,27 +33,27 @@ pub struct RequestEvent<'a> {
     /// Request duration in milliseconds.
     pub duration_ms: f64,
     /// HTTP protocol version ("HTTP/1.1", "HTTP/2.0", "HTTP/3.0").
-    pub protocol: &'a str,
+    pub protocol: Cow<'a, str>,
     /// Scheme ("http" or "https").
-    pub scheme: &'a str,
+    pub scheme: Cow<'a, str>,
     /// TLS version if applicable (e.g. "1.3"), normalized.
     pub tls_version: Option<Cow<'a, str>>,
     /// Best real client IP (pre-CF precedence: raw connection IP).
-    pub client_ip: Option<&'a str>,
+    pub client_ip: Option<Cow<'a, str>>,
     /// X-Forwarded-For header raw value.
-    pub xff: Option<&'a str>,
+    pub xff: Option<Cow<'a, str>>,
     /// User-Agent header.
-    pub user_agent: Option<&'a str>,
+    pub user_agent: Option<Cow<'a, str>>,
     /// Referer header.
-    pub referer: Option<&'a str>,
+    pub referer: Option<Cow<'a, str>>,
     /// Cloudflare CF-Connecting-IP header.
-    pub cf_connecting_ip: Option<&'a str>,
+    pub cf_connecting_ip: Option<Cow<'a, str>>,
     /// Cloudflare CF-Country header.
-    pub cf_country: Option<&'a str>,
+    pub cf_country: Option<Cow<'a, str>>,
     /// Cloudflare CF-Cache-Status header.
-    pub cf_cache_status: Option<&'a str>,
+    pub cf_cache_status: Option<Cow<'a, str>>,
     /// Cloudflare CF-Verified-Bot header.
-    pub cf_verified_bot: Option<&'a str>,
+    pub cf_verified_bot: Option<Cow<'a, str>>,
 }
 
 /// HTTP status code class.

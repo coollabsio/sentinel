@@ -5,6 +5,8 @@
 pub mod caddy;
 pub mod traefik;
 
+use std::borrow::Cow;
+
 use crate::event::RequestEvent;
 
 /// Which reverse-proxy access-log format to parse.
@@ -60,6 +62,24 @@ pub fn parse_line(proxy: ProxyType, line: &[u8]) -> Option<RequestEvent<'_>> {
             ProxyType::Caddy => caddy::parse(line),
             ProxyType::Auto => None,
         },
+    }
+}
+
+/// Strip a URI's query string, keeping the value borrowed when it already was.
+///
+/// A `Cow` in / `Cow` out so neither branch allocates unnecessarily: a
+/// borrowed URI yields a borrowed sub-slice, and an owned one (produced when
+/// `serde_json` had to unescape the source string) is truncated in place
+/// rather than re-copied.
+pub(crate) fn strip_query(uri: Cow<'_, str>) -> Cow<'_, str> {
+    match uri {
+        Cow::Borrowed(s) => Cow::Borrowed(s.split_once('?').map_or(s, |(p, _)| p)),
+        Cow::Owned(mut s) => {
+            if let Some(i) = s.find('?') {
+                s.truncate(i);
+            }
+            Cow::Owned(s)
+        }
     }
 }
 

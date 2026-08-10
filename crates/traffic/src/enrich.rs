@@ -81,25 +81,31 @@ impl Enricher {
 
     /// Enrich `ev`, applying client-IP, country, UA, and bot precedence rules.
     pub fn enrich(&self, ev: &RequestEvent) -> Enriched {
-        let client_ip_str = ev
+        let client_ip_str: Option<&str> = ev
             .cf_connecting_ip
-            .or_else(|| ev.xff.and_then(|xff| xff.split(',').next().map(str::trim)))
-            .or(ev.client_ip);
+            .as_deref()
+            .or_else(|| {
+                ev.xff
+                    .as_deref()
+                    .and_then(|xff| xff.split(',').next().map(str::trim))
+            })
+            .or(ev.client_ip.as_deref());
         let client_ip: Option<IpAddr> = client_ip_str.and_then(|s| s.parse().ok());
 
         let country = ev
             .cf_country
+            .as_deref()
             .map(String::from)
             .or_else(|| client_ip.and_then(|ip| self.geo.country(ip)));
 
-        let ua = match ev.user_agent {
+        let ua = match ev.user_agent.as_deref() {
             Some(ua_str) => self.parse_ua_cached(ua_str),
             None => UaInfo::default(),
         };
 
         let bot = ev.cf_verified_bot.is_some() || ua.is_bot;
 
-        let cache = ev.cf_cache_status.map(String::from);
+        let cache = ev.cf_cache_status.as_deref().map(String::from);
 
         Enriched {
             country,
@@ -147,14 +153,14 @@ mod tests {
             ts_ms: 0,
             app: "".into(),
             host: "".into(),
-            method: "",
-            path: "",
+            method: "".into(),
+            path: "".into(),
             status: 0,
             bytes_in: 0,
             bytes_out: 0,
             duration_ms: 0.0,
-            protocol: "",
-            scheme: "",
+            protocol: "".into(),
+            scheme: "".into(),
             tls_version: None,
             client_ip: None,
             xff: None,
@@ -171,8 +177,8 @@ mod tests {
     fn cf_country_wins_over_geoip() {
         let enricher = Enricher::new(Arc::new(FakeGeo), 8);
         let mut ev = base_event();
-        ev.cf_country = Some("US");
-        ev.client_ip = Some("1.2.3.4");
+        ev.cf_country = Some("US".into());
+        ev.client_ip = Some("1.2.3.4".into());
 
         let result = enricher.enrich(&ev);
 
@@ -184,7 +190,7 @@ mod tests {
         let enricher = Enricher::new(Arc::new(FakeGeo), 8);
         let mut ev = base_event();
         ev.cf_country = None;
-        ev.client_ip = Some("1.2.3.4");
+        ev.client_ip = Some("1.2.3.4".into());
 
         let result = enricher.enrich(&ev);
 
@@ -197,9 +203,9 @@ mod tests {
 
         // cf_connecting_ip beats xff and client_ip.
         let mut ev = base_event();
-        ev.cf_connecting_ip = Some("10.0.0.1");
-        ev.xff = Some("10.0.0.2, 10.0.0.3");
-        ev.client_ip = Some("10.0.0.4");
+        ev.cf_connecting_ip = Some("10.0.0.1".into());
+        ev.xff = Some("10.0.0.2, 10.0.0.3".into());
+        ev.client_ip = Some("10.0.0.4".into());
         let result = enricher.enrich(&ev);
         assert_eq!(
             result.client_ip,
@@ -208,8 +214,8 @@ mod tests {
 
         // xff beats client_ip when cf_connecting_ip is absent.
         let mut ev = base_event();
-        ev.xff = Some("10.0.0.2, 10.0.0.3");
-        ev.client_ip = Some("10.0.0.4");
+        ev.xff = Some("10.0.0.2, 10.0.0.3".into());
+        ev.client_ip = Some("10.0.0.4".into());
         let result = enricher.enrich(&ev);
         assert_eq!(
             result.client_ip,
@@ -218,7 +224,7 @@ mod tests {
 
         // client_ip used when neither cf_connecting_ip nor xff present.
         let mut ev = base_event();
-        ev.client_ip = Some("10.0.0.4");
+        ev.client_ip = Some("10.0.0.4".into());
         let result = enricher.enrich(&ev);
         assert_eq!(
             result.client_ip,
@@ -231,7 +237,7 @@ mod tests {
         let enricher = Enricher::new(Arc::new(NoGeo), 8);
         let mut ev = base_event();
         ev.user_agent =
-            Some("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)");
+            Some("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)".into());
 
         let result = enricher.enrich(&ev);
 
@@ -243,7 +249,8 @@ mod tests {
         let enricher = Enricher::new(Arc::new(NoGeo), 8);
         let mut ev = base_event();
         ev.user_agent = Some(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                .into(),
         );
 
         let first = enricher.enrich(&ev);

@@ -109,7 +109,7 @@ impl Aggregator {
         self.paths
             .entry(app.clone())
             .or_default()
-            .add(ev.path, 1, ev.bytes_out);
+            .add(&ev.path, 1, ev.bytes_out);
         self.path_latency
             .entry((app.clone(), ev.path.to_string()))
             .or_default()
@@ -124,11 +124,17 @@ impl Aggregator {
             &status_str,
             ev.bytes_out,
         );
-        record_breakdown(&mut self.breakdown, &app, "method", ev.method, ev.bytes_out);
+        record_breakdown(
+            &mut self.breakdown,
+            &app,
+            "method",
+            &ev.method,
+            ev.bytes_out,
+        );
         if let Some(country) = &en.country {
             add_breakdown(&mut self.breakdown, &app, "country", country, ev.bytes_out);
         }
-        if let Some(referer) = ev.referer {
+        if let Some(referer) = ev.referer.as_deref() {
             add_breakdown(&mut self.breakdown, &app, "referer", referer, ev.bytes_out);
         }
         add_breakdown(
@@ -150,10 +156,16 @@ impl Aggregator {
             &mut self.breakdown,
             &app,
             "protocol",
-            ev.protocol,
+            &ev.protocol,
             ev.bytes_out,
         );
-        record_breakdown(&mut self.breakdown, &app, "scheme", ev.scheme, ev.bytes_out);
+        record_breakdown(
+            &mut self.breakdown,
+            &app,
+            "scheme",
+            &ev.scheme,
+            ev.bytes_out,
+        );
         if let Some(tls) = &ev.tls_version {
             add_breakdown(&mut self.breakdown, &app, "tls", tls, ev.bytes_out);
         }
@@ -305,14 +317,14 @@ mod tests {
             ts_ms: 0,
             app: "app-1".into(),
             host: "example.com".into(),
-            method: "GET",
-            path: "/",
+            method: "GET".into(),
+            path: "/".into(),
             status: 200,
             bytes_in: 0,
             bytes_out: 100,
             duration_ms: 10.0,
-            protocol: "HTTP/1.1",
-            scheme: "https",
+            protocol: "HTTP/1.1".into(),
+            scheme: "https".into(),
             tls_version: None,
             client_ip: None,
             xff: None,
@@ -417,11 +429,11 @@ mod tests {
         let en = base_enriched();
 
         let mut fast = base_event();
-        fast.path = "/fast";
+        fast.path = "/fast".into();
         fast.duration_ms = 5.0;
 
         let mut slow = base_event();
-        slow.path = "/slow";
+        slow.path = "/slow".into();
         slow.duration_ms = 500.0;
 
         for _ in 0..5 {
@@ -506,7 +518,7 @@ mod tests {
         let mut a = Aggregator::new(50);
         let en = base_enriched();
         let mut ev = base_event();
-        ev.method = "";
+        ev.method = "".into();
 
         a.record(&ev, &en);
 
