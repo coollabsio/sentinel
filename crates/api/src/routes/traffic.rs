@@ -34,6 +34,7 @@ use crate::types::{
     TrafficStatusBreakdown,
 };
 
+const MINUTE_MS: i64 = 60_000;
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
 
@@ -54,6 +55,15 @@ const DEFAULT_LIMIT: usize = 50;
 /// handler to materialize an unbounded result set.
 const MAX_LIMIT: usize = 1_000;
 
+/// Last-resort ceiling on the row budget computed by [`scan_budget`], purely
+/// as a memory backstop against a pathological span/top-N combination (an
+/// unbounded `from` at the `1d` tier with a huge `TRAFFIC_TOPN`, say). It is
+/// deliberately far above what any tier can legitimately emit for a sane
+/// configuration — the budget is meant to be governed by [`scan_budget`]'s
+/// arithmetic, not by this number. Hitting it is logged, so truncation is
+/// observable rather than silent.
+const MAX_SCAN_ROWS: usize = 1_000_000;
+
 /// Row budget handed to `paths_range`/`breakdown_range`, deliberately *not*
 /// the caller's `limit`.
 ///
@@ -62,10 +72,45 @@ const MAX_LIMIT: usize = 1_000;
 /// truncate the input to the grouping and can pick the wrong keys entirely
 /// (a value with 4+5 requests across two buckets outranks one with 6 in a
 /// single bucket, but only the grouped view can see that). So the store call
-/// is bounded by this constant purely as a memory guard, and the caller's
-/// limit is applied after grouping. At 1m resolution a 48h window holds 2880
-/// buckets, so this still admits ~34 distinct keys per bucket at full depth.
-const MAX_SCAN_ROWS: usize = 100_000;
+/// is bounded by this budget purely as a memory guard, and the caller's limit
+/// is applied after grouping.
+///
+/// The budget is therefore sized to what the aggregator can *legitimately*
+/// produce for the queried span at the resolved tier, rather than to a guess
+/// at typical usage: `TopN` emits at most `topn` keys plus one `__other__`
+/// roll-up row per (bucket, app, key-space), so a full-depth window is
+/// `buckets × (topn + 1)` rows. A fixed constant instead truncates real
+/// queries — at `topn = 50` a 100_000-row cap covers only ~1961 of the `1m`
+/// tier's 2880 buckets, and since these queries order by bucket ascending the
+/// rows it drops are the *newest* ones.
+fn scan_budget(tier: Tier, from: i64, to: i64, topn: u32) -> usize {
+    let bucket_ms = match tier {
+        Tier::M1 => MINUTE_MS,
+        Tier::H1 => HOUR_MS,
+        Tier::D1 => DAY_MS,
+    } as u128;
+    let span = to.saturating_sub(from).max(0) as u128;
+    // A partial bucket is still a bucket, and a zero-width span still admits
+    // the one bucket its bound falls in.
+    let buckets = span.div_ceil(bucket_ms).max(1);
+    let budget = buckets.saturating_mul(u128::from(topn) + 1);
+    budget.min(MAX_SCAN_ROWS as u128) as usize
+}
+
+/// Logs when a scan came back exactly at its budget, i.e. the SQL `LIMIT`
+/// may have cut rows out of the grouping. With a tier-aware [`scan_budget`]
+/// this should only ever happen when [`MAX_SCAN_ROWS`] clamped the budget.
+fn warn_if_truncated(query: &str, app: &str, rows: usize, budget: usize) {
+    if rows >= budget {
+        tracing::warn!(
+            query,
+            app,
+            rows,
+            budget,
+            "traffic scan hit its row budget; results may be truncated"
+        );
+    }
+}
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -221,6 +266,7 @@ async fn paths(
         Err(resp) => return resp,
     };
     let tier = tier_for_span(from, to);
+    let budget = scan_budget(tier, from, to, state.config.traffic.topn);
 
     let permit = match state.history_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
@@ -228,8 +274,11 @@ async fn paths(
     };
     let result = tokio::task::spawn_blocking(move || {
         analytics
-            .paths_range(tier, &app, from, to, MAX_SCAN_ROWS)
-            .map(|rows| top_paths(rows, limit))
+            .paths_range(tier, &app, from, to, budget)
+            .map(|rows| {
+                warn_if_truncated("paths", &app, rows.len(), budget);
+                top_paths(rows, limit)
+            })
     })
     .await;
     drop(permit);
@@ -257,6 +306,7 @@ async fn breakdown(
         Err(resp) => return resp,
     };
     let tier = tier_for_span(from, to);
+    let budget = scan_budget(tier, from, to, state.config.traffic.topn);
 
     let permit = match state.history_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
@@ -264,8 +314,11 @@ async fn breakdown(
     };
     let result = tokio::task::spawn_blocking(move || {
         analytics
-            .breakdown_range(tier, &app, &dimension, from, to, MAX_SCAN_ROWS)
-            .map(|rows| top_breakdown(rows, limit))
+            .breakdown_range(tier, &app, &dimension, from, to, budget)
+            .map(|rows| {
+                warn_if_truncated("breakdown", &app, rows.len(), budget);
+                top_breakdown(rows, limit)
+            })
     })
     .await;
     drop(permit);
@@ -348,11 +401,21 @@ fn summarize_stats(rows: Vec<StatsRow>) -> TrafficOverview {
 
 /// Groups per-bucket path rows by path, summing counters and merging each
 /// path's latency digests, then returns the `limit` busiest paths.
+///
+/// Each path's digests are folded *incrementally*, one row at a time, rather
+/// than collected into a `Vec` and merged once at the end. Accumulating them
+/// would hold one decoded digest per (path, bucket) resident simultaneously —
+/// at the `1m` tier's full depth that is hundreds of thousands of ≤100-centroid
+/// digests, tens to hundreds of MB, times up to `MAX_CONCURRENT_HISTORY_QUERIES`
+/// in flight. Folding as we go bounds resident sketch memory by the number of
+/// *distinct paths* instead. `LatencyDigest::merge` re-compresses to its
+/// centroid cap on every call, so repeated pairwise folding costs a little
+/// accuracy drift and no memory.
 fn top_paths(rows: Vec<PathRow>, limit: usize) -> Vec<TrafficPath> {
     struct Acc {
         requests: i64,
         bytes_out: i64,
-        digests: Vec<LatencyDigest>,
+        latency: LatencyDigest,
     }
 
     let mut by_path: HashMap<String, Acc> = HashMap::new();
@@ -360,12 +423,17 @@ fn top_paths(rows: Vec<PathRow>, limit: usize) -> Vec<TrafficPath> {
         let acc = by_path.entry(r.path).or_insert_with(|| Acc {
             requests: 0,
             bytes_out: 0,
-            digests: Vec::new(),
+            latency: LatencyDigest::new(),
         });
         acc.requests = acc.requests.saturating_add(r.requests);
         acc.bytes_out = acc.bytes_out.saturating_add(r.bytes_out);
         match LatencyDigest::from_bytes(&r.latency_tdigest) {
-            Ok(d) => acc.digests.push(d),
+            // `merge` of an empty digest with `d` is `d`, so the first row of
+            // a path needs no special case.
+            Ok(d) => {
+                let so_far = std::mem::take(&mut acc.latency);
+                acc.latency = LatencyDigest::merge(&[so_far, d]);
+            }
             Err(e) => tracing::warn!(
                 error = %e, app = %r.app, bucket = r.bucket,
                 "skipping undecodable path latency sketch"
@@ -375,15 +443,12 @@ fn top_paths(rows: Vec<PathRow>, limit: usize) -> Vec<TrafficPath> {
 
     let mut out: Vec<TrafficPath> = by_path
         .into_iter()
-        .map(|(path, acc)| {
-            let d = LatencyDigest::merge(&acc.digests);
-            TrafficPath {
-                path,
-                requests: acc.requests,
-                bytes_out: acc.bytes_out,
-                p50: d.quantile(0.5),
-                p95: d.quantile(0.95),
-            }
+        .map(|(path, acc)| TrafficPath {
+            path,
+            requests: acc.requests,
+            bytes_out: acc.bytes_out,
+            p50: acc.latency.quantile(0.5),
+            p95: acc.latency.quantile(0.95),
         })
         .collect();
     sort_and_truncate(&mut out, limit, |p| (p.requests, &p.path));
@@ -802,6 +867,129 @@ mod tests {
 
         let (s, _) = get("/api/app/app-a/traffic/paths?from=&to=&limit=").await;
         assert_eq!(s, StatusCode::OK, "empty bounds must default, not 400");
+    }
+
+    /// 2023-11-14T00:00:00Z, the start of WIDE_RANGE below.
+    const WIDE_FROM: i64 = 1_699_920_000_000;
+    /// 47h — inside the `1m` tier's 48h ceiling, so the widest window the
+    /// finest tier can be asked for: 2820 one-minute buckets.
+    const WIDE_BUCKETS: i64 = 47 * 60;
+    const WIDE_RANGE: &str = "from=2023-11-14T00:00:00Z&to=2023-11-15T23:00:00Z";
+    /// Distinct paths per bucket. 40 × 2820 = 112,800 rows, comfortably over
+    /// the 100_000 fixed budget this used to be capped at, and under the
+    /// tier-aware budget of 2820 × (topn + 1) = 143,820.
+    const WIDE_PATHS: i64 = 40;
+
+    /// A realistic worst case for the `1m` tier: every bucket of a 47h window
+    /// carrying a full set of per-path rows. The old fixed `MAX_SCAN_ROWS`
+    /// (100_000) truncated this at 2500 buckets, silently dropping the newest
+    /// 320 buckets — `paths_range` orders by bucket ascending, so the rows the
+    /// LIMIT discards are the most recent ones.
+    #[tokio::test]
+    async fn a_full_width_1m_window_is_not_truncated_by_the_scan_budget() {
+        let a = AnalyticsStore::open_in_memory().unwrap();
+        let latency = digest_bytes(&[5.0]);
+        let mut rows = Vec::with_capacity((WIDE_BUCKETS * WIDE_PATHS) as usize);
+        for b in 0..WIDE_BUCKETS {
+            for p in 0..WIDE_PATHS {
+                rows.push(path_row(
+                    WIDE_FROM + b * 60_000,
+                    "app-a",
+                    &format!("/p{p}"),
+                    1,
+                    latency.clone(),
+                ));
+            }
+        }
+        assert!(
+            rows.len() > 100_000,
+            "the fixture must exceed the old fixed budget to be a regression test"
+        );
+        a.flush_window(&[], &rows, &[]).unwrap();
+
+        let (s, j) = get_with(
+            state(Some(a)),
+            &format!("/api/app/app-a/traffic/paths?{WIDE_RANGE}&limit=1000"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let out = j.as_array().unwrap();
+        assert_eq!(out.len(), WIDE_PATHS as usize, "every path must survive");
+        for row in out {
+            assert_eq!(
+                row["requests"], WIDE_BUCKETS,
+                "{} lost buckets to truncation",
+                row["path"]
+            );
+        }
+    }
+
+    /// The scan budget is derived from what the resolved tier can legitimately
+    /// emit for the queried span, not from a fixed guess.
+    #[test]
+    fn scan_budget_covers_what_the_tier_can_emit() {
+        // 47h of 1m buckets at topn=50 (+1 `__other__` row) = 143_820.
+        assert_eq!(
+            scan_budget(Tier::M1, WIDE_FROM, WIDE_FROM + 47 * HOUR_MS, 50),
+            2820 * 51
+        );
+        // Same span read at coarser resolution needs proportionally less.
+        assert_eq!(scan_budget(Tier::H1, 0, 47 * HOUR_MS, 50), 47 * 51);
+        assert_eq!(scan_budget(Tier::D1, 0, 47 * HOUR_MS, 50), 2 * 51);
+        // Partial buckets round up, and a zero-width span still admits one.
+        assert_eq!(scan_budget(Tier::M1, 0, 1, 50), 51);
+        assert_eq!(scan_budget(Tier::M1, 0, 0, 50), 51);
+        assert_eq!(scan_budget(Tier::M1, 10, 0, 50), 51);
+        // A configured top-N is honoured rather than assumed.
+        assert_eq!(scan_budget(Tier::M1, 0, 10 * 60_000, 200), 10 * 201);
+        // The backstop caps a pathological span/top-N combination.
+        assert_eq!(scan_budget(Tier::D1, 0, i64::MAX, 1_000_000), MAX_SCAN_ROWS);
+    }
+
+    /// Proves the incremental fold in [`top_paths`] is behaviourally identical
+    /// to the all-at-once merge it replaced: every bucket's latencies have to
+    /// reach the final digest, not just the last one folded in.
+    #[test]
+    fn top_paths_merges_the_latencies_of_every_bucket() {
+        let rows = vec![
+            path_row(BUCKET, "app-a", "/a", 1, digest_bytes(&ramp(1, 50))),
+            path_row(
+                BUCKET + 60_000,
+                "app-a",
+                "/a",
+                1,
+                digest_bytes(&ramp(51, 100)),
+            ),
+            path_row(
+                BUCKET + 120_000,
+                "app-a",
+                "/a",
+                1,
+                digest_bytes(&ramp(101, 150)),
+            ),
+            path_row(
+                BUCKET + 180_000,
+                "app-a",
+                "/a",
+                1,
+                digest_bytes(&ramp(151, 200)),
+            ),
+        ];
+        let out = top_paths(rows, 10);
+        assert_eq!(out.len(), 1);
+        // 1..=200 across four buckets: a digest holding only the last bucket
+        // (151..=200) would put p50 near 175, and one holding only the first
+        // would put p95 near 48.
+        assert!(
+            (90.0..=112.0).contains(&out[0].p50),
+            "p50 was {}, which is not the median of 1..=200",
+            out[0].p50
+        );
+        assert!(
+            (180.0..=200.0).contains(&out[0].p95),
+            "p95 was {}, which is not the p95 of 1..=200",
+            out[0].p95
+        );
     }
 
     /// Pins the documented consequence of `DEFAULT_FROM`: omitting `from`
