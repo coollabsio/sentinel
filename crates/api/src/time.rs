@@ -29,3 +29,8 @@ pub fn format_millis(ms: i64) -> String {
 pub fn now_layout() -> String {
     OffsetDateTime::now_utc().format(LAYOUT).unwrap_or_default()
 }
+
+/// The current time as unix milliseconds UTC, for bucket-aligning a series.
+pub fn now_ms() -> i64 {
+    (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
+}

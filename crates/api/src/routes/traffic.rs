@@ -15,9 +15,10 @@ use traffic::sketches::{LatencyDigest, Uniques};
 
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
+use crate::time::now_ms;
 use crate::types::{
     ErrorBody, TrafficAttribution, TrafficBreakdownEntry, TrafficLatency, TrafficOverview,
-    TrafficPath, TrafficStatusBreakdown,
+    TrafficPath, TrafficSeriesBucket, TrafficStatusBreakdown,
 };
 
 const MIN_MS: i64 = 60_000;
@@ -65,10 +66,12 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/app/{uuid}/traffic/breakdown/{dimension}",
             get(breakdown),
         )
+        .route("/api/app/{uuid}/traffic/series", get(app_series))
         // Server-wide variants: same shapes, merged across every app/host.
         .route("/api/traffic/overview", get(server_overview))
         .route("/api/traffic/paths", get(server_paths))
         .route("/api/traffic/breakdown/{dimension}", get(server_breakdown))
+        .route("/api/traffic/series", get(series))
         .route("/api/traffic/attribution", get(attribution))
 }
 
@@ -94,6 +97,12 @@ impl TopQuery {
             to: self.to.clone(),
         }
     }
+}
+
+/// The only knob for the series endpoints: `24h` (hourly) or `7d`/`30d` (daily).
+#[derive(Debug, Deserialize)]
+pub struct SeriesQuery {
+    pub range: Option<String>,
 }
 
 /// Floors `ts` to the start of its containing `width`-wide bucket. `div_euclid`
@@ -128,6 +137,85 @@ fn tier_reads(from: i64, to: i64) -> [(Tier, i64, i64); 3] {
         (Tier::H1, floor_to(from, HOUR_MS), to),
         (Tier::D1, floor_to(from, DAY_MS), to),
     ]
+}
+
+/// Maps the `range` query value to an output bucket width (ms) and a fixed
+/// output length. `24h` → 24 hourly buckets; `7d`/`30d` → 7/30 daily buckets.
+/// Empty or absent → `24h`. Anything else is a 400.
+#[allow(clippy::result_large_err)]
+fn resolve_series(range: Option<&str>) -> Result<(i64, usize), Response> {
+    match range.filter(|s| !s.is_empty()) {
+        None | Some("24h") => Ok((HOUR_MS, 24)),
+        Some("7d") => Ok((DAY_MS, 7)),
+        Some("30d") => Ok((DAY_MS, 30)),
+        Some(_) => Err(bad_range()),
+    }
+}
+
+fn bad_range() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorBody {
+            error: "Invalid 'range'. Use one of: 24h, 7d, 30d".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// Tiers to read for a series at the given output `width`. Only tiers at or
+/// finer than the output bucket are read, so every source bucket floors
+/// cleanly and completely into one output bucket:
+///   - hourly output (`HOUR_MS`): `M1` + `H1`. `D1` is skipped — nothing
+///     younger than 24h is ever compacted to the daily tier, so this loses no
+///     data and prevents a full day's counts landing in a single hour.
+///   - daily output (`DAY_MS`): `M1` + `H1` + `D1`; day is the coarsest tier,
+///     so no over-coarse rows can exist.
+fn tier_reads_for(width: i64, from: i64, to: i64) -> Vec<(Tier, i64, i64)> {
+    let all = tier_reads(from, to);
+    if width == HOUR_MS {
+        all[..2].to_vec()
+    } else {
+        all.to_vec()
+    }
+}
+
+/// Re-buckets per-bucket stats rows into a fixed-length, zero-filled series of
+/// `count` buckets, each `width` ms wide, ending at the bucket containing
+/// `now`. Rows outside that window are dropped. Pure — `now` is passed in so
+/// the aggregation is deterministic and testable.
+fn aggregate_series(
+    rows: Vec<StatsRow>,
+    now: i64,
+    width: i64,
+    count: usize,
+) -> Vec<TrafficSeriesBucket> {
+    let end = floor_to(now, width);
+    let first = end - (count as i64 - 1) * width;
+    let mut out: Vec<TrafficSeriesBucket> = (0..count)
+        .map(|i| TrafficSeriesBucket {
+            bucket: first + i as i64 * width,
+            s2xx: 0,
+            s3xx: 0,
+            s4xx: 0,
+            s5xx: 0,
+        })
+        .collect();
+
+    for r in &rows {
+        // `b` and `first` are both multiples of `width`, so the division is
+        // exact; a row before the window yields a negative index and is skipped.
+        let b = floor_to(r.bucket, width);
+        let idx = (b - first) / width;
+        if idx < 0 || idx as usize >= count {
+            continue;
+        }
+        let slot = &mut out[idx as usize];
+        slot.s2xx = slot.s2xx.saturating_add(r.s2xx);
+        slot.s3xx = slot.s3xx.saturating_add(r.s3xx);
+        slot.s4xx = slot.s4xx.saturating_add(r.s4xx);
+        slot.s5xx = slot.s5xx.saturating_add(r.s5xx);
+    }
+    out
 }
 
 #[allow(clippy::result_large_err)]
@@ -197,6 +285,77 @@ async fn attribution(State(state): State<Arc<AppState>>) -> Response {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     Json(TrafficAttribution { attribution }).into_response()
+}
+
+/// Server-wide status-class time series: per-bucket 2xx/3xx/4xx/5xx counts
+/// across every app/host, zero-filled to a fixed length by `range`.
+async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQuery>) -> Response {
+    let Some(analytics) = state.analytics.clone() else {
+        return analytics_disabled();
+    };
+    let (width, count) = match resolve_series(q.range.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let now = now_ms();
+    let end = floor_to(now, width);
+    let from = end - (count as i64 - 1) * width;
+
+    let permit = match state.analytics_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let mut rows = Vec::new();
+        for (tier, lo, hi) in tier_reads_for(width, from, now) {
+            rows.extend(analytics.stats_rows_between(tier, lo, hi)?);
+        }
+        Ok::<_, store::StoreError>(aggregate_series(rows, now, width, count))
+    })
+    .await;
+    drop(permit);
+    match result {
+        Ok(Ok(out)) => Json(out).into_response(),
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Per-app variant of [`series`], filtered to one app via `stats_range`.
+async fn app_series(
+    Path(app): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SeriesQuery>,
+) -> Response {
+    let Some(analytics) = state.analytics.clone() else {
+        return analytics_disabled();
+    };
+    let (width, count) = match resolve_series(q.range.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let now = now_ms();
+    let end = floor_to(now, width);
+    let from = end - (count as i64 - 1) * width;
+
+    let permit = match state.analytics_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let mut rows = Vec::new();
+        for (tier, lo, hi) in tier_reads_for(width, from, now) {
+            rows.extend(analytics.stats_range(tier, &app, lo, hi)?);
+        }
+        Ok::<_, store::StoreError>(aggregate_series(rows, now, width, count))
+    })
+    .await;
+    drop(permit);
+    match result {
+        Ok(Ok(out)) => Json(out).into_response(),
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(e),
+    }
 }
 
 async fn overview(

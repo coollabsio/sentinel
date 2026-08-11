@@ -118,6 +118,18 @@ pub struct TrafficBreakdownEntry {
     pub bytes_out: i64,
 }
 
+/// One time bucket of status-class request counts, for the series endpoints.
+/// `bucket` is the unix-millis start of the bucket (hour- or day-aligned by
+/// the request's `range`). Counts are zero for buckets with no traffic.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficSeriesBucket {
+    pub bucket: i64,
+    pub s2xx: i64,
+    pub s3xx: i64,
+    pub s4xx: i64,
+    pub s5xx: i64,
+}
+
 /// The attribution string required by the license of whichever GeoIP source
 /// is currently active (design spec §6), or `null` when none applies (GeoIP
 /// disabled, not yet resolved, or an unrecognized `GEOIP_DB_URL` override).
