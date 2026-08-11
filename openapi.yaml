@@ -468,6 +468,36 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/app/{uuid}/traffic/series:
+    get:
+      summary: Get app status-class time series
+      description: |
+        Per-bucket 2xx/3xx/4xx/5xx request counts for one app, zero-filled to
+        a fixed length: 24 hourly buckets for `range=24h`, 7 or 30 daily
+        buckets for `range=7d`/`range=30d`.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/AppUuid'
+        - $ref: '#/components/parameters/Range'
+      responses:
+        '200':
+          description: Status-class time series for the app
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TrafficSeriesBucket'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /api/traffic/overview:
     get:
       summary: Get server-wide traffic overview
@@ -593,6 +623,34 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/traffic/series:
+    get:
+      summary: Get server-wide status-class time series
+      description: |
+        Per-bucket 2xx/3xx/4xx/5xx request counts across every app/host,
+        zero-filled to a fixed length (see the per-app variant for granularity).
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/Range'
+      responses:
+        '200':
+          description: Status-class time series
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TrafficSeriesBucket'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /api/stats:
     get:
       summary: Get database statistics
@@ -671,6 +729,19 @@ components:
         maximum: 1000
         default: 50
       example: 20
+
+    Range:
+      name: range
+      in: query
+      description: |
+        Time window and bucket granularity for a series. `24h` yields 24
+        hourly buckets; `7d`/`30d` yield 7/30 daily buckets. Defaults to `24h`.
+      required: false
+      schema:
+        type: string
+        enum: [24h, 7d, 30d]
+        default: 24h
+      example: 7d
 
   schemas:
     CurrentCPUUsage:
@@ -908,6 +979,35 @@ components:
           type: integer
           format: int64
           example: 40
+
+    TrafficSeriesBucket:
+      type: object
+      description: |
+        One time bucket of status-class request counts. `bucket` is the
+        unix-millis start of the bucket (hour- or day-aligned per `range`);
+        counts are zero for buckets with no traffic.
+      properties:
+        bucket:
+          type: integer
+          format: int64
+          description: Unix-millis start of the bucket
+          example: 1723334400000
+        s2xx:
+          type: integer
+          format: int64
+          example: 42
+        s3xx:
+          type: integer
+          format: int64
+          example: 3
+        s4xx:
+          type: integer
+          format: int64
+          example: 1
+        s5xx:
+          type: integer
+          format: int64
+          example: 0
 
     TrafficLatency:
       type: object

@@ -692,6 +692,58 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ---
 
+### Get App Status-Class Time Series
+
+Per-bucket request counts by HTTP status class for one app, for charting. The response is a fixed-length, zero-filled array: 24 hourly buckets for `range=24h`, and 7 or 30 daily buckets for `range=7d`/`range=30d`.
+
+**Endpoint:** `GET /api/app/:uuid/traffic/series`
+
+**Path Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `uuid` | string | Yes | Coolify app UUID (or host, for Caddy) |
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `range` | string | No | `24h` | Window + granularity: `24h` (hourly), `7d`/`30d` (daily) |
+
+Each element is `{ "bucket", "s2xx", "s3xx", "s4xx", "s5xx" }`, where `bucket` is the unix-millis start of the bucket. An app with no data in range returns a `200` with every bucket zeroed, not a `404`.
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/app/jc4wsgs/traffic/series?range=24h"
+```
+
+```json
+[
+  { "bucket": 1723334400000, "s2xx": 42, "s3xx": 3, "s4xx": 1, "s5xx": 0 },
+  { "bucket": 1723338000000, "s2xx": 0, "s3xx": 0, "s4xx": 0, "s5xx": 0 }
+]
+```
+
+---
+
+### Get Server-Wide Status-Class Time Series
+
+Same shape as [Get App Status-Class Time Series](#get-app-status-class-time-series), merged across **every app and host** on the box.
+
+**Endpoint:** `GET /api/traffic/series`
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `range` | string | No | `24h` | Window + granularity: `24h` (hourly), `7d`/`30d` (daily) |
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/traffic/series?range=7d"
+```
+
+---
+
 ### Get GeoIP Attribution
 
 Retrieve the license attribution string for whichever GeoIP data source is currently active, so it can be surfaced in a UI.
