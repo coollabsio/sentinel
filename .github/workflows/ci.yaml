@@ -65,7 +65,12 @@ jobs:
       - name: Audit
         run: cargo audit
 
+  # Verifies the image still builds, on PRs only. On a push to main/next the
+  # matching release workflow (release-main.yaml / release-next.yaml) rebuilds
+  # the same Dockerfile and pushes it, so repeating a build-only pass here would
+  # be pure duplicate work — those runs already fail the pipeline if it breaks.
   docker:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7

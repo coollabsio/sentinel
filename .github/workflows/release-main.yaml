@@ -1,0 +1,81 @@
+name: Sentinel Release Main
+
+# Every merge to `main` publishes a multi-arch `main` image to GHCR so it can
+# be pulled for development WITHOUT cutting a release. Deliberately GHCR-only
+# and never tagged `latest`: `latest` is reserved for real releases
+# (`release.yaml`), and Docker Hub only carries released/`next` images.
+
+on:
+  push:
+    branches: ['main']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GITHUB_REGISTRY: ghcr.io
+  IMAGE_NAME: "coollabsio/sentinel"
+
+jobs:
+  build-push:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            platform: linux/aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to ${{ env.GITHUB_REGISTRY }}
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.GITHUB_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Image (${{ matrix.arch }})
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ matrix.arch }}
+          labels: |
+            coolify.managed=true
+
+  merge-manifest:
+    runs-on: ubuntu-24.04
+    needs: build-push
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to ${{ env.GITHUB_REGISTRY }}
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.GITHUB_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create & publish manifest on ${{ env.GITHUB_REGISTRY }}
+        run: |
+          docker buildx imagetools create \
+          ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:main-amd64 \
+          ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:main-aarch64 \
+          --tag ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:main
