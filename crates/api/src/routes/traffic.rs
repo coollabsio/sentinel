@@ -165,9 +165,11 @@ fn bad_range() -> Response {
 /// Tiers to read for a series at the given output `width`. Only tiers at or
 /// finer than the output bucket are read, so every source bucket floors
 /// cleanly and completely into one output bucket:
-///   - hourly output (`HOUR_MS`): `M1` + `H1`. `D1` is skipped — nothing
-///     younger than 24h is ever compacted to the daily tier, so this loses no
-///     data and prevents a full day's counts landing in a single hour.
+///   - hourly output (`HOUR_MS`): `M1` + `H1`. `D1` is skipped so a whole
+///     day's counts can't collapse into a single hour. This is safe because
+///     `1h→1d` compaction holds `1h` rows for a full day past the UTC
+///     boundary (see `traffic::compaction::compact_1h_to_1d`), so every hour
+///     in the rolling 24h window is still present in `H1`.
 ///   - daily output (`DAY_MS`): `M1` + `H1` + `D1`; day is the coarsest tier,
 ///     so no over-coarse rows can exist.
 fn tier_reads_for(width: i64, from: i64, to: i64) -> Vec<(Tier, i64, i64)> {
@@ -293,32 +295,10 @@ async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQuery>
     let Some(analytics) = state.analytics.clone() else {
         return analytics_disabled();
     };
-    let (width, count) = match resolve_series(q.range.as_deref()) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    let now = now_ms();
-    let end = floor_to(now, width);
-    let from = end - (count as i64 - 1) * width;
-
-    let permit = match state.analytics_queries.clone().acquire_owned().await {
-        Ok(permit) => permit,
-        Err(e) => return internal_error(e),
-    };
-    let result = tokio::task::spawn_blocking(move || {
-        let mut rows = Vec::new();
-        for (tier, lo, hi) in tier_reads_for(width, from, now) {
-            rows.extend(analytics.stats_rows_between(tier, lo, hi)?);
-        }
-        Ok::<_, store::StoreError>(aggregate_series(rows, now, width, count))
+    run_series(state, q.range, move |tier, lo, hi| {
+        analytics.stats_rows_between(tier, lo, hi)
     })
-    .await;
-    drop(permit);
-    match result {
-        Ok(Ok(out)) => Json(out).into_response(),
-        Ok(Err(e)) => internal_error(e),
-        Err(e) => internal_error(e),
-    }
+    .await
 }
 
 /// Per-app variant of [`series`], filtered to one app via `stats_range`.
@@ -330,7 +310,21 @@ async fn app_series(
     let Some(analytics) = state.analytics.clone() else {
         return analytics_disabled();
     };
-    let (width, count) = match resolve_series(q.range.as_deref()) {
+    run_series(state, q.range, move |tier, lo, hi| {
+        analytics.stats_range(tier, &app, lo, hi)
+    })
+    .await
+}
+
+/// Shared body for the two series endpoints. Resolves `range`, bounds the DB
+/// read to the rolling window, and re-buckets via [`aggregate_series`]. The
+/// only per-endpoint difference is `fetch`, which pulls one tier's stats rows
+/// either server-wide or filtered to an app.
+async fn run_series<F>(state: Arc<AppState>, range: Option<String>, fetch: F) -> Response
+where
+    F: Fn(Tier, i64, i64) -> Result<Vec<StatsRow>, store::StoreError> + Send + 'static,
+{
+    let (width, count) = match resolve_series(range.as_deref()) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -345,7 +339,7 @@ async fn app_series(
     let result = tokio::task::spawn_blocking(move || {
         let mut rows = Vec::new();
         for (tier, lo, hi) in tier_reads_for(width, from, now) {
-            rows.extend(analytics.stats_range(tier, &app, lo, hi)?);
+            rows.extend(fetch(tier, lo, hi)?);
         }
         Ok::<_, store::StoreError>(aggregate_series(rows, now, width, count))
     })

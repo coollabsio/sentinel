@@ -212,7 +212,7 @@ fn other_never_competes_for_a_topn_slot() {
     )
     .unwrap();
 
-    let written = compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR, 2).unwrap();
+    let written = compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR, 2, 0).unwrap();
     assert_eq!(written, 3);
 
     let rows = s
@@ -253,7 +253,7 @@ fn capped_values_fold_into_the_existing_other_bucket() {
     )
     .unwrap();
 
-    compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR, 1).unwrap();
+    compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR, 1, 0).unwrap();
     let rows = s
         .breakdown_rows_between(Tier::H1, i64::MIN, i64::MAX)
         .unwrap();
@@ -269,7 +269,9 @@ fn capped_values_fold_into_the_existing_other_bucket() {
     );
 }
 
-/// 1h -> 1d floors to the UTC day boundary.
+/// 1h -> 1d floors to the UTC day boundary. `1h→1d` holds a full extra day
+/// (so the rolling 24h series stays whole), so a day's hours only compact once
+/// `now` has moved a further day past that day's boundary.
 #[test]
 fn compacts_hours_into_days() {
     let s = AnalyticsStore::open_in_memory().unwrap();
@@ -285,13 +287,47 @@ fn compacts_hours_into_days() {
     )
     .unwrap();
 
-    assert_eq!(compact_1h_to_1d(&s, day + DAY, 50).unwrap(), 1);
+    assert_eq!(compact_1h_to_1d(&s, day + 2 * DAY, 50).unwrap(), 1);
     let rows = s.stats_rows_between(Tier::D1, i64::MIN, i64::MAX).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].bucket, day);
     assert_eq!(rows[0].requests, 5);
     assert!(
         s.stats_rows_between(Tier::H1, i64::MIN, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Regression: the `range=24h` series reads only the `1m`+`1h` tiers, so an
+/// `1h` row still inside the rolling 24h window must NOT be compacted away to
+/// `1d`. Before the `hold`, `1h→1d` keyed off the current UTC midnight and
+/// deleted every pre-midnight hour, blanking the left half of the chart.
+#[test]
+fn keeps_recent_hours_for_the_rolling_24h_window() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    let day = 100 * DAY;
+    // 23:00 the day before — one hour before the UTC day boundary.
+    s.write_rows(
+        Tier::H1,
+        &[stats_row(day - HOUR, "a", "h", 5, &[1.0])],
+        &[],
+        &[],
+    )
+    .unwrap();
+
+    // Sweep at 00:30 the next day: the 23:00 hour is ~1.5h old and must stay
+    // in the `1h` tier so the 24h series can still read it.
+    assert_eq!(compact_1h_to_1d(&s, day + HOUR / 2, 50).unwrap(), 0);
+    assert_eq!(
+        s.stats_rows_between(Tier::H1, i64::MIN, i64::MAX)
+            .unwrap()
+            .len(),
+        1,
+        "an hour younger than 24h must not be compacted to the daily tier"
+    );
+    assert!(
+        s.stats_rows_between(Tier::D1, i64::MIN, i64::MAX)
             .unwrap()
             .is_empty()
     );
@@ -520,7 +556,7 @@ fn paths_are_recapped_with_an_other_row() {
         .collect();
     s.flush_window(&[], &rows, &[]).unwrap();
 
-    compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR, 2).unwrap();
+    compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR, 2, 0).unwrap();
 
     let got = s.paths_rows_between(Tier::H1, i64::MIN, i64::MAX).unwrap();
     assert_eq!(got.len(), 3, "2 kept paths + 1 __other__ row");
@@ -560,7 +596,7 @@ fn incoming_other_path_rows_do_not_compete_for_a_slot() {
     s.flush_window(&[], &[mk("/a", 10), mk("/b", 8), mk("__other__", 9)], &[])
         .unwrap();
 
-    compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR, 2).unwrap();
+    compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR, 2, 0).unwrap();
 
     let got = s.paths_rows_between(Tier::H1, i64::MIN, i64::MAX).unwrap();
     assert_eq!(got.len(), 3, "/a + /b kept, exactly one __other__ row");
@@ -748,11 +784,11 @@ fn a_late_row_re_caps_the_coarse_bucket_instead_of_widening_it() {
         ],
     )
     .unwrap();
-    compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR, 2).unwrap();
+    compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR, 2, 0).unwrap();
 
     s.flush_window(&[], &[], &[breakdown_row(hour + 59 * MIN, "D", 100)])
         .unwrap();
-    compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR + MIN, 2).unwrap();
+    compact_tier(&s, Tier::M1, Tier::H1, HOUR, hour + HOUR + MIN, 2, 0).unwrap();
 
     let rows = s
         .breakdown_rows_between(Tier::H1, i64::MIN, i64::MAX)

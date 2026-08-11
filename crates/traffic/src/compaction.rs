@@ -35,6 +35,8 @@ pub fn compact_1m_to_1h(
     now: i64,
     topn: usize,
 ) -> Result<usize, TrafficError> {
+    // No consumer reads finer than `1h`, so hold nothing: compact as soon as
+    // the hour closes.
     compact_tier(
         store,
         Tier::M1,
@@ -42,6 +44,7 @@ pub fn compact_1m_to_1h(
         HOUR_MS,
         now,
         effective_topn(topn),
+        0,
     )
 }
 
@@ -52,7 +55,18 @@ pub fn compact_1h_to_1d(
     now: i64,
     topn: usize,
 ) -> Result<usize, TrafficError> {
-    compact_tier(store, Tier::H1, Tier::D1, DAY_MS, now, effective_topn(topn))
+    // The `range=24h` series reads only the `1m`+`1h` tiers, so an `1h` row
+    // must outlive its bucket by at least 24h or the rolling window goes
+    // blank once it crosses UTC midnight. Hold a full day past the boundary.
+    compact_tier(
+        store,
+        Tier::H1,
+        Tier::D1,
+        DAY_MS,
+        now,
+        effective_topn(topn),
+        DAY_MS,
+    )
 }
 
 /// Floors a millisecond timestamp to the start of its containing `width`-wide
@@ -87,10 +101,13 @@ struct PathAcc {
 /// Rolls every closed `width`-wide bucket of `from_tier` up into `to_tier`,
 /// one bucket per transaction. Returns the number of coarser rows written.
 ///
-/// The upper bound is `floor_to(now, width)`, so the still-open bucket `now`
-/// falls inside is never touched. `cap` is the *effective* top-N — the public
-/// entry points reconcile it against [`COMPACTION_TOPN`]; this applies it as
-/// given so tests can exercise eviction at small values.
+/// The upper bound is `floor_to(now - hold, width)`. With `hold == 0` this is
+/// the still-open bucket `now` falls inside, so it is never touched; a positive
+/// `hold` keeps that much extra finer-tier history so a rolling window reading
+/// only the finer tiers stays whole (see [`compact_1h_to_1d`]). `cap` is the
+/// *effective* top-N — the public entry points reconcile it against
+/// [`COMPACTION_TOPN`]; this applies it as given so tests can exercise eviction
+/// at small values.
 fn compact_tier(
     store: &AnalyticsStore,
     from_tier: Tier,
@@ -98,8 +115,9 @@ fn compact_tier(
     width: i64,
     now: i64,
     cap: usize,
+    hold: i64,
 ) -> Result<usize, TrafficError> {
-    let cutoff = floor_to(now, width);
+    let cutoff = floor_to(now.saturating_sub(hold), width);
 
     // Floor and dedupe finer buckets to find closed coarse buckets with work.
     let mut coarse: Vec<i64> = store
