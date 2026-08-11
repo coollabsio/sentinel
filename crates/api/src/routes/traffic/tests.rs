@@ -817,3 +817,85 @@ async fn an_unbounded_range_sees_fresh_1m_data_immediately() {
         "1m (/a, /b) and 1d (/c) rows must all appear: {paths:?}"
     );
 }
+
+/// Minimal `StatsRow` with explicit status counts; sketch BLOBs are unused by
+/// `aggregate_series` so they are left empty.
+fn srow(bucket: i64, s2xx: i64, s3xx: i64, s4xx: i64, s5xx: i64) -> StatsRow {
+    StatsRow {
+        bucket,
+        app: "a".into(),
+        host: "h".into(),
+        requests: 0,
+        bytes_in: 0,
+        bytes_out: 0,
+        s2xx,
+        s3xx,
+        s4xx,
+        s5xx,
+        latency_tdigest: Vec::new(),
+        uniques_hll: Vec::new(),
+    }
+}
+
+/// `Response` is not `Debug`, so `Result::unwrap` won't compile; unwrap the Ok
+/// side by hand.
+fn ok_series(r: Result<(i64, usize), Response>) -> (i64, usize) {
+    match r {
+        Ok(v) => v,
+        Err(_) => panic!("expected Ok"),
+    }
+}
+
+#[test]
+fn resolve_series_maps_range_to_width_and_count() {
+    assert_eq!(ok_series(resolve_series(None)), (HOUR_MS, 24));
+    assert_eq!(ok_series(resolve_series(Some(""))), (HOUR_MS, 24));
+    assert_eq!(ok_series(resolve_series(Some("24h"))), (HOUR_MS, 24));
+    assert_eq!(ok_series(resolve_series(Some("7d"))), (DAY_MS, 7));
+    assert_eq!(ok_series(resolve_series(Some("30d"))), (DAY_MS, 30));
+    assert!(resolve_series(Some("bogus")).is_err());
+}
+
+#[test]
+fn tier_reads_for_excludes_daily_at_hourly_width() {
+    let hourly = tier_reads_for(HOUR_MS, 0, HOUR_MS);
+    assert_eq!(hourly.len(), 2);
+    assert_eq!(hourly[0].0, Tier::M1);
+    assert_eq!(hourly[1].0, Tier::H1);
+
+    let daily = tier_reads_for(DAY_MS, 0, DAY_MS);
+    assert_eq!(daily.len(), 3);
+    assert_eq!(daily[2].0, Tier::D1);
+}
+
+#[test]
+fn aggregate_series_zero_fills_sums_and_drops_out_of_range() {
+    let now = 5 * HOUR_MS + 1234; // mid-hour; end bucket = 5*HOUR
+    let rows = vec![
+        srow(4 * HOUR_MS + 30_000, 10, 1, 0, 0), // floors to 4*HOUR -> idx 1
+        srow(4 * HOUR_MS + 90_000, 5, 0, 2, 0),  // same hour bucket -> summed
+        srow(5 * HOUR_MS, 7, 0, 0, 3),           // idx 2
+        srow(2 * HOUR_MS, 99, 99, 99, 99),       // before window -> dropped
+    ];
+    let out = aggregate_series(rows, now, HOUR_MS, 3);
+
+    assert_eq!(out.len(), 3);
+    // Bucket 0 (3*HOUR) had no rows -> zero-filled.
+    assert_eq!(out[0].bucket, 3 * HOUR_MS);
+    assert_eq!(
+        (out[0].s2xx, out[0].s3xx, out[0].s4xx, out[0].s5xx),
+        (0, 0, 0, 0)
+    );
+    // Bucket 1 (4*HOUR) sums the two rows in that hour.
+    assert_eq!(out[1].bucket, 4 * HOUR_MS);
+    assert_eq!(
+        (out[1].s2xx, out[1].s3xx, out[1].s4xx, out[1].s5xx),
+        (15, 1, 2, 0)
+    );
+    // Bucket 2 (5*HOUR).
+    assert_eq!(out[2].bucket, 5 * HOUR_MS);
+    assert_eq!(
+        (out[2].s2xx, out[2].s3xx, out[2].s4xx, out[2].s5xx),
+        (7, 0, 0, 3)
+    );
+}

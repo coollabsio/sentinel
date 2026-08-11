@@ -17,7 +17,7 @@ use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
 use crate::types::{
     ErrorBody, TrafficAttribution, TrafficBreakdownEntry, TrafficLatency, TrafficOverview,
-    TrafficPath, TrafficStatusBreakdown,
+    TrafficPath, TrafficSeriesBucket, TrafficStatusBreakdown,
 };
 
 const MIN_MS: i64 = 60_000;
@@ -128,6 +128,85 @@ fn tier_reads(from: i64, to: i64) -> [(Tier, i64, i64); 3] {
         (Tier::H1, floor_to(from, HOUR_MS), to),
         (Tier::D1, floor_to(from, DAY_MS), to),
     ]
+}
+
+/// Maps the `range` query value to an output bucket width (ms) and a fixed
+/// output length. `24h` → 24 hourly buckets; `7d`/`30d` → 7/30 daily buckets.
+/// Empty or absent → `24h`. Anything else is a 400.
+#[allow(clippy::result_large_err)]
+fn resolve_series(range: Option<&str>) -> Result<(i64, usize), Response> {
+    match range.filter(|s| !s.is_empty()) {
+        None | Some("24h") => Ok((HOUR_MS, 24)),
+        Some("7d") => Ok((DAY_MS, 7)),
+        Some("30d") => Ok((DAY_MS, 30)),
+        Some(_) => Err(bad_range()),
+    }
+}
+
+fn bad_range() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorBody {
+            error: "Invalid 'range'. Use one of: 24h, 7d, 30d".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// Tiers to read for a series at the given output `width`. Only tiers at or
+/// finer than the output bucket are read, so every source bucket floors
+/// cleanly and completely into one output bucket:
+///   - hourly output (`HOUR_MS`): `M1` + `H1`. `D1` is skipped — nothing
+///     younger than 24h is ever compacted to the daily tier, so this loses no
+///     data and prevents a full day's counts landing in a single hour.
+///   - daily output (`DAY_MS`): `M1` + `H1` + `D1`; day is the coarsest tier,
+///     so no over-coarse rows can exist.
+fn tier_reads_for(width: i64, from: i64, to: i64) -> Vec<(Tier, i64, i64)> {
+    let all = tier_reads(from, to);
+    if width == HOUR_MS {
+        all[..2].to_vec()
+    } else {
+        all.to_vec()
+    }
+}
+
+/// Re-buckets per-bucket stats rows into a fixed-length, zero-filled series of
+/// `count` buckets, each `width` ms wide, ending at the bucket containing
+/// `now`. Rows outside that window are dropped. Pure — `now` is passed in so
+/// the aggregation is deterministic and testable.
+fn aggregate_series(
+    rows: Vec<StatsRow>,
+    now: i64,
+    width: i64,
+    count: usize,
+) -> Vec<TrafficSeriesBucket> {
+    let end = floor_to(now, width);
+    let first = end - (count as i64 - 1) * width;
+    let mut out: Vec<TrafficSeriesBucket> = (0..count)
+        .map(|i| TrafficSeriesBucket {
+            bucket: first + i as i64 * width,
+            s2xx: 0,
+            s3xx: 0,
+            s4xx: 0,
+            s5xx: 0,
+        })
+        .collect();
+
+    for r in &rows {
+        // `b` and `first` are both multiples of `width`, so the division is
+        // exact; a row before the window yields a negative index and is skipped.
+        let b = floor_to(r.bucket, width);
+        let idx = (b - first) / width;
+        if idx < 0 || idx as usize >= count {
+            continue;
+        }
+        let slot = &mut out[idx as usize];
+        slot.s2xx = slot.s2xx.saturating_add(r.s2xx);
+        slot.s3xx = slot.s3xx.saturating_add(r.s3xx);
+        slot.s4xx = slot.s4xx.saturating_add(r.s4xx);
+        slot.s5xx = slot.s5xx.saturating_add(r.s5xx);
+    }
+    out
 }
 
 #[allow(clippy::result_large_err)]
