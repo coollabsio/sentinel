@@ -899,3 +899,46 @@ fn aggregate_series_zero_fills_sums_and_drops_out_of_range() {
         (7, 0, 0, 3)
     );
 }
+
+#[tokio::test]
+async fn server_series_is_fixed_length_and_zero_filled() {
+    // Seeded data sits in 2023, far outside any window ending "now", so counts
+    // are zero — but the array is always full length.
+    let (status, body) = get("/api/traffic/series?range=7d").await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = body.as_array().expect("array body");
+    assert_eq!(arr.len(), 7);
+    for b in arr {
+        assert!(b["bucket"].is_i64());
+        assert_eq!(b["s2xx"], 0);
+        assert_eq!(b["s3xx"], 0);
+        assert_eq!(b["s4xx"], 0);
+        assert_eq!(b["s5xx"], 0);
+    }
+}
+
+#[tokio::test]
+async fn server_series_defaults_to_24_hourly_buckets() {
+    let (status, body) = get("/api/traffic/series").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().expect("array body").len(), 24);
+}
+
+#[tokio::test]
+async fn app_series_is_fixed_length() {
+    let (status, body) = get("/api/app/app-a/traffic/series?range=30d").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().expect("array body").len(), 30);
+}
+
+#[tokio::test]
+async fn series_rejects_unknown_range() {
+    let (status, _) = get("/api/traffic/series?range=bogus").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn series_404_when_analytics_disabled() {
+    let (status, _) = get_with(state(None), "/api/traffic/series").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

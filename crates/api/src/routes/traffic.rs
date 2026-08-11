@@ -15,6 +15,7 @@ use traffic::sketches::{LatencyDigest, Uniques};
 
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
+use crate::time::now_ms;
 use crate::types::{
     ErrorBody, TrafficAttribution, TrafficBreakdownEntry, TrafficLatency, TrafficOverview,
     TrafficPath, TrafficSeriesBucket, TrafficStatusBreakdown,
@@ -65,10 +66,12 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/app/{uuid}/traffic/breakdown/{dimension}",
             get(breakdown),
         )
+        .route("/api/app/{uuid}/traffic/series", get(app_series))
         // Server-wide variants: same shapes, merged across every app/host.
         .route("/api/traffic/overview", get(server_overview))
         .route("/api/traffic/paths", get(server_paths))
         .route("/api/traffic/breakdown/{dimension}", get(server_breakdown))
+        .route("/api/traffic/series", get(series))
         .route("/api/traffic/attribution", get(attribution))
 }
 
@@ -94,6 +97,12 @@ impl TopQuery {
             to: self.to.clone(),
         }
     }
+}
+
+/// The only knob for the series endpoints: `24h` (hourly) or `7d`/`30d` (daily).
+#[derive(Debug, Deserialize)]
+pub struct SeriesQuery {
+    pub range: Option<String>,
 }
 
 /// Floors `ts` to the start of its containing `width`-wide bucket. `div_euclid`
@@ -276,6 +285,77 @@ async fn attribution(State(state): State<Arc<AppState>>) -> Response {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     Json(TrafficAttribution { attribution }).into_response()
+}
+
+/// Server-wide status-class time series: per-bucket 2xx/3xx/4xx/5xx counts
+/// across every app/host, zero-filled to a fixed length by `range`.
+async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQuery>) -> Response {
+    let Some(analytics) = state.analytics.clone() else {
+        return analytics_disabled();
+    };
+    let (width, count) = match resolve_series(q.range.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let now = now_ms();
+    let end = floor_to(now, width);
+    let from = end - (count as i64 - 1) * width;
+
+    let permit = match state.analytics_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let mut rows = Vec::new();
+        for (tier, lo, hi) in tier_reads_for(width, from, now) {
+            rows.extend(analytics.stats_rows_between(tier, lo, hi)?);
+        }
+        Ok::<_, store::StoreError>(aggregate_series(rows, now, width, count))
+    })
+    .await;
+    drop(permit);
+    match result {
+        Ok(Ok(out)) => Json(out).into_response(),
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// Per-app variant of [`series`], filtered to one app via `stats_range`.
+async fn app_series(
+    Path(app): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SeriesQuery>,
+) -> Response {
+    let Some(analytics) = state.analytics.clone() else {
+        return analytics_disabled();
+    };
+    let (width, count) = match resolve_series(q.range.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let now = now_ms();
+    let end = floor_to(now, width);
+    let from = end - (count as i64 - 1) * width;
+
+    let permit = match state.analytics_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let mut rows = Vec::new();
+        for (tier, lo, hi) in tier_reads_for(width, from, now) {
+            rows.extend(analytics.stats_range(tier, &app, lo, hi)?);
+        }
+        Ok::<_, store::StoreError>(aggregate_series(rows, now, width, count))
+    })
+    .await;
+    drop(permit);
+    match result {
+        Ok(Ok(out)) => Json(out).into_response(),
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(e),
+    }
 }
 
 async fn overview(
