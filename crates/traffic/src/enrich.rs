@@ -77,9 +77,11 @@ static KNOWN_AGENTS: &[(&str, &str)] = &[
     ("perplexitybot", "PerplexityBot"),
     // Mistral
     ("mistralai-user", "MistralAI-User"),
-    // xAI
+    // xAI. No bare "grok" token: xAI's documented crawlers rarely send an
+    // identifiable UA in practice (they largely spoof browser UAs instead),
+    // and a bare substring match would false-positive on unrelated products
+    // whose name merely contains "grok" (e.g. Logstash's Grok filters).
     ("grokbot", "GrokBot"),
-    ("grok", "Grok"),
     // DeepSeek
     ("deepseekbot", "DeepSeekBot"),
     // Amazon

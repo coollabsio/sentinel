@@ -654,7 +654,7 @@ Busiest request paths across **every app** on the box, summed over the range wit
 |-----------|------|----------|---------|-------------|
 | `from` | string | No | `1970-01-01T00:00:00Z` | Start date in ISO 8601 format |
 | `to` | string | No | Current time | End date in ISO 8601 format |
-| `limit` | integer | No | `50` | Number of paths to return (max `1000`), applied after summing across apps and buckets |
+| `limit` | integer | No | `50` | Number of paths to return (max `1000`), applied after summing each `(app, path)` pair across buckets |
 
 Response body is identical to the per-app top-paths endpoint.
 

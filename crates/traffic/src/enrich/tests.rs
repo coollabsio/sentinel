@@ -142,7 +142,25 @@ fn known_agent_prefers_more_specific_token_over_its_substring() {
     assert_eq!(
         result.agent_name.as_deref(),
         Some("GrokBot"),
-        "GrokBot must not be masked by the plain Grok token"
+        "GrokBot must resolve to its own canonical name"
+    );
+}
+
+#[test]
+fn known_agent_does_not_false_positive_on_unrelated_products_containing_grok() {
+    let enricher = Enricher::new(Arc::new(NoGeo), 8);
+    let mut ev = base_event();
+    ev.user_agent = Some(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NotGrokClient/1.0 AppleWebKit/537.36 Chrome/91.0"
+            .into(),
+    );
+
+    let result = enricher.enrich(&ev);
+
+    assert_eq!(
+        result.agent_name, None,
+        "there is no bare 'grok' token, so an unrelated product name containing \
+         'grok' must not be misclassified as the xAI crawler"
     );
 }
 
