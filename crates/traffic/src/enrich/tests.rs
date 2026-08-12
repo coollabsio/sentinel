@@ -123,6 +123,70 @@ fn known_agent_detected_from_ua_substring() {
 }
 
 #[test]
+fn known_agent_prefers_more_specific_token_over_its_substring() {
+    let enricher = Enricher::new(Arc::new(NoGeo), 8);
+
+    let mut ev = base_event();
+    ev.user_agent =
+        Some("Mozilla/5.0 (Applebot-Extended/0.1; +http://www.apple.com/go/applebot)".into());
+    let result = enricher.enrich(&ev);
+    assert_eq!(
+        result.agent_name.as_deref(),
+        Some("Applebot-Extended"),
+        "Applebot-Extended must not be masked by the plain Applebot token"
+    );
+
+    let mut ev = base_event();
+    ev.user_agent = Some("Mozilla/5.0 (compatible; GrokBot/1.0)".into());
+    let result = enricher.enrich(&ev);
+    assert_eq!(
+        result.agent_name.as_deref(),
+        Some("GrokBot"),
+        "GrokBot must not be masked by the plain Grok token"
+    );
+}
+
+#[test]
+fn known_agent_covers_recently_added_ai_labs() {
+    let enricher = Enricher::new(Arc::new(NoGeo), 8);
+
+    let cases = [
+        (
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
+            "ClaudeBot",
+        ),
+        (
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; MistralAI-User/1.0; +https://docs.mistral.ai/robots)",
+            "MistralAI-User",
+        ),
+        (
+            "DeepSeekBot/1.0 (+https://deepseek.com/deepseekbot)",
+            "DeepSeekBot",
+        ),
+        (
+            "Mozilla/5.0 (compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)",
+            "PerplexityBot",
+        ),
+        (
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Meta-ExternalFetcher/1.1)",
+            "Meta-ExternalFetcher",
+        ),
+        ("bigsur.ai (+https://www.bigsur.ai)", "bigsur.ai"),
+    ];
+
+    for (ua, expected) in cases {
+        let mut ev = base_event();
+        ev.user_agent = Some(ua.into());
+        let result = enricher.enrich(&ev);
+        assert_eq!(
+            result.agent_name.as_deref(),
+            Some(expected),
+            "UA {ua:?} should resolve to {expected}"
+        );
+    }
+}
+
+#[test]
 fn normal_browser_has_no_agent_name_and_is_not_a_bot() {
     let enricher = Enricher::new(Arc::new(NoGeo), 8);
     let mut ev = base_event();

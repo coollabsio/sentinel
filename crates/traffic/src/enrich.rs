@@ -42,29 +42,80 @@ pub struct UaInfo {
 /// Well-known bot / AI-agent User-Agent tokens and their canonical display
 /// names, matched case-insensitively as a substring of the raw User-Agent.
 /// This catches AI crawlers even when Cloudflare's verified-bot header is
-/// absent (self-hosted, non-CF deployments). Ordered most-specific first so a
-/// vendor's specific product token (`Google-Extended`) is preferred over its
-/// generic crawler (`Googlebot`) when both could match; the first hit wins.
+/// absent (self-hosted, non-CF deployments), or when Cloudflare hasn't
+/// verified a given crawler yet.
+///
+/// Grouped by operator; within a group, a token that is itself a substring of
+/// another token in the same group (e.g. `applebot` inside
+/// `applebot-extended`) is listed *after* the longer, more specific token so
+/// the specific one wins — the first hit in list order wins overall.
+/// Sourced from each operator's own crawler docs plus the community-maintained
+/// <https://github.com/ai-robots-txt/ai.robots.txt> registry.
 static KNOWN_AGENTS: &[(&str, &str)] = &[
+    // OpenAI
     ("gptbot", "GPTBot"),
-    ("chatgpt-user", "ChatGPT-User"),
     ("oai-searchbot", "OAI-SearchBot"),
-    ("claudebot", "ClaudeBot"),
+    ("chatgpt-operator", "ChatGPT-Operator"),
+    ("chatgpt-user", "ChatGPT-User"),
+    // Anthropic
+    ("claude-code", "Claude-Code"),
+    ("claude-searchbot", "Claude-SearchBot"),
+    ("claude-user", "Claude-User"),
     ("claude-web", "Claude-Web"),
+    ("claudebot", "ClaudeBot"),
     ("anthropic-ai", "anthropic-ai"),
-    ("perplexitybot", "PerplexityBot"),
+    // Google
     ("google-extended", "Google-Extended"),
+    ("googleother", "GoogleOther"),
     ("googlebot", "Googlebot"),
-    ("bingbot", "Bingbot"),
-    ("bytespider", "Bytespider"),
-    ("ccbot", "CCBot"),
-    ("amazonbot", "Amazonbot"),
-    ("applebot", "Applebot"),
+    // Meta
     ("meta-externalagent", "Meta-ExternalAgent"),
-    ("facebookexternalhit", "Meta-ExternalAgent"),
+    ("meta-externalfetcher", "Meta-ExternalFetcher"),
+    ("facebookexternalhit", "facebookexternalhit"),
+    // Perplexity
+    ("perplexity-user", "Perplexity-User"),
+    ("perplexitybot", "PerplexityBot"),
+    // Mistral
+    ("mistralai-user", "MistralAI-User"),
+    // xAI
+    ("grokbot", "GrokBot"),
+    ("grok", "Grok"),
+    // DeepSeek
+    ("deepseekbot", "DeepSeekBot"),
+    // Amazon
+    ("amazonbot", "Amazonbot"),
+    // Apple
+    ("applebot-extended", "Applebot-Extended"),
+    ("applebot", "Applebot"),
+    // ByteDance
+    ("bytespider", "Bytespider"),
+    ("tiktokspider", "TikTokSpider"),
+    // Common Crawl (training data used by many labs)
+    ("ccbot", "CCBot"),
+    // Cohere
+    (
+        "cohere-training-data-crawler",
+        "cohere-training-data-crawler",
+    ),
     ("cohere-ai", "cohere-ai"),
+    // Allen Institute for AI
+    ("ai2bot-dolma", "Ai2Bot-Dolma"),
+    ("ai2bot", "AI2Bot"),
+    // Other AI-specific crawlers
+    ("bigsur.ai", "bigsur.ai"),
+    ("digitaloceangenai-crawler", "DigitalOceanGenAI-Crawler"),
+    ("linerbot", "LinerBot"),
+    ("mycentralaiscraperbot", "MyCentralAIScraperBot"),
+    ("pangubot", "PanguBot"),
+    ("sbintuitionsbot", "SBIntuitionsBot"),
+    ("youbot", "YouBot"),
     ("diffbot", "Diffbot"),
+    ("img2dataset", "img2dataset"),
+    ("quillbot", "QuillBot"),
+    // Search engines with an AI-assist crawler
+    ("duckassistbot", "DuckAssistBot"),
     ("duckduckbot", "DuckDuckBot"),
+    ("bingbot", "Bingbot"),
     ("yandexbot", "YandexBot"),
 ];
 
