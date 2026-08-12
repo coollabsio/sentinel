@@ -554,6 +554,7 @@ Retrieve the busiest request paths for one app, summed across every bucket in ra
 [
   {
     "path": "/api/checkout",
+    "app": "jc4wsgs",
     "requests": 5210,
     "bytes_out": 41200000,
     "p50": 38.0,
@@ -564,6 +565,7 @@ Retrieve the busiest request paths for one app, summed across every bucket in ra
 
 **Fields:**
 - `path` (string): Request path. A synthetic `__other__` entry absorbs the long tail past the server's top-N cap (`TRAFFIC_TOPN`)
+- `app` (string): The app (Coolify app UUID, or host for Caddy) that served this path. On this per-app endpoint it is always the queried app; on the server-wide endpoint it attributes each path back to its owning app
 - `requests` (number): Total request count for this path in range
 - `bytes_out` (number): Total response bytes for this path in range
 - `p50` / `p95` (number): Approximate per-path latency percentiles in milliseconds (`p99` is available from the overview endpoint)
@@ -578,7 +580,7 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ### Get App Dimension Breakdown
 
-Retrieve the top values of one dimension (status, method, country, referer, browser, OS, device, protocol, scheme, TLS version, cache status, or bot classification) for one app, summed across every bucket in range.
+Retrieve the top values of one dimension (status, method, country, referer, browser, OS, device, protocol, scheme, TLS version, cache status, bot classification, bot/AI-agent name, resolved client IP, or raw User-Agent) for one app, summed across every bucket in range.
 
 **Endpoint:** `GET /api/app/:uuid/traffic/breakdown/:dimension`
 
@@ -586,7 +588,7 @@ Retrieve the top values of one dimension (status, method, country, referer, brow
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `uuid` | string | Yes | Coolify app UUID (or host, for Caddy) |
-| `dimension` | string | Yes | One of `status`, `method`, `country`, `referer`, `browser`, `os`, `device`, `protocol`, `scheme`, `tls`, `cache`, `bot`. An unrecognized dimension returns an empty array, not an error |
+| `dimension` | string | Yes | One of `status`, `method`, `country`, `referer`, `browser`, `os`, `device`, `protocol`, `scheme`, `tls`, `cache`, `bot`, `agent`, `ip`, `useragent`. `agent` holds the bot/AI-agent name (e.g. `GPTBot`, `ClaudeBot`) and is only present for bot traffic. `ip` holds the resolved real client IP (respecting Cloudflare `CF-Connecting-IP` and `X-Forwarded-For`); `useragent` holds the raw `User-Agent` header. An unrecognized dimension returns an empty array, not an error |
 
 **Query Parameters:**
 | Parameter | Type | Required | Default | Description |
@@ -643,7 +645,7 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ### Get Server-Wide Top Paths
 
-Busiest request paths across **every app** on the box, summed over the range with per-path latency. The same path served by multiple apps is merged into a single entry, giving a correct top-N across all apps rather than a merge of per-app top-N lists.
+Busiest request paths across **every app** on the box, summed over the range with per-path latency. Rows are keyed by `(app, path)`, so the same path served by multiple apps stays a separate entry per app — each labelled with its owning `app` — giving a correct top-N across all apps that preserves per-app attribution rather than merging distinct apps' paths together.
 
 **Endpoint:** `GET /api/traffic/paths`
 
@@ -652,7 +654,7 @@ Busiest request paths across **every app** on the box, summed over the range wit
 |-----------|------|----------|---------|-------------|
 | `from` | string | No | `1970-01-01T00:00:00Z` | Start date in ISO 8601 format |
 | `to` | string | No | Current time | End date in ISO 8601 format |
-| `limit` | integer | No | `50` | Number of paths to return (max `1000`), applied after summing across apps and buckets |
+| `limit` | integer | No | `50` | Number of paths to return (max `1000`), applied after summing each `(app, path)` pair across buckets |
 
 Response body is identical to the per-app top-paths endpoint.
 
@@ -673,7 +675,7 @@ Top values of one dimension across **every app** on the box, summed over the ran
 **Path Parameters:**
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `dimension` | string | Yes | One of `status`, `method`, `country`, `referer`, `browser`, `os`, `device`, `protocol`, `scheme`, `tls`, `cache`, `bot`. An unrecognized dimension returns an empty array, not an error |
+| `dimension` | string | Yes | One of `status`, `method`, `country`, `referer`, `browser`, `os`, `device`, `protocol`, `scheme`, `tls`, `cache`, `bot`, `agent`, `ip`, `useragent`. `agent` holds the bot/AI-agent name (e.g. `GPTBot`, `ClaudeBot`) and is only present for bot traffic. `ip` holds the resolved real client IP (respecting Cloudflare `CF-Connecting-IP` and `X-Forwarded-For`); `useragent` holds the raw `User-Agent` header. An unrecognized dimension returns an empty array, not an error |
 
 **Query Parameters:**
 | Parameter | Type | Required | Default | Description |

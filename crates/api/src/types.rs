@@ -103,6 +103,10 @@ pub struct TrafficLatency {
 #[derive(Debug, Clone, Serialize)]
 pub struct TrafficPath {
     pub path: String,
+    /// The app (Coolify app UUID, or host for Caddy) that served this path,
+    /// so a server-wide response can attribute each path back to its owning
+    /// app/domain. On a per-app endpoint every row carries the queried app.
+    pub app: String,
     pub requests: i64,
     pub bytes_out: i64,
     pub p50: f64,

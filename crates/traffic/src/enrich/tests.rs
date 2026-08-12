@@ -106,6 +106,123 @@ fn detects_bot_via_woothee() {
 }
 
 #[test]
+fn known_agent_detected_from_ua_substring() {
+    let enricher = Enricher::new(Arc::new(NoGeo), 8);
+    let mut ev = base_event();
+    ev.user_agent =
+        Some("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.1; +https://openai.com/gptbot".into());
+
+    let result = enricher.enrich(&ev);
+
+    assert_eq!(
+        result.agent_name.as_deref(),
+        Some("GPTBot"),
+        "a UA containing GPTBot must resolve to the canonical agent name"
+    );
+    assert!(result.bot, "a matched known agent must imply bot traffic");
+}
+
+#[test]
+fn known_agent_prefers_more_specific_token_over_its_substring() {
+    let enricher = Enricher::new(Arc::new(NoGeo), 8);
+
+    let mut ev = base_event();
+    ev.user_agent =
+        Some("Mozilla/5.0 (Applebot-Extended/0.1; +http://www.apple.com/go/applebot)".into());
+    let result = enricher.enrich(&ev);
+    assert_eq!(
+        result.agent_name.as_deref(),
+        Some("Applebot-Extended"),
+        "Applebot-Extended must not be masked by the plain Applebot token"
+    );
+
+    let mut ev = base_event();
+    ev.user_agent = Some("Mozilla/5.0 (compatible; GrokBot/1.0)".into());
+    let result = enricher.enrich(&ev);
+    assert_eq!(
+        result.agent_name.as_deref(),
+        Some("GrokBot"),
+        "GrokBot must resolve to its own canonical name"
+    );
+}
+
+#[test]
+fn known_agent_does_not_false_positive_on_unrelated_products_containing_grok() {
+    let enricher = Enricher::new(Arc::new(NoGeo), 8);
+    let mut ev = base_event();
+    ev.user_agent = Some(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NotGrokClient/1.0 AppleWebKit/537.36 Chrome/91.0"
+            .into(),
+    );
+
+    let result = enricher.enrich(&ev);
+
+    assert_eq!(
+        result.agent_name, None,
+        "there is no bare 'grok' token, so an unrelated product name containing \
+         'grok' must not be misclassified as the xAI crawler"
+    );
+}
+
+#[test]
+fn known_agent_covers_recently_added_ai_labs() {
+    let enricher = Enricher::new(Arc::new(NoGeo), 8);
+
+    let cases = [
+        (
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
+            "ClaudeBot",
+        ),
+        (
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; MistralAI-User/1.0; +https://docs.mistral.ai/robots)",
+            "MistralAI-User",
+        ),
+        (
+            "DeepSeekBot/1.0 (+https://deepseek.com/deepseekbot)",
+            "DeepSeekBot",
+        ),
+        (
+            "Mozilla/5.0 (compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)",
+            "PerplexityBot",
+        ),
+        (
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Meta-ExternalFetcher/1.1)",
+            "Meta-ExternalFetcher",
+        ),
+        ("bigsur.ai (+https://www.bigsur.ai)", "bigsur.ai"),
+    ];
+
+    for (ua, expected) in cases {
+        let mut ev = base_event();
+        ev.user_agent = Some(ua.into());
+        let result = enricher.enrich(&ev);
+        assert_eq!(
+            result.agent_name.as_deref(),
+            Some(expected),
+            "UA {ua:?} should resolve to {expected}"
+        );
+    }
+}
+
+#[test]
+fn normal_browser_has_no_agent_name_and_is_not_a_bot() {
+    let enricher = Enricher::new(Arc::new(NoGeo), 8);
+    let mut ev = base_event();
+    ev.user_agent = Some(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            .into(),
+    );
+
+    let result = enricher.enrich(&ev);
+
+    assert_eq!(
+        result.agent_name, None,
+        "a normal Chrome UA matches no agent"
+    );
+    assert!(!result.bot);
+}
+
+#[test]
 fn ua_cache_memoizes() {
     let enricher = Enricher::new(Arc::new(NoGeo), 8);
     let mut ev = base_event();

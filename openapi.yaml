@@ -443,7 +443,11 @@ paths:
           required: true
           description: |
             One of: status, method, country, referer, browser, os, device,
-            protocol, scheme, tls, cache, bot.
+            protocol, scheme, tls, cache, bot, agent, ip, useragent. The
+            `agent` dimension holds the bot/AI-agent name (e.g. GPTBot,
+            ClaudeBot) and is only present for bot traffic. `ip` holds the
+            resolved real client IP (respecting Cloudflare CF-Connecting-IP
+            and X-Forwarded-For); `useragent` holds the raw User-Agent header.
           schema:
             type: string
           example: country
@@ -575,7 +579,11 @@ paths:
           required: true
           description: |
             One of: status, method, country, referer, browser, os, device,
-            protocol, scheme, tls, cache, bot.
+            protocol, scheme, tls, cache, bot, agent, ip, useragent. The
+            `agent` dimension holds the bot/AI-agent name (e.g. GPTBot,
+            ClaudeBot) and is only present for bot traffic. `ip` holds the
+            resolved real client IP (respecting Cloudflare CF-Connecting-IP
+            and X-Forwarded-For); `useragent` holds the raw User-Agent header.
           schema:
             type: string
           example: country
@@ -1058,10 +1066,19 @@ components:
       description: |
         One row of the top-paths table, summed over every bucket in the
         range. p99 is deliberately omitted to keep large responses small.
+        Rows are keyed by (app, path), so on the server-wide endpoint the same
+        path served by different apps stays a separate row per app.
       properties:
         path:
           type: string
           example: /api/checkout
+        app:
+          type: string
+          description: |
+            The app (Coolify app UUID, or host for Caddy) that served this
+            path. Always the queried app on a per-app endpoint; attributes each
+            path to its owning app on the server-wide endpoint.
+          example: jc4wsgs
         requests:
           type: integer
           format: int64

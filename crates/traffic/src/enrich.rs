@@ -39,6 +39,98 @@ pub struct UaInfo {
     pub is_bot: bool,
 }
 
+/// Well-known bot / AI-agent User-Agent tokens and their canonical display
+/// names, matched case-insensitively as a substring of the raw User-Agent.
+/// This catches AI crawlers even when Cloudflare's verified-bot header is
+/// absent (self-hosted, non-CF deployments), or when Cloudflare hasn't
+/// verified a given crawler yet.
+///
+/// Grouped by operator; within a group, a token that is itself a substring of
+/// another token in the same group (e.g. `applebot` inside
+/// `applebot-extended`) is listed *after* the longer, more specific token so
+/// the specific one wins — the first hit in list order wins overall.
+/// Sourced from each operator's own crawler docs plus the community-maintained
+/// <https://github.com/ai-robots-txt/ai.robots.txt> registry.
+static KNOWN_AGENTS: &[(&str, &str)] = &[
+    // OpenAI
+    ("gptbot", "GPTBot"),
+    ("oai-searchbot", "OAI-SearchBot"),
+    ("chatgpt-operator", "ChatGPT-Operator"),
+    ("chatgpt-user", "ChatGPT-User"),
+    // Anthropic
+    ("claude-code", "Claude-Code"),
+    ("claude-searchbot", "Claude-SearchBot"),
+    ("claude-user", "Claude-User"),
+    ("claude-web", "Claude-Web"),
+    ("claudebot", "ClaudeBot"),
+    ("anthropic-ai", "anthropic-ai"),
+    // Google
+    ("google-extended", "Google-Extended"),
+    ("googleother", "GoogleOther"),
+    ("googlebot", "Googlebot"),
+    // Meta
+    ("meta-externalagent", "Meta-ExternalAgent"),
+    ("meta-externalfetcher", "Meta-ExternalFetcher"),
+    ("facebookexternalhit", "facebookexternalhit"),
+    // Perplexity
+    ("perplexity-user", "Perplexity-User"),
+    ("perplexitybot", "PerplexityBot"),
+    // Mistral
+    ("mistralai-user", "MistralAI-User"),
+    // xAI. No bare "grok" token: xAI's documented crawlers rarely send an
+    // identifiable UA in practice (they largely spoof browser UAs instead),
+    // and a bare substring match would false-positive on unrelated products
+    // whose name merely contains "grok" (e.g. Logstash's Grok filters).
+    ("grokbot", "GrokBot"),
+    // DeepSeek
+    ("deepseekbot", "DeepSeekBot"),
+    // Amazon
+    ("amazonbot", "Amazonbot"),
+    // Apple
+    ("applebot-extended", "Applebot-Extended"),
+    ("applebot", "Applebot"),
+    // ByteDance
+    ("bytespider", "Bytespider"),
+    ("tiktokspider", "TikTokSpider"),
+    // Common Crawl (training data used by many labs)
+    ("ccbot", "CCBot"),
+    // Cohere
+    (
+        "cohere-training-data-crawler",
+        "cohere-training-data-crawler",
+    ),
+    ("cohere-ai", "cohere-ai"),
+    // Allen Institute for AI
+    ("ai2bot-dolma", "Ai2Bot-Dolma"),
+    ("ai2bot", "AI2Bot"),
+    // Other AI-specific crawlers
+    ("bigsur.ai", "bigsur.ai"),
+    ("digitaloceangenai-crawler", "DigitalOceanGenAI-Crawler"),
+    ("linerbot", "LinerBot"),
+    ("mycentralaiscraperbot", "MyCentralAIScraperBot"),
+    ("pangubot", "PanguBot"),
+    ("sbintuitionsbot", "SBIntuitionsBot"),
+    ("youbot", "YouBot"),
+    ("diffbot", "Diffbot"),
+    ("img2dataset", "img2dataset"),
+    ("quillbot", "QuillBot"),
+    // Search engines with an AI-assist crawler
+    ("duckassistbot", "DuckAssistBot"),
+    ("duckduckbot", "DuckDuckBot"),
+    ("bingbot", "Bingbot"),
+    ("yandexbot", "YandexBot"),
+];
+
+/// Returns the canonical name of the first [`KNOWN_AGENTS`] token found as a
+/// case-insensitive substring of `ua`, or `None` when no known agent matches.
+fn detect_known_agent(ua: &str) -> Option<&'static str> {
+    let lower = ua.to_ascii_lowercase();
+    KNOWN_AGENTS
+        .iter()
+        .find(|(token, _)| lower.contains(token))
+        .map(|(_, name)| *name)
+}
+
 /// Result of enriching a `RequestEvent`.
 pub struct Enriched {
     /// Resolved country code, if any.
@@ -51,6 +143,10 @@ pub struct Enriched {
     pub cache: Option<String>,
     /// Whether the request is attributed to a bot.
     pub bot: bool,
+    /// Canonical name of a recognized bot / AI-agent (e.g. "GPTBot",
+    /// "ClaudeBot"), from the [`KNOWN_AGENTS`] substring match, or `None`.
+    /// A match here also forces [`Self::bot`] true.
+    pub agent_name: Option<String>,
 }
 
 /// Enriches `RequestEvent`s with geolocation, UA parsing, and CF-header precedence.
@@ -95,7 +191,17 @@ impl Enricher {
             None => UaInfo::default(),
         };
 
-        let bot = ev.cf_verified_bot.is_some() || ua.is_bot;
+        // A known-agent substring match is derived from the *raw* UA, not
+        // woothee's parse, so AI crawlers are caught even where woothee has no
+        // rule for them. A match implies bot traffic, OR'd into the existing
+        // detection so neither signal can regress the other.
+        let agent_name = ev
+            .user_agent
+            .as_deref()
+            .and_then(detect_known_agent)
+            .map(String::from);
+
+        let bot = ev.cf_verified_bot.is_some() || ua.is_bot || agent_name.is_some();
 
         let cache = ev.cf_cache_status.as_deref().map(String::from);
 
@@ -105,6 +211,7 @@ impl Enricher {
             client_ip,
             cache,
             bot,
+            agent_name,
         }
     }
 

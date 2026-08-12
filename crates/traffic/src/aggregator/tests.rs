@@ -34,6 +34,7 @@ fn base_enriched() -> Enriched {
         client_ip: None,
         cache: None,
         bot: false,
+        agent_name: None,
     }
 }
 
@@ -195,6 +196,123 @@ fn take_rollup_clears_state_for_next_window() {
     let third = a.take_rollup(180_000);
     assert_eq!(third.stats.len(), 1);
     assert_eq!(third.stats[0].requests, 1);
+}
+
+#[test]
+fn agent_dimension_records_a_known_ai_agent() {
+    let mut a = Aggregator::new(50);
+    let ev = base_event();
+    let mut en = base_enriched();
+    // A known AI agent, as the enricher's known-agent detector would resolve.
+    en.agent_name = Some("GPTBot".to_string());
+    en.bot = true;
+
+    a.record(&ev, &en);
+
+    let rollup = a.take_rollup(60_000);
+    let agent_rows: Vec<_> = rollup
+        .breakdown
+        .iter()
+        .filter(|r| r.dimension == "agent")
+        .collect();
+    assert_eq!(agent_rows.len(), 1, "one agent row for the bot request");
+    assert_eq!(agent_rows[0].value, "GPTBot");
+    assert_eq!(agent_rows[0].requests, 1);
+}
+
+#[test]
+fn agent_dimension_is_absent_for_normal_browser_traffic() {
+    let mut a = Aggregator::new(50);
+    let ev = base_event();
+    // base_enriched(): bot=false, agent_name=None, ua.is_bot=false — all three
+    // agent sources resolve to empty, so `skip_empty` records nothing.
+    let en = base_enriched();
+
+    a.record(&ev, &en);
+
+    let rollup = a.take_rollup(60_000);
+    assert!(
+        rollup.breakdown.iter().all(|r| r.dimension != "agent"),
+        "non-bot traffic must not produce an agent breakdown row"
+    );
+}
+
+#[test]
+fn ip_dimension_records_the_resolved_client_ip() {
+    let mut a = Aggregator::new(50);
+    let ev = base_event();
+    let mut en = base_enriched();
+    // `client_ip` is already CF/XFF-resolved in enrich; the aggregator just
+    // renders it into an `ip` breakdown value.
+    en.client_ip = Some("203.0.113.7".parse::<IpAddr>().unwrap());
+
+    a.record(&ev, &en);
+
+    let rollup = a.take_rollup(60_000);
+    let ip_rows: Vec<_> = rollup
+        .breakdown
+        .iter()
+        .filter(|r| r.dimension == "ip")
+        .collect();
+    assert_eq!(ip_rows.len(), 1, "one ip row for the resolvable request");
+    assert_eq!(ip_rows[0].value, "203.0.113.7");
+    assert_eq!(ip_rows[0].requests, 1);
+}
+
+#[test]
+fn ip_dimension_is_absent_when_client_ip_unresolved() {
+    let mut a = Aggregator::new(50);
+    let ev = base_event();
+    // base_enriched(): client_ip = None — skip_empty drops the row.
+    let en = base_enriched();
+
+    a.record(&ev, &en);
+
+    let rollup = a.take_rollup(60_000);
+    assert!(
+        rollup.breakdown.iter().all(|r| r.dimension != "ip"),
+        "a request with no resolvable client IP must not produce an ip row"
+    );
+}
+
+#[test]
+fn useragent_dimension_records_the_raw_user_agent() {
+    let mut a = Aggregator::new(50);
+    let mut ev = base_event();
+    let ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36";
+    ev.user_agent = Some(ua.into());
+    let en = base_enriched();
+
+    a.record(&ev, &en);
+
+    let rollup = a.take_rollup(60_000);
+    let ua_rows: Vec<_> = rollup
+        .breakdown
+        .iter()
+        .filter(|r| r.dimension == "useragent")
+        .collect();
+    assert_eq!(ua_rows.len(), 1, "one useragent row for the request");
+    assert_eq!(
+        ua_rows[0].value, ua,
+        "the raw User-Agent must be recorded verbatim, not normalized"
+    );
+    assert_eq!(ua_rows[0].requests, 1);
+}
+
+#[test]
+fn useragent_dimension_is_absent_when_header_missing() {
+    let mut a = Aggregator::new(50);
+    // base_event(): user_agent = None — skip_empty drops the row.
+    let ev = base_event();
+    let en = base_enriched();
+
+    a.record(&ev, &en);
+
+    let rollup = a.take_rollup(60_000);
+    assert!(
+        rollup.breakdown.iter().all(|r| r.dimension != "useragent"),
+        "a request with no User-Agent must not produce a useragent row"
+    );
 }
 
 #[test]

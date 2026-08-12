@@ -405,9 +405,11 @@ async fn paths_sum_across_buckets_and_sort_by_requests() {
     let rows = j.as_array().unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["path"], "/b", "22 requests must outrank /a's 8");
+    assert_eq!(rows[0]["app"], "app-a", "every row carries its owning app");
     assert_eq!(rows[0]["requests"], 22);
     assert_eq!(rows[0]["bytes_out"], 2200);
     assert_eq!(rows[1]["path"], "/a");
+    assert_eq!(rows[1]["app"], "app-a");
     assert_eq!(rows[1]["requests"], 8);
     assert!(rows[0]["p50"].as_f64().unwrap() > 0.0);
     assert!(rows[0]["p95"].as_f64().unwrap() > 0.0);
@@ -478,17 +480,31 @@ async fn server_overview_merges_across_all_apps() {
 }
 
 #[tokio::test]
-async fn server_paths_merge_the_same_path_across_apps() {
+async fn server_paths_keep_apps_separate_with_per_app_attribution() {
+    // `/a` is served by both app-a (8) and app-b (4). Keyed by (app, path),
+    // the server-wide endpoint must return two distinct `/a` rows — one per
+    // app — instead of merging them into a single 12-request row, so a UI can
+    // map each path back to its owning app.
     let (s, j) = get(&format!("/api/traffic/paths?{RANGE}")).await;
     assert_eq!(s, StatusCode::OK);
     let rows = j.as_array().unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3, "/a is not merged across apps");
+
     assert_eq!(rows[0]["path"], "/b", "app-a's 22 still leads");
+    assert_eq!(rows[0]["app"], "app-a");
     assert_eq!(rows[0]["requests"], 22);
+
+    // Both `/a` rows follow; requests desc then the (app, path) tie-break puts
+    // app-a's 8 ahead of app-b's 4.
     assert_eq!(rows[1]["path"], "/a");
+    assert_eq!(rows[1]["app"], "app-a");
+    assert_eq!(rows[1]["requests"], 8);
+
+    assert_eq!(rows[2]["path"], "/a");
+    assert_eq!(rows[2]["app"], "app-b");
     assert_eq!(
-        rows[1]["requests"], 12,
-        "/a is app-a's 8 + app-b's 4 merged across apps"
+        rows[2]["requests"], 4,
+        "app-b's /a stays its own row, attributed to app-b"
     );
 }
 
