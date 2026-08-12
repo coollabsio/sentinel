@@ -958,11 +958,7 @@ fn aggregate_series_sums_counters_and_merges_sketches_per_bucket() {
         b.unique_visitors
     );
     // p95 of a 1..=200 ramp is ~190.
-    assert!(
-        (180.0..=200.0).contains(&b.p95),
-        "p95 was {}",
-        b.p95
-    );
+    assert!((180.0..=200.0).contains(&b.p95), "p95 was {}", b.p95);
 }
 
 #[tokio::test]
