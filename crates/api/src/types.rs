@@ -122,16 +122,27 @@ pub struct TrafficBreakdownEntry {
     pub bytes_out: i64,
 }
 
-/// One time bucket of status-class request counts, for the series endpoints.
-/// `bucket` is the unix-millis start of the bucket (hour- or day-aligned by
-/// the request's `range`). Counts are zero for buckets with no traffic.
+/// One time bucket of traffic totals, for the series endpoints. `bucket` is
+/// the unix-millis start of the bucket (hour- or day-aligned by the request's
+/// `range`). Counters are zero for buckets with no traffic.
+///
+/// `unique_visitors` is a per-bucket HyperLogLog++ estimate (the bucket's own
+/// sketches merged, ~1-2% error) — it is *not* additive across buckets, so a
+/// sum of these will overcount a range's true distinct visitors. `p95` is the
+/// bucket's 95th-percentile latency in ms (t-digest estimate), `0.0` when the
+/// bucket holds no decodable latency sketch.
 #[derive(Debug, Clone, Serialize)]
 pub struct TrafficSeriesBucket {
     pub bucket: i64,
+    pub requests: i64,
+    pub bytes_in: i64,
+    pub bytes_out: i64,
     pub s2xx: i64,
     pub s3xx: i64,
     pub s4xx: i64,
     pub s5xx: i64,
+    pub unique_visitors: u64,
+    pub p95: f64,
 }
 
 /// The attribution string required by the license of whichever GeoIP source

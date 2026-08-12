@@ -185,6 +185,12 @@ fn tier_reads_for(width: i64, from: i64, to: i64) -> Vec<(Tier, i64, i64)> {
 /// `count` buckets, each `width` ms wide, ending at the bucket containing
 /// `now`. Rows outside that window are dropped. Pure — `now` is passed in so
 /// the aggregation is deterministic and testable.
+///
+/// Counters sum; `unique_visitors` and `p95` are true sketch merges *within*
+/// each output bucket (an HLL union and a t-digest merge over just that
+/// bucket's rows), so a bucket spanning several finer input rows still reports
+/// one honest distinct-visitor estimate and quantile. An undecodable sketch
+/// contributes its counters but is skipped for that sketch, and logged.
 fn aggregate_series(
     rows: Vec<StatsRow>,
     now: i64,
@@ -196,12 +202,23 @@ fn aggregate_series(
     let mut out: Vec<TrafficSeriesBucket> = (0..count)
         .map(|i| TrafficSeriesBucket {
             bucket: first + i as i64 * width,
+            requests: 0,
+            bytes_in: 0,
+            bytes_out: 0,
             s2xx: 0,
             s3xx: 0,
             s4xx: 0,
             s5xx: 0,
+            unique_visitors: 0,
+            p95: 0.0,
         })
         .collect();
+
+    // Sketch accumulators, one per output bucket, parallel to `out`. Kept out
+    // of the wire struct (which carries only finalized estimates) and folded
+    // into it after the scan.
+    let mut visitors: Vec<Uniques> = (0..count).map(|_| Uniques::new()).collect();
+    let mut digests: Vec<Vec<LatencyDigest>> = (0..count).map(|_| Vec::new()).collect();
 
     for r in &rows {
         // `b` and `first` are both multiples of `width`, so the division is
@@ -211,11 +228,35 @@ fn aggregate_series(
         if idx < 0 || idx as usize >= count {
             continue;
         }
-        let slot = &mut out[idx as usize];
+        let idx = idx as usize;
+        let slot = &mut out[idx];
+        slot.requests = slot.requests.saturating_add(r.requests);
+        slot.bytes_in = slot.bytes_in.saturating_add(r.bytes_in);
+        slot.bytes_out = slot.bytes_out.saturating_add(r.bytes_out);
         slot.s2xx = slot.s2xx.saturating_add(r.s2xx);
         slot.s3xx = slot.s3xx.saturating_add(r.s3xx);
         slot.s4xx = slot.s4xx.saturating_add(r.s4xx);
         slot.s5xx = slot.s5xx.saturating_add(r.s5xx);
+
+        match Uniques::from_bytes(&r.uniques_hll) {
+            Ok(u) => visitors[idx].merge_from(&u),
+            Err(e) => tracing::warn!(
+                error = %e, app = %r.app, host = %r.host, bucket = r.bucket,
+                "skipping undecodable uniques sketch"
+            ),
+        }
+        match LatencyDigest::from_bytes(&r.latency_tdigest) {
+            Ok(d) => digests[idx].push(d),
+            Err(e) => tracing::warn!(
+                error = %e, app = %r.app, host = %r.host, bucket = r.bucket,
+                "skipping undecodable latency sketch"
+            ),
+        }
+    }
+
+    for (i, slot) in out.iter_mut().enumerate() {
+        slot.unique_visitors = visitors[i].count();
+        slot.p95 = LatencyDigest::merge(&digests[i]).quantile(0.95);
     }
     out
 }

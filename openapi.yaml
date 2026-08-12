@@ -991,15 +991,30 @@ components:
     TrafficSeriesBucket:
       type: object
       description: |
-        One time bucket of status-class request counts. `bucket` is the
-        unix-millis start of the bucket (hour- or day-aligned per `range`);
-        counts are zero for buckets with no traffic.
+        One time bucket of traffic totals. `bucket` is the unix-millis start of
+        the bucket (hour- or day-aligned per `range`); counters are zero for
+        buckets with no traffic. `unique_visitors` is a per-bucket HyperLogLog++
+        estimate (~1-2% error) and is NOT additive across buckets. `p95` is the
+        bucket's 95th-percentile latency in ms (t-digest estimate), 0.0 when the
+        bucket holds no decodable latency sketch.
       properties:
         bucket:
           type: integer
           format: int64
           description: Unix-millis start of the bucket
           example: 1723334400000
+        requests:
+          type: integer
+          format: int64
+          example: 46
+        bytes_in:
+          type: integer
+          format: int64
+          example: 12800
+        bytes_out:
+          type: integer
+          format: int64
+          example: 402000
         s2xx:
           type: integer
           format: int64
@@ -1016,6 +1031,16 @@ components:
           type: integer
           format: int64
           example: 0
+        unique_visitors:
+          type: integer
+          format: int64
+          description: Per-bucket approximate distinct client IPs (HyperLogLog++)
+          example: 37
+        p95:
+          type: number
+          format: float
+          description: 95th-percentile latency in ms (t-digest estimate)
+          example: 118.0
 
     TrafficLatency:
       type: object

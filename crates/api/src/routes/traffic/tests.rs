@@ -916,6 +916,55 @@ fn aggregate_series_zero_fills_sums_and_drops_out_of_range() {
     );
 }
 
+#[test]
+fn aggregate_series_sums_counters_and_merges_sketches_per_bucket() {
+    let now = 5 * HOUR_MS + 1234; // end bucket = 5*HOUR
+    // Two rows land in the 4*HOUR bucket with disjoint IP sets (0..100 and
+    // 100..200): a per-bucket HLL union must estimate ~200 distinct, not 100.
+    let rows = vec![
+        stats(
+            4 * HOUR_MS + 30_000,
+            "a",
+            "h",
+            10,
+            digest_bytes(&ramp(1, 200)),
+            uniques_bytes(0..100),
+        ),
+        stats(
+            4 * HOUR_MS + 90_000,
+            "a",
+            "h",
+            5,
+            digest_bytes(&ramp(1, 200)),
+            uniques_bytes(100..200),
+        ),
+    ];
+    let out = aggregate_series(rows, now, HOUR_MS, 3);
+
+    // Bucket 0 (3*HOUR): no rows -> everything zero, sketch estimates zero.
+    assert_eq!(out[0].requests, 0);
+    assert_eq!(out[0].unique_visitors, 0);
+    assert_eq!(out[0].p95, 0.0);
+
+    // Bucket 1 (4*HOUR): counters sum across the two rows.
+    let b = &out[1];
+    assert_eq!(b.requests, 15);
+    assert_eq!(b.bytes_in, 150); // requests*10 summed: 100 + 50
+    assert_eq!(b.bytes_out, 1500); // requests*100 summed: 1000 + 500
+    // HLL union of the two disjoint sets, ~1-2% error around 200.
+    assert!(
+        (188..=212).contains(&b.unique_visitors),
+        "unique_visitors was {}",
+        b.unique_visitors
+    );
+    // p95 of a 1..=200 ramp is ~190.
+    assert!(
+        (180.0..=200.0).contains(&b.p95),
+        "p95 was {}",
+        b.p95
+    );
+}
+
 #[tokio::test]
 async fn server_series_is_fixed_length_and_zero_filled() {
     // Seeded data sits in 2023, far outside any window ending "now", so counts

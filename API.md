@@ -710,7 +710,7 @@ Per-bucket request counts by HTTP status class for one app, for charting. The re
 |-----------|------|----------|---------|-------------|
 | `range` | string | No | `24h` | Window + granularity: `24h` (hourly), `7d`/`30d` (daily) |
 
-Each element is `{ "bucket", "s2xx", "s3xx", "s4xx", "s5xx" }`, where `bucket` is the unix-millis start of the bucket. An app with no data in range returns a `200` with every bucket zeroed, not a `404`.
+Each element is `{ "bucket", "requests", "bytes_in", "bytes_out", "s2xx", "s3xx", "s4xx", "s5xx", "unique_visitors", "p95" }`, where `bucket` is the unix-millis start of the bucket. `unique_visitors` is a per-bucket HyperLogLog++ estimate (~1-2% error) and is **not** additive across buckets. `p95` is the bucket's 95th-percentile latency in ms (t-digest estimate), `0.0` when the bucket holds no decodable latency sketch. An app with no data in range returns a `200` with every bucket zeroed, not a `404`.
 
 **Example:**
 ```bash
@@ -720,8 +720,8 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ```json
 [
-  { "bucket": 1723334400000, "s2xx": 42, "s3xx": 3, "s4xx": 1, "s5xx": 0 },
-  { "bucket": 1723338000000, "s2xx": 0, "s3xx": 0, "s4xx": 0, "s5xx": 0 }
+  { "bucket": 1723334400000, "requests": 46, "bytes_in": 12800, "bytes_out": 402000, "s2xx": 42, "s3xx": 3, "s4xx": 1, "s5xx": 0, "unique_visitors": 37, "p95": 118.0 },
+  { "bucket": 1723338000000, "requests": 0, "bytes_in": 0, "bytes_out": 0, "s2xx": 0, "s3xx": 0, "s4xx": 0, "s5xx": 0, "unique_visitors": 0, "p95": 0.0 }
 ]
 ```
 
