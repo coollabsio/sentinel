@@ -39,6 +39,45 @@ pub struct UaInfo {
     pub is_bot: bool,
 }
 
+/// Well-known bot / AI-agent User-Agent tokens and their canonical display
+/// names, matched case-insensitively as a substring of the raw User-Agent.
+/// This catches AI crawlers even when Cloudflare's verified-bot header is
+/// absent (self-hosted, non-CF deployments). Ordered most-specific first so a
+/// vendor's specific product token (`Google-Extended`) is preferred over its
+/// generic crawler (`Googlebot`) when both could match; the first hit wins.
+static KNOWN_AGENTS: &[(&str, &str)] = &[
+    ("gptbot", "GPTBot"),
+    ("chatgpt-user", "ChatGPT-User"),
+    ("oai-searchbot", "OAI-SearchBot"),
+    ("claudebot", "ClaudeBot"),
+    ("claude-web", "Claude-Web"),
+    ("anthropic-ai", "anthropic-ai"),
+    ("perplexitybot", "PerplexityBot"),
+    ("google-extended", "Google-Extended"),
+    ("googlebot", "Googlebot"),
+    ("bingbot", "Bingbot"),
+    ("bytespider", "Bytespider"),
+    ("ccbot", "CCBot"),
+    ("amazonbot", "Amazonbot"),
+    ("applebot", "Applebot"),
+    ("meta-externalagent", "Meta-ExternalAgent"),
+    ("facebookexternalhit", "Meta-ExternalAgent"),
+    ("cohere-ai", "cohere-ai"),
+    ("diffbot", "Diffbot"),
+    ("duckduckbot", "DuckDuckBot"),
+    ("yandexbot", "YandexBot"),
+];
+
+/// Returns the canonical name of the first [`KNOWN_AGENTS`] token found as a
+/// case-insensitive substring of `ua`, or `None` when no known agent matches.
+fn detect_known_agent(ua: &str) -> Option<&'static str> {
+    let lower = ua.to_ascii_lowercase();
+    KNOWN_AGENTS
+        .iter()
+        .find(|(token, _)| lower.contains(token))
+        .map(|(_, name)| *name)
+}
+
 /// Result of enriching a `RequestEvent`.
 pub struct Enriched {
     /// Resolved country code, if any.
@@ -51,6 +90,10 @@ pub struct Enriched {
     pub cache: Option<String>,
     /// Whether the request is attributed to a bot.
     pub bot: bool,
+    /// Canonical name of a recognized bot / AI-agent (e.g. "GPTBot",
+    /// "ClaudeBot"), from the [`KNOWN_AGENTS`] substring match, or `None`.
+    /// A match here also forces [`Self::bot`] true.
+    pub agent_name: Option<String>,
 }
 
 /// Enriches `RequestEvent`s with geolocation, UA parsing, and CF-header precedence.
@@ -95,7 +138,17 @@ impl Enricher {
             None => UaInfo::default(),
         };
 
-        let bot = ev.cf_verified_bot.is_some() || ua.is_bot;
+        // A known-agent substring match is derived from the *raw* UA, not
+        // woothee's parse, so AI crawlers are caught even where woothee has no
+        // rule for them. A match implies bot traffic, OR'd into the existing
+        // detection so neither signal can regress the other.
+        let agent_name = ev
+            .user_agent
+            .as_deref()
+            .and_then(detect_known_agent)
+            .map(String::from);
+
+        let bot = ev.cf_verified_bot.is_some() || ua.is_bot || agent_name.is_some();
 
         let cache = ev.cf_cache_status.as_deref().map(String::from);
 
@@ -105,6 +158,7 @@ impl Enricher {
             client_ip,
             cache,
             bot,
+            agent_name,
         }
     }
 

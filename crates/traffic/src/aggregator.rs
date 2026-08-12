@@ -83,8 +83,8 @@ impl Aggregator {
     /// Folds one already-enriched event into the current window.
     ///
     /// Every optional enrichment/event field (country, referer, tls,
-    /// cache, browser/os/device, client_ip) is skipped cleanly when
-    /// absent/empty rather than guessed at, matching the project's
+    /// cache, browser/os/device, client_ip, user_agent) is skipped cleanly
+    /// when absent/empty rather than guessed at, matching the project's
     /// "skip incomplete data" convention.
     pub fn record(&mut self, ev: &RequestEvent, en: &Enriched) {
         let app = ev.app.to_string();
@@ -153,6 +153,35 @@ impl Aggregator {
         }
         let bot = if en.bot { "true" } else { "false" };
         record_breakdown(dims, "bot", bot, bytes, topn, false);
+
+        // `agent` — the bot's / AI-agent's name, recorded only for bot traffic.
+        // Value precedence: Cloudflare's verified-bot name, else the
+        // known-agent detector, else woothee's crawler name (`browser` when
+        // `is_bot`). `skip_empty=true` drops non-bot traffic, where all three
+        // resolve to empty, so this dimension only ever holds bots.
+        let agent = ev
+            .cf_verified_bot
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .or(en.agent_name.as_deref())
+            .or_else(|| en.ua.is_bot.then_some(en.ua.browser.as_str()))
+            .unwrap_or("");
+        record_breakdown(dims, "agent", agent, bytes, topn, true);
+
+        // `ip` — the resolved *real* client IP. `en.client_ip` is already
+        // CF/XFF-resolved in `enrich` (CF-Connecting-IP → first X-Forwarded-For
+        // entry → raw connection IP), so this dimension naturally holds the real
+        // visitor behind Cloudflare / a reverse proxy, not the proxy's own IP.
+        // Rendered into a local binding so the borrow outlives the call.
+        // `skip_empty=true` drops requests with no resolvable IP.
+        let ip = en.client_ip.map(|ip| ip.to_string()).unwrap_or_default();
+        record_breakdown(dims, "ip", &ip, bytes, topn, true);
+
+        // `useragent` — the raw User-Agent header, recorded verbatim (never
+        // lowercased or normalized) so the UI can show the full agent string.
+        // `skip_empty=true` drops requests without a User-Agent.
+        let user_agent = ev.user_agent.as_deref().unwrap_or("");
+        record_breakdown(dims, "useragent", user_agent, bytes, topn, true);
     }
 
     /// Drains the current window into row types for `bucket`, capping
@@ -249,11 +278,11 @@ impl Aggregator {
 /// Adds one value to a dimension's top-N within an app's [`DimMap`]. With
 /// `skip_empty`, an empty
 /// `value` (a woothee UA-parse fallback, or an absent event field) is dropped
-/// rather than recorded — used by the seven optional dimensions (`country`,
-/// `referer`, `browser`, `os`, `device`, `tls`, `cache`). The five
-/// always-recorded dimensions (`status`, `method`, `protocol`, `scheme`,
-/// `bot`), drawn from required fields, pass `skip_empty=false` so an empty
-/// value is never silently dropped.
+/// rather than recorded — used by the ten optional dimensions (`country`,
+/// `referer`, `browser`, `os`, `device`, `tls`, `cache`, `agent`, `ip`,
+/// `useragent`). The five always-recorded dimensions (`status`, `method`,
+/// `protocol`, `scheme`, `bot`), drawn from required fields, pass
+/// `skip_empty=false` so an empty value is never silently dropped.
 fn record_breakdown(
     dims: &mut DimMap,
     dim: &'static str,

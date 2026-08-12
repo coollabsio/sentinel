@@ -106,6 +106,41 @@ fn detects_bot_via_woothee() {
 }
 
 #[test]
+fn known_agent_detected_from_ua_substring() {
+    let enricher = Enricher::new(Arc::new(NoGeo), 8);
+    let mut ev = base_event();
+    ev.user_agent =
+        Some("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.1; +https://openai.com/gptbot".into());
+
+    let result = enricher.enrich(&ev);
+
+    assert_eq!(
+        result.agent_name.as_deref(),
+        Some("GPTBot"),
+        "a UA containing GPTBot must resolve to the canonical agent name"
+    );
+    assert!(result.bot, "a matched known agent must imply bot traffic");
+}
+
+#[test]
+fn normal_browser_has_no_agent_name_and_is_not_a_bot() {
+    let enricher = Enricher::new(Arc::new(NoGeo), 8);
+    let mut ev = base_event();
+    ev.user_agent = Some(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            .into(),
+    );
+
+    let result = enricher.enrich(&ev);
+
+    assert_eq!(
+        result.agent_name, None,
+        "a normal Chrome UA matches no agent"
+    );
+    assert!(!result.bot);
+}
+
+#[test]
 fn ua_cache_memoizes() {
     let enricher = Enricher::new(Arc::new(NoGeo), 8);
     let mut ev = base_event();

@@ -504,9 +504,10 @@ async fn server_overview(
     }
 }
 
-/// Server-wide top paths: [`paths`] across every app. `top_paths` groups by path
-/// string, so the same path served by different apps (e.g. `/`) merges into one
-/// server-wide row — a correct top-N over all apps, not a merge of per-app lists.
+/// Server-wide top paths: [`paths`] across every app. `top_paths` groups by
+/// `(app, path)`, so the same path served by different apps (e.g. `/`) stays a
+/// separate row per app, each carrying its owning app — a correct top-N over
+/// all apps that preserves per-app attribution, not a merge of per-app lists.
 async fn server_paths(State(state): State<Arc<AppState>>, Query(q): Query<TopQuery>) -> Response {
     let Some(analytics) = state.analytics.clone() else {
         return analytics_disabled();
@@ -651,8 +652,14 @@ fn summarize_stats(rows: Vec<StatsRow>) -> TrafficOverview {
     }
 }
 
-/// Groups per-bucket path rows by path, summing counters and merging each
-/// path's latency digests, then returns the `limit` busiest paths.
+/// Groups per-bucket path rows by `(app, path)`, summing counters and merging
+/// each group's latency digests, then returns the `limit` busiest paths.
+///
+/// Keying by `(app, path)` rather than `path` alone keeps per-app attribution
+/// on the server-wide endpoint: the same path (e.g. `/`) served by two apps
+/// stays two rows, each labelled with its owning app, instead of collapsing
+/// into one. The per-app endpoint is unaffected — every row shares one app, so
+/// the tuple degenerates to grouping by path.
 ///
 /// Digests are folded *incrementally*, one row at a time, so resident sketch
 /// memory is bounded by the number of distinct paths rather than by (path,
@@ -666,13 +673,15 @@ fn top_paths(rows: Vec<PathRow>, limit: usize) -> Vec<TrafficPath> {
         latency: LatencyDigest,
     }
 
-    let mut by_path: HashMap<String, Acc> = HashMap::new();
+    let mut by_path: HashMap<(String, String), Acc> = HashMap::new();
     for r in rows {
-        let acc = by_path.entry(r.path).or_insert_with(|| Acc {
-            requests: 0,
-            bytes_out: 0,
-            latency: LatencyDigest::new(),
-        });
+        let acc = by_path
+            .entry((r.app.clone(), r.path))
+            .or_insert_with(|| Acc {
+                requests: 0,
+                bytes_out: 0,
+                latency: LatencyDigest::new(),
+            });
         acc.requests = acc.requests.saturating_add(r.requests);
         acc.bytes_out = acc.bytes_out.saturating_add(r.bytes_out);
         match LatencyDigest::from_bytes(&r.latency_tdigest) {
@@ -691,15 +700,18 @@ fn top_paths(rows: Vec<PathRow>, limit: usize) -> Vec<TrafficPath> {
 
     let mut out: Vec<TrafficPath> = by_path
         .into_iter()
-        .map(|(path, acc)| TrafficPath {
+        .map(|((app, path), acc)| TrafficPath {
             path,
+            app,
             requests: acc.requests,
             bytes_out: acc.bytes_out,
             p50: acc.latency.quantile(0.5),
             p95: acc.latency.quantile(0.95),
         })
         .collect();
-    sort_and_truncate(&mut out, limit, |p| (p.requests, &p.path));
+    sort_and_truncate(&mut out, limit, |p| {
+        (p.requests, (p.app.clone(), p.path.clone()))
+    });
     out
 }
 
@@ -721,21 +733,25 @@ fn top_breakdown(rows: Vec<BreakdownRow>, limit: usize) -> Vec<TrafficBreakdownE
             bytes_out,
         })
         .collect();
-    sort_and_truncate(&mut out, limit, |e| (e.requests, &e.value));
+    sort_and_truncate(&mut out, limit, |e| (e.requests, e.value.clone()));
     out
 }
 
 /// Sorts by request count descending, breaking ties on the key ascending so
 /// the response is deterministic (the `HashMap` grouping above is not), then
-/// keeps the top `limit`.
-fn sort_and_truncate<T, F>(rows: &mut Vec<T>, limit: usize, key: F)
+/// keeps the top `limit`. The tie-break key is generic so paths can break ties
+/// on `(app, path)` while breakdowns break on the single `value`.
+fn sort_and_truncate<T, K, F>(rows: &mut Vec<T>, limit: usize, key: F)
 where
-    F: Fn(&T) -> (i64, &String),
+    K: Ord,
+    F: Fn(&T) -> (i64, K),
 {
-    rows.sort_by(|a, b| {
-        let (a_reqs, a_key) = key(a);
-        let (b_reqs, b_key) = key(b);
-        b_reqs.cmp(&a_reqs).then_with(|| a_key.cmp(b_key))
+    // `Reverse` on the request count sorts it descending while the owned
+    // tie-break key stays ascending. `sort_by_cached_key` computes each row's
+    // key once, so the per-row key allocation is O(rows), not O(rows log rows).
+    rows.sort_by_cached_key(|t| {
+        let (reqs, k) = key(t);
+        (std::cmp::Reverse(reqs), k)
     });
     rows.truncate(limit);
 }
