@@ -659,6 +659,78 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/traffic/dashboard:
+    get:
+      summary: Get aggregate traffic dashboard (server-wide)
+      description: |
+        Bundle every traffic shape into one response so a dashboard can replace
+        ~15 separate requests with a single call. Each member is verbatim the
+        shape of its standalone endpoint, with the same server-side sketch
+        merges (t-digest latency, HLL uniques) — nothing is re-summed.
+
+        `overview`, `paths`, and every `breakdowns` dimension follow `from`/`to`;
+        `series` follows `range`. The server-wide variant includes `apps` (every
+        app with traffic, ranked by requests desc, capped at `apps_limit`). An
+        empty range returns 200 with zeroed/empty members, never 404.
+
+        Additive: older Coolify keeps calling the individual endpoints; new
+        Coolify calls this first and falls back to them on 404.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - $ref: '#/components/parameters/Range'
+        - $ref: '#/components/parameters/PathsLimit'
+        - $ref: '#/components/parameters/BreakdownLimit'
+        - $ref: '#/components/parameters/AppsLimit'
+      responses:
+        '200':
+          description: Aggregate dashboard, including the app leaderboard
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrafficDashboard'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/app/{uuid}/traffic/dashboard:
+    get:
+      summary: Get aggregate traffic dashboard (per app)
+      description: |
+        Per-app variant of `GET /api/traffic/dashboard`: every member filtered
+        to one app, and `apps` omitted entirely. `apps_limit` is ignored.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/AppUuid'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - $ref: '#/components/parameters/Range'
+        - $ref: '#/components/parameters/PathsLimit'
+        - $ref: '#/components/parameters/BreakdownLimit'
+      responses:
+        '200':
+          description: Aggregate dashboard for one app (no leaderboard)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrafficDashboard'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /api/stats:
     get:
       summary: Get database statistics
@@ -750,6 +822,44 @@ components:
         enum: [24h, 7d, 30d]
         default: 24h
       example: 7d
+
+    PathsLimit:
+      name: paths_limit
+      in: query
+      description: Top-N cap for the dashboard's `paths`. Defaults to 50, capped at 1000.
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 50
+      example: 25
+
+    BreakdownLimit:
+      name: breakdown_limit
+      in: query
+      description: Top-N cap per dashboard breakdown dimension. Defaults to 50, capped at 1000.
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 50
+      example: 25
+
+    AppsLimit:
+      name: apps_limit
+      in: query
+      description: |
+        Cap for the server-wide dashboard's `apps` leaderboard. Defaults to
+        200, capped at 1000. Ignored by the per-app variant.
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 200
+      example: 100
 
   schemas:
     CurrentCPUUsage:
@@ -1148,6 +1258,99 @@ components:
             when GeoIP is disabled, not yet resolved, or the active source
             is an unrecognized GEOIP_DB_URL override.
           example: "This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com"
+
+    TrafficBreakdowns:
+      type: object
+      description: |
+        The eleven breakdown dimensions Coolify renders, each a top-N list in
+        the same shape as GET /traffic/breakdown/{dimension}.
+      properties:
+        country:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficBreakdownEntry'
+        referer:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficBreakdownEntry'
+        browser:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficBreakdownEntry'
+        os:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficBreakdownEntry'
+        device:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficBreakdownEntry'
+        protocol:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficBreakdownEntry'
+        cache:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficBreakdownEntry'
+        status:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficBreakdownEntry'
+        agent:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficBreakdownEntry'
+        ip:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficBreakdownEntry'
+        useragent:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficBreakdownEntry'
+
+    TrafficAppEntry:
+      type: object
+      description: One row of the server-wide app leaderboard.
+      properties:
+        uuid:
+          type: string
+          example: jc4wsgs
+        overview:
+          $ref: '#/components/schemas/TrafficOverview'
+
+    TrafficDashboard:
+      type: object
+      description: |
+        Every traffic shape bundled into one response. Each member is verbatim
+        the shape of its standalone endpoint. `apps` is present only on the
+        server-wide variant.
+      properties:
+        overview:
+          $ref: '#/components/schemas/TrafficOverview'
+        paths:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficPath'
+        breakdowns:
+          $ref: '#/components/schemas/TrafficBreakdowns'
+        series:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficSeriesBucket'
+        attribution:
+          type: string
+          nullable: true
+          description: The active GeoIP source's attribution string, or null.
+          example: "This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com"
+        apps:
+          type: array
+          description: |
+            Per-app leaderboard, ranked by requests desc. Present only on the
+            server-wide dashboard; omitted on the per-app variant.
+          items:
+            $ref: '#/components/schemas/TrafficAppEntry'
 
     DatabaseStats:
       type: object

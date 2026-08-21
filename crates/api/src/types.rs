@@ -152,3 +152,48 @@ pub struct TrafficSeriesBucket {
 pub struct TrafficAttribution {
     pub attribution: Option<String>,
 }
+
+/// Everything Coolify's traffic dashboard needs in one payload, so it can
+/// replace ~15 separate round-trips with a single request. Every member is the
+/// verbatim shape of its standalone endpoint — the same serializers and
+/// server-side sketch merges — bundled, never re-summed.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficDashboard {
+    pub overview: TrafficOverview,
+    pub paths: Vec<TrafficPath>,
+    pub breakdowns: TrafficBreakdowns,
+    pub series: Vec<TrafficSeriesBucket>,
+    /// The active GeoIP attribution string, or `null`. Flattened out of
+    /// [`TrafficAttribution`] so the dashboard carries the bare value.
+    pub attribution: Option<String>,
+    /// Per-app leaderboard, present only on the server-wide dashboard and
+    /// omitted entirely on the per-app variant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apps: Option<Vec<TrafficAppEntry>>,
+}
+
+/// The eleven breakdown dimensions Coolify renders, each a top-N list in the
+/// same shape as `GET /traffic/breakdown/{dim}`. A fixed struct rather than a
+/// map so the dimension set is the single source of truth and always complete.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficBreakdowns {
+    pub country: Vec<TrafficBreakdownEntry>,
+    pub referer: Vec<TrafficBreakdownEntry>,
+    pub browser: Vec<TrafficBreakdownEntry>,
+    pub os: Vec<TrafficBreakdownEntry>,
+    pub device: Vec<TrafficBreakdownEntry>,
+    pub protocol: Vec<TrafficBreakdownEntry>,
+    pub cache: Vec<TrafficBreakdownEntry>,
+    pub status: Vec<TrafficBreakdownEntry>,
+    pub agent: Vec<TrafficBreakdownEntry>,
+    pub ip: Vec<TrafficBreakdownEntry>,
+    pub useragent: Vec<TrafficBreakdownEntry>,
+}
+
+/// One row of the server-wide app leaderboard: an app UUID plus its overview,
+/// ranked by request count descending.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficAppEntry {
+    pub uuid: String,
+    pub overview: TrafficOverview,
+}

@@ -539,6 +539,8 @@ async fn every_endpoint_404s_when_analytics_is_disabled() {
         "/api/traffic/paths",
         "/api/traffic/breakdown/country",
         "/api/traffic/attribution",
+        "/api/traffic/dashboard",
+        "/api/app/app-a/traffic/dashboard",
     ] {
         let (s, j) = get_with(state(None), uri).await;
         assert_eq!(s, StatusCode::NOT_FOUND, "{uri}");
@@ -1002,4 +1004,127 @@ async fn series_rejects_unknown_range() {
 async fn series_404_when_analytics_disabled() {
     let (status, _) = get_with(state(None), "/api/traffic/series").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// --- Dashboard --------------------------------------------------------------
+
+/// The server-wide dashboard bundles the exact shapes of the standalone
+/// endpoints, so each member must match what its own endpoint returns.
+#[tokio::test]
+async fn server_dashboard_bundles_every_member() {
+    let (s, j) = get(&format!("/api/traffic/dashboard?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Overview identical to GET /traffic/overview (47 across every app/host).
+    assert_eq!(j["overview"]["requests"], 47);
+    assert_eq!(j["overview"]["status"]["s2xx"], 41);
+
+    // Paths identical to GET /traffic/paths: /a stays per-app, 3 rows.
+    let paths = j["paths"].as_array().unwrap();
+    assert_eq!(paths.len(), 3);
+    assert_eq!(paths[0]["path"], "/b");
+    assert_eq!(paths[0]["requests"], 22);
+
+    // Breakdowns: all eleven dimensions present; country merged across apps.
+    let bds = &j["breakdowns"];
+    for dim in [
+        "country",
+        "referer",
+        "browser",
+        "os",
+        "device",
+        "protocol",
+        "cache",
+        "status",
+        "agent",
+        "ip",
+        "useragent",
+    ] {
+        assert!(bds[dim].is_array(), "breakdown '{dim}' missing");
+    }
+    let country = bds["country"].as_array().unwrap();
+    assert_eq!(country[0]["value"], "US");
+    assert_eq!(country[0]["requests"], 15);
+
+    // Series is the fixed-length zero-filled array (default 24h → 24 buckets).
+    assert_eq!(j["series"].as_array().unwrap().len(), 24);
+
+    // attribution flattened to the bare value (null here — GeoIP not resolved).
+    assert!(j["attribution"].is_null());
+
+    // Leaderboard ranked by requests desc: app-a (40) then app-b (7).
+    let apps = j["apps"].as_array().unwrap();
+    assert_eq!(apps.len(), 2);
+    assert_eq!(apps[0]["uuid"], "app-a");
+    assert_eq!(apps[0]["overview"]["requests"], 40);
+    assert_eq!(apps[1]["uuid"], "app-b");
+    assert_eq!(apps[1]["overview"]["requests"], 7);
+}
+
+/// The per-app variant filters every member to one app and omits `apps`.
+#[tokio::test]
+async fn app_dashboard_filters_and_omits_leaderboard() {
+    let (s, j) = get(&format!("/api/app/app-a/traffic/dashboard?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // app-a only: 10 + 30 = 40, not the 47 that includes app-b.
+    assert_eq!(j["overview"]["requests"], 40);
+    // Every path row belongs to app-a.
+    for p in j["paths"].as_array().unwrap() {
+        assert_eq!(p["app"], "app-a");
+    }
+    // No leaderboard on the per-app variant.
+    assert!(j.get("apps").is_none(), "apps must be omitted for per-app");
+}
+
+/// An out-of-range window returns 200 with zeroed/empty members, never 404.
+#[tokio::test]
+async fn dashboard_empty_range_is_zeroed_not_404() {
+    let (s, j) =
+        get("/api/traffic/dashboard?from=2000-01-01T00:00:00Z&to=2000-01-02T00:00:00Z").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j["overview"]["requests"], 0);
+    assert_eq!(j["paths"].as_array().unwrap().len(), 0);
+    assert_eq!(j["breakdowns"]["country"].as_array().unwrap().len(), 0);
+    // Series stays fixed-length and zero-filled.
+    assert_eq!(j["series"].as_array().unwrap().len(), 24);
+    // Leaderboard still lists the apps, each with a zeroed overview.
+    for entry in j["apps"].as_array().unwrap() {
+        assert_eq!(entry["overview"]["requests"], 0);
+    }
+}
+
+/// The three limits and the series range are honored, and empty values fall
+/// back to defaults rather than 400.
+#[tokio::test]
+async fn dashboard_honors_limits_and_range() {
+    let (s, j) = get(&format!(
+        "/api/traffic/dashboard?{RANGE}&paths_limit=1&apps_limit=1&range=7d"
+    ))
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j["paths"].as_array().unwrap().len(), 1, "paths_limit=1");
+    assert_eq!(j["apps"].as_array().unwrap().len(), 1, "apps_limit=1");
+    assert_eq!(j["series"].as_array().unwrap().len(), 7, "range=7d");
+
+    let (s, _) = get(&format!(
+        "/api/traffic/dashboard?{RANGE}&paths_limit=&breakdown_limit=&apps_limit="
+    ))
+    .await;
+    assert_eq!(s, StatusCode::OK, "empty limits must default, not 400");
+}
+
+/// Malformed knobs are rejected with 400, matching the per-endpoint routes.
+#[tokio::test]
+async fn dashboard_rejects_malformed_knobs() {
+    for uri in [
+        "/api/traffic/dashboard?from=bogus",
+        "/api/traffic/dashboard?paths_limit=0",
+        "/api/traffic/dashboard?breakdown_limit=abc",
+        "/api/traffic/dashboard?apps_limit=0",
+        "/api/traffic/dashboard?range=bogus",
+    ] {
+        let (s, _) = get(uri).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{uri}");
+    }
 }
