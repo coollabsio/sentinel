@@ -770,6 +770,69 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ---
 
+### Get Aggregate Dashboard
+
+Bundle every traffic shape above into a single response, so a dashboard can replace ~15 separate requests with one. Each member is **verbatim** the shape of its standalone endpoint — the same server-side merges (t-digest latency, HLL uniques merged, never re-summed).
+
+Additive: older Coolify keeps calling the individual endpoints; new Coolify calls this first and falls back to them on `404`.
+
+**Endpoint:** `GET /api/traffic/dashboard` (server-wide) and `GET /api/app/:uuid/traffic/dashboard` (per app)
+
+**Path Parameters** (per-app variant only):
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `uuid` | string | Yes | Coolify app UUID (or host, for Caddy) |
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from` | string | No | epoch | ISO-8601 Zulu start bound for overview/paths/breakdowns |
+| `to` | string | No | now | ISO-8601 Zulu end bound for overview/paths/breakdowns |
+| `range` | string | No | `24h` | Series window + granularity: `24h` (hourly), `7d`/`30d` (daily) |
+| `paths_limit` | integer | No | `50` | Top-N cap for `paths` (max `1000`) |
+| `breakdown_limit` | integer | No | `50` | Top-N cap per breakdown dimension (max `1000`) |
+| `apps_limit` | integer | No | `200` | Cap for the `apps` leaderboard (max `1000`; server-wide only) |
+
+**Response:** a single object. `overview`, `paths`, and each `breakdowns` dimension follow `from`/`to`; `series` follows `range`. The server-wide variant includes `apps` (every app with traffic, ranked by requests desc, capped at `apps_limit`); the per-app variant omits `apps` entirely. An empty range returns `200` with zeroed/empty members — never `404`.
+
+Each member is verbatim the shape of its standalone endpoint (see the sections above): `overview` is [Get App Traffic Overview](#get-app-traffic-overview); `paths` is [Get App Top Paths](#get-app-top-paths); each `breakdowns.<dim>` entry is `{ "value", "requests", "bytes_out" }`; `series` is [Get App Status-Class Time Series](#get-app-status-class-time-series); `attribution` is the bare string from [Get GeoIP Attribution](#get-geoip-attribution) (or `null`). Only apps with traffic in the range appear in `apps`.
+
+```json
+{
+  "overview": {
+    "requests": 128340,
+    "bytes_in": 15200000,
+    "bytes_out": 981000000,
+    "status": { "s2xx": 120000, "s3xx": 4000, "s4xx": 4200, "s5xx": 140 },
+    "latency": { "p50": 42.0, "p95": 118.0, "p99": 240.0 },
+    "unique_visitors": 8421
+  },
+  "paths": [
+    { "path": "/api/checkout", "app": "jc4wsgs", "requests": 42000, "bytes_out": 320000000, "p50": 40.0, "p95": 110.0 }
+  ],
+  "breakdowns": {
+    "country": [ { "value": "US", "requests": 42000, "bytes_out": 320000000 } ],
+    "referer": [], "browser": [], "os": [], "device": [], "protocol": [],
+    "cache": [], "status": [], "agent": [], "ip": [], "useragent": []
+  },
+  "series": [
+    { "bucket": 1723334400000, "requests": 46, "bytes_in": 12800, "bytes_out": 402000, "s2xx": 42, "s3xx": 3, "s4xx": 1, "s5xx": 0, "unique_visitors": 37, "p95": 118.0 }
+  ],
+  "attribution": "This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com",
+  "apps": [
+    { "uuid": "jc4wsgs", "overview": { "requests": 128340, "bytes_in": 15200000, "bytes_out": 981000000, "status": { "s2xx": 120000, "s3xx": 4000, "s4xx": 4200, "s5xx": 140 }, "latency": { "p50": 42.0, "p95": 118.0, "p99": 240.0 }, "unique_visitors": 8421 } }
+  ]
+}
+```
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/traffic/dashboard?range=7d&paths_limit=25"
+```
+
+---
+
 ## Debug Endpoints
 
 Debug endpoints are only available when the `DEBUG` environment variable is set to `true`.

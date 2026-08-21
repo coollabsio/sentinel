@@ -10,15 +10,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use store::traffic::{BreakdownRow, PathRow, StatsRow, Tier};
+use store::traffic::{AnalyticsStore, BreakdownRow, PathRow, StatsRow, Tier};
 use traffic::sketches::{LatencyDigest, Uniques};
 
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
 use crate::time::now_ms;
 use crate::types::{
-    ErrorBody, TrafficAttribution, TrafficBreakdownEntry, TrafficLatency, TrafficOverview,
-    TrafficPath, TrafficSeriesBucket, TrafficStatusBreakdown,
+    ErrorBody, TrafficAppEntry, TrafficAttribution, TrafficBreakdownEntry, TrafficBreakdowns,
+    TrafficDashboard, TrafficLatency, TrafficOverview, TrafficPath, TrafficSeriesBucket,
+    TrafficStatusBreakdown,
 };
 
 const MIN_MS: i64 = 60_000;
@@ -35,6 +36,9 @@ const DEFAULT_LIMIT: usize = 50;
 /// Upper bound on the caller-supplied `limit`, so one request cannot ask the
 /// handler to materialize an unbounded result set.
 const MAX_LIMIT: usize = 1_000;
+
+/// Default cap on the dashboard's app leaderboard when `apps_limit` is absent.
+const DEFAULT_APPS_LIMIT: usize = 200;
 
 /// SQL `LIMIT` on `paths_range`/`breakdown_range`, purely a memory backstop
 /// against a pathological span. Real queries fall far below it; hitting it is
@@ -67,12 +71,15 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(breakdown),
         )
         .route("/api/app/{uuid}/traffic/series", get(app_series))
+        .route("/api/app/{uuid}/traffic/dashboard", get(app_dashboard))
         // Server-wide variants: same shapes, merged across every app/host.
         .route("/api/traffic/overview", get(server_overview))
         .route("/api/traffic/paths", get(server_paths))
         .route("/api/traffic/breakdown/{dimension}", get(server_breakdown))
         .route("/api/traffic/series", get(series))
         .route("/api/traffic/attribution", get(attribution))
+        // One request that bundles every shape above, for Coolify's dashboard.
+        .route("/api/traffic/dashboard", get(server_dashboard))
 }
 
 /// `from`/`to` plus a top-N cap, for the two ranked endpoints.
@@ -103,6 +110,22 @@ impl TopQuery {
 #[derive(Debug, Deserialize)]
 pub struct SeriesQuery {
     pub range: Option<String>,
+}
+
+/// Every windowing knob the dashboard bundles: `from`/`to` drive the overview,
+/// paths, and breakdowns; `range` drives the series (independently, like the
+/// standalone `/series`); the three limits cap each ranked member. All are
+/// `Option<String>` so `?from=` / `?paths_limit=` (empty) fall back to the
+/// default rather than being rejected — the same courtesy the other endpoints
+/// extend.
+#[derive(Debug, Deserialize)]
+pub struct DashboardQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub range: Option<String>,
+    pub paths_limit: Option<String>,
+    pub breakdown_limit: Option<String>,
+    pub apps_limit: Option<String>,
 }
 
 /// Floors `ts` to the start of its containing `width`-wide bucket. `div_euclid`
@@ -272,6 +295,19 @@ fn resolve_limit(raw: Option<&str>) -> Result<usize, Response> {
     }
 }
 
+/// Like [`resolve_limit`] but defaults to [`DEFAULT_APPS_LIMIT`] when absent.
+/// Shares the `0`/non-numeric rejection and the [`MAX_LIMIT`] ceiling.
+#[allow(clippy::result_large_err)]
+fn resolve_apps_limit(raw: Option<&str>) -> Result<usize, Response> {
+    let Some(s) = raw.filter(|s| !s.is_empty()) else {
+        return Ok(DEFAULT_APPS_LIMIT);
+    };
+    match s.parse::<usize>() {
+        Ok(0) | Err(_) => Err(bad_limit()),
+        Ok(n) => Ok(n.min(MAX_LIMIT)),
+    }
+}
+
 fn bad_limit() -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -418,7 +454,7 @@ async fn overview(
         for (tier, lo, hi) in tier_reads(from, to) {
             rows.extend(analytics.stats_range(tier, &app, lo, hi)?);
         }
-        Ok::<_, store::StoreError>(summarize_stats(rows))
+        Ok::<_, store::StoreError>(summarize_stats(&rows))
     })
     .await;
     drop(permit);
@@ -534,7 +570,7 @@ async fn server_overview(
         for (tier, lo, hi) in tier_reads(from, to) {
             rows.extend(analytics.stats_rows_between(tier, lo, hi)?);
         }
-        Ok::<_, store::StoreError>(summarize_stats(rows))
+        Ok::<_, store::StoreError>(summarize_stats(&rows))
     })
     .await;
     drop(permit);
@@ -631,7 +667,7 @@ async fn server_breakdown(
 /// skipped for that sketch, and logged. One corrupted page must not turn a
 /// dashboard query into a 500 — the same "skip malformed data, don't crash"
 /// rule the parser and compaction paths follow.
-fn summarize_stats(rows: Vec<StatsRow>) -> TrafficOverview {
+fn summarize_stats(rows: &[StatsRow]) -> TrafficOverview {
     let mut requests = 0i64;
     let mut bytes_in = 0i64;
     let mut bytes_out = 0i64;
@@ -645,7 +681,7 @@ fn summarize_stats(rows: Vec<StatsRow>) -> TrafficOverview {
     // this a plain fold; an HLL union with an empty sketch is a no-op.
     let mut visitors = Uniques::new();
 
-    for r in &rows {
+    for r in rows {
         requests = requests.saturating_add(r.requests);
         bytes_in = bytes_in.saturating_add(r.bytes_in);
         bytes_out = bytes_out.saturating_add(r.bytes_out);
@@ -795,6 +831,303 @@ where
         (std::cmp::Reverse(reqs), k)
     });
     rows.truncate(limit);
+}
+
+// --- Aggregate dashboard ----------------------------------------------------
+
+/// Selects whether a dashboard query runs server-wide (every app/host) or is
+/// filtered to one app, unifying the two store method families behind one
+/// interface so [`build_dashboard`] keeps a single code path. Each method is
+/// exactly the call the corresponding standalone handler already makes.
+enum Target {
+    Server,
+    App(String),
+}
+
+impl Target {
+    /// Label for the truncation warning: `*` server-wide, else the app.
+    fn label(&self) -> &str {
+        match self {
+            Target::Server => "*",
+            Target::App(app) => app,
+        }
+    }
+
+    fn stats(
+        &self,
+        a: &AnalyticsStore,
+        tier: Tier,
+        lo: i64,
+        hi: i64,
+    ) -> Result<Vec<StatsRow>, store::StoreError> {
+        match self {
+            Target::Server => a.stats_rows_between(tier, lo, hi),
+            Target::App(app) => a.stats_range(tier, app, lo, hi),
+        }
+    }
+
+    fn paths(
+        &self,
+        a: &AnalyticsStore,
+        tier: Tier,
+        lo: i64,
+        hi: i64,
+        budget: usize,
+    ) -> Result<Vec<PathRow>, store::StoreError> {
+        match self {
+            Target::Server => a.paths_rows_between(tier, lo, hi),
+            Target::App(app) => a.paths_range(tier, app, lo, hi, budget),
+        }
+    }
+
+    fn breakdown(
+        &self,
+        a: &AnalyticsStore,
+        tier: Tier,
+        dim: &str,
+        lo: i64,
+        hi: i64,
+        budget: usize,
+    ) -> Result<Vec<BreakdownRow>, store::StoreError> {
+        match self {
+            Target::Server => a.breakdown_dim_rows_between(tier, dim, lo, hi, budget),
+            Target::App(app) => a.breakdown_range(tier, app, dim, lo, hi, budget),
+        }
+    }
+}
+
+/// The already-resolved windowing for one dashboard query. `from`/`to` bound
+/// the overview/paths/breakdowns; `series_width`/`series_count` come from
+/// `range` and drive only the series (whose window is derived from `now`).
+struct DashboardParams {
+    from: i64,
+    to: i64,
+    now: i64,
+    paths_limit: usize,
+    breakdown_limit: usize,
+    series_width: i64,
+    series_count: usize,
+    apps_limit: usize,
+}
+
+/// Assembles the whole dashboard in one blocking pass, reusing the exact
+/// merge helpers the standalone endpoints use — nothing is re-summed. Returns
+/// `attribution: None`; the handler fills it in from `AppState` afterwards.
+fn build_dashboard(
+    analytics: &AnalyticsStore,
+    target: &Target,
+    p: &DashboardParams,
+    include_apps: bool,
+) -> Result<TrafficDashboard, store::StoreError> {
+    // Overview — same tier union + sketch merge as `overview`/`server_overview`.
+    // On the server-wide target these rows span every app, so the leaderboard
+    // below reuses them (grouped by app) instead of re-querying per app.
+    let mut stats_rows = Vec::new();
+    for (tier, lo, hi) in tier_reads(p.from, p.to) {
+        stats_rows.extend(target.stats(analytics, tier, lo, hi)?);
+    }
+    let overview = summarize_stats(&stats_rows);
+
+    // Paths. Only the per-app read applies the `LIMIT budget`; the server-wide
+    // `paths_rows_between` is unbounded, so a truncation warning there would be
+    // a false signal (nothing was cut).
+    let path_budget_applies = matches!(target, Target::App(_));
+    let mut path_rows = Vec::new();
+    for (tier, lo, hi) in tier_reads(p.from, p.to) {
+        let r = target.paths(analytics, tier, lo, hi, MAX_SCAN_ROWS)?;
+        if path_budget_applies {
+            warn_if_truncated("dashboard_paths", target.label(), r.len(), MAX_SCAN_ROWS);
+        }
+        path_rows.extend(r);
+    }
+    let paths = top_paths(path_rows, p.paths_limit);
+
+    // Breakdowns — one ranked list per dimension. The dimension set is the
+    // struct's own fields, so it stays in lockstep with Coolify's list.
+    let dim = |name: &str| -> Result<Vec<TrafficBreakdownEntry>, store::StoreError> {
+        let mut rows = Vec::new();
+        for (tier, lo, hi) in tier_reads(p.from, p.to) {
+            let r = target.breakdown(analytics, tier, name, lo, hi, MAX_SCAN_ROWS)?;
+            warn_if_truncated(
+                "dashboard_breakdown",
+                target.label(),
+                r.len(),
+                MAX_SCAN_ROWS,
+            );
+            rows.extend(r);
+        }
+        Ok(top_breakdown(rows, p.breakdown_limit))
+    };
+    let breakdowns = TrafficBreakdowns {
+        country: dim("country")?,
+        referer: dim("referer")?,
+        browser: dim("browser")?,
+        os: dim("os")?,
+        device: dim("device")?,
+        protocol: dim("protocol")?,
+        cache: dim("cache")?,
+        status: dim("status")?,
+        agent: dim("agent")?,
+        ip: dim("ip")?,
+        useragent: dim("useragent")?,
+    };
+
+    // Series — its window derives from `now`, independent of `from`/`to`.
+    let series_end = floor_to(p.now, p.series_width);
+    let series_from = series_end - (p.series_count as i64 - 1) * p.series_width;
+    let mut series_rows = Vec::new();
+    for (tier, lo, hi) in tier_reads_for(p.series_width, series_from, p.now) {
+        series_rows.extend(target.stats(analytics, tier, lo, hi)?);
+    }
+    let series = aggregate_series(series_rows, p.now, p.series_width, p.series_count);
+
+    // `include_apps` is only ever set for the server-wide target, whose
+    // `stats_rows` already covers every app — so grouping them by app costs no
+    // extra query, however many apps exist.
+    let apps = if include_apps {
+        Some(app_leaderboard(stats_rows, p.apps_limit))
+    } else {
+        None
+    };
+
+    Ok(TrafficDashboard {
+        overview,
+        paths,
+        breakdowns,
+        series,
+        attribution: None,
+        apps,
+    })
+}
+
+/// Builds the leaderboard from the server-wide stats rows already fetched for
+/// the overview: groups them by app, merges each group into a per-app overview
+/// (a real sketch merge — grouping by `app` reproduces exactly what a per-app
+/// `stats_range` scan would have returned), then ranks by requests desc (ties
+/// broken by uuid asc for determinism) and caps at `apps_limit`.
+///
+/// Only apps with traffic in the range appear — an idle app is simply absent
+/// from a request-ranked leaderboard rather than a zeroed tail entry.
+fn app_leaderboard(rows: Vec<StatsRow>, apps_limit: usize) -> Vec<TrafficAppEntry> {
+    let mut by_app: HashMap<String, Vec<StatsRow>> = HashMap::new();
+    for r in rows {
+        by_app.entry(r.app.clone()).or_default().push(r);
+    }
+    let mut entries: Vec<TrafficAppEntry> = by_app
+        .into_iter()
+        .map(|(uuid, rows)| TrafficAppEntry {
+            uuid,
+            overview: summarize_stats(&rows),
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.overview
+            .requests
+            .cmp(&a.overview.requests)
+            .then_with(|| a.uuid.cmp(&b.uuid))
+    });
+    entries.truncate(apps_limit);
+    entries
+}
+
+/// Server-wide dashboard: every member merged across all apps, plus the app
+/// leaderboard.
+async fn server_dashboard(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DashboardQuery>,
+) -> Response {
+    run_dashboard(state, Target::Server, true, q).await
+}
+
+/// Per-app dashboard: same members filtered to one app, `apps` omitted.
+async fn app_dashboard(
+    Path(app): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DashboardQuery>,
+) -> Response {
+    run_dashboard(state, Target::App(app), false, q).await
+}
+
+/// Shared body for both dashboard handlers: resolve every knob (any invalid
+/// one is a 400), snapshot the GeoIP attribution, then build the payload in a
+/// single blocking task under one query permit. A missing analytics store is
+/// the only 404 — an empty range still returns 200 with zeroed/empty members.
+async fn run_dashboard(
+    state: Arc<AppState>,
+    target: Target,
+    include_apps: bool,
+    q: DashboardQuery,
+) -> Response {
+    let Some(analytics) = state.analytics.clone() else {
+        return analytics_disabled();
+    };
+    let (from, to) = match resolve_range(
+        &HistoryQuery {
+            from: q.from,
+            to: q.to,
+        },
+        DEFAULT_FROM,
+    ) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let paths_limit = match resolve_limit(q.paths_limit.as_deref()) {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    let breakdown_limit = match resolve_limit(q.breakdown_limit.as_deref()) {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    // Only meaningful on the server-wide variant, so the per-app endpoint must
+    // ignore it entirely — even an invalid value — matching the documented
+    // "ignored for this variant" contract.
+    let apps_limit = if include_apps {
+        match resolve_apps_limit(q.apps_limit.as_deref()) {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        }
+    } else {
+        DEFAULT_APPS_LIMIT
+    };
+    let (series_width, series_count) = match resolve_series(q.range.as_deref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let attribution = state
+        .geoip_attribution
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let params = DashboardParams {
+        from,
+        to,
+        now: now_ms(),
+        paths_limit,
+        breakdown_limit,
+        series_width,
+        series_count,
+        apps_limit,
+    };
+
+    let permit = match state.analytics_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        build_dashboard(&analytics, &target, &params, include_apps)
+    })
+    .await;
+    drop(permit);
+    match result {
+        Ok(Ok(mut dash)) => {
+            dash.attribution = attribution;
+            Json(dash).into_response()
+        }
+        Ok(Err(e)) => internal_error(e),
+        Err(e) => internal_error(e),
+    }
 }
 
 #[cfg(test)]
