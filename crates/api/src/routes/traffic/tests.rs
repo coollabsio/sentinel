@@ -1073,6 +1073,17 @@ async fn app_dashboard_filters_and_omits_leaderboard() {
     for p in j["paths"].as_array().unwrap() {
         assert_eq!(p["app"], "app-a");
     }
+    // Breakdowns are app-scoped: app-a's country US is 9 (5 + 4), not the 15
+    // that includes app-b's 6 — so the dimension is filtered, not server-wide.
+    let country = j["breakdowns"]["country"].as_array().unwrap();
+    let us = country
+        .iter()
+        .find(|e| e["value"] == "US")
+        .expect("US present");
+    assert_eq!(us["requests"], 9, "country breakdown filtered to app-a");
+    // Series stays fixed-length (its window is app-filtered through the same
+    // Target::App path as overview/paths).
+    assert_eq!(j["series"].as_array().unwrap().len(), 24);
     // No leaderboard on the per-app variant.
     assert!(j.get("apps").is_none(), "apps must be omitted for per-app");
 }

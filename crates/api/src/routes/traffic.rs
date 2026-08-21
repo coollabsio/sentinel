@@ -928,11 +928,16 @@ fn build_dashboard(
     }
     let overview = summarize_stats(&stats_rows);
 
-    // Paths.
+    // Paths. Only the per-app read applies the `LIMIT budget`; the server-wide
+    // `paths_rows_between` is unbounded, so a truncation warning there would be
+    // a false signal (nothing was cut).
+    let path_budget_applies = matches!(target, Target::App(_));
     let mut path_rows = Vec::new();
     for (tier, lo, hi) in tier_reads(p.from, p.to) {
         let r = target.paths(analytics, tier, lo, hi, MAX_SCAN_ROWS)?;
-        warn_if_truncated("dashboard_paths", target.label(), r.len(), MAX_SCAN_ROWS);
+        if path_budget_applies {
+            warn_if_truncated("dashboard_paths", target.label(), r.len(), MAX_SCAN_ROWS);
+        }
         path_rows.extend(r);
     }
     let paths = top_paths(path_rows, p.paths_limit);
