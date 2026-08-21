@@ -1088,10 +1088,9 @@ async fn dashboard_empty_range_is_zeroed_not_404() {
     assert_eq!(j["breakdowns"]["country"].as_array().unwrap().len(), 0);
     // Series stays fixed-length and zero-filled.
     assert_eq!(j["series"].as_array().unwrap().len(), 24);
-    // Leaderboard still lists the apps, each with a zeroed overview.
-    for entry in j["apps"].as_array().unwrap() {
-        assert_eq!(entry["overview"]["requests"], 0);
-    }
+    // No app had traffic in this range, so the request-ranked leaderboard is
+    // empty (idle apps are absent, not zeroed tail entries) — still 200.
+    assert_eq!(j["apps"].as_array().unwrap().len(), 0);
 }
 
 /// The three limits and the series range are honored, and empty values fall
@@ -1127,4 +1126,16 @@ async fn dashboard_rejects_malformed_knobs() {
         let (s, _) = get(uri).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{uri}");
     }
+}
+
+/// The per-app variant ignores `apps_limit` (it has no leaderboard), so even
+/// an invalid value must not turn into a 400 — the documented contract.
+#[tokio::test]
+async fn app_dashboard_ignores_invalid_apps_limit() {
+    let (s, j) = get(&format!(
+        "/api/app/app-a/traffic/dashboard?{RANGE}&apps_limit=0"
+    ))
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(j.get("apps").is_none());
 }

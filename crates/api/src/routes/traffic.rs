@@ -454,7 +454,7 @@ async fn overview(
         for (tier, lo, hi) in tier_reads(from, to) {
             rows.extend(analytics.stats_range(tier, &app, lo, hi)?);
         }
-        Ok::<_, store::StoreError>(summarize_stats(rows))
+        Ok::<_, store::StoreError>(summarize_stats(&rows))
     })
     .await;
     drop(permit);
@@ -570,7 +570,7 @@ async fn server_overview(
         for (tier, lo, hi) in tier_reads(from, to) {
             rows.extend(analytics.stats_rows_between(tier, lo, hi)?);
         }
-        Ok::<_, store::StoreError>(summarize_stats(rows))
+        Ok::<_, store::StoreError>(summarize_stats(&rows))
     })
     .await;
     drop(permit);
@@ -667,7 +667,7 @@ async fn server_breakdown(
 /// skipped for that sketch, and logged. One corrupted page must not turn a
 /// dashboard query into a 500 — the same "skip malformed data, don't crash"
 /// rule the parser and compaction paths follow.
-fn summarize_stats(rows: Vec<StatsRow>) -> TrafficOverview {
+fn summarize_stats(rows: &[StatsRow]) -> TrafficOverview {
     let mut requests = 0i64;
     let mut bytes_in = 0i64;
     let mut bytes_out = 0i64;
@@ -681,7 +681,7 @@ fn summarize_stats(rows: Vec<StatsRow>) -> TrafficOverview {
     // this a plain fold; an HLL union with an empty sketch is a no-op.
     let mut visitors = Uniques::new();
 
-    for r in &rows {
+    for r in rows {
         requests = requests.saturating_add(r.requests);
         bytes_in = bytes_in.saturating_add(r.bytes_in);
         bytes_out = bytes_out.saturating_add(r.bytes_out);
@@ -920,11 +920,13 @@ fn build_dashboard(
     include_apps: bool,
 ) -> Result<TrafficDashboard, store::StoreError> {
     // Overview — same tier union + sketch merge as `overview`/`server_overview`.
+    // On the server-wide target these rows span every app, so the leaderboard
+    // below reuses them (grouped by app) instead of re-querying per app.
     let mut stats_rows = Vec::new();
     for (tier, lo, hi) in tier_reads(p.from, p.to) {
         stats_rows.extend(target.stats(analytics, tier, lo, hi)?);
     }
-    let overview = summarize_stats(stats_rows);
+    let overview = summarize_stats(&stats_rows);
 
     // Paths.
     let mut path_rows = Vec::new();
@@ -974,8 +976,11 @@ fn build_dashboard(
     }
     let series = aggregate_series(series_rows, p.now, p.series_width, p.series_count);
 
+    // `include_apps` is only ever set for the server-wide target, whose
+    // `stats_rows` already covers every app — so grouping them by app costs no
+    // extra query, however many apps exist.
     let apps = if include_apps {
-        Some(app_leaderboard(analytics, p)?)
+        Some(app_leaderboard(stats_rows, p.apps_limit))
     } else {
         None
     };
@@ -990,33 +995,34 @@ fn build_dashboard(
     })
 }
 
-/// Per-app overview for every app with traffic, ranked by requests desc
-/// (ties broken by uuid asc for determinism) and capped at `apps_limit`.
-/// Each overview is a real sketch merge, not a re-sum of anything.
-fn app_leaderboard(
-    analytics: &AnalyticsStore,
-    p: &DashboardParams,
-) -> Result<Vec<TrafficAppEntry>, store::StoreError> {
-    let uuids = analytics.apps()?;
-    let mut entries: Vec<TrafficAppEntry> = Vec::with_capacity(uuids.len());
-    for uuid in uuids {
-        let mut rows = Vec::new();
-        for (tier, lo, hi) in tier_reads(p.from, p.to) {
-            rows.extend(analytics.stats_range(tier, &uuid, lo, hi)?);
-        }
-        entries.push(TrafficAppEntry {
-            uuid,
-            overview: summarize_stats(rows),
-        });
+/// Builds the leaderboard from the server-wide stats rows already fetched for
+/// the overview: groups them by app, merges each group into a per-app overview
+/// (a real sketch merge — grouping by `app` reproduces exactly what a per-app
+/// `stats_range` scan would have returned), then ranks by requests desc (ties
+/// broken by uuid asc for determinism) and caps at `apps_limit`.
+///
+/// Only apps with traffic in the range appear — an idle app is simply absent
+/// from a request-ranked leaderboard rather than a zeroed tail entry.
+fn app_leaderboard(rows: Vec<StatsRow>, apps_limit: usize) -> Vec<TrafficAppEntry> {
+    let mut by_app: HashMap<String, Vec<StatsRow>> = HashMap::new();
+    for r in rows {
+        by_app.entry(r.app.clone()).or_default().push(r);
     }
+    let mut entries: Vec<TrafficAppEntry> = by_app
+        .into_iter()
+        .map(|(uuid, rows)| TrafficAppEntry {
+            uuid,
+            overview: summarize_stats(&rows),
+        })
+        .collect();
     entries.sort_by(|a, b| {
         b.overview
             .requests
             .cmp(&a.overview.requests)
             .then_with(|| a.uuid.cmp(&b.uuid))
     });
-    entries.truncate(p.apps_limit);
-    Ok(entries)
+    entries.truncate(apps_limit);
+    entries
 }
 
 /// Server-wide dashboard: every member merged across all apps, plus the app
@@ -1068,9 +1074,16 @@ async fn run_dashboard(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let apps_limit = match resolve_apps_limit(q.apps_limit.as_deref()) {
-        Ok(n) => n,
-        Err(resp) => return resp,
+    // Only meaningful on the server-wide variant, so the per-app endpoint must
+    // ignore it entirely — even an invalid value — matching the documented
+    // "ignored for this variant" contract.
+    let apps_limit = if include_apps {
+        match resolve_apps_limit(q.apps_limit.as_deref()) {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        }
+    } else {
+        DEFAULT_APPS_LIMIT
     };
     let (series_width, series_count) = match resolve_series(q.range.as_deref()) {
         Ok(v) => v,

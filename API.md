@@ -795,20 +795,35 @@ Additive: older Coolify keeps calling the individual endpoints; new Coolify call
 
 **Response:** a single object. `overview`, `paths`, and each `breakdowns` dimension follow `from`/`to`; `series` follows `range`. The server-wide variant includes `apps` (every app with traffic, ranked by requests desc, capped at `apps_limit`); the per-app variant omits `apps` entirely. An empty range returns `200` with zeroed/empty members — never `404`.
 
+Each member is verbatim the shape of its standalone endpoint (see the sections above): `overview` is [Get App Traffic Overview](#get-app-traffic-overview); `paths` is [Get App Top Paths](#get-app-top-paths); each `breakdowns.<dim>` entry is `{ "value", "requests", "bytes_out" }`; `series` is [Get App Status-Class Time Series](#get-app-status-class-time-series); `attribution` is the bare string from [Get GeoIP Attribution](#get-geoip-attribution) (or `null`). Only apps with traffic in the range appear in `apps`.
+
 ```json
 {
-  "overview":    { /* identical to GET /traffic/overview */ },
-  "paths":       [ /* identical to GET /traffic/paths */ ],
-  "breakdowns":  { "country": [], "referer": [], "browser": [], "os": [],
-                   "device": [], "protocol": [], "cache": [], "status": [],
-                   "agent": [], "ip": [], "useragent": [] },
-  "series":      [ /* identical to GET /traffic/series */ ],
-  "attribution": "This product includes GeoLite2 data created by MaxMind, ...",
-  "apps":        [ { "uuid": "jc4wsgs", "overview": { /* per-app overview */ } } ]
+  "overview": {
+    "requests": 128340,
+    "bytes_in": 15200000,
+    "bytes_out": 981000000,
+    "status": { "s2xx": 120000, "s3xx": 4000, "s4xx": 4200, "s5xx": 140 },
+    "latency": { "p50": 42.0, "p95": 118.0, "p99": 240.0 },
+    "unique_visitors": 8421
+  },
+  "paths": [
+    { "path": "/api/checkout", "app": "jc4wsgs", "requests": 42000, "bytes_out": 320000000, "p50": 40.0, "p95": 110.0 }
+  ],
+  "breakdowns": {
+    "country": [ { "value": "US", "requests": 42000, "bytes_out": 320000000 } ],
+    "referer": [], "browser": [], "os": [], "device": [], "protocol": [],
+    "cache": [], "status": [], "agent": [], "ip": [], "useragent": []
+  },
+  "series": [
+    { "bucket": 1723334400000, "requests": 46, "bytes_in": 12800, "bytes_out": 402000, "s2xx": 42, "s3xx": 3, "s4xx": 1, "s5xx": 0, "unique_visitors": 37, "p95": 118.0 }
+  ],
+  "attribution": "This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com",
+  "apps": [
+    { "uuid": "jc4wsgs", "overview": { "requests": 128340, "bytes_in": 15200000, "bytes_out": 981000000, "status": { "s2xx": 120000, "s3xx": 4000, "s4xx": 4200, "s5xx": 140 }, "latency": { "p50": 42.0, "p95": 118.0, "p99": 240.0 }, "unique_visitors": 8421 } }
+  ]
 }
 ```
-
-Each `breakdowns.<dim>` entry is `{ "value", "requests", "bytes_out" }`; `attribution` is the bare string from [Get GeoIP Attribution](#get-geoip-attribution) (or `null`).
 
 **Example:**
 ```bash
