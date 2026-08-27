@@ -83,6 +83,39 @@ fn migration_is_idempotent() {
 }
 
 #[test]
+fn migration_leaves_free_pages_for_sqlite_to_reuse() {
+    let dir = tmpdir("no-vacuum");
+    let path = dir.join("m.sqlite");
+    let _ = std::fs::remove_file(&path);
+    legacy_db(&path);
+
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute("CREATE TABLE migration_padding (value BLOB)", [])
+            .unwrap();
+        c.execute(
+            "INSERT INTO migration_padding VALUES (zeroblob(1048576))",
+            [],
+        )
+        .unwrap();
+        c.execute("DROP TABLE migration_padding", []).unwrap();
+    }
+
+    Store::open(&path).unwrap();
+
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let free_pages: i64 = c
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        free_pages > 0,
+        "startup migration must not VACUUM reusable free pages"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn migrates_available_legacy_tables_when_one_is_missing() {
     let dir = tmpdir("partial");
     let path = dir.join("m.sqlite");

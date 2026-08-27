@@ -96,6 +96,7 @@ pub fn migrate_legacy(conn: &Connection) -> rusqlite::Result<bool> {
         return Ok(false);
     }
     tracing::info!("legacy metrics schema detected, migrating to typed schema");
+    let started_at = std::time::Instant::now();
 
     let tx = conn.unchecked_transaction()?;
 
@@ -134,16 +135,12 @@ pub fn migrate_legacy(conn: &Connection) -> rusqlite::Result<bool> {
     tx.execute_batch("DROP TABLE IF EXISTS container_logs")?;
 
     tx.commit()?;
-    // VACUUM cannot run inside a transaction. It only reclaims disk space left
-    // by the dropped legacy tables — the migration is already durably committed
-    // above. A VACUUM failure (e.g. transient disk-full) must NOT propagate:
-    // the caller (Store::open) treats a migration error as an unopenable DB and
-    // renames the file aside, which would hide the freshly-migrated history.
-    // Log and continue with the successfully migrated data instead.
-    if let Err(e) = conn.execute_batch("VACUUM") {
-        tracing::warn!(error = %e, "post-migration VACUUM failed; continuing with migrated data");
-    }
-    tracing::info!("legacy schema migration complete");
+    // Do not VACUUM during startup. SQLite will reuse pages freed by the legacy
+    // tables, while compacting here can delay health checks for large histories.
+    tracing::info!(
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "legacy schema migration complete"
+    );
     Ok(true)
 }
 
