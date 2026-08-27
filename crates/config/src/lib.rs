@@ -277,28 +277,18 @@ fn u32_nonneg_from_env(key: &'static str, fallback: u32) -> Result<u32, ConfigEr
 // Mirrors validateEndpoint in pkg/config/config.go: scheme must be http/https,
 // host must be present, and userinfo/query/fragment are all rejected.
 //
-// Go's check is `parsed.User != nil`, which only looks at the authority
-// component (before the host) — a literal '@' later in the path, like
-// "https://example.com/path/@handle", is valid there. Scanning the whole
-// remainder for '@' would reject that URL incorrectly, so the userinfo
-// check is scoped to the authority: everything up to the first '/', '?',
-// or '#'. Query and fragment are rejected anywhere after the authority,
-// since neither can legitimately appear in a bare path segment.
+// Go's `parsed.User != nil` check only covers the authority, so a literal '@'
+// later in a path remains valid. `url::Url` gives us the same distinction while
+// also rejecting malformed hosts, ports, IPv6 literals, and percent encoding.
 fn validate_endpoint(endpoint: &str) -> Result<(), ConfigError> {
-    let rest = match endpoint.split_once("://") {
-        Some(("http", rest)) | Some(("https", rest)) => rest,
-        _ => return Err(ConfigError::InvalidEndpoint),
-    };
-    if rest.is_empty() {
-        return Err(ConfigError::InvalidEndpoint);
-    }
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    if authority.is_empty() || authority.contains('@') || authority.starts_with(':') {
-        return Err(ConfigError::InvalidEndpoint);
-    }
-    let remainder = &rest[authority_end..];
-    if remainder.contains('?') || remainder.contains('#') {
+    let parsed = url::Url::parse(endpoint).map_err(|_| ConfigError::InvalidEndpoint)?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
         return Err(ConfigError::InvalidEndpoint);
     }
     Ok(())

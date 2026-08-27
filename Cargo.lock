@@ -390,6 +390,7 @@ name = "config"
 version = "1.0.0"
 dependencies = [
  "thiserror",
+ "url",
 ]
 
 [[package]]

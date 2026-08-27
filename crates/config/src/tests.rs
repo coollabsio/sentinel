@@ -155,6 +155,23 @@ fn rejects_endpoint_without_a_host() {
 }
 
 #[test]
+fn rejects_malformed_http_endpoints_like_go() {
+    for bad in [
+        "https://example .com",
+        "https://example.com:abc",
+        "https://[::1",
+        "https://exa%mple.com",
+    ] {
+        let _l = env_lock().lock().unwrap();
+        let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", bad)]);
+        assert!(
+            matches!(Config::load(false), Err(ConfigError::InvalidEndpoint)),
+            "expected {bad} to be rejected"
+        );
+    }
+}
+
+#[test]
 fn rejects_out_of_range_port() {
     for bad in ["0", "65536", "abc"] {
         let _l = env_lock().lock().unwrap();
