@@ -129,11 +129,19 @@ impl DockerClient {
     }
 
     pub async fn inspect_health(&self, id: &str) -> Result<String, DockerError> {
+        Ok(self.inspect_health_and_restart_count(id).await?.0)
+    }
+
+    pub async fn inspect_health_and_restart_count(
+        &self,
+        id: &str,
+    ) -> Result<(String, u64), DockerError> {
         let d = self
             .inner
             .inspect_container(id, None::<InspectContainerOptions>)
             .await?;
-        Ok(d.state
+        let health_status = d
+            .state
             .as_ref()
             .and_then(|st| st.health.as_ref())
             .and_then(|h| h.status.as_ref())
@@ -141,7 +149,10 @@ impl DockerClient {
             // "starting", "none", "") — matching Go's raw status string. See
             // the state field in list_containers for the rationale.
             .map(|s| s.to_string())
-            .unwrap_or_else(|| "unknown".to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let restart_count = d.restart_count.filter(|count| *count >= 0).unwrap_or(0) as u64;
+
+        Ok((health_status, restart_count))
     }
 }
 

@@ -26,6 +26,7 @@ fn container_entry_serializes_expected_keys() {
         state: "running".into(),
         labels: std::collections::HashMap::from([("k".to_string(), "v".to_string())]),
         health_status: "healthy".into(),
+        restart_count: 4,
     };
     let j = serde_json::to_value(&c).unwrap();
     for key in [
@@ -36,8 +37,10 @@ fn container_entry_serializes_expected_keys() {
         "state",
         "labels",
         "health_status",
+        "restart_count",
     ] {
         assert!(j.get(key).is_some(), "missing key {key}");
     }
     assert_eq!(j["labels"]["k"], "v");
+    assert_eq!(j["restart_count"], 4);
 }

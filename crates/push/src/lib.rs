@@ -42,6 +42,7 @@ pub struct Container {
     pub state: String,
     pub labels: HashMap<String, String>,
     pub health_status: String,
+    pub restart_count: u64,
 }
 
 pub fn snapshot_metadata(inspection_failures: usize) -> serde_json::Value {
@@ -250,13 +251,14 @@ async fn inspect(
     summary: docker::ContainerSummary,
     now: String,
 ) -> Option<Container> {
-    let health = match docker.inspect_health(&summary.id).await {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!(id = %summary.id, error = %e, "failed to inspect container");
-            return None;
-        }
-    };
+    let (health_status, restart_count) =
+        match docker.inspect_health_and_restart_count(&summary.id).await {
+            Ok(details) => details,
+            Err(e) => {
+                tracing::warn!(id = %summary.id, error = %e, "failed to inspect container");
+                return None;
+            }
+        };
 
     // The push payload uses the raw Docker name, NOT the coolify.name label
     // that the collector uses. Preserved from the Go implementation.
@@ -273,6 +275,7 @@ async fn inspect(
         name,
         state: summary.state,
         labels: summary.labels,
-        health_status: health,
+        health_status,
+        restart_count,
     })
 }
