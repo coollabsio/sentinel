@@ -95,6 +95,8 @@ struct StatsAcc {
 struct PathAcc {
     requests: i64,
     bytes_out: i64,
+    s4xx: i64,
+    s5xx: i64,
     digests: Vec<LatencyDigest>,
 }
 
@@ -201,6 +203,7 @@ fn merge_paths(
     // surviving rows still need their merged per-path digest, which `TopN`
     // does not carry.
     let mut tops: HashMap<String, TopN, RandomState> = HashMap::default();
+    let mut other_errors: HashMap<String, (i64, i64), RandomState> = HashMap::default();
 
     for row in rows.into_iter().chain(existing) {
         let top = tops.entry(row.app.clone()).or_default();
@@ -209,6 +212,9 @@ fn merge_paths(
         if row.path == OTHER {
             top.other.0 += reqs;
             top.other.1 += bytes;
+            let errors = other_errors.entry(row.app).or_default();
+            errors.0 += row.s4xx;
+            errors.1 += row.s5xx;
             continue;
         }
         top.add(&row.path, reqs, bytes);
@@ -216,6 +222,8 @@ fn merge_paths(
         let acc = groups.entry((row.app, row.path)).or_default();
         acc.requests += row.requests;
         acc.bytes_out += row.bytes_out;
+        acc.s4xx += row.s4xx;
+        acc.s5xx += row.s5xx;
         if let Some(digest) = decode_digest(&row.latency_tdigest) {
             acc.digests.push(digest);
         }
@@ -229,6 +237,9 @@ fn merge_paths(
     for ((app, path), acc) in groups {
         // Evicted by the cap: its counters already live in `top.other`.
         if !tops.get(&app).is_some_and(|t| t.counts.contains_key(&path)) {
+            let errors = other_errors.entry(app).or_default();
+            errors.0 += acc.s4xx;
+            errors.1 += acc.s5xx;
             continue;
         }
         out.push(PathRow {
@@ -237,17 +248,22 @@ fn merge_paths(
             path,
             requests: acc.requests,
             bytes_out: acc.bytes_out,
+            s4xx: acc.s4xx,
+            s5xx: acc.s5xx,
             latency_tdigest: LatencyDigest::merge(&acc.digests).to_bytes(),
         });
     }
     for (app, top) in tops {
         if top.other.0 > 0 {
+            let errors = other_errors.remove(&app).unwrap_or_default();
             out.push(PathRow {
                 bucket,
                 app,
                 path: OTHER.to_string(),
                 requests: top.other.0 as i64,
                 bytes_out: top.other.1 as i64,
+                s4xx: errors.0,
+                s5xx: errors.1,
                 latency_tdigest: LatencyDigest::new().to_bytes(),
             });
         }

@@ -109,6 +109,8 @@ pub struct TrafficPath {
     pub app: String,
     pub requests: i64,
     pub bytes_out: i64,
+    pub s4xx: i64,
+    pub s5xx: i64,
     pub p50: f64,
     pub p95: f64,
 }

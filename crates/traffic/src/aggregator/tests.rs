@@ -152,6 +152,58 @@ fn paths_get_per_path_latency() {
 }
 
 #[test]
+fn paths_count_client_and_server_errors() {
+    let mut aggregator = Aggregator::new(50);
+    let enriched = base_enriched();
+
+    for status in [200, 404, 422, 500] {
+        let mut event = base_event();
+        event.path = "/checkout".into();
+        event.status = status;
+        aggregator.record(&event, &enriched);
+    }
+
+    let rollup = aggregator.take_rollup(60_000);
+    let path = rollup
+        .paths
+        .iter()
+        .find(|row| row.path == "/checkout")
+        .unwrap();
+
+    assert_eq!(path.requests, 4);
+    assert_eq!(path.s4xx, 2);
+    assert_eq!(path.s5xx, 1);
+}
+
+#[test]
+fn path_errors_follow_evicted_requests_into_other() {
+    let mut aggregator = Aggregator::new(1);
+    let enriched = base_enriched();
+
+    for _ in 0..2 {
+        let mut event = base_event();
+        event.path = "/popular".into();
+        aggregator.record(&event, &enriched);
+    }
+
+    let mut failed = base_event();
+    failed.path = "/failed".into();
+    failed.status = 500;
+    aggregator.record(&failed, &enriched);
+
+    let rollup = aggregator.take_rollup(60_000);
+    let other = rollup
+        .paths
+        .iter()
+        .find(|row| row.path == "__other__")
+        .unwrap();
+
+    assert_eq!(other.requests, 1);
+    assert_eq!(other.s4xx, 0);
+    assert_eq!(other.s5xx, 1);
+}
+
+#[test]
 fn uniques_skip_when_client_ip_absent() {
     let mut a = Aggregator::new(50);
     let ev = base_event();

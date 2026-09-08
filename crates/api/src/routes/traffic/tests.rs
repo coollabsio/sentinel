@@ -64,8 +64,31 @@ fn path_row(bucket: i64, app: &str, path: &str, requests: i64, latency: Vec<u8>)
         path: path.into(),
         requests,
         bytes_out: requests * 100,
+        s4xx: 2,
+        s5xx: 1,
         latency_tdigest: latency,
     }
+}
+
+#[test]
+fn top_paths_returns_error_counts() {
+    let rows = vec![
+        path_row(0, "app", "/checkout", 4, LatencyDigest::new().to_bytes()),
+        path_row(
+            60_000,
+            "app",
+            "/checkout",
+            6,
+            LatencyDigest::new().to_bytes(),
+        ),
+    ];
+
+    let paths = top_paths(rows, 10);
+
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].requests, 10);
+    assert_eq!(paths[0].s4xx, 4);
+    assert_eq!(paths[0].s5xx, 2);
 }
 
 fn bd(bucket: i64, app: &str, value: &str, requests: i64) -> BreakdownRow {

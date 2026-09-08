@@ -747,6 +747,8 @@ fn top_paths(rows: Vec<PathRow>, limit: usize) -> Vec<TrafficPath> {
     struct Acc {
         requests: i64,
         bytes_out: i64,
+        s4xx: i64,
+        s5xx: i64,
         latency: LatencyDigest,
     }
 
@@ -757,10 +759,14 @@ fn top_paths(rows: Vec<PathRow>, limit: usize) -> Vec<TrafficPath> {
             .or_insert_with(|| Acc {
                 requests: 0,
                 bytes_out: 0,
+                s4xx: 0,
+                s5xx: 0,
                 latency: LatencyDigest::new(),
             });
         acc.requests = acc.requests.saturating_add(r.requests);
         acc.bytes_out = acc.bytes_out.saturating_add(r.bytes_out);
+        acc.s4xx = acc.s4xx.saturating_add(r.s4xx);
+        acc.s5xx = acc.s5xx.saturating_add(r.s5xx);
         match LatencyDigest::from_bytes(&r.latency_tdigest) {
             // `merge` of an empty digest with `d` is `d`, so the first row of
             // a path needs no special case.
@@ -782,6 +788,8 @@ fn top_paths(rows: Vec<PathRow>, limit: usize) -> Vec<TrafficPath> {
             app,
             requests: acc.requests,
             bytes_out: acc.bytes_out,
+            s4xx: acc.s4xx,
+            s5xx: acc.s5xx,
             p50: acc.latency.quantile(0.5),
             p95: acc.latency.quantile(0.95),
         })

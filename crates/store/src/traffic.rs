@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS traffic_paths_{sfx} (
     path            TEXT    NOT NULL,
     requests        INTEGER NOT NULL,
     bytes_out       INTEGER NOT NULL,
+    s4xx            INTEGER NOT NULL,
+    s5xx            INTEGER NOT NULL,
     latency_tdigest BLOB    NOT NULL,
     PRIMARY KEY (bucket, app, path)
 ) STRICT;
@@ -69,7 +71,33 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             ddl.push_str(&template.replace("{sfx}", sfx));
         }
     }
-    conn.execute_batch(&ddl)
+    conn.execute_batch(&ddl)?;
+    for tier in [Tier::M1, Tier::H1, Tier::D1] {
+        let table = format!("traffic_paths_{}", suffix(tier));
+        let mut migrated = false;
+        for column in ["s4xx", "s5xx"] {
+            let exists = conn.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"
+                ),
+                [column],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                ))?;
+                migrated = true;
+            }
+        }
+        if migrated {
+            // Old path rows cannot be backfilled accurately because status and
+            // path were aggregated independently. Rebuild this bounded data
+            // from new access-log events instead of reporting false zero rates.
+            conn.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+    }
+    Ok(())
 }
 
 /// Roll-up tier; maps to the `_1m`/`_1h`/`_1d` table-name suffix.
@@ -111,6 +139,8 @@ pub struct PathRow {
     pub path: String,
     pub requests: i64,
     pub bytes_out: i64,
+    pub s4xx: i64,
+    pub s5xx: i64,
     pub latency_tdigest: Vec<u8>,
 }
 
@@ -670,11 +700,13 @@ fn insert_rows(
     {
         let sql = format!(
             "INSERT INTO traffic_paths_{sfx}
-                (bucket, app, path, requests, bytes_out, latency_tdigest)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                (bucket, app, path, requests, bytes_out, s4xx, s5xx, latency_tdigest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(bucket, app, path) DO UPDATE SET
                 requests = requests + excluded.requests,
                 bytes_out = bytes_out + excluded.bytes_out,
+                s4xx = s4xx + excluded.s4xx,
+                s5xx = s5xx + excluded.s5xx,
                 latency_tdigest = excluded.latency_tdigest"
         );
         let mut ins = conn.prepare_cached(&sql)?;
@@ -685,6 +717,8 @@ fn insert_rows(
                 &r.path,
                 r.requests,
                 r.bytes_out,
+                r.s4xx,
+                r.s5xx,
                 &r.latency_tdigest,
             ))?;
         }
@@ -718,7 +752,7 @@ fn insert_rows(
 // connection-scoped selects below, so a schema column can only be read one
 // way. The `?N` order in every SELECT must match the `r.get(N)` order here.
 const STATS_COLS: &str = "bucket, app, host, requests, bytes_in, bytes_out, s2xx, s3xx, s4xx, s5xx, latency_tdigest, uniques_hll";
-const PATHS_COLS: &str = "bucket, app, path, requests, bytes_out, latency_tdigest";
+const PATHS_COLS: &str = "bucket, app, path, requests, bytes_out, s4xx, s5xx, latency_tdigest";
 const BREAKDOWN_COLS: &str = "bucket, app, dimension, value, requests, bytes_out";
 
 fn map_stats_row(r: &rusqlite::Row) -> rusqlite::Result<StatsRow> {
@@ -745,7 +779,9 @@ fn map_path_row(r: &rusqlite::Row) -> rusqlite::Result<PathRow> {
         path: r.get(2)?,
         requests: r.get(3)?,
         bytes_out: r.get(4)?,
-        latency_tdigest: r.get(5)?,
+        s4xx: r.get(5)?,
+        s5xx: r.get(6)?,
+        latency_tdigest: r.get(7)?,
     })
 }
 
