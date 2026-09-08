@@ -9,7 +9,7 @@ info:
     REST endpoints.
 
     This service is designed for integration with [Coolify.io](https://coolify.io).
-  version: 1.0.0
+  version: 1.0.1-rc.1
   contact:
     name: Coolify
     url: https://coolify.io
@@ -74,7 +74,7 @@ paths:
             text/plain:
               schema:
                 type: string
-                example: 1.0.0
+                example: 1.0.1-rc.1
 
   /api/cpu/current:
     get:
@@ -1222,6 +1222,16 @@ components:
           type: integer
           format: int64
           example: 41200000
+        s4xx:
+          type: integer
+          format: int64
+          description: Client-error responses for this path
+          example: 12
+        s5xx:
+          type: integer
+          format: int64
+          description: Server-error responses for this path
+          example: 184
         p50:
           type: number
           format: float

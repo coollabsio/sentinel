@@ -54,6 +54,8 @@ fn path_row(bucket: i64, path: &str, requests: i64, bytes_out: i64, latency: &[f
         path: path.into(),
         requests,
         bytes_out,
+        s4xx: 0,
+        s5xx: 0,
         latency_tdigest: digest_bytes(latency),
     }
 }
@@ -552,7 +554,12 @@ fn paths_are_recapped_with_an_other_row() {
     let hour = 100 * HOUR;
     // Descending requests, so the cap keeps /p0 and /p1.
     let rows: Vec<PathRow> = (0..5)
-        .map(|i| path_row(hour + i * MIN, &format!("/p{i}"), 100 - i, 10, &[1.0]))
+        .map(|i| {
+            let mut row = path_row(hour + i * MIN, &format!("/p{i}"), 100 - i, 10, &[1.0]);
+            row.s4xx = i;
+            row.s5xx = i * 2;
+            row
+        })
         .collect();
     s.flush_window(&[], &rows, &[]).unwrap();
 
@@ -578,6 +585,8 @@ fn paths_are_recapped_with_an_other_row() {
         "/p2 + /p3 + /p4 folded into __other__"
     );
     assert_eq!(other.bytes_out, 30);
+    assert_eq!(other.s4xx, 2 + 3 + 4);
+    assert_eq!(other.s5xx, 4 + 6 + 8);
     assert!(
         LatencyDigest::from_bytes(&other.latency_tdigest).is_ok(),
         "the __other__ digest must be an empty-but-decodable sketch, not \

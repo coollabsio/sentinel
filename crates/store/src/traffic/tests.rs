@@ -205,7 +205,54 @@ fn path_row(bucket: i64, app: &str, path: &str, requests: i64) -> PathRow {
         path: path.into(),
         requests,
         bytes_out: 20,
+        s4xx: 2,
+        s5xx: 1,
         latency_tdigest: vec![1],
+    }
+}
+
+#[test]
+fn apply_migrates_existing_path_tables_and_drops_incomplete_history() {
+    let conn = Connection::open_in_memory().unwrap();
+    for suffix in ["1m", "1h", "1d"] {
+        conn.execute_batch(&format!(
+            "CREATE TABLE traffic_paths_{suffix} (
+                bucket INTEGER NOT NULL,
+                app TEXT NOT NULL,
+                path TEXT NOT NULL,
+                requests INTEGER NOT NULL,
+                bytes_out INTEGER NOT NULL,
+                latency_tdigest BLOB NOT NULL,
+                PRIMARY KEY (bucket, app, path)
+            ) STRICT;
+            INSERT INTO traffic_paths_{suffix}
+                (bucket, app, path, requests, bytes_out, latency_tdigest)
+            VALUES (60000, 'app', '/legacy', 7, 70, X'');"
+        ))
+        .unwrap();
+    }
+
+    apply(&conn).unwrap();
+
+    for suffix in ["1m", "1h", "1d"] {
+        let legacy_rows: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM traffic_paths_{suffix}"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_rows, 0);
+
+        conn.execute(
+            &format!(
+                "INSERT INTO traffic_paths_{suffix}
+                    (bucket, app, path, requests, bytes_out, s4xx, s5xx, latency_tdigest)
+                 VALUES (120000, 'app', '/new', 3, 30, 1, 1, X'')"
+            ),
+            [],
+        )
+        .unwrap();
     }
 }
 
@@ -251,6 +298,8 @@ fn write_rows_m1_matches_flush_window() {
     let paths = s.paths_range(Tier::M1, "a", 0, 120_000, 10).unwrap();
     assert_eq!(paths.len(), 1);
     assert_eq!(paths[0].requests, 8);
+    assert_eq!(paths[0].s4xx, 4);
+    assert_eq!(paths[0].s5xx, 2);
 
     let bd = s
         .breakdown_range(Tier::M1, "a", "country", 0, 120_000, 10)

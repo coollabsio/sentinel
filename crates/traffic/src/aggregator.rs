@@ -55,6 +55,8 @@ pub struct Aggregator {
     /// Per-`(app, path)` latency digest, independent of whether the path
     /// survives `paths`' top-N cap.
     path_latency: HashMap<(String, String), LatencyDigest, RandomState>,
+    path_errors: HashMap<(String, String), (i64, i64), RandomState>,
+    path_other_errors: HashMap<String, (i64, i64), RandomState>,
     /// Per-app, per-dimension top-N of dimension values (by request count).
     /// Nested (app -> dimension -> top-N) so recording an event enters the
     /// per-app map once and then looks up each dimension by a `&'static str`,
@@ -71,6 +73,8 @@ impl Aggregator {
             per_key: HashMap::default(),
             paths: HashMap::default(),
             path_latency: HashMap::default(),
+            path_errors: HashMap::default(),
+            path_other_errors: HashMap::default(),
             breakdown: HashMap::default(),
         }
     }
@@ -111,7 +115,27 @@ impl Aggregator {
         // here matches the one `take_rollup` looks the digest back up by.
         let path = truncate_key(&ev.path);
         let paths = self.paths.entry(app.clone()).or_default();
+        let previous_len = paths.counts.len();
+        let was_present = paths.counts.contains_key(path);
         paths.add_bounded(path, 1, ev.bytes_out, self.topn);
+
+        let errors = self
+            .path_errors
+            .entry((app.clone(), path.to_string()))
+            .or_default();
+        match status_class(ev.status) {
+            StatusClass::S4xx => errors.0 += 1,
+            StatusClass::S5xx => errors.1 += 1,
+            _ => {}
+        }
+        if paths.counts.len() < previous_len + usize::from(!was_present) {
+            fold_evicted_path_errors(
+                &app,
+                paths,
+                &mut self.path_errors,
+                &mut self.path_other_errors,
+            );
+        }
 
         // Only keep a latency digest for a path still in the top-N candidate
         // set: one already folded into `__other__` has its digest discarded at
@@ -210,9 +234,19 @@ impl Aggregator {
         let mut paths = Vec::new();
         for (app, mut topn) in self.paths.drain() {
             topn.cap(self.topn);
+            fold_evicted_path_errors(
+                &app,
+                &topn,
+                &mut self.path_errors,
+                &mut self.path_other_errors,
+            );
             for (path, (reqs, bytes)) in topn.counts.into_iter() {
                 let digest = self
                     .path_latency
+                    .remove(&(app.clone(), path.clone()))
+                    .unwrap_or_default();
+                let errors = self
+                    .path_errors
                     .remove(&(app.clone(), path.clone()))
                     .unwrap_or_default();
                 paths.push(PathRow {
@@ -221,16 +255,21 @@ impl Aggregator {
                     path,
                     requests: reqs as i64,
                     bytes_out: bytes as i64,
+                    s4xx: errors.0,
+                    s5xx: errors.1,
                     latency_tdigest: digest.to_bytes(),
                 });
             }
             if topn.other.0 > 0 {
+                let errors = self.path_other_errors.remove(&app).unwrap_or_default();
                 paths.push(PathRow {
                     bucket,
                     app: app.clone(),
                     path: "__other__".to_string(),
                     requests: topn.other.0 as i64,
                     bytes_out: topn.other.1 as i64,
+                    s4xx: errors.0,
+                    s5xx: errors.1,
                     latency_tdigest: LatencyDigest::new().to_bytes(),
                 });
             }
@@ -239,6 +278,8 @@ impl Aggregator {
         // apps with no surviving top-N entries at all) are never removed
         // above; drop them here so the window fully resets.
         self.path_latency.clear();
+        self.path_errors.clear();
+        self.path_other_errors.clear();
 
         let mut breakdown = Vec::new();
         for (app, dims) in self.breakdown.drain() {
@@ -271,6 +312,26 @@ impl Aggregator {
             stats,
             paths,
             breakdown,
+        }
+    }
+}
+
+fn fold_evicted_path_errors(
+    app: &str,
+    paths: &TopN,
+    errors: &mut HashMap<(String, String), (i64, i64), RandomState>,
+    other: &mut HashMap<String, (i64, i64), RandomState>,
+) {
+    let evicted: Vec<_> = errors
+        .keys()
+        .filter(|(candidate_app, path)| candidate_app == app && !paths.counts.contains_key(path))
+        .cloned()
+        .collect();
+    let other = other.entry(app.to_string()).or_default();
+    for key in evicted {
+        if let Some((s4xx, s5xx)) = errors.remove(&key) {
+            other.0 += s4xx;
+            other.1 += s5xx;
         }
     }
 }

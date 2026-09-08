@@ -72,7 +72,7 @@ Get the current version of Sentinel.
 
 **Response:**
 ```
-1.0.0
+1.0.1-rc.1
 ```
 
 **Example:**
@@ -557,6 +557,8 @@ Retrieve the busiest request paths for one app, summed across every bucket in ra
     "app": "jc4wsgs",
     "requests": 5210,
     "bytes_out": 41200000,
+    "s4xx": 12,
+    "s5xx": 184,
     "p50": 38.0,
     "p95": 190.0
   }
@@ -568,6 +570,7 @@ Retrieve the busiest request paths for one app, summed across every bucket in ra
 - `app` (string): The app (Coolify app UUID, or host for Caddy) that served this path. On this per-app endpoint it is always the queried app; on the server-wide endpoint it attributes each path back to its owning app
 - `requests` (number): Total request count for this path in range
 - `bytes_out` (number): Total response bytes for this path in range
+- `s4xx` / `s5xx` (number): Client-error and server-error response counts for this path
 - `p50` / `p95` (number): Approximate per-path latency percentiles in milliseconds (`p99` is available from the overview endpoint)
 
 **Example:**
@@ -808,7 +811,7 @@ Each member is verbatim the shape of its standalone endpoint (see the sections a
     "unique_visitors": 8421
   },
   "paths": [
-    { "path": "/api/checkout", "app": "jc4wsgs", "requests": 42000, "bytes_out": 320000000, "p50": 40.0, "p95": 110.0 }
+    { "path": "/api/checkout", "app": "jc4wsgs", "requests": 42000, "bytes_out": 320000000, "s4xx": 120, "s5xx": 8, "p50": 40.0, "p95": 110.0 }
   ],
   "breakdowns": {
     "country": [ { "value": "US", "requests": 42000, "bytes_out": 320000000 } ],
