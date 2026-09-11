@@ -188,8 +188,23 @@ pub(crate) async fn connect_endpoint(
         if certificates.is_empty() {
             return Err(FluxConnectionError::InvalidCa);
         }
+        for certificate in certificates {
+            let (remaining, _) = x509_parser::parse_x509_certificate(certificate.as_ref())
+                .map_err(|_| FluxConnectionError::InvalidCa)?;
+            if !remaining.is_empty() {
+                return Err(FluxConnectionError::InvalidCa);
+            }
+        }
+        let domain_name = url
+            .host_str()
+            .map(|host| host.trim_matches(['[', ']']))
+            .ok_or(FluxConnectionError::InvalidEndpoint)?;
         endpoint = endpoint
-            .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca)))
+            .tls_config(
+                ClientTlsConfig::new()
+                    .domain_name(domain_name)
+                    .ca_certificate(Certificate::from_pem(ca)),
+            )
             .map_err(|_| FluxConnectionError::InvalidCa)?;
     }
     endpoint

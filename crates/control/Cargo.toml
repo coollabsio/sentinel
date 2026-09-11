@@ -21,9 +21,11 @@ tokio-stream = "0.1"
 tonic.workspace = true
 tracing.workspace = true
 url.workspace = true
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 axum.workspace = true
+rcgen = "0.14.10"
 tokio.workspace = true
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic-health = "0.14.6"
