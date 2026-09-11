@@ -73,6 +73,26 @@ fn executes_system_info_commands() {
 }
 
 #[test]
+fn rejects_a_command_type_and_payload_mismatch() {
+    use sentinel_protocol::control::v1::command::Payload;
+    use sentinel_protocol::control::v1::{Command, SystemInfoRequest};
+
+    let execution = crate::commands::CommandExecutor::new("dev").execute(
+        Command {
+            command_id: "mismatch-1".into(),
+            command_type: sentinel_protocol::CAPABILITY_SYSTEM_PING.into(),
+            payload_version: 1,
+            payload: Some(Payload::SystemInfo(SystemInfoRequest {})),
+            expires_at_unix_ms: i64::MAX,
+            ..Default::default()
+        },
+        true,
+    );
+
+    assert!(!execution.accepted);
+}
+
+#[test]
 fn rejects_expired_system_ping_commands() {
     let mut executor = crate::commands::CommandExecutor::new("dev");
     let result = executor.execute(

@@ -63,10 +63,10 @@ impl CommandExecutor {
                 }
             };
         }
-        let has_valid_payload = match command.payload.as_ref() {
-            Some(Payload::SystemPing(ping)) => !ping.nonce.is_empty(),
-            Some(Payload::SystemInfo(_)) => true,
-            None => false,
+        let has_valid_payload = match (command.command_type.as_str(), command.payload.as_ref()) {
+            (CAPABILITY_SYSTEM_PING, Some(Payload::SystemPing(ping))) => !ping.nonce.is_empty(),
+            (CAPABILITY_SYSTEM_INFO, Some(Payload::SystemInfo(_))) => true,
+            _ => false,
         };
         let accepted = !(command.command_id.is_empty()
             || !matches!(
