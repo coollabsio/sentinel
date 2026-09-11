@@ -411,6 +411,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "control"
+version = "1.0.1"
+dependencies = [
+ "axum",
+ "protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
