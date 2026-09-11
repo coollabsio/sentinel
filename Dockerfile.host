@@ -1,0 +1,20 @@
+FROM rust:1.97.1-alpine3.24 AS builder
+
+RUN apk add --no-cache musl-dev gcc file
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY src ./src
+
+ARG VERSION
+ENV SENTINEL_BUILD_VERSION=$VERSION
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo rustc --release --locked -p sentinel --features traffic -- -C target-feature=+crt-static && \
+    cp /app/target/release/sentinel /sentinel && \
+    file /sentinel | grep -Eq 'static.*linked'
+
+FROM scratch
+COPY --from=builder /sentinel /sentinel

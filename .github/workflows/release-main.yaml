@@ -16,6 +16,7 @@ permissions:
 env:
   GITHUB_REGISTRY: ghcr.io
   IMAGE_NAME: "coollabsio/sentinel"
+  HOST_IMAGE_NAME: "coollabsio/sentinel-host"
 
 jobs:
   build-push:
@@ -56,6 +57,21 @@ jobs:
           labels: |
             coolify.managed=true
 
+      - name: Build and Push Host Artifact (${{ matrix.arch }})
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.host
+          platforms: ${{ matrix.platform }}
+          push: true
+          build-args: |
+            VERSION=main
+          tags: |
+            ${{ env.GITHUB_REGISTRY }}/${{ env.HOST_IMAGE_NAME }}:main-${{ matrix.arch }}
+          labels: |
+            coolify.managed=true
+            org.opencontainers.image.description=Portable Sentinel host binary
+
   merge-manifest:
     runs-on: ubuntu-24.04
     needs: build-push
@@ -79,3 +95,10 @@ jobs:
           ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:main-amd64 \
           ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:main-aarch64 \
           --tag ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:main
+
+      - name: Create & publish host artifact manifest
+        run: |
+          docker buildx imagetools create \
+          ${{ env.GITHUB_REGISTRY }}/${{ env.HOST_IMAGE_NAME }}:main-amd64 \
+          ${{ env.GITHUB_REGISTRY }}/${{ env.HOST_IMAGE_NAME }}:main-aarch64 \
+          --tag ${{ env.GITHUB_REGISTRY }}/${{ env.HOST_IMAGE_NAME }}:main
