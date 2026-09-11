@@ -1,9 +1,13 @@
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
+use rcgen::{CertificateParams, KeyPair};
 use sentinel_protocol::{CAPABILITY_SYSTEM_PING, PROTOCOL_MAX, PROTOCOL_MIN};
+use tonic::transport::Server;
 
 use super::*;
 
@@ -222,4 +226,175 @@ async fn registry_times_out_when_sentinel_does_not_return_a_result() {
         .await;
     assert!(receiver.recv().await.is_some());
     assert_eq!(result.unwrap_err(), CommandDispatchError::Timeout);
+}
+
+struct TestTlsMaterial {
+    certificate: String,
+    private_key: String,
+}
+
+fn test_tls_material(expired: bool) -> TestTlsMaterial {
+    let now = time::OffsetDateTime::now_utc();
+    let mut parameters = CertificateParams::new(vec!["localhost".into()]).unwrap();
+    parameters.not_before = now - time::Duration::minutes(1);
+    parameters.not_after = if expired {
+        now - time::Duration::seconds(1)
+    } else {
+        now + time::Duration::hours(1)
+    };
+    let private_key = KeyPair::generate().unwrap();
+    let certificate = parameters.self_signed(&private_key).unwrap();
+
+    TestTlsMaterial {
+        certificate: certificate.pem(),
+        private_key: private_key.serialize_pem(),
+    }
+}
+
+struct TestTlsFiles {
+    certificate_path: PathBuf,
+    private_key_path: PathBuf,
+}
+
+impl TestTlsFiles {
+    fn new(certificate: &str, private_key: &str) -> Self {
+        static NEXT_FILE_ID: AtomicUsize = AtomicUsize::new(0);
+        let id = NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let certificate_path = std::env::temp_dir().join(format!("flux-tls-{nanos}-{id}.crt"));
+        let private_key_path = std::env::temp_dir().join(format!("flux-tls-{nanos}-{id}.key"));
+        std::fs::write(&certificate_path, certificate).unwrap();
+        std::fs::write(&private_key_path, private_key).unwrap();
+
+        Self {
+            certificate_path,
+            private_key_path,
+        }
+    }
+}
+
+impl Drop for TestTlsFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.certificate_path);
+        let _ = std::fs::remove_file(&self.private_key_path);
+    }
+}
+
+#[test]
+fn loads_valid_flux_tls_files() {
+    let material = test_tls_material(false);
+    let files = TestTlsFiles::new(&material.certificate, &material.private_key);
+
+    assert!(
+        load_server_tls(
+            Some(files.certificate_path.clone()),
+            Some(files.private_key_path.clone()),
+            false,
+        )
+        .unwrap()
+        .is_some()
+    );
+}
+
+#[test]
+fn configures_tonic_with_validated_flux_tls() {
+    let material = test_tls_material(false);
+    let files = TestTlsFiles::new(&material.certificate, &material.private_key);
+    let tls_config = load_server_tls(
+        Some(files.certificate_path.clone()),
+        Some(files.private_key_path.clone()),
+        false,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(Server::builder().tls_config(tls_config).is_ok());
+}
+
+#[test]
+fn rejects_incomplete_flux_tls_configuration() {
+    let material = test_tls_material(false);
+    let files = TestTlsFiles::new(&material.certificate, &material.private_key);
+
+    let error = load_server_tls(Some(files.certificate_path.clone()), None, false).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "FLUX_TLS_CERT_PATH and FLUX_TLS_KEY_PATH must both be set"
+    );
+}
+
+#[test]
+fn rejects_unreadable_flux_tls_files_without_exposing_the_path() {
+    let missing = PathBuf::from("/tmp/flux-tls-does-not-exist.pem");
+
+    let error =
+        load_server_tls(Some(missing), Some(PathBuf::from("/tmp/key.pem")), false).unwrap_err();
+
+    assert_eq!(error.to_string(), "cannot read Flux TLS certificate");
+}
+
+#[test]
+fn rejects_invalid_flux_tls_pem() {
+    let files = TestTlsFiles::new("not a certificate", "not a private key");
+
+    let error = load_server_tls(
+        Some(files.certificate_path.clone()),
+        Some(files.private_key_path.clone()),
+        false,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "Flux TLS certificate is invalid");
+}
+
+#[test]
+fn rejects_flux_tls_certificate_and_private_key_mismatch() {
+    let certificate = test_tls_material(false);
+    let private_key = test_tls_material(false);
+    let files = TestTlsFiles::new(&certificate.certificate, &private_key.private_key);
+
+    let error = load_server_tls(
+        Some(files.certificate_path.clone()),
+        Some(files.private_key_path.clone()),
+        false,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "Flux TLS certificate and private key do not match"
+    );
+}
+
+#[test]
+fn rejects_an_expired_flux_tls_leaf_certificate() {
+    let material = test_tls_material(true);
+    let files = TestTlsFiles::new(&material.certificate, &material.private_key);
+
+    let error = load_server_tls(
+        Some(files.certificate_path.clone()),
+        Some(files.private_key_path.clone()),
+        false,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "Flux TLS certificate is not currently valid"
+    );
+}
+
+#[test]
+fn permits_plaintext_only_with_the_explicit_development_opt_in() {
+    let error = load_server_tls(None, None, false).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "Flux TLS is required unless FLUX_DEVELOPMENT_ALLOW_PLAINTEXT=true"
+    );
+    assert!(load_server_tls(None, None, true).unwrap().is_none());
 }

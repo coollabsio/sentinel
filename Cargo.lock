@@ -818,7 +818,10 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "protocol",
+ "rcgen",
  "reqwest",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "thiserror",
@@ -830,6 +833,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

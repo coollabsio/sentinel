@@ -11,6 +11,8 @@ ed25519-dalek = "2.2"
 futures-util.workspace = true
 sentinel_protocol = { path = "../protocol", package = "protocol" }
 reqwest.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pemfile = "2.2"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -22,5 +24,7 @@ tonic-health = "0.14.6"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid = { version = "1", features = ["v4"] }
+x509-parser = "0.18.1"
 
 [dev-dependencies]
+rcgen = "0.14.10"

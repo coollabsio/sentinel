@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use flux::{
-    AgentService, ConnectionRegistry, CredentialVerifier, EventReporter, serve_internal_api,
+    AgentService, ConnectionRegistry, CredentialVerifier, EventReporter, TlsConfigurationError,
+    load_server_tls, serve_internal_api,
 };
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::transport::Server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,6 +22,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen: SocketAddr = std::env::var("FLUX_LISTEN_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:7443".into())
         .parse()?;
+    let tls_config = load_server_tls(
+        std::env::var_os("FLUX_TLS_CERT_PATH").map(PathBuf::from),
+        std::env::var_os("FLUX_TLS_KEY_PATH").map(PathBuf::from),
+        std::env::var("FLUX_DEVELOPMENT_ALLOW_PLAINTEXT").is_ok_and(|value| value == "true"),
+    )?;
     let key_id = required("FLUX_SIGNING_KEY_ID")?;
     let public_key = decode_key(&required("FLUX_SIGNING_PUBLIC_KEY")?)?;
     let issuer = required("FLUX_ISSUER")?;
@@ -43,19 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let (_health_reporter, health_service) = tonic_health::server::health_reporter();
     let mut server = Server::builder();
-    match (
-        std::env::var("FLUX_TLS_CERT_PATH").ok(),
-        std::env::var("FLUX_TLS_KEY_PATH").ok(),
-    ) {
-        (Some(cert_path), Some(key_path)) => {
-            let cert = std::fs::read(cert_path)?;
-            let key = std::fs::read(key_path)?;
-            server = server
-                .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))?;
-            tracing::info!(%listen, "Flux is listening with TLS");
-        }
-        (None, None) => tracing::warn!(%listen, "Flux is listening without TLS"),
-        _ => return Err("both FLUX_TLS_CERT_PATH and FLUX_TLS_KEY_PATH are required".into()),
+    if let Some(tls_config) = tls_config {
+        server = server
+            .tls_config(tls_config)
+            .map_err(|_| TlsConfigurationError::InvalidCertificate)?;
+        tracing::info!(%listen, "Flux is listening with TLS");
+    } else {
+        tracing::warn!(%listen, "Flux is listening without TLS");
     }
     server
         .add_service(health_service)
