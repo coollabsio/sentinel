@@ -33,6 +33,17 @@ pub enum ConfigError {
     NotPositive(&'static str),
     #[error("invalid {0}: must be true or false")]
     InvalidBool(&'static str),
+    #[error("FLUX_CA_PATH environment variable is required when CONTROL_PLANE_ENABLED is true")]
+    MissingFluxCaPath,
+    #[error("FLUX_TRUST_BUNDLE_VERSION must be a positive integer")]
+    InvalidFluxTrustBundleVersion,
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlTlsConfig {
+    pub ca_path: PathBuf,
+    pub trust_bundle_version: u64,
+    pub allow_plaintext: bool,
 }
 
 /// Traffic-analytics subsystem configuration (spec §5). Inert unless
@@ -64,6 +75,7 @@ pub struct Config {
     pub version: String,
     pub debug: bool,
     pub control_plane_enabled: bool,
+    pub control_tls: Option<ControlTlsConfig>,
     pub refresh_rate_seconds: u64,
     pub push_enabled: bool,
     pub push_interval_seconds: u64,
@@ -93,6 +105,22 @@ impl Config {
 
         let debug = bool_from_env("DEBUG", false)?;
         let control_plane_enabled = bool_from_env("CONTROL_PLANE_ENABLED", false)?;
+        let control_tls = if control_plane_enabled {
+            let ca_path = non_empty("FLUX_CA_PATH").ok_or(ConfigError::MissingFluxCaPath)?;
+            let trust_bundle_version = non_empty("FLUX_TRUST_BUNDLE_VERSION")
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|version| *version > 0)
+                .ok_or(ConfigError::InvalidFluxTrustBundleVersion)?;
+            let allow_plaintext =
+                matches!(std::env::var("SENTINEL_DEVELOPMENT").as_deref(), Ok("true"));
+            Some(ControlTlsConfig {
+                ca_path: PathBuf::from(ca_path),
+                trust_bundle_version,
+                allow_plaintext,
+            })
+        } else {
+            None
+        };
         let collector_enabled = bool_from_env("COLLECTOR_ENABLED", false)?;
         let push_interval_seconds = positive_from_env("PUSH_INTERVAL_SECONDS", 60)?;
         let refresh_rate_seconds = positive_from_env("COLLECTOR_REFRESH_RATE_SECONDS", 5)?;
@@ -169,6 +197,7 @@ impl Config {
             version: VERSION.to_string(),
             debug,
             control_plane_enabled,
+            control_tls,
             refresh_rate_seconds,
             push_enabled: true,
             push_interval_seconds,
@@ -195,6 +224,7 @@ impl Config {
             version: VERSION.to_string(),
             debug: false,
             control_plane_enabled: false,
+            control_tls: None,
             refresh_rate_seconds: 5,
             push_enabled: false,
             push_interval_seconds: 60,

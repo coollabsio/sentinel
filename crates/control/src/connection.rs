@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use config::ControlTlsConfig;
 use sentinel_protocol::control::v1::agent_message;
 use sentinel_protocol::control::v1::control_message;
 use sentinel_protocol::control::v1::{AgentMessage, CommandAccepted, Heartbeat, Hello};
@@ -9,7 +10,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
-use tonic::transport::{ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 use url::Url;
 
 use crate::Assignment;
@@ -25,9 +26,10 @@ pub enum FluxTransport {
 }
 
 impl FluxTransport {
-    pub fn from_url(url: &Url) -> Result<Self, FluxConnectionError> {
+    pub fn from_url(url: &Url, allow_plaintext: bool) -> Result<Self, FluxConnectionError> {
         match url.scheme() {
-            "http" => Ok(Self::Plaintext),
+            "http" if allow_plaintext => Ok(Self::Plaintext),
+            "http" => Err(FluxConnectionError::PlaintextRejected),
             "https" => Ok(Self::Tls),
             _ => Err(FluxConnectionError::InvalidEndpoint),
         }
@@ -44,27 +46,30 @@ pub enum FluxConnectionError {
     Connection,
     #[error("Flux handshake failed")]
     Handshake,
+    #[error("Flux CA bundle is missing")]
+    MissingCa,
+    #[error("Flux CA bundle is invalid")]
+    InvalidCa,
+    #[error("Flux trust bundle version does not match the assignment")]
+    TrustBundleVersionMismatch,
+    #[error("plaintext Flux connections are disabled")]
+    PlaintextRejected,
 }
 
 pub async fn connect(
     assignment: &Assignment,
     sentinel_version: &str,
+    control_tls: ControlTlsConfig,
     mut shutdown: watch::Receiver<bool>,
     command_executor: Arc<tokio::sync::Mutex<CommandExecutor>>,
 ) -> Result<(), FluxConnectionError> {
-    let transport = FluxTransport::from_url(assignment.flux_url())?;
-    let mut endpoint = Endpoint::from_shared(assignment.flux_url().to_string())
-        .map_err(|_| FluxConnectionError::InvalidEndpoint)?
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(CONNECT_TIMEOUT);
-    if transport == FluxTransport::Tls {
-        endpoint = endpoint
-            .tls_config(ClientTlsConfig::new().with_native_roots())
-            .map_err(|_| FluxConnectionError::InvalidEndpoint)?;
+    if assignment.trust_bundle_version() != control_tls.trust_bundle_version {
+        return Err(FluxConnectionError::TrustBundleVersionMismatch);
     }
+    let transport = FluxTransport::from_url(assignment.flux_url(), control_tls.allow_plaintext)?;
     let channel = tokio::select! {
         _ = shutdown.changed() => return Ok(()),
-        result = endpoint.connect() => result.map_err(|_| FluxConnectionError::Connection)?,
+        result = connect_endpoint(assignment.flux_url(), &control_tls) => result?,
     };
     let mut client = sentinel_protocol::control::v1::agent_client::AgentClient::new(channel)
         .max_decoding_message_size(MESSAGE_LIMIT)
@@ -160,6 +165,44 @@ pub async fn connect(
             }
         }
     }
+}
+
+pub(crate) async fn connect_endpoint(
+    url: &Url,
+    control_tls: &ControlTlsConfig,
+) -> Result<tonic::transport::Channel, FluxConnectionError> {
+    install_crypto_provider();
+    let transport = FluxTransport::from_url(url, control_tls.allow_plaintext)?;
+    let mut endpoint = Endpoint::from_shared(url.to_string())
+        .map_err(|_| FluxConnectionError::InvalidEndpoint)?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(CONNECT_TIMEOUT);
+    if transport == FluxTransport::Tls {
+        let ca = std::fs::read(&control_tls.ca_path).map_err(|_| FluxConnectionError::MissingCa)?;
+        if ca.is_empty() {
+            return Err(FluxConnectionError::MissingCa);
+        }
+        let certificates = rustls_pemfile::certs(&mut std::io::BufReader::new(ca.as_slice()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| FluxConnectionError::InvalidCa)?;
+        if certificates.is_empty() {
+            return Err(FluxConnectionError::InvalidCa);
+        }
+        endpoint = endpoint
+            .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca)))
+            .map_err(|_| FluxConnectionError::InvalidCa)?;
+    }
+    endpoint
+        .connect()
+        .await
+        .map_err(|_| FluxConnectionError::Connection)
+}
+
+pub(crate) fn install_crypto_provider() {
+    static CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
+    CRYPTO_PROVIDER.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 fn boot_id() -> String {

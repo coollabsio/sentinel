@@ -2,6 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use config::ControlTlsConfig;
 use reqwest::StatusCode;
 use sentinel_protocol::{
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, PROTOCOL_MAX, PROTOCOL_MIN, select_protocol,
@@ -72,6 +73,7 @@ pub struct Assignment {
     protocol_min: u32,
     protocol_max: u32,
     heartbeat_interval: Duration,
+    trust_bundle_version: u64,
 }
 
 impl Assignment {
@@ -102,6 +104,10 @@ impl Assignment {
     pub fn heartbeat_interval(&self) -> Duration {
         self.heartbeat_interval
     }
+
+    pub fn trust_bundle_version(&self) -> u64 {
+        self.trust_bundle_version
+    }
 }
 
 impl fmt::Debug for Assignment {
@@ -115,6 +121,7 @@ impl fmt::Debug for Assignment {
             .field("protocol_min", &self.protocol_min)
             .field("protocol_max", &self.protocol_max)
             .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("trust_bundle_version", &self.trust_bundle_version)
             .finish()
     }
 }
@@ -169,6 +176,7 @@ pub struct AssignmentClient {
     assignment_url: Url,
     token: String,
     sentinel_version: String,
+    control_tls: ControlTlsConfig,
 }
 
 impl AssignmentClient {
@@ -176,6 +184,7 @@ impl AssignmentClient {
         endpoint: &str,
         token: &str,
         sentinel_version: &str,
+        control_tls: ControlTlsConfig,
     ) -> Result<Self, AssignmentError> {
         let assignment_url = assignment_url(endpoint)?;
         if token.is_empty() {
@@ -198,6 +207,7 @@ impl AssignmentClient {
             assignment_url,
             token: token.to_string(),
             sentinel_version: sentinel_version.to_string(),
+            control_tls,
         })
     }
 
@@ -298,6 +308,7 @@ impl AssignmentClient {
                     let retry_after = match crate::connection::connect(
                         &assignment,
                         &self.sentinel_version,
+                        self.control_tls.clone(),
                         shutdown.clone(),
                         command_executor.clone(),
                     )
@@ -381,6 +392,7 @@ struct AssignmentResponse {
     protocol_min: Option<u32>,
     protocol_max: Option<u32>,
     heartbeat_interval_seconds: Option<u64>,
+    trust_bundle_version: Option<u64>,
     retry_after_seconds: Option<u64>,
 }
 
@@ -427,6 +439,12 @@ impl AssignmentResponse {
                 "heartbeat interval is outside allowed limits",
             ));
         }
+        let trust_bundle_version = self
+            .trust_bundle_version
+            .filter(|version| *version > 0)
+            .ok_or(AssignmentError::InvalidResponse(
+                "trust bundle version is missing or invalid",
+            ))?;
 
         Ok(AssignmentOutcome::Enabled(Assignment {
             server_id,
@@ -436,6 +454,7 @@ impl AssignmentResponse {
             protocol_min,
             protocol_max,
             heartbeat_interval: Duration::from_secs(heartbeat_seconds),
+            trust_bundle_version,
         }))
     }
 }

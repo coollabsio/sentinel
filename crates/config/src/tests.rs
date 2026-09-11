@@ -85,6 +85,8 @@ fn control_plane_can_be_enabled() {
         ("TOKEN", "t"),
         ("PUSH_ENDPOINT", "https://example.com"),
         ("CONTROL_PLANE_ENABLED", "true"),
+        ("FLUX_CA_PATH", "/etc/coolify/sentinel-flux-ca.pem"),
+        ("FLUX_TRUST_BUNDLE_VERSION", "1"),
     ]);
     let config = Config::load(false).unwrap();
     assert!(config.control_plane_enabled);
@@ -361,4 +363,60 @@ fn traffic_rejects_zero_topn_and_retention() {
             "expected {var}=0 to be rejected"
         );
     }
+}
+
+#[test]
+fn control_plane_requires_a_private_ca_bundle_configuration() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "https://example.com"),
+        ("CONTROL_PLANE_ENABLED", "true"),
+        ("FLUX_CA_PATH", ""),
+        ("FLUX_TRUST_BUNDLE_VERSION", ""),
+    ]);
+
+    assert!(matches!(
+        Config::load(false),
+        Err(ConfigError::MissingFluxCaPath)
+    ));
+}
+
+#[test]
+fn control_plane_requires_a_positive_private_ca_bundle_version() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "https://example.com"),
+        ("CONTROL_PLANE_ENABLED", "true"),
+        ("FLUX_CA_PATH", "/etc/coolify/sentinel-flux-ca.pem"),
+        ("FLUX_TRUST_BUNDLE_VERSION", "0"),
+    ]);
+
+    assert!(matches!(
+        Config::load(false),
+        Err(ConfigError::InvalidFluxTrustBundleVersion)
+    ));
+}
+
+#[test]
+fn control_plane_configuration_allows_plaintext_only_for_explicit_development() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "https://example.com"),
+        ("CONTROL_PLANE_ENABLED", "true"),
+        ("FLUX_CA_PATH", "/etc/coolify/sentinel-flux-ca.pem"),
+        ("FLUX_TRUST_BUNDLE_VERSION", "1"),
+        ("SENTINEL_DEVELOPMENT", "true"),
+    ]);
+
+    let config = Config::load(false).unwrap();
+    let control_tls = config.control_tls.unwrap();
+    assert_eq!(
+        control_tls.ca_path,
+        PathBuf::from("/etc/coolify/sentinel-flux-ca.pem")
+    );
+    assert_eq!(control_tls.trust_bundle_version, 1);
+    assert!(control_tls.allow_plaintext);
 }

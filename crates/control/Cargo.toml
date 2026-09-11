@@ -5,10 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+config = { path = "../config" }
 protocol = { path = "../protocol" }
 futures-util.workspace = true
 prost.workspace = true
 reqwest.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pemfile = "2.2"
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
@@ -22,3 +25,5 @@ url.workspace = true
 [dev-dependencies]
 axum.workspace = true
 tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic-health = "0.14.6"

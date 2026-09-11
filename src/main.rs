@@ -34,12 +34,17 @@ fn assignment_client(
     endpoint: &str,
     token: &str,
     version: &str,
+    control_tls: Option<&config::ControlTlsConfig>,
 ) -> Option<control::AssignmentClient> {
     if !enabled {
         return None;
     }
+    let Some(control_tls) = control_tls else {
+        tracing::error!("Sentinel control task could not start; TLS configuration is missing");
+        return None;
+    };
 
-    match control::AssignmentClient::new(endpoint, token, version) {
+    match control::AssignmentClient::new(endpoint, token, version, control_tls.clone()) {
         Ok(client) => Some(client),
         Err(error) => {
             tracing::error!(%error, "Sentinel control task could not start; existing services remain active");
@@ -261,6 +266,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &config.endpoint,
         &config.token,
         &config.version,
+        config.control_tls.as_ref(),
     ) {
         let rx = shutdown_rx.clone();
         control_services.spawn(async move {
