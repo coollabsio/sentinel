@@ -67,6 +67,49 @@ fn builds_push_url_and_trims_trailing_slash() {
 }
 
 #[test]
+fn control_plane_defaults_to_disabled() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "https://example.com"),
+        ("CONTROL_PLANE_ENABLED", ""),
+    ]);
+    let config = Config::load(false).unwrap();
+    assert!(!config.control_plane_enabled);
+}
+
+#[test]
+fn control_plane_can_be_enabled() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "https://example.com"),
+        ("CONTROL_PLANE_ENABLED", "true"),
+    ]);
+    let config = Config::load(false).unwrap();
+    assert!(config.control_plane_enabled);
+}
+
+#[test]
+fn control_plane_rejects_invalid_boolean() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "https://example.com"),
+        ("CONTROL_PLANE_ENABLED", "enabled"),
+    ]);
+    assert!(matches!(
+        Config::load(false),
+        Err(ConfigError::InvalidBool("CONTROL_PLANE_ENABLED"))
+    ));
+}
+
+#[test]
+fn test_config_disables_control_plane() {
+    assert!(!Config::load_for_test().control_plane_enabled);
+}
+
+#[test]
 fn rejects_non_http_endpoint() {
     let _l = env_lock().lock().unwrap();
     let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", "ftp://example.com")]);

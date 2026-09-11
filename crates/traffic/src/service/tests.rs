@@ -19,6 +19,7 @@ fn test_config(access_log_path: PathBuf, sample_threshold: u32) -> config::Confi
     config::Config {
         version: "0.0.0-test".into(),
         debug: false,
+        control_plane_enabled: false,
         refresh_rate_seconds: 5,
         push_enabled: false,
         push_interval_seconds: 60,

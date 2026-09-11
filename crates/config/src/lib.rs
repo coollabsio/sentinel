@@ -63,6 +63,7 @@ pub struct TrafficSettings {
 pub struct Config {
     pub version: String,
     pub debug: bool,
+    pub control_plane_enabled: bool,
     pub refresh_rate_seconds: u64,
     pub push_enabled: bool,
     pub push_interval_seconds: u64,
@@ -91,6 +92,7 @@ impl Config {
         };
 
         let debug = bool_from_env("DEBUG", false)?;
+        let control_plane_enabled = bool_from_env("CONTROL_PLANE_ENABLED", false)?;
         let collector_enabled = bool_from_env("COLLECTOR_ENABLED", false)?;
         let push_interval_seconds = positive_from_env("PUSH_INTERVAL_SECONDS", 60)?;
         let refresh_rate_seconds = positive_from_env("COLLECTOR_REFRESH_RATE_SECONDS", 5)?;
@@ -166,6 +168,7 @@ impl Config {
         Ok(Config {
             version: VERSION.to_string(),
             debug,
+            control_plane_enabled,
             refresh_rate_seconds,
             push_enabled: true,
             push_interval_seconds,
@@ -191,6 +194,7 @@ impl Config {
         Config {
             version: VERSION.to_string(),
             debug: false,
+            control_plane_enabled: false,
             refresh_rate_seconds: 5,
             push_enabled: false,
             push_interval_seconds: 60,
