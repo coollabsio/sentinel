@@ -506,6 +506,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sysinfo",
  "thiserror",
  "time",
  "tokio",

@@ -2,12 +2,13 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use prost::Message;
-use sentinel_protocol::CAPABILITY_SYSTEM_PING;
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    Command, CommandError, CommandResult, CommandStatus, SystemPingResult,
+    Command, CommandError, CommandResult, CommandStatus, SystemInfoResult, SystemPingResult,
 };
+use sentinel_protocol::{CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING};
+use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
 
 const MAX_CACHED_RESULTS: usize = 1_000;
 const RESULT_TTL: Duration = Duration::from_secs(30 * 60);
@@ -62,12 +63,16 @@ impl CommandExecutor {
                 }
             };
         }
-        let has_valid_payload = matches!(
-            command.payload.as_ref(),
-            Some(Payload::SystemPing(ping)) if !ping.nonce.is_empty()
-        );
+        let has_valid_payload = match command.payload.as_ref() {
+            Some(Payload::SystemPing(ping)) => !ping.nonce.is_empty(),
+            Some(Payload::SystemInfo(_)) => true,
+            None => false,
+        };
         let accepted = !(command.command_id.is_empty()
-            || command.command_type != CAPABILITY_SYSTEM_PING
+            || !matches!(
+                command.command_type.as_str(),
+                CAPABILITY_SYSTEM_PING | CAPABILITY_SYSTEM_INFO
+            )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
             || !capability_accepted)
@@ -76,7 +81,7 @@ impl CommandExecutor {
             failed(
                 &command.command_id,
                 "invalid_command",
-                "Ping command is invalid or expired.",
+                "Command is invalid or expired.",
             )
         } else if let Some(Payload::SystemPing(ping)) = command.payload {
             CommandResult {
@@ -90,6 +95,16 @@ impl CommandExecutor {
                     sentinel_version: self.sentinel_version.clone(),
                     boot_id: boot_id(),
                 })),
+            }
+        } else if let Some(Payload::SystemInfo(_)) = command.payload {
+            CommandResult {
+                event_id: format!("{}:result", command.command_id),
+                command_id: command.command_id.clone(),
+                status: CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: now_millis(),
+                payload: Some(command_result::Payload::SystemInfo(system_info(
+                    &self.sentinel_version,
+                ))),
             }
         } else {
             failed(
@@ -133,6 +148,56 @@ impl CommandExecutor {
             self.results.remove(&oldest);
         }
     }
+}
+
+fn system_info(sentinel_version: &str) -> SystemInfoResult {
+    let mut system = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+    );
+    system.refresh_memory();
+    let disks = Disks::new_with_refreshed_list();
+    let root_disk = disks
+        .list()
+        .iter()
+        .find(|disk| disk.mount_point() == std::path::Path::new("/"));
+    let (container_runtime, container_runtime_version) = container_runtime();
+
+    SystemInfoResult {
+        hostname: System::host_name(),
+        operating_system: System::name(),
+        operating_system_version: System::os_version(),
+        kernel_version: System::kernel_version(),
+        architecture: Some(System::cpu_arch()),
+        cpu_count: std::thread::available_parallelism()
+            .ok()
+            .and_then(|count| u32::try_from(count.get()).ok()),
+        memory_bytes: Some(system.total_memory()),
+        disk_total_bytes: root_disk.map(|disk| disk.total_space()),
+        disk_available_bytes: root_disk.map(|disk| disk.available_space()),
+        sentinel_version: sentinel_version.into(),
+        boot_id: Some(boot_id()),
+        uptime_seconds: Some(System::uptime()),
+        container_runtime,
+        container_runtime_version,
+    }
+}
+
+fn container_runtime() -> (Option<String>, Option<String>) {
+    for runtime in ["docker", "podman"] {
+        let output = std::process::Command::new(runtime)
+            .args(["version", "--format", "{{.Server.Version}}"])
+            .output();
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !version.is_empty() {
+                return (Some(runtime.into()), Some(version));
+            }
+        }
+    }
+
+    (None, None)
 }
 
 fn failed(command_id: &str, code: &str, message: &str) -> CommandResult {

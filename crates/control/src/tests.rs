@@ -44,6 +44,35 @@ fn executes_and_deduplicates_system_ping_commands() {
 }
 
 #[test]
+fn executes_system_info_commands() {
+    use sentinel_protocol::control::v1::command::Payload;
+    use sentinel_protocol::control::v1::command_result;
+    use sentinel_protocol::control::v1::{Command, SystemInfoRequest};
+
+    let mut executor = crate::commands::CommandExecutor::new("dev");
+    let execution = executor.execute(
+        Command {
+            command_id: "system-info-1".into(),
+            command_type: sentinel_protocol::CAPABILITY_SYSTEM_INFO.into(),
+            payload_version: 1,
+            payload: Some(Payload::SystemInfo(SystemInfoRequest {})),
+            expires_at_unix_ms: i64::MAX,
+            ..Default::default()
+        },
+        true,
+    );
+
+    assert!(execution.accepted);
+    assert!(matches!(
+        execution.result.payload,
+        Some(command_result::Payload::SystemInfo(result))
+            if result.sentinel_version == "dev"
+                && result.cpu_count.is_some_and(|count| count > 0)
+                && result.memory_bytes.is_some_and(|bytes| bytes > 0)
+    ));
+}
+
+#[test]
 fn rejects_expired_system_ping_commands() {
     let mut executor = crate::commands::CommandExecutor::new("dev");
     let result = executor.execute(
