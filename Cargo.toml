@@ -23,7 +23,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 prost = "0.14.4"
-tonic = "0.14.6"
+tonic = { version = "0.14.6", features = ["tls-ring", "tls-native-roots"] }
 tonic-prost = "0.14.6"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

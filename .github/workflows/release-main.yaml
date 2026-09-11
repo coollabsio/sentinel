@@ -17,6 +17,7 @@ env:
   GITHUB_REGISTRY: ghcr.io
   IMAGE_NAME: "coollabsio/sentinel"
   HOST_IMAGE_NAME: "coollabsio/sentinel-host"
+  FLUX_IMAGE_NAME: "coollabsio/flux"
 
 jobs:
   build-push:
@@ -72,6 +73,19 @@ jobs:
             coolify.managed=true
             org.opencontainers.image.description=Portable Sentinel host binary
 
+      - name: Build and Push Flux Image (${{ matrix.arch }})
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.flux
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ${{ env.GITHUB_REGISTRY }}/${{ env.FLUX_IMAGE_NAME }}:main-${{ matrix.arch }}
+          labels: |
+            coolify.managed=true
+            org.opencontainers.image.description=Coolify Flux connection broker
+
   merge-manifest:
     runs-on: ubuntu-24.04
     needs: build-push
@@ -102,3 +116,10 @@ jobs:
           ${{ env.GITHUB_REGISTRY }}/${{ env.HOST_IMAGE_NAME }}:main-amd64 \
           ${{ env.GITHUB_REGISTRY }}/${{ env.HOST_IMAGE_NAME }}:main-aarch64 \
           --tag ${{ env.GITHUB_REGISTRY }}/${{ env.HOST_IMAGE_NAME }}:main
+
+      - name: Create & publish Flux manifest
+        run: |
+          docker buildx imagetools create \
+          ${{ env.GITHUB_REGISTRY }}/${{ env.FLUX_IMAGE_NAME }}:main-amd64 \
+          ${{ env.GITHUB_REGISTRY }}/${{ env.FLUX_IMAGE_NAME }}:main-aarch64 \
+          --tag ${{ env.GITHUB_REGISTRY }}/${{ env.FLUX_IMAGE_NAME }}:main

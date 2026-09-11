@@ -7,6 +7,7 @@ use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::http::{Request, Response, StatusCode};
 use serde_json::{Value, json};
+use url::Url;
 
 use super::*;
 
@@ -449,4 +450,16 @@ fn rejects_invalid_client_configuration_without_exposing_token() {
         assert_eq!(error.kind(), AssignmentErrorKind::InvalidConfiguration);
         assert!(!error.to_string().contains("very-secret-token"));
     }
+}
+
+#[test]
+fn selects_flux_transport_from_assignment_url_scheme() {
+    assert_eq!(
+        FluxTransport::from_url(&Url::parse("http://127.0.0.1:7443").unwrap()).unwrap(),
+        FluxTransport::Plaintext
+    );
+    assert_eq!(
+        FluxTransport::from_url(&Url::parse("https://flux.example.com:7443").unwrap()).unwrap(),
+        FluxTransport::Tls
+    );
 }

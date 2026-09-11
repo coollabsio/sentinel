@@ -18,7 +18,6 @@ const MAX_HEARTBEAT_SECONDS: u64 = 120;
 const DEFAULT_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(60);
 const AUTHENTICATION_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
 const UNSUPPORTED_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
-const ENABLED_WITHOUT_FLUX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_TEMPORARY_RETRY_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +263,7 @@ impl AssignmentClient {
         tracing::info!("Sentinel control assignment polling started");
         let mut last_status = None;
         let mut temporary_attempt = 0;
+        let mut connection_attempt = 0;
 
         loop {
             if *shutdown.borrow() {
@@ -278,6 +278,7 @@ impl AssignmentClient {
             let (status, retry_after) = match outcome {
                 Ok(AssignmentOutcome::Disabled { retry_after }) => {
                     temporary_attempt = 0;
+                    connection_attempt = 0;
                     let status = PollStatus::Disabled;
                     if last_status != Some(status) {
                         tracing::info!(
@@ -287,17 +288,35 @@ impl AssignmentClient {
                     }
                     (status, retry_after)
                 }
-                Ok(AssignmentOutcome::Enabled(_)) => {
+                Ok(AssignmentOutcome::Enabled(assignment)) => {
                     temporary_attempt = 0;
                     let status = PollStatus::Enabled;
-                    if last_status != Some(status) {
-                        tracing::warn!(
-                            "Sentinel received an enabled control assignment, but Flux is not connected yet"
-                        );
-                    }
-                    (status, ENABLED_WITHOUT_FLUX_RETRY_DELAY)
+                    let retry_after = match crate::connection::connect(
+                        &assignment,
+                        &self.sentinel_version,
+                        shutdown.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            connection_attempt = 0;
+                            Duration::from_secs(1)
+                        }
+                        Err(error) => {
+                            let retry_after = retry_delay(
+                                &AssignmentError::Temporary,
+                                connection_attempt,
+                                jitter_seed(),
+                            );
+                            tracing::warn!(%error, retry_after_seconds = retry_after.as_secs(), "Sentinel Flux connection failed");
+                            connection_attempt = connection_attempt.saturating_add(1);
+                            retry_after
+                        }
+                    };
+                    (status, retry_after)
                 }
                 Err(error) => {
+                    connection_attempt = 0;
                     let kind = error.kind();
                     let status = PollStatus::Error(kind);
                     let retry_after = retry_delay(&error, temporary_attempt, jitter_seed());
