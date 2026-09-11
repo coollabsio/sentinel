@@ -52,6 +52,7 @@ edition.workspace = true
 api = { path = "crates/api" }
 collector = { path = "crates/collector" }
 config = { path = "crates/config" }
+control = { path = "crates/control" }
 docker = { path = "crates/docker" }
 push = { path = "crates/push" }
 store = { path = "crates/store" }

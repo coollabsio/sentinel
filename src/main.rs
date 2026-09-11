@@ -29,6 +29,25 @@ fn unexpected_service_exit(
     }
 }
 
+fn assignment_client(
+    enabled: bool,
+    endpoint: &str,
+    token: &str,
+    version: &str,
+) -> Option<control::AssignmentClient> {
+    if !enabled {
+        return None;
+    }
+
+    match control::AssignmentClient::new(endpoint, token, version) {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::error!(%error, "Sentinel control task could not start; existing services remain active");
+            None
+        }
+    }
+}
+
 /// Bind the API listener. `addr` is config's dual-stack `[::]`; if IPv6 is
 /// disabled the bind fails, so fall back to `0.0.0.0` (mirrors Go's dual-stack
 /// `net.Listen`).
@@ -142,6 +161,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut services = tokio::task::JoinSet::new();
+    let mut control_services = tokio::task::JoinSet::new();
 
     // HTTP API. Bind eagerly, before spawning: a bind failure surfaces via `?`
     // here rather than having to cascade out of a spawned task, and health
@@ -231,6 +251,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         services.spawn(async move {
             pusher.run(rx).await;
             Ok::<(), String>(())
+        });
+    }
+
+    // V5 control assignment discovery. This remains fully dormant unless the
+    // explicit gate is enabled and does not affect metrics or push services.
+    if let Some(client) = assignment_client(
+        config.control_plane_enabled,
+        &config.endpoint,
+        &config.token,
+        &config.version,
+    ) {
+        let rx = shutdown_rx.clone();
+        control_services.spawn(async move {
+            client.run(rx).await;
         });
     }
 
@@ -497,15 +531,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    tokio::select! {
-        _ = wait_for_signal() => {}
-        result = services.join_next() => return unexpected_service_exit(result),
+    loop {
+        tokio::select! {
+            _ = wait_for_signal() => break,
+            result = services.join_next() => return unexpected_service_exit(result),
+            result = control_services.join_next(), if !control_services.is_empty() => {
+                match result {
+                    Some(Ok(())) => tracing::error!("Sentinel control task stopped unexpectedly; existing services remain active"),
+                    Some(Err(error)) => tracing::error!(%error, "Sentinel control task failed; existing services remain active"),
+                    None => {}
+                }
+            }
+        }
     }
     tracing::info!("shutdown signal received");
     let _ = shutdown_tx.send(true);
 
     match tokio::time::timeout(SHUTDOWN_GRACE, async {
         while services.join_next().await.is_some() {}
+        while control_services.join_next().await.is_some() {}
     })
     .await
     {

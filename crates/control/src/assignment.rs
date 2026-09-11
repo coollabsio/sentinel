@@ -1,5 +1,5 @@
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::StatusCode;
 use sentinel_protocol::{
@@ -15,6 +15,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ASSIGNMENT_RESPONSE_BYTES: usize = 64 * 1024;
 const MIN_HEARTBEAT_SECONDS: u64 = 10;
 const MAX_HEARTBEAT_SECONDS: u64 = 120;
+const DEFAULT_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(60);
+const AUTHENTICATION_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
+const UNSUPPORTED_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
+const ENABLED_WITHOUT_FLUX_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_TEMPORARY_RETRY_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignmentErrorKind {
@@ -120,6 +125,45 @@ pub enum AssignmentOutcome {
     Disabled { retry_after: Duration },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollStatus {
+    Disabled,
+    Enabled,
+    Error(AssignmentErrorKind),
+}
+
+pub(crate) fn retry_delay(
+    error: &AssignmentError,
+    temporary_attempt: u32,
+    jitter_seed: u64,
+) -> Duration {
+    match error {
+        AssignmentError::AuthenticationRejected => AUTHENTICATION_RETRY_DELAY,
+        AssignmentError::Unsupported
+        | AssignmentError::Incompatible
+        | AssignmentError::InvalidConfiguration(_)
+        | AssignmentError::InvalidResponse(_) => UNSUPPORTED_RETRY_DELAY,
+        AssignmentError::RateLimited { retry_after } => {
+            retry_after.unwrap_or(DEFAULT_RATE_LIMIT_RETRY_DELAY)
+        }
+        AssignmentError::Temporary => {
+            let ceiling = 1_u64
+                .checked_shl(temporary_attempt.min(6))
+                .unwrap_or(MAX_TEMPORARY_RETRY_SECONDS)
+                .min(MAX_TEMPORARY_RETRY_SECONDS);
+            Duration::from_secs(1 + jitter_seed % ceiling)
+        }
+    }
+}
+
+fn jitter_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos()
+        .into()
+}
+
 pub struct AssignmentClient {
     client: reqwest::Client,
     assignment_url: Url,
@@ -214,6 +258,73 @@ impl AssignmentClient {
         let response: AssignmentResponse = serde_json::from_slice(&body)
             .map_err(|_| AssignmentError::InvalidResponse("response is not valid JSON"))?;
         response.validate()
+    }
+
+    pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        tracing::info!("Sentinel control assignment polling started");
+        let mut last_status = None;
+        let mut temporary_attempt = 0;
+
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+
+            let outcome = tokio::select! {
+                _ = shutdown.changed() => break,
+                outcome = self.request() => outcome,
+            };
+
+            let (status, retry_after) = match outcome {
+                Ok(AssignmentOutcome::Disabled { retry_after }) => {
+                    temporary_attempt = 0;
+                    let status = PollStatus::Disabled;
+                    if last_status != Some(status) {
+                        tracing::info!(
+                            retry_after_seconds = retry_after.as_secs(),
+                            "Sentinel control assignment is disabled"
+                        );
+                    }
+                    (status, retry_after)
+                }
+                Ok(AssignmentOutcome::Enabled(_)) => {
+                    temporary_attempt = 0;
+                    let status = PollStatus::Enabled;
+                    if last_status != Some(status) {
+                        tracing::warn!(
+                            "Sentinel received an enabled control assignment, but Flux is not connected yet"
+                        );
+                    }
+                    (status, ENABLED_WITHOUT_FLUX_RETRY_DELAY)
+                }
+                Err(error) => {
+                    let kind = error.kind();
+                    let status = PollStatus::Error(kind);
+                    let retry_after = retry_delay(&error, temporary_attempt, jitter_seed());
+                    if last_status != Some(status) {
+                        tracing::warn!(
+                            error = %error,
+                            retry_after_seconds = retry_after.as_secs(),
+                            "Sentinel control assignment request failed"
+                        );
+                    }
+                    if matches!(error, AssignmentError::Temporary) {
+                        temporary_attempt = temporary_attempt.saturating_add(1);
+                    } else {
+                        temporary_attempt = 0;
+                    }
+                    (status, retry_after)
+                }
+            };
+            last_status = Some(status);
+
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = tokio::time::sleep(retry_after) => {}
+            }
+        }
+
+        tracing::info!("Sentinel control assignment polling stopped");
     }
 }
 

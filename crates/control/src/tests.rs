@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -80,6 +81,151 @@ fn enabled_response() -> Value {
         "protocol_max": 1,
         "heartbeat_interval_seconds": 30
     })
+}
+
+async fn start_counting_disabled_server(retry_after_seconds: u64) -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let handler_requests = requests.clone();
+    let app = Router::new().fallback(move || {
+        let requests = handler_requests.clone();
+        async move {
+            requests.fetch_add(1, Ordering::SeqCst);
+            axum::Json(json!({
+                "enabled": false,
+                "retry_after_seconds": retry_after_seconds
+            }))
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    (format!("http://{address}"), requests)
+}
+
+async fn start_stalled_server() -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let handler_requests = requests.clone();
+    let app = Router::new().fallback(move || {
+        let requests = handler_requests.clone();
+        async move {
+            requests.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Response<Body>>().await
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    (format!("http://{address}"), requests)
+}
+
+#[tokio::test]
+async fn polls_again_after_a_disabled_assignment() {
+    let (endpoint, requests) = start_counting_disabled_server(1).await;
+    let client = AssignmentClient::new(&endpoint, "token", "main").unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(client.run(shutdown_rx));
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_the_assignment_retry_delay() {
+    let (endpoint, requests) = start_counting_disabled_server(3600).await;
+    let client = AssignmentClient::new(&endpoint, "token", "main").unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(client.run(shutdown_rx));
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while requests.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_an_assignment_request() {
+    let (endpoint, requests) = start_stalled_server().await;
+    let client = AssignmentClient::new(&endpoint, "token", "main").unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(client.run(shutdown_rx));
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while requests.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn assignment_errors_use_the_documented_retry_delays() {
+    assert_eq!(
+        crate::assignment::retry_delay(&AssignmentError::AuthenticationRejected, 0, 0),
+        Duration::from_secs(15 * 60)
+    );
+    assert_eq!(
+        crate::assignment::retry_delay(&AssignmentError::Unsupported, 0, 0),
+        Duration::from_secs(60 * 60)
+    );
+    assert_eq!(
+        crate::assignment::retry_delay(&AssignmentError::Incompatible, 0, 0),
+        Duration::from_secs(60 * 60)
+    );
+    assert_eq!(
+        crate::assignment::retry_delay(
+            &AssignmentError::RateLimited {
+                retry_after: Some(Duration::from_secs(75)),
+            },
+            0,
+            0,
+        ),
+        Duration::from_secs(75)
+    );
+}
+
+#[test]
+fn temporary_assignment_errors_use_bounded_full_jitter() {
+    assert_eq!(
+        crate::assignment::retry_delay(&AssignmentError::Temporary, 0, 0),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        crate::assignment::retry_delay(&AssignmentError::Temporary, 3, 7),
+        Duration::from_secs(8)
+    );
+    assert_eq!(
+        crate::assignment::retry_delay(&AssignmentError::Temporary, 20, u64::MAX),
+        Duration::from_secs(16)
+    );
 }
 
 #[tokio::test]

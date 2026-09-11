@@ -422,6 +422,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "url",
 ]
 
@@ -2058,6 +2059,7 @@ dependencies = [
  "clap",
  "collector",
  "config",
+ "control",
  "docker",
  "dotenvy",
  "http-body-util",

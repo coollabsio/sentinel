@@ -1,4 +1,4 @@
-use super::unexpected_service_exit;
+use super::{assignment_client, unexpected_service_exit};
 
 #[test]
 fn a_clean_service_exit_is_still_unexpected_before_shutdown() {
@@ -15,4 +15,25 @@ fn a_clean_service_exit_is_still_unexpected_before_shutdown() {
 fn a_service_error_is_propagated() {
     let result = unexpected_service_exit(Some(Ok(Err("api failed".into()))));
     assert_eq!(result.unwrap_err().to_string(), "api failed");
+}
+
+#[test]
+fn control_assignment_stays_dormant_when_disabled() {
+    let client = assignment_client(false, "", "", "");
+
+    assert!(client.is_none());
+}
+
+#[test]
+fn control_assignment_client_is_created_when_enabled() {
+    let client = assignment_client(true, "https://coolify.example.com", "token", "main");
+
+    assert!(client.is_some());
+}
+
+#[test]
+fn invalid_control_assignment_configuration_does_not_fail_startup() {
+    let client = assignment_client(true, "not-a-url", "token", "main");
+
+    assert!(client.is_none());
 }
