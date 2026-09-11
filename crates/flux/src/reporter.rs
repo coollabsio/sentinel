@@ -18,6 +18,10 @@ struct Event<'a> {
     protocol_version: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     observed_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_bundle_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<&'a str>,
 }
 
 impl EventReporter {
@@ -38,6 +42,8 @@ impl EventReporter {
         connection_id: &str,
         sentinel_version: &str,
         protocol_version: u32,
+        trust_bundle_version: u64,
+        transport: &str,
     ) {
         self.send(Event {
             event: "connected",
@@ -46,6 +52,8 @@ impl EventReporter {
             sentinel_version: Some(sentinel_version),
             protocol_version: Some(protocol_version),
             observed_at_unix_ms: None,
+            trust_bundle_version: Some(trust_bundle_version),
+            transport: Some(transport),
         })
         .await;
     }
@@ -58,6 +66,8 @@ impl EventReporter {
             sentinel_version: None,
             protocol_version: None,
             observed_at_unix_ms: Some(observed_at_unix_ms),
+            trust_bundle_version: None,
+            transport: None,
         })
         .await;
     }
@@ -70,6 +80,8 @@ impl EventReporter {
             sentinel_version: None,
             protocol_version: None,
             observed_at_unix_ms: None,
+            trust_bundle_version: None,
+            transport: None,
         })
         .await;
     }

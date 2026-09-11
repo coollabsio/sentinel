@@ -37,7 +37,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("FLUX_INTERNAL_TOKEN").ok(),
     );
     let registry = ConnectionRegistry::default();
-    let service = AgentService::new(verifier, registry.clone(), reporter);
+    let transport = if tls_config.is_some() {
+        "tls"
+    } else {
+        "plaintext"
+    };
+    let service = AgentService::new(verifier, registry.clone(), reporter, transport);
     let internal_listen: SocketAddr = std::env::var("FLUX_INTERNAL_LISTEN_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:7080".into())
         .parse()?;

@@ -84,6 +84,7 @@ pub async fn connect(
                 protocol_max: assignment.protocol_max(),
                 capabilities: vec![CAPABILITY_SYSTEM_PING.into(), CAPABILITY_SYSTEM_INFO.into()],
                 boot_id: boot_id(),
+                trust_bundle_version: control_tls.trust_bundle_version,
             })),
         })
         .await

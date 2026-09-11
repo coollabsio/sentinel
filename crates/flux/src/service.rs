@@ -21,6 +21,7 @@ pub struct AgentService {
     verifier: Arc<CredentialVerifier>,
     registry: ConnectionRegistry,
     reporter: EventReporter,
+    transport: &'static str,
 }
 
 impl AgentService {
@@ -28,11 +29,13 @@ impl AgentService {
         verifier: CredentialVerifier,
         registry: ConnectionRegistry,
         reporter: EventReporter,
+        transport: &'static str,
     ) -> Self {
         Self {
             verifier: Arc::new(verifier),
             registry,
             reporter,
+            transport,
         }
     }
 
@@ -97,6 +100,8 @@ impl Agent for AgentService {
                 &connection_id,
                 &hello.sentinel_version,
                 negotiated.protocol_version,
+                hello.trust_bundle_version,
+                self.transport,
             )
             .await;
 

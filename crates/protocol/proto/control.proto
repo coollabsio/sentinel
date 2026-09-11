@@ -31,6 +31,7 @@ message Hello {
   uint32 protocol_max = 4;
   repeated string capabilities = 5;
   string boot_id = 6;
+  uint64 trust_bundle_version = 7;
 }
 
 message Heartbeat {

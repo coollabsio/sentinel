@@ -108,6 +108,7 @@ fn selects_protocol_and_capabilities_for_valid_hello() {
         protocol_max: 1,
         capabilities: vec![CAPABILITY_SYSTEM_PING.into()],
         boot_id: "boot-1".into(),
+        trust_bundle_version: 1,
     };
 
     let negotiated = negotiate(&claims, &hello).unwrap();
