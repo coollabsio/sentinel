@@ -2055,6 +2055,7 @@ version = "1.0.1"
 dependencies = [
  "api",
  "axum",
+ "clap",
  "collector",
  "config",
  "docker",

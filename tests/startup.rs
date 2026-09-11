@@ -7,6 +7,49 @@ fn sentinel_command() -> Command {
     command
 }
 
+#[test]
+fn help_does_not_require_runtime_configuration() {
+    let out = sentinel_command().arg("--help").output().unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Usage:"), "stdout was: {stdout}");
+    assert!(stdout.contains("--version"), "stdout was: {stdout}");
+    assert!(
+        out.stderr.is_empty(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn version_does_not_require_runtime_configuration() {
+    let out = sentinel_command().arg("--version").output().unwrap();
+
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("sentinel {}", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn unknown_arguments_are_rejected_before_startup() {
+    let out = sentinel_command().arg("--verison").output().unwrap();
+
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unexpected argument"),
+        "stderr was: {stderr}"
+    );
+}
+
 /// The binary must refuse to start without required configuration, matching
 /// the Go implementation's fail-fast behavior.
 #[test]

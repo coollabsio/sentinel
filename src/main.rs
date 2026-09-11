@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use clap::Parser;
 use tokio::sync::{Mutex, Semaphore, watch};
 
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -12,6 +13,10 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// appended line is lost. On timeout, enrichment stays off until the next refresh.
 #[cfg(feature = "traffic")]
 const GEOIP_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Parser)]
+#[command(version = config::VERSION, about = "Collect and push server metrics")]
+struct Cli {}
 
 fn unexpected_service_exit(
     result: Option<Result<Result<(), String>, tokio::task::JoinError>>,
@@ -41,6 +46,8 @@ async fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListe
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    Cli::parse();
+
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
