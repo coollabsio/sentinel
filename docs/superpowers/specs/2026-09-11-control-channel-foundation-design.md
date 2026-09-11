@@ -6,7 +6,7 @@
 
 ## 1. Goal
 
-Add a dormant control-channel client to the existing Sentinel agent and add Flux as a separate binary in the Sentinel Rust workspace.
+Add a dormant control-channel client to Sentinel and add Flux as a separate binary in the Sentinel Rust workspace. The same Sentinel product and executable supports the existing container deployment and the new host-native deployment.
 
 The first vertical slice must let Coolify:
 
@@ -111,6 +111,10 @@ flux
 
 Sentinel and Flux can release at different times. The protocol crate is an internal workspace dependency. Compatibility is based on the wire protocol range and capabilities, not matching binary versions.
 
+Sentinel keeps its current name in both deployment forms. The project does not introduce a second `coolify-agent` product or executable. GitHub Actions builds the container image and versioned host-native Linux artifacts from the same Sentinel source revision.
+
+During migration, the current container Sentinel continues existing metrics and traffic work while the host-native Sentinel owns the v5 control connection and new host operations. Coolify assigns capability ownership explicitly. The two processes must not own the same capability at the same time. Capabilities move to the host process in stages, and Coolify retires the container only after parity and rollback validation.
+
 The published Sentinel image contains the control client. A runtime environment gate keeps it disabled. There is no separate `sentinel-v5` image and no compile-time control-channel feature gate.
 
 Flux uses its own image or binary artifact. It is not embedded in the Sentinel process.
@@ -148,7 +152,7 @@ Coolify has two gates:
 1. An instance gate that permits the experimental control channel.
 2. A per-server opt-in setting.
 
-Coolify sets `CONTROL_PLANE_ENABLED=true` only when both gates are enabled. All other Sentinel containers omit the variable or receive `false`.
+Coolify sets `CONTROL_PLANE_ENABLED=true` only when both gates are enabled. The host-native Sentinel is the production owner of the v5 control connection. A containerized Sentinel can enable it only in an explicit development protocol test. Existing v4 Sentinel containers omit the variable or receive `false`.
 
 The first implementation remains restricted to development or an equivalent explicit experimental rollout gate. It must not activate the archived v5 runtime in production.
 
