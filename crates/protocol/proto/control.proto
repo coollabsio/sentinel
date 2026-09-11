@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package coolify.sentinel.control.v1;
+
+service Agent {
+  rpc Stream(stream AgentMessage) returns (stream ControlMessage);
+}
+
+message AgentMessage {
+  oneof message {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+    CommandAccepted command_accepted = 3;
+    CommandResult command_result = 4;
+  }
+}
+
+message ControlMessage {
+  oneof message {
+    Welcome welcome = 1;
+    Command command = 2;
+    EventAck event_ack = 3;
+    ShutdownHint shutdown_hint = 4;
+  }
+}
+
+message Hello {
+  string server_id = 1;
+  string sentinel_version = 2;
+  uint32 protocol_min = 3;
+  uint32 protocol_max = 4;
+  repeated string capabilities = 5;
+  string boot_id = 6;
+}
+
+message Heartbeat {
+  string connection_id = 1;
+  int64 sent_at_unix_ms = 2;
+}
+
+message Welcome {
+  string connection_id = 1;
+  uint32 protocol_version = 2;
+  uint32 heartbeat_interval_seconds = 3;
+  repeated string accepted_capabilities = 4;
+  int64 server_time_unix_ms = 5;
+}
+
+message Command {
+  string command_id = 1;
+  string command_type = 2;
+  uint32 payload_version = 3;
+  int64 created_at_unix_ms = 4;
+  reserved 5 to 9;
+  oneof payload {
+    SystemPingRequest system_ping = 10;
+    SystemInfoRequest system_info = 11;
+  }
+  int64 expires_at_unix_ms = 20;
+}
+
+message CommandAccepted {
+  string command_id = 1;
+  int64 accepted_at_unix_ms = 2;
+}
+
+enum CommandStatus {
+  COMMAND_STATUS_UNSPECIFIED = 0;
+  COMMAND_STATUS_SUCCEEDED = 1;
+  COMMAND_STATUS_FAILED = 2;
+}
+
+message CommandResult {
+  string event_id = 1;
+  string command_id = 2;
+  CommandStatus status = 3;
+  int64 observed_at_unix_ms = 4;
+  reserved 5 to 9;
+  oneof payload {
+    SystemPingResult system_ping = 10;
+    SystemInfoResult system_info = 11;
+    CommandError error = 20;
+  }
+}
+
+message EventAck {
+  string event_id = 1;
+}
+
+message ShutdownHint {
+  string reason = 1;
+  uint32 reconnect_after_seconds = 2;
+}
+
+message SystemPingRequest {
+  string nonce = 1;
+}
+
+message SystemPingResult {
+  string nonce = 1;
+  int64 sentinel_time_unix_ms = 2;
+}
+
+message SystemInfoRequest {}
+
+message SystemInfoResult {
+  optional string hostname = 1;
+  optional string operating_system = 2;
+  optional string operating_system_version = 3;
+  optional string kernel_version = 4;
+  optional string architecture = 5;
+  optional uint32 cpu_count = 6;
+  optional uint64 memory_bytes = 7;
+  optional uint64 disk_total_bytes = 8;
+  optional uint64 disk_available_bytes = 9;
+  string sentinel_version = 10;
+  optional string boot_id = 11;
+}
+
+message CommandError {
+  string code = 1;
+  string message = 2;
+}

@@ -266,7 +266,7 @@ Sentinel opens one outbound TLS-protected bidirectional gRPC stream to Flux.
 
 ```protobuf
 service Agent {
-  rpc Connect(stream AgentMessage) returns (stream ControlMessage);
+  rpc Stream(stream AgentMessage) returns (stream ControlMessage);
 }
 ```
 

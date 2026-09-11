@@ -1,0 +1,18 @@
+[package]
+name = "protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "sentinel_protocol"
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+prost-build = "0.14.4"
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.6"
