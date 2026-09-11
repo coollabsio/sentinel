@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sentinel_protocol::control::v1::{ControlMessage, ShutdownHint, control_message};
-use tokio::sync::{RwLock, mpsc};
+use sentinel_protocol::control::v1::{
+    Command, CommandResult, ControlMessage, ShutdownHint, control_message,
+};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
@@ -22,6 +24,26 @@ struct Connection {
 #[derive(Clone, Default)]
 pub struct ConnectionRegistry {
     connections: Arc<RwLock<HashMap<String, Connection>>>,
+    pending: Arc<Mutex<HashMap<String, PendingCommand>>>,
+}
+
+struct PendingCommand {
+    server_id: String,
+    result: oneshot::Sender<CommandResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CommandDispatchError {
+    #[error("server is not connected")]
+    Offline,
+    #[error("Sentinel does not support this command")]
+    Unsupported,
+    #[error("command could not be sent")]
+    Send,
+    #[error("connection command queue is full")]
+    QueueFull,
+    #[error("command timed out")]
+    Timeout,
 }
 
 impl ConnectionRegistry {
@@ -87,6 +109,65 @@ impl ConnectionRegistry {
             .await
             .get(server_id)
             .map(|connection| connection.info.clone())
+    }
+
+    pub async fn dispatch(
+        &self,
+        server_id: &str,
+        command: Command,
+        timeout: std::time::Duration,
+    ) -> Result<CommandResult, CommandDispatchError> {
+        let command_id = command.command_id.clone();
+        let (result_sender, result_receiver) = oneshot::channel();
+        self.pending.lock().await.insert(
+            command_id.clone(),
+            PendingCommand {
+                server_id: server_id.into(),
+                result: result_sender,
+            },
+        );
+        let send_result = {
+            let connections = self.connections.read().await;
+            let Some(connection) = connections.get(server_id) else {
+                self.pending.lock().await.remove(&command_id);
+                return Err(CommandDispatchError::Offline);
+            };
+            if !connection.info.capabilities.contains(&command.command_type) {
+                self.pending.lock().await.remove(&command_id);
+                return Err(CommandDispatchError::Unsupported);
+            }
+            connection.sender.try_send(ControlMessage {
+                message: Some(control_message::Message::Command(command)),
+            })
+        };
+        if let Err(error) = send_result {
+            self.pending.lock().await.remove(&command_id);
+            return Err(match error {
+                mpsc::error::TrySendError::Full(_) => CommandDispatchError::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => CommandDispatchError::Send,
+            });
+        }
+        match tokio::time::timeout(timeout, result_receiver).await {
+            Ok(Ok(result)) => Ok(result),
+            _ => {
+                self.pending.lock().await.remove(&command_id);
+                Err(CommandDispatchError::Timeout)
+            }
+        }
+    }
+
+    pub async fn complete(&self, server_id: &str, result: CommandResult) -> bool {
+        let mut pending = self.pending.lock().await;
+        let matches = pending
+            .get(&result.command_id)
+            .is_some_and(|command| command.server_id == server_id);
+        if !matches {
+            return false;
+        }
+        let Some(command) = pending.remove(&result.command_id) else {
+            return false;
+        };
+        command.result.send(result).is_ok()
     }
 }
 

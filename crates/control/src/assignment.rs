@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::StatusCode;
@@ -264,6 +265,9 @@ impl AssignmentClient {
         let mut last_status = None;
         let mut temporary_attempt = 0;
         let mut connection_attempt = 0;
+        let command_executor = Arc::new(tokio::sync::Mutex::new(
+            crate::commands::CommandExecutor::new(&self.sentinel_version),
+        ));
 
         loop {
             if *shutdown.borrow() {
@@ -295,6 +299,7 @@ impl AssignmentClient {
                         &assignment,
                         &self.sentinel_version,
                         shutdown.clone(),
+                        command_executor.clone(),
                     )
                     .await
                     {

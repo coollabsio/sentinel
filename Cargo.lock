@@ -437,6 +437,7 @@ version = "1.0.1"
 dependencies = [
  "axum",
  "futures-util",
+ "prost",
  "protocol",
  "reqwest",
  "serde",
@@ -726,6 +727,7 @@ dependencies = [
 name = "flux"
 version = "1.0.1"
 dependencies = [
+ "axum",
  "base64",
  "ed25519-dalek",
  "futures-util",

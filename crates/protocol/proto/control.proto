@@ -99,6 +99,8 @@ message SystemPingRequest {
 message SystemPingResult {
   string nonce = 1;
   int64 sentinel_time_unix_ms = 2;
+  string sentinel_version = 3;
+  string boot_id = 4;
 }
 
 message SystemInfoRequest {}

@@ -136,6 +136,10 @@ impl Agent for AgentService {
                             .heartbeat(&server_id, &task_connection_id, heartbeat.sent_at_unix_ms)
                             .await;
                     }
+                    Some(agent_message::Message::CommandAccepted(_)) => {}
+                    Some(agent_message::Message::CommandResult(result)) => {
+                        registry.complete(&server_id, result).await;
+                    }
                     _ => break,
                 }
             }

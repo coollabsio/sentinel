@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 base64 = "0.22"
+axum = "0.8"
 ed25519-dalek = "2.2"
 futures-util.workspace = true
 sentinel_protocol = { path = "../protocol", package = "protocol" }

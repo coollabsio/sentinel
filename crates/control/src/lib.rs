@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod assignment;
+mod commands;
 mod connection;
 
 pub use assignment::{

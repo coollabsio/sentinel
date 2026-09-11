@@ -11,6 +11,108 @@ use url::Url;
 
 use super::*;
 
+#[test]
+fn executes_and_deduplicates_system_ping_commands() {
+    use sentinel_protocol::control::v1::command::Payload;
+    use sentinel_protocol::control::v1::command_result;
+    use sentinel_protocol::control::v1::{Command, SystemPingRequest};
+
+    let mut executor = crate::commands::CommandExecutor::new("dev");
+    let command = Command {
+        command_id: "command-1".into(),
+        command_type: sentinel_protocol::CAPABILITY_SYSTEM_PING.into(),
+        payload_version: 1,
+        created_at_unix_ms: 1,
+        payload: Some(Payload::SystemPing(SystemPingRequest {
+            nonce: "nonce-1".into(),
+        })),
+        expires_at_unix_ms: i64::MAX,
+    };
+    let first = executor.execute(command.clone(), true);
+    let second = executor.execute(command, true);
+
+    assert!(first.accepted);
+    assert_eq!(first.result, second.result);
+    assert!(matches!(
+        first.result.payload,
+        Some(command_result::Payload::SystemPing(result)) if result.nonce == "nonce-1" && result.sentinel_version == "dev"
+    ));
+}
+
+#[test]
+fn rejects_expired_system_ping_commands() {
+    let mut executor = crate::commands::CommandExecutor::new("dev");
+    let result = executor.execute(
+        sentinel_protocol::control::v1::Command {
+            command_id: "expired".into(),
+            command_type: sentinel_protocol::CAPABILITY_SYSTEM_PING.into(),
+            expires_at_unix_ms: 1,
+            ..Default::default()
+        },
+        true,
+    );
+
+    assert!(!result.accepted);
+    assert_eq!(
+        result.result.status,
+        sentinel_protocol::control::v1::CommandStatus::Failed as i32
+    );
+}
+
+#[test]
+fn rejects_system_ping_without_a_nonce() {
+    use sentinel_protocol::control::v1::command::Payload;
+    use sentinel_protocol::control::v1::{Command, SystemPingRequest};
+
+    let mut executor = crate::commands::CommandExecutor::new("dev");
+    let result = executor.execute(
+        Command {
+            command_id: "missing-nonce".into(),
+            command_type: sentinel_protocol::CAPABILITY_SYSTEM_PING.into(),
+            payload_version: 1,
+            payload: Some(Payload::SystemPing(SystemPingRequest {
+                nonce: String::new(),
+            })),
+            expires_at_unix_ms: i64::MAX,
+            ..Default::default()
+        },
+        true,
+    );
+
+    assert!(!result.accepted);
+    assert_eq!(
+        result.result.status,
+        sentinel_protocol::control::v1::CommandStatus::Failed as i32
+    );
+}
+
+#[test]
+fn rejects_a_duplicate_command_id_with_a_different_payload() {
+    use sentinel_protocol::control::v1::command::Payload;
+    use sentinel_protocol::control::v1::command_result;
+    use sentinel_protocol::control::v1::{Command, SystemPingRequest};
+
+    let mut executor = crate::commands::CommandExecutor::new("dev");
+    let command = |nonce: &str| Command {
+        command_id: "command-1".into(),
+        command_type: sentinel_protocol::CAPABILITY_SYSTEM_PING.into(),
+        payload_version: 1,
+        payload: Some(Payload::SystemPing(SystemPingRequest {
+            nonce: nonce.into(),
+        })),
+        expires_at_unix_ms: i64::MAX,
+        ..Default::default()
+    };
+    executor.execute(command("first"), true);
+    let duplicate = executor.execute(command("second"), true);
+
+    assert!(!duplicate.accepted);
+    assert!(matches!(
+        duplicate.result.payload,
+        Some(command_result::Payload::Error(error)) if error.code == "command_id_conflict"
+    ));
+}
+
 #[derive(Clone)]
 struct Reply {
     status: StatusCode,

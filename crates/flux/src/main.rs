@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use flux::{AgentService, ConnectionRegistry, CredentialVerifier, EventReporter};
+use flux::{
+    AgentService, ConnectionRegistry, CredentialVerifier, EventReporter, serve_internal_api,
+};
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 #[tokio::main]
@@ -27,7 +29,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("FLUX_INTERNAL_EVENTS_URL").ok(),
         std::env::var("FLUX_INTERNAL_TOKEN").ok(),
     );
-    let service = AgentService::new(verifier, ConnectionRegistry::default(), reporter);
+    let registry = ConnectionRegistry::default();
+    let service = AgentService::new(verifier, registry.clone(), reporter);
+    let internal_listen: SocketAddr = std::env::var("FLUX_INTERNAL_LISTEN_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:7080".into())
+        .parse()?;
+    let internal_token = required("FLUX_INTERNAL_TOKEN")?;
+    let internal_listener = tokio::net::TcpListener::bind(internal_listen).await?;
+    tokio::spawn(async move {
+        if let Err(error) = serve_internal_api(internal_listener, registry, internal_token).await {
+            tracing::error!(%error, "Flux internal command API stopped");
+        }
+    });
     let (_health_reporter, health_service) = tonic_health::server::health_reporter();
     let mut server = Server::builder();
     match (

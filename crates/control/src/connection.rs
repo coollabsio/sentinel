@@ -1,8 +1,9 @@
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sentinel_protocol::control::v1::agent_message;
 use sentinel_protocol::control::v1::control_message;
-use sentinel_protocol::control::v1::{AgentMessage, Heartbeat, Hello};
+use sentinel_protocol::control::v1::{AgentMessage, CommandAccepted, Heartbeat, Hello};
 use sentinel_protocol::{CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -12,6 +13,7 @@ use tonic::transport::{ClientTlsConfig, Endpoint};
 use url::Url;
 
 use crate::Assignment;
+use crate::commands::CommandExecutor;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MESSAGE_LIMIT: usize = 1024 * 1024;
@@ -48,6 +50,7 @@ pub async fn connect(
     assignment: &Assignment,
     sentinel_version: &str,
     mut shutdown: watch::Receiver<bool>,
+    command_executor: Arc<tokio::sync::Mutex<CommandExecutor>>,
 ) -> Result<(), FluxConnectionError> {
     let transport = FluxTransport::from_url(assignment.flux_url())?;
     let mut endpoint = Endpoint::from_shared(assignment.flux_url().to_string())
@@ -116,6 +119,10 @@ pub async fn connect(
     .max(Duration::from_secs(1));
     let refresh = tokio::time::sleep(refresh_after);
     tokio::pin!(refresh);
+    let ping_accepted = welcome
+        .accepted_capabilities
+        .iter()
+        .any(|capability| capability == CAPABILITY_SYSTEM_PING);
     ticker.tick().await;
     loop {
         tokio::select! {
@@ -129,7 +136,25 @@ pub async fn connect(
             }
             message = inbound.message() => match message {
                 Ok(Some(message)) => {
-                    if matches!(message.message, Some(control_message::Message::ShutdownHint(_))) { return Ok(()); }
+                    match message.message {
+                        Some(control_message::Message::ShutdownHint(_)) => return Ok(()),
+                        Some(control_message::Message::Command(command)) => {
+                            let command_id = command.command_id.clone();
+                            let execution = command_executor.lock().await.execute(command, ping_accepted);
+                            if execution.accepted {
+                                sender.send(AgentMessage {
+                                    message: Some(agent_message::Message::CommandAccepted(CommandAccepted {
+                                        command_id,
+                                        accepted_at_unix_ms: now_millis(),
+                                    })),
+                                }).await.map_err(|_| FluxConnectionError::Connection)?;
+                            }
+                            sender.send(AgentMessage {
+                                message: Some(agent_message::Message::CommandResult(execution.result)),
+                            }).await.map_err(|_| FluxConnectionError::Connection)?;
+                        }
+                        _ => {}
+                    }
                 }
                 _ => return Err(FluxConnectionError::Connection),
             }

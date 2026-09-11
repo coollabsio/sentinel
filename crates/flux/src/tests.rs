@@ -134,3 +134,92 @@ async fn registry_replaces_the_previous_connection() {
         "connection-2"
     );
 }
+
+#[tokio::test]
+async fn registry_routes_a_ping_result_to_the_waiting_request() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![CAPABILITY_SYSTEM_PING.into()],
+        )
+        .await;
+    let command = sentinel_protocol::control::v1::Command {
+        command_id: "command-1".into(),
+        command_type: CAPABILITY_SYSTEM_PING.into(),
+        payload_version: 1,
+        created_at_unix_ms: now_millis(),
+        payload: Some(
+            sentinel_protocol::control::v1::command::Payload::SystemPing(
+                sentinel_protocol::control::v1::SystemPingRequest {
+                    nonce: "nonce-1".into(),
+                },
+            ),
+        ),
+        expires_at_unix_ms: now_millis() + 10_000,
+    };
+    let pending_registry = registry.clone();
+    let waiter = tokio::spawn(async move {
+        pending_registry
+            .dispatch("server-1", command, Duration::from_secs(1))
+            .await
+    });
+    receiver.recv().await.unwrap();
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: "event-1".into(),
+                command_id: "command-1".into(),
+                status: sentinel_protocol::control::v1::CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: now_millis(),
+                payload: None,
+            },
+        )
+        .await;
+
+    assert_eq!(waiter.await.unwrap().unwrap().command_id, "command-1");
+}
+
+#[tokio::test]
+async fn registry_reports_an_offline_server_without_waiting() {
+    let result = ConnectionRegistry::default()
+        .dispatch(
+            "offline",
+            sentinel_protocol::control::v1::Command::default(),
+            Duration::from_secs(1),
+        )
+        .await;
+
+    assert_eq!(result.unwrap_err(), CommandDispatchError::Offline);
+}
+
+#[tokio::test]
+async fn registry_times_out_when_sentinel_does_not_return_a_result() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![CAPABILITY_SYSTEM_PING.into()],
+        )
+        .await;
+    let command = sentinel_protocol::control::v1::Command {
+        command_id: "command-timeout".into(),
+        command_type: CAPABILITY_SYSTEM_PING.into(),
+        ..Default::default()
+    };
+
+    let result = registry
+        .dispatch("server-1", command, Duration::from_millis(1))
+        .await;
+    assert!(receiver.recv().await.is_some());
+    assert_eq!(result.unwrap_err(), CommandDispatchError::Timeout);
+}
