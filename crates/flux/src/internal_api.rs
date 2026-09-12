@@ -9,8 +9,8 @@ use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
     Command, CommandStatus, ContainerListRequest, ContainerPort, SystemInfoRequest,
-    SystemPingRequest, WorkloadDeployRequest, WorkloadEnvironmentVariable,
-    WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadLabel,
+    SystemPingRequest, WorkloadDeployRequest, WorkloadEnvironmentVariable, WorkloadLabel,
+    WorkloadLifecycleAction, WorkloadLifecycleRequest,
 };
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
@@ -184,10 +184,7 @@ pub async fn serve(
         .route("/v1/commands/system.info", post(system_info))
         .route("/v1/commands/container.list", post(container_list))
         .route("/v1/commands/workload.deploy", post(workload_deploy))
-        .route(
-            "/v1/commands/workload.lifecycle",
-            post(workload_lifecycle),
-        )
+        .route("/v1/commands/workload.lifecycle", post(workload_lifecycle))
         .with_state(ApiState { registry, token });
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "Flux internal command API is listening");

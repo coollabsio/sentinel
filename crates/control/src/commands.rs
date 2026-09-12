@@ -304,15 +304,10 @@ pub(crate) fn podman_lifecycle_args(
         Some(WorkloadLifecycleAction::Stop) => {
             Ok(vec!["stop".into(), "--time".into(), "10".into(), name])
         }
-        Some(WorkloadLifecycleAction::Restart) => Ok(vec![
-            "restart".into(),
-            "--time".into(),
-            "10".into(),
-            name,
-        ]),
-        Some(WorkloadLifecycleAction::Remove) => {
-            Ok(vec!["rm".into(), "--force".into(), name])
+        Some(WorkloadLifecycleAction::Restart) => {
+            Ok(vec!["restart".into(), "--time".into(), "10".into(), name])
         }
+        Some(WorkloadLifecycleAction::Remove) => Ok(vec!["rm".into(), "--force".into(), name]),
         _ => Err("The workload lifecycle action is invalid.".into()),
     }
 }
