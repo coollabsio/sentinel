@@ -58,6 +58,7 @@ message Command {
     SystemInfoRequest system_info = 11;
     ContainerListRequest container_list = 12;
     WorkloadDeployRequest workload_deploy = 13;
+    WorkloadLifecycleRequest workload_lifecycle = 14;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -84,6 +85,7 @@ message CommandResult {
     SystemInfoResult system_info = 11;
     ContainerListResult container_list = 12;
     WorkloadDeployResult workload_deploy = 13;
+    WorkloadLifecycleResult workload_lifecycle = 14;
     CommandError error = 20;
   }
 }
@@ -177,6 +179,24 @@ message WorkloadDeployResult {
   string runtime_id = 1;
   string name = 2;
   string image = 3;
+}
+
+enum WorkloadLifecycleAction {
+  WORKLOAD_LIFECYCLE_ACTION_UNSPECIFIED = 0;
+  WORKLOAD_LIFECYCLE_ACTION_START = 1;
+  WORKLOAD_LIFECYCLE_ACTION_STOP = 2;
+  WORKLOAD_LIFECYCLE_ACTION_RESTART = 3;
+  WORKLOAD_LIFECYCLE_ACTION_REMOVE = 4;
+}
+
+message WorkloadLifecycleRequest {
+  string name = 1;
+  WorkloadLifecycleAction action = 2;
+}
+
+message WorkloadLifecycleResult {
+  string name = 1;
+  WorkloadLifecycleAction action = 2;
 }
 
 message CommandError {

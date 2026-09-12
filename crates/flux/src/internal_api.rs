@@ -9,11 +9,12 @@ use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
     Command, CommandStatus, ContainerListRequest, ContainerPort, SystemInfoRequest,
-    SystemPingRequest, WorkloadDeployRequest, WorkloadEnvironmentVariable, WorkloadLabel,
+    SystemPingRequest, WorkloadDeployRequest, WorkloadEnvironmentVariable,
+    WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadLabel,
 };
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WORKLOAD_DEPLOY,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -22,6 +23,7 @@ use crate::{CommandDispatchError, ConnectionRegistry, now_millis};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 #[derive(Clone)]
 struct ApiState {
@@ -59,6 +61,34 @@ struct WorkloadDeployApiRequest {
     #[serde(default)]
     labels: std::collections::HashMap<String, String>,
     restart_policy: String,
+}
+
+#[derive(Deserialize)]
+struct WorkloadLifecycleApiRequest {
+    server_id: String,
+    command_id: String,
+    name: String,
+    action: WorkloadLifecycleApiAction,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkloadLifecycleApiAction {
+    Start,
+    Stop,
+    Restart,
+    Remove,
+}
+
+impl WorkloadLifecycleApiAction {
+    fn protocol(self) -> WorkloadLifecycleAction {
+        match self {
+            Self::Start => WorkloadLifecycleAction::Start,
+            Self::Stop => WorkloadLifecycleAction::Stop,
+            Self::Restart => WorkloadLifecycleAction::Restart,
+            Self::Remove => WorkloadLifecycleAction::Remove,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -115,6 +145,14 @@ pub struct WorkloadDeployResponse {
 }
 
 #[derive(Serialize)]
+pub struct WorkloadLifecycleResponse {
+    command_id: String,
+    observed_at_unix_ms: i64,
+    name: String,
+    action: WorkloadLifecycleApiAction,
+}
+
+#[derive(Serialize)]
 struct ContainerResponse {
     runtime_id: String,
     name: String,
@@ -146,10 +184,75 @@ pub async fn serve(
         .route("/v1/commands/system.info", post(system_info))
         .route("/v1/commands/container.list", post(container_list))
         .route("/v1/commands/workload.deploy", post(workload_deploy))
+        .route(
+            "/v1/commands/workload.lifecycle",
+            post(workload_lifecycle),
+        )
         .with_state(ApiState { registry, token });
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "Flux internal command API is listening");
     axum::serve(listener, router).await
+}
+
+async fn workload_lifecycle(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<WorkloadLifecycleApiRequest>,
+) -> Result<Json<WorkloadLifecycleResponse>, (StatusCode, &'static str)> {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    if authorization != Some(&format!("Bearer {}", state.token)) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if request.server_id.is_empty()
+        || request.server_id.len() > 255
+        || request.command_id.is_empty()
+        || request.command_id.len() > 128
+        || !request
+            .command_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
+    {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request"));
+    }
+    let now = now_millis();
+    let action = request.action;
+    let result = state
+        .registry
+        .dispatch(
+            &request.server_id,
+            Command {
+                command_id: request.command_id.clone(),
+                command_type: CAPABILITY_WORKLOAD_LIFECYCLE.into(),
+                payload_version: 1,
+                created_at_unix_ms: now,
+                payload: Some(Payload::WorkloadLifecycle(WorkloadLifecycleRequest {
+                    name: request.name,
+                    action: action.protocol().into(),
+                })),
+                expires_at_unix_ms: now + LIFECYCLE_TIMEOUT.as_millis() as i64,
+            },
+            LIFECYCLE_TIMEOUT,
+        )
+        .await
+        .map_err(dispatch_error)?;
+    if result.status != CommandStatus::Succeeded as i32 {
+        return Err((StatusCode::BAD_GATEWAY, "Sentinel command failed"));
+    }
+    let observed_at_unix_ms = result.observed_at_unix_ms;
+    let Some(command_result::Payload::WorkloadLifecycle(changed)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    };
+    if changed.action != action.protocol() as i32 {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    }
+    Ok(Json(WorkloadLifecycleResponse {
+        command_id: request.command_id,
+        observed_at_unix_ms,
+        name: changed.name,
+        action,
+    }))
 }
 
 async fn workload_deploy(

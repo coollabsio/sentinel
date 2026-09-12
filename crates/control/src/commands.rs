@@ -4,10 +4,11 @@ use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
     Command, CommandError, CommandResult, CommandStatus, ContainerListResult, ContainerObservation,
     ContainerPort, SystemInfoResult, SystemPingResult, WorkloadDeployRequest, WorkloadDeployResult,
+    WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WORKLOAD_DEPLOY,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
@@ -102,6 +103,9 @@ impl CommandExecutor {
             (CAPABILITY_WORKLOAD_DEPLOY, Some(Payload::WorkloadDeploy(request))) => {
                 podman_deploy_args(request).is_ok()
             }
+            (CAPABILITY_WORKLOAD_LIFECYCLE, Some(Payload::WorkloadLifecycle(request))) => {
+                podman_lifecycle_args(request).is_ok()
+            }
             _ => false,
         };
         let accepted = !(command.command_id.is_empty()
@@ -111,6 +115,7 @@ impl CommandExecutor {
                     | CAPABILITY_SYSTEM_INFO
                     | CAPABILITY_CONTAINER_LIST
                     | CAPABILITY_WORKLOAD_DEPLOY
+                    | CAPABILITY_WORKLOAD_LIFECYCLE
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
@@ -227,6 +232,17 @@ impl CommandExecutor {
                 },
                 Err(message) => failed(&command.command_id, "workload_deploy_failed", &message),
             }
+        } else if let Some(Payload::WorkloadLifecycle(request)) = command.payload {
+            match workload_lifecycle(&request) {
+                Ok(result) => CommandResult {
+                    event_id: format!("{}:result", command.command_id),
+                    command_id: command.command_id.clone(),
+                    status: CommandStatus::Succeeded.into(),
+                    observed_at_unix_ms: now_millis(),
+                    payload: Some(command_result::Payload::WorkloadLifecycle(result)),
+                },
+                Err(message) => failed(&command.command_id, "workload_lifecycle_failed", &message),
+            }
         } else {
             failed(
                 &command.command_id,
@@ -244,6 +260,60 @@ impl CommandExecutor {
             accepted: true,
             result,
         }
+    }
+}
+
+fn workload_lifecycle(
+    request: &WorkloadLifecycleRequest,
+) -> Result<WorkloadLifecycleResult, String> {
+    let output = std::process::Command::new("podman")
+        .args(podman_lifecycle_args(request)?)
+        .output()
+        .map_err(|_| "Podman is unavailable.".to_string())?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if message.is_empty() {
+            "Podman could not change the workload state.".into()
+        } else {
+            message.chars().take(2_000).collect()
+        });
+    }
+
+    Ok(WorkloadLifecycleResult {
+        name: request.name.clone(),
+        action: request.action,
+    })
+}
+
+pub(crate) fn podman_lifecycle_args(
+    request: &WorkloadLifecycleRequest,
+) -> Result<Vec<String>, String> {
+    if request.name.is_empty()
+        || request.name.len() > 128
+        || !request
+            .name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+    {
+        return Err("The container name is invalid.".into());
+    }
+
+    let name = request.name.clone();
+    match WorkloadLifecycleAction::try_from(request.action).ok() {
+        Some(WorkloadLifecycleAction::Start) => Ok(vec!["start".into(), name]),
+        Some(WorkloadLifecycleAction::Stop) => {
+            Ok(vec!["stop".into(), "--time".into(), "10".into(), name])
+        }
+        Some(WorkloadLifecycleAction::Restart) => Ok(vec![
+            "restart".into(),
+            "--time".into(),
+            "10".into(),
+            name,
+        ]),
+        Some(WorkloadLifecycleAction::Remove) => {
+            Ok(vec!["rm".into(), "--force".into(), name])
+        }
+        _ => Err("The workload lifecycle action is invalid.".into()),
     }
 }
 

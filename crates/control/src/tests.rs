@@ -433,7 +433,8 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "system.ping.v1",
             "system.info.v1",
             "container.list.v1",
-            "workload.deploy.v1"
+            "workload.deploy.v1",
+            "workload.lifecycle.v1"
         ])
     );
 }
@@ -1087,4 +1088,27 @@ fn rejects_unsafe_or_oversized_deploy_requests() {
     assert!(crate::commands::podman_deploy_args(&request("bad name", "alpine")).is_err());
     assert!(crate::commands::podman_deploy_args(&request("safe-name", "")).is_err());
     assert!(crate::commands::podman_deploy_args(&request("safe-name", "alpine;rm")).is_err());
+}
+
+#[test]
+fn builds_shell_free_podman_lifecycle_arguments() {
+    use sentinel_protocol::control::v1::{WorkloadLifecycleAction, WorkloadLifecycleRequest};
+
+    let request = |action| WorkloadLifecycleRequest {
+        name: "coolify-test-web".into(),
+        action,
+    };
+
+    assert_eq!(crate::commands::podman_lifecycle_args(&request(WorkloadLifecycleAction::Start.into())).unwrap(), ["start", "coolify-test-web"]);
+    assert_eq!(crate::commands::podman_lifecycle_args(&request(WorkloadLifecycleAction::Stop.into())).unwrap(), ["stop", "--time", "10", "coolify-test-web"]);
+    assert_eq!(crate::commands::podman_lifecycle_args(&request(WorkloadLifecycleAction::Restart.into())).unwrap(), ["restart", "--time", "10", "coolify-test-web"]);
+    assert_eq!(crate::commands::podman_lifecycle_args(&request(WorkloadLifecycleAction::Remove.into())).unwrap(), ["rm", "--force", "coolify-test-web"]);
+}
+
+#[test]
+fn rejects_unsafe_workload_lifecycle_requests() {
+    use sentinel_protocol::control::v1::WorkloadLifecycleRequest;
+
+    assert!(crate::commands::podman_lifecycle_args(&WorkloadLifecycleRequest { name: "bad name".into(), action: 1 }).is_err());
+    assert!(crate::commands::podman_lifecycle_args(&WorkloadLifecycleRequest { name: "coolify-safe".into(), action: 0 }).is_err());
 }
