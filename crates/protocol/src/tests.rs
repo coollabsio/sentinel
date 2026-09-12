@@ -10,6 +10,7 @@ fn publishes_version_one_and_initial_capabilities() {
     assert_eq!(PROTOCOL_MAX, 1);
     assert_eq!(CAPABILITY_SYSTEM_PING, "system.ping.v1");
     assert_eq!(CAPABILITY_SYSTEM_INFO, "system.info.v1");
+    assert_eq!(CAPABILITY_CONTAINER_LIST, "container.list.v1");
 }
 
 #[test]
@@ -31,17 +32,20 @@ fn rejects_invalid_protocol_ranges() {
 fn intersects_capabilities_in_supported_order_without_duplicates() {
     let granted = vec![
         CAPABILITY_SYSTEM_INFO.to_string(),
+        CAPABILITY_CONTAINER_LIST.to_string(),
         CAPABILITY_SYSTEM_PING.to_string(),
         CAPABILITY_SYSTEM_PING.to_string(),
     ];
     let advertised = vec![
         CAPABILITY_SYSTEM_PING.to_string(),
         CAPABILITY_SYSTEM_INFO.to_string(),
+        CAPABILITY_CONTAINER_LIST.to_string(),
     ];
     let supported = [
         CAPABILITY_SYSTEM_PING,
         CAPABILITY_SYSTEM_PING,
         CAPABILITY_SYSTEM_INFO,
+        CAPABILITY_CONTAINER_LIST,
         "future.unsupported.v1",
     ];
 
@@ -50,6 +54,7 @@ fn intersects_capabilities_in_supported_order_without_duplicates() {
         vec![
             CAPABILITY_SYSTEM_PING.to_string(),
             CAPABILITY_SYSTEM_INFO.to_string(),
+            CAPABILITY_CONTAINER_LIST.to_string(),
         ]
     );
 }

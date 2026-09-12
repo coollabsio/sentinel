@@ -56,6 +56,7 @@ message Command {
   oneof payload {
     SystemPingRequest system_ping = 10;
     SystemInfoRequest system_info = 11;
+    ContainerListRequest container_list = 12;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -80,6 +81,7 @@ message CommandResult {
   oneof payload {
     SystemPingResult system_ping = 10;
     SystemInfoResult system_info = 11;
+    ContainerListResult container_list = 12;
     CommandError error = 20;
   }
 }
@@ -121,6 +123,32 @@ message SystemInfoResult {
   optional uint64 uptime_seconds = 12;
   optional string container_runtime = 13;
   optional string container_runtime_version = 14;
+}
+
+message ContainerListRequest {}
+
+message ContainerListResult {
+  repeated ContainerObservation containers = 1;
+}
+
+message ContainerObservation {
+  string runtime_id = 1;
+  string name = 2;
+  string image = 3;
+  string state = 4;
+  optional string health_status = 5;
+  optional uint32 restart_count = 6;
+  repeated ContainerPort ports = 7;
+  map<string, string> labels = 8;
+  optional int64 created_at_unix_ms = 9;
+  optional int64 started_at_unix_ms = 10;
+}
+
+message ContainerPort {
+  optional string host_ip = 1;
+  optional uint32 host_port = 2;
+  uint32 container_port = 3;
+  string protocol = 4;
 }
 
 message CommandError {

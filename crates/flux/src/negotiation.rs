@@ -1,7 +1,7 @@
 use sentinel_protocol::control::v1::Hello;
 use sentinel_protocol::{
-    CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, PROTOCOL_MAX, PROTOCOL_MIN,
-    intersect_capabilities, select_protocol,
+    CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, PROTOCOL_MAX,
+    PROTOCOL_MIN, intersect_capabilities, select_protocol,
 };
 
 use crate::CredentialClaims;
@@ -43,7 +43,11 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
     let capabilities = intersect_capabilities(
         &claims.capabilities,
         &hello.capabilities,
-        &[CAPABILITY_SYSTEM_PING, CAPABILITY_SYSTEM_INFO],
+        &[
+            CAPABILITY_SYSTEM_PING,
+            CAPABILITY_SYSTEM_INFO,
+            CAPABILITY_CONTAINER_LIST,
+        ],
     );
     Ok(Negotiated {
         protocol_version,

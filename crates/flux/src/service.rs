@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{ConnectionRegistry, CredentialVerifier, EventReporter, negotiate, now_millis};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AgentService {

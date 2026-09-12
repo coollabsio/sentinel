@@ -8,9 +8,11 @@ use axum::routing::post;
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    Command, CommandStatus, SystemInfoRequest, SystemPingRequest,
+    Command, CommandStatus, ContainerListRequest, SystemInfoRequest, SystemPingRequest,
 };
-use sentinel_protocol::{CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING};
+use sentinel_protocol::{
+    CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -31,6 +33,11 @@ struct PingRequest {
 
 #[derive(Deserialize)]
 struct SystemInfoApiRequest {
+    server_id: String,
+}
+
+#[derive(Deserialize)]
+struct ContainerListApiRequest {
     server_id: String,
 }
 
@@ -63,6 +70,35 @@ pub struct SystemInfoResponse {
     container_runtime_version: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct ContainerListResponse {
+    command_id: String,
+    observed_at_unix_ms: i64,
+    containers: Vec<ContainerResponse>,
+}
+
+#[derive(Serialize)]
+struct ContainerResponse {
+    runtime_id: String,
+    name: String,
+    image: String,
+    state: String,
+    health_status: Option<String>,
+    restart_count: Option<u32>,
+    ports: Vec<ContainerPortResponse>,
+    labels: std::collections::HashMap<String, String>,
+    created_at_unix_ms: Option<i64>,
+    started_at_unix_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct ContainerPortResponse {
+    host_ip: Option<String>,
+    host_port: Option<u32>,
+    container_port: u32,
+    protocol: String,
+}
+
 pub async fn serve(
     listener: tokio::net::TcpListener,
     registry: ConnectionRegistry,
@@ -71,10 +107,83 @@ pub async fn serve(
     let router = Router::new()
         .route("/v1/commands/system.ping", post(ping))
         .route("/v1/commands/system.info", post(system_info))
+        .route("/v1/commands/container.list", post(container_list))
         .with_state(ApiState { registry, token });
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "Flux internal command API is listening");
     axum::serve(listener, router).await
+}
+
+async fn container_list(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ContainerListApiRequest>,
+) -> Result<Json<ContainerListResponse>, (StatusCode, &'static str)> {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    if authorization != Some(&format!("Bearer {}", state.token)) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if request.server_id.is_empty() || request.server_id.len() > 255 {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID"));
+    }
+    let command_id = Uuid::new_v4().to_string();
+    let now = now_millis();
+    let result = state
+        .registry
+        .dispatch(
+            &request.server_id,
+            Command {
+                command_id: command_id.clone(),
+                command_type: CAPABILITY_CONTAINER_LIST.into(),
+                payload_version: 1,
+                created_at_unix_ms: now,
+                payload: Some(Payload::ContainerList(ContainerListRequest {})),
+                expires_at_unix_ms: now + COMMAND_TIMEOUT.as_millis() as i64,
+            },
+            COMMAND_TIMEOUT,
+        )
+        .await
+        .map_err(dispatch_error)?;
+    if result.status != CommandStatus::Succeeded as i32 {
+        return Err((StatusCode::BAD_GATEWAY, "Sentinel command failed"));
+    }
+    let observed_at_unix_ms = result.observed_at_unix_ms;
+    let Some(command_result::Payload::ContainerList(list)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    };
+    let containers = list
+        .containers
+        .into_iter()
+        .map(|container| ContainerResponse {
+            runtime_id: container.runtime_id,
+            name: container.name,
+            image: container.image,
+            state: container.state,
+            health_status: container.health_status,
+            restart_count: container.restart_count,
+            ports: container
+                .ports
+                .into_iter()
+                .map(|port| ContainerPortResponse {
+                    host_ip: port.host_ip,
+                    host_port: port.host_port,
+                    container_port: port.container_port,
+                    protocol: port.protocol,
+                })
+                .collect(),
+            labels: container.labels,
+            created_at_unix_ms: container.created_at_unix_ms,
+            started_at_unix_ms: container.started_at_unix_ms,
+        })
+        .collect();
+
+    Ok(Json(ContainerListResponse {
+        command_id,
+        observed_at_unix_ms,
+        containers,
+    }))
 }
 
 async fn system_info(

@@ -5,7 +5,9 @@ use config::ControlTlsConfig;
 use sentinel_protocol::control::v1::agent_message;
 use sentinel_protocol::control::v1::control_message;
 use sentinel_protocol::control::v1::{AgentMessage, CommandAccepted, Heartbeat, Hello};
-use sentinel_protocol::{CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING};
+use sentinel_protocol::{
+    CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
+};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
@@ -17,7 +19,7 @@ use crate::Assignment;
 use crate::commands::CommandExecutor;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MESSAGE_LIMIT: usize = 1024 * 1024;
+const MESSAGE_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FluxTransport {
@@ -82,7 +84,11 @@ pub async fn connect(
                 sentinel_version: sentinel_version.into(),
                 protocol_min: assignment.protocol_min(),
                 protocol_max: assignment.protocol_max(),
-                capabilities: vec![CAPABILITY_SYSTEM_PING.into(), CAPABILITY_SYSTEM_INFO.into()],
+                capabilities: vec![
+                    CAPABILITY_SYSTEM_PING.into(),
+                    CAPABILITY_SYSTEM_INFO.into(),
+                    CAPABILITY_CONTAINER_LIST.into(),
+                ],
                 boot_id: boot_id(),
                 trust_bundle_version: control_tls.trust_bundle_version,
             })),
@@ -125,10 +131,12 @@ pub async fn connect(
     .max(Duration::from_secs(1));
     let refresh = tokio::time::sleep(refresh_after);
     tokio::pin!(refresh);
-    let ping_accepted = welcome
-        .accepted_capabilities
-        .iter()
-        .any(|capability| capability == CAPABILITY_SYSTEM_PING);
+    let accepted_capabilities = welcome.accepted_capabilities.clone();
+    let capability_accepted = |required: &str| {
+        accepted_capabilities
+            .iter()
+            .any(|capability| capability == required)
+    };
     ticker.tick().await;
     loop {
         tokio::select! {
@@ -146,7 +154,8 @@ pub async fn connect(
                         Some(control_message::Message::ShutdownHint(_)) => return Ok(()),
                         Some(control_message::Message::Command(command)) => {
                             let command_id = command.command_id.clone();
-                            let execution = command_executor.lock().await.execute(command, ping_accepted);
+                            let command_capability_accepted = capability_accepted(&command.command_type);
+                            let execution = command_executor.lock().await.execute(command, command_capability_accepted);
                             if execution.accepted {
                                 sender.send(AgentMessage {
                                     message: Some(agent_message::Message::CommandAccepted(CommandAccepted {

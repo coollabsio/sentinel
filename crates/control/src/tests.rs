@@ -428,7 +428,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
     assert_eq!(request.body["protocol_max"], 1);
     assert_eq!(
         request.body["capabilities"],
-        json!(["system.ping.v1", "system.info.v1"])
+        json!(["system.ping.v1", "system.info.v1", "container.list.v1"])
     );
 }
 
@@ -886,4 +886,28 @@ async fn rejects_assignment_with_a_different_trust_bundle_version_before_connect
             .await,
         Err(FluxConnectionError::TrustBundleVersionMismatch)
     ));
+}
+
+#[test]
+fn parses_podman_container_inventory() {
+    let containers = crate::commands::parse_podman_containers(
+        br#"[{"Id":"container-1","Image":"docker.io/library/nginx:latest","Names":["web"],"State":"running","Health":"healthy","Restarts":2,"Created":1789237060,"StartedAt":1789237061,"Labels":{"coolify.managed":"true"},"Ports":[{"host_ip":"0.0.0.0","host_port":8080,"container_port":80,"protocol":"tcp"}]}]"#,
+    )
+    .unwrap();
+
+    assert_eq!(containers.len(), 1);
+    let container = &containers[0];
+    assert_eq!(container.runtime_id, "container-1");
+    assert_eq!(container.name, "web");
+    assert_eq!(container.health_status.as_deref(), Some("healthy"));
+    assert_eq!(container.restart_count, Some(2));
+    assert_eq!(container.created_at_unix_ms, Some(1_789_237_060_000));
+    assert_eq!(container.ports[0].host_port, Some(8080));
+    assert_eq!(container.labels["coolify.managed"], "true");
+}
+
+#[test]
+fn rejects_invalid_podman_container_inventory() {
+    assert!(crate::commands::parse_podman_containers(b"not-json").is_err());
+    assert!(crate::commands::parse_podman_containers(br#"[{"Image":"alpine"}]"#).is_err());
 }

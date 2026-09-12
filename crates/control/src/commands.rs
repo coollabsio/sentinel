@@ -5,9 +5,12 @@ use prost::Message;
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    Command, CommandError, CommandResult, CommandStatus, SystemInfoResult, SystemPingResult,
+    Command, CommandError, CommandResult, CommandStatus, ContainerListResult, ContainerObservation,
+    ContainerPort, SystemInfoResult, SystemPingResult,
 };
-use sentinel_protocol::{CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING};
+use sentinel_protocol::{
+    CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
+};
 use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
 
 pub(crate) const CONTAINER_RUNTIMES: [&str; 2] = ["podman", "docker"];
@@ -68,12 +71,13 @@ impl CommandExecutor {
         let has_valid_payload = match (command.command_type.as_str(), command.payload.as_ref()) {
             (CAPABILITY_SYSTEM_PING, Some(Payload::SystemPing(ping))) => !ping.nonce.is_empty(),
             (CAPABILITY_SYSTEM_INFO, Some(Payload::SystemInfo(_))) => true,
+            (CAPABILITY_CONTAINER_LIST, Some(Payload::ContainerList(_))) => true,
             _ => false,
         };
         let accepted = !(command.command_id.is_empty()
             || !matches!(
                 command.command_type.as_str(),
-                CAPABILITY_SYSTEM_PING | CAPABILITY_SYSTEM_INFO
+                CAPABILITY_SYSTEM_PING | CAPABILITY_SYSTEM_INFO | CAPABILITY_CONTAINER_LIST
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
@@ -107,6 +111,19 @@ impl CommandExecutor {
                 payload: Some(command_result::Payload::SystemInfo(system_info(
                     &self.sentinel_version,
                 ))),
+            }
+        } else if let Some(Payload::ContainerList(_)) = command.payload {
+            match container_list() {
+                Ok(containers) => CommandResult {
+                    event_id: format!("{}:result", command.command_id),
+                    command_id: command.command_id.clone(),
+                    status: CommandStatus::Succeeded.into(),
+                    observed_at_unix_ms: now_millis(),
+                    payload: Some(command_result::Payload::ContainerList(
+                        ContainerListResult { containers },
+                    )),
+                },
+                Err(message) => failed(&command.command_id, "container_list_failed", message),
             }
         } else {
             failed(
@@ -150,6 +167,117 @@ impl CommandExecutor {
             self.results.remove(&oldest);
         }
     }
+}
+
+fn container_list() -> Result<Vec<ContainerObservation>, &'static str> {
+    let output = std::process::Command::new("podman")
+        .args(["ps", "--all", "--no-trunc", "--format", "json"])
+        .output()
+        .map_err(|_| "Podman is unavailable.")?;
+    if !output.status.success() {
+        return Err("Podman could not list containers.");
+    }
+
+    parse_podman_containers(&output.stdout)
+}
+
+pub(crate) fn parse_podman_containers(
+    output: &[u8],
+) -> Result<Vec<ContainerObservation>, &'static str> {
+    let values: Vec<serde_json::Value> =
+        serde_json::from_slice(output).map_err(|_| "Podman returned invalid container data.")?;
+    if values.len() > 10_000 {
+        return Err("Podman returned too many containers.");
+    }
+
+    values
+        .iter()
+        .map(|value| {
+            let runtime_id = string_field(value, &["Id", "ID"])
+                .filter(|value| !value.is_empty())
+                .ok_or("Podman returned a container without an ID.")?;
+            let name = value
+                .get("Names")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|names| names.first())
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| string_field(value, &["Name"]))
+                .filter(|value| !value.is_empty())
+                .ok_or("Podman returned a container without a name.")?;
+            let image = string_field(value, &["Image"])
+                .filter(|value| !value.is_empty())
+                .ok_or("Podman returned a container without an image.")?;
+            let state = string_field(value, &["State"])
+                .filter(|value| !value.is_empty())
+                .ok_or("Podman returned a container without a state.")?;
+            let labels = value
+                .get("Labels")
+                .and_then(serde_json::Value::as_object)
+                .map(|labels| {
+                    labels
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.into()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let ports = value
+                .get("Ports")
+                .and_then(serde_json::Value::as_array)
+                .map(|ports| ports.iter().filter_map(container_port).collect())
+                .unwrap_or_default();
+
+            Ok(ContainerObservation {
+                runtime_id: runtime_id.into(),
+                name: name.into(),
+                image: image.into(),
+                state: state.into(),
+                health_status: string_field(value, &["Health", "HealthStatus"]).map(str::to_string),
+                restart_count: value
+                    .get("Restarts")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+                ports,
+                labels,
+                created_at_unix_ms: unix_millis(value, &["Created"]),
+                started_at_unix_ms: unix_millis(value, &["StartedAt"]),
+            })
+        })
+        .collect()
+}
+
+fn string_field<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|name| value.get(name)?.as_str())
+}
+
+fn unix_millis(value: &serde_json::Value, names: &[&str]) -> Option<i64> {
+    names
+        .iter()
+        .find_map(|name| value.get(name)?.as_i64())
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .filter(|value| *value > 0)
+}
+
+fn container_port(value: &serde_json::Value) -> Option<ContainerPort> {
+    let container_port = value
+        .get("container_port")
+        .or_else(|| value.get("ContainerPort"))?
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())?;
+
+    Some(ContainerPort {
+        host_ip: string_field(value, &["host_ip", "HostIp"]).map(str::to_string),
+        host_port: value
+            .get("host_port")
+            .or_else(|| value.get("HostPort"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
+        container_port,
+        protocol: string_field(value, &["protocol", "Protocol"])
+            .unwrap_or("tcp")
+            .into(),
+    })
 }
 
 fn system_info(sentinel_version: &str) -> SystemInfoResult {

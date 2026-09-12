@@ -6,6 +6,7 @@ pub const PROTOCOL_MIN: u32 = 1;
 pub const PROTOCOL_MAX: u32 = 1;
 pub const CAPABILITY_SYSTEM_PING: &str = "system.ping.v1";
 pub const CAPABILITY_SYSTEM_INFO: &str = "system.info.v1";
+pub const CAPABILITY_CONTAINER_LIST: &str = "container.list.v1";
 
 pub mod control {
     pub mod v1 {
