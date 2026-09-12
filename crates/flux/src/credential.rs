@@ -6,7 +6,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Deserialize;
 
 const AUDIENCE: &str = "flux";
-const PURPOSE: &str = "v5-control-channel";
+const PURPOSE: &str = "node-control-channel";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialClaims {

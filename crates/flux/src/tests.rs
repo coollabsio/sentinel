@@ -30,7 +30,7 @@ fn token(
     );
     let claims = URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&serde_json::json!({
-            "iss": "coolify-dev", "aud": "flux", "purpose": "v5-control-channel",
+            "iss": "coolify-dev", "aud": "flux", "purpose": "node-control-channel",
             "sub": subject, "jti": "token-id", "iat": now, "nbf": now + not_before_delta,
             "exp": now + expires_delta, "caps": [CAPABILITY_SYSTEM_PING],
             "pmin": PROTOCOL_MIN, "pmax": PROTOCOL_MAX

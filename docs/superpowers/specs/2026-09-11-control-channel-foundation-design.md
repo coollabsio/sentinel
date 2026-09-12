@@ -236,7 +236,7 @@ The initial credential is a signed JWT with these required claims:
 ```text
 iss     Coolify installation identity
 aud     flux
-purpose v5-control-channel
+purpose node-control-channel
 sub     server UUID
 jti     unique token ID
 iat     issued-at time
