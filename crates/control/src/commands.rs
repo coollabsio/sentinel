@@ -3,10 +3,11 @@ use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
     Command, CommandError, CommandResult, CommandStatus, ContainerListResult, ContainerObservation,
-    ContainerPort, SystemInfoResult, SystemPingResult,
+    ContainerPort, SystemInfoResult, SystemPingResult, WorkloadDeployRequest, WorkloadDeployResult,
 };
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
+    CAPABILITY_WORKLOAD_DEPLOY,
 };
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
@@ -98,12 +99,18 @@ impl CommandExecutor {
             (CAPABILITY_SYSTEM_PING, Some(Payload::SystemPing(ping))) => !ping.nonce.is_empty(),
             (CAPABILITY_SYSTEM_INFO, Some(Payload::SystemInfo(_))) => true,
             (CAPABILITY_CONTAINER_LIST, Some(Payload::ContainerList(_))) => true,
+            (CAPABILITY_WORKLOAD_DEPLOY, Some(Payload::WorkloadDeploy(request))) => {
+                podman_deploy_args(request).is_ok()
+            }
             _ => false,
         };
         let accepted = !(command.command_id.is_empty()
             || !matches!(
                 command.command_type.as_str(),
-                CAPABILITY_SYSTEM_PING | CAPABILITY_SYSTEM_INFO | CAPABILITY_CONTAINER_LIST
+                CAPABILITY_SYSTEM_PING
+                    | CAPABILITY_SYSTEM_INFO
+                    | CAPABILITY_CONTAINER_LIST
+                    | CAPABILITY_WORKLOAD_DEPLOY
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
@@ -209,11 +216,22 @@ impl CommandExecutor {
                 },
                 Err(message) => failed(&command.command_id, "container_list_failed", message),
             }
+        } else if let Some(Payload::WorkloadDeploy(request)) = command.payload {
+            match workload_deploy(&request) {
+                Ok(result) => CommandResult {
+                    event_id: format!("{}:result", command.command_id),
+                    command_id: command.command_id.clone(),
+                    status: CommandStatus::Succeeded.into(),
+                    observed_at_unix_ms: now_millis(),
+                    payload: Some(command_result::Payload::WorkloadDeploy(result)),
+                },
+                Err(message) => failed(&command.command_id, "workload_deploy_failed", &message),
+            }
         } else {
             failed(
                 &command.command_id,
                 "invalid_payload",
-                "Ping payload is missing.",
+                "Command payload is missing.",
             )
         };
         if let Err(error) =
@@ -227,6 +245,137 @@ impl CommandExecutor {
             result,
         }
     }
+}
+
+fn workload_deploy(request: &WorkloadDeployRequest) -> Result<WorkloadDeployResult, String> {
+    let output = std::process::Command::new("podman")
+        .args(podman_deploy_args(request)?)
+        .output()
+        .map_err(|_| "Podman is unavailable.".to_string())?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if message.is_empty() {
+            "Podman could not deploy the workload.".into()
+        } else {
+            message.chars().take(2_000).collect()
+        });
+    }
+    let runtime_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if runtime_id.is_empty() {
+        return Err("Podman did not return a container ID.".into());
+    }
+    Ok(WorkloadDeployResult {
+        runtime_id,
+        name: request.name.clone(),
+        image: request.image.clone(),
+    })
+}
+
+pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<String>, String> {
+    if request.name.is_empty()
+        || request.name.len() > 128
+        || !request
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
+    {
+        return Err("The container name is invalid.".into());
+    }
+    if request.image.is_empty()
+        || request.image.len() > 2_048
+        || !request
+            .image
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-/:@".contains(c))
+    {
+        return Err("The image reference is invalid.".into());
+    }
+    if !matches!(
+        request.restart_policy.as_str(),
+        "no" | "always" | "on-failure" | "unless-stopped"
+    ) {
+        return Err("The restart policy is invalid.".into());
+    }
+    if request.command.len() > 64
+        || request.environment.len() > 256
+        || request.labels.len() > 128
+        || request.ports.len() > 128
+    {
+        return Err("The workload configuration is too large.".into());
+    }
+    let mut args = vec![
+        "run".into(),
+        "--detach".into(),
+        "--replace".into(),
+        "--pull".into(),
+        "missing".into(),
+        "--name".into(),
+        request.name.clone(),
+        "--restart".into(),
+        request.restart_policy.clone(),
+    ];
+    for variable in &request.environment {
+        let key = &variable.key;
+        let value = &variable.value;
+        if key.is_empty()
+            || key.len() > 255
+            || value.len() > 4_096
+            || value.contains('\0')
+            || !key.chars().enumerate().all(|(i, c)| {
+                c == '_' || c.is_ascii_alphanumeric() && (i > 0 || !c.is_ascii_digit())
+            })
+        {
+            return Err("An environment variable is invalid.".into());
+        }
+        args.extend(["--env".into(), format!("{key}={value}")]);
+    }
+    for label in &request.labels {
+        let key = &label.key;
+        let value = &label.value;
+        if key.is_empty()
+            || key.len() > 255
+            || value.len() > 4_096
+            || key.contains('=')
+            || key.contains('\0')
+            || value.contains('\0')
+        {
+            return Err("A container label is invalid.".into());
+        }
+        args.extend(["--label".into(), format!("{key}={value}")]);
+    }
+    for port in &request.ports {
+        if port.container_port == 0
+            || port.container_port > 65_535
+            || port.host_port.is_some_and(|p| p == 0 || p > 65_535)
+            || !matches!(port.protocol.as_str(), "tcp" | "udp" | "sctp")
+        {
+            return Err("A published port is invalid.".into());
+        }
+        let mut published = String::new();
+        if let Some(host_ip) = &port.host_ip {
+            if host_ip.parse::<std::net::IpAddr>().is_err() {
+                return Err("A published port host IP is invalid.".into());
+            }
+            published.push_str(host_ip);
+            published.push(':');
+        }
+        if let Some(host_port) = port.host_port {
+            published.push_str(&host_port.to_string());
+            published.push(':');
+        }
+        published.push_str(&format!("{}/{}", port.container_port, port.protocol));
+        args.extend(["--publish".into(), published]);
+    }
+    if request
+        .command
+        .iter()
+        .any(|v| v.len() > 4_096 || v.contains('\0'))
+    {
+        return Err("A command argument is invalid.".into());
+    }
+    args.push(request.image.clone());
+    args.extend(request.command.clone());
+    Ok(args)
 }
 
 fn container_list() -> Result<Vec<ContainerObservation>, &'static str> {

@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use config::ControlTlsConfig;
 use reqwest::StatusCode;
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, PROTOCOL_MAX,
-    PROTOCOL_MIN, select_protocol,
+    CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
+    CAPABILITY_WORKLOAD_DEPLOY, PROTOCOL_MAX, PROTOCOL_MIN, select_protocol,
 };
 use serde::{Deserialize, Serialize};
 use store::CommandJournal;
@@ -231,6 +231,7 @@ impl AssignmentClient {
                 CAPABILITY_SYSTEM_PING,
                 CAPABILITY_SYSTEM_INFO,
                 CAPABILITY_CONTAINER_LIST,
+                CAPABILITY_WORKLOAD_DEPLOY,
             ],
         };
         let mut response = self
@@ -397,7 +398,7 @@ struct AssignmentRequest<'a> {
     sentinel_version: &'a str,
     protocol_min: u32,
     protocol_max: u32,
-    capabilities: [&'static str; 3],
+    capabilities: [&'static str; 4],
 }
 
 #[derive(Deserialize)]

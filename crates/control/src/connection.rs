@@ -7,6 +7,7 @@ use sentinel_protocol::control::v1::control_message;
 use sentinel_protocol::control::v1::{AgentMessage, CommandAccepted, Heartbeat, Hello};
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
+    CAPABILITY_WORKLOAD_DEPLOY,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -88,6 +89,7 @@ pub async fn connect(
                     CAPABILITY_SYSTEM_PING.into(),
                     CAPABILITY_SYSTEM_INFO.into(),
                     CAPABILITY_CONTAINER_LIST.into(),
+                    CAPABILITY_WORKLOAD_DEPLOY.into(),
                 ],
                 boot_id: boot_id(),
                 trust_bundle_version: control_tls.trust_bundle_version,

@@ -429,7 +429,12 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
     assert_eq!(request.body["protocol_max"], 1);
     assert_eq!(
         request.body["capabilities"],
-        json!(["system.ping.v1", "system.info.v1", "container.list.v1"])
+        json!([
+            "system.ping.v1",
+            "system.info.v1",
+            "container.list.v1",
+            "workload.deploy.v1"
+        ])
     );
 }
 
@@ -989,4 +994,72 @@ fn completed_commands_replay_after_the_request_expired() {
         execution.result.status,
         sentinel_protocol::control::v1::CommandStatus::Succeeded as i32
     );
+}
+
+#[test]
+fn builds_shell_free_podman_deploy_arguments() {
+    let request = sentinel_protocol::control::v1::WorkloadDeployRequest {
+        name: "coolify-test-web".into(),
+        image: "docker.io/library/alpine:latest".into(),
+        command: vec!["sleep".into(), "3600".into()],
+        environment: vec![
+            sentinel_protocol::control::v1::WorkloadEnvironmentVariable {
+                key: "APP_ENV".into(),
+                value: "production".into(),
+            },
+        ],
+        ports: vec![sentinel_protocol::control::v1::ContainerPort {
+            host_ip: Some("127.0.0.1".into()),
+            host_port: Some(18080),
+            container_port: 8080,
+            protocol: "tcp".into(),
+        }],
+        labels: vec![sentinel_protocol::control::v1::WorkloadLabel {
+            key: "coolify.managed".into(),
+            value: "true".into(),
+        }],
+        restart_policy: "unless-stopped".into(),
+    };
+
+    let arguments = crate::commands::podman_deploy_args(&request).unwrap();
+
+    assert_eq!(arguments[0], "run");
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--name", "coolify-test-web"])
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--env", "APP_ENV=production"])
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--publish", "127.0.0.1:18080:8080/tcp"])
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--label", "coolify.managed=true"])
+    );
+    assert_eq!(
+        &arguments[arguments.len() - 3..],
+        ["docker.io/library/alpine:latest", "sleep", "3600"]
+    );
+}
+
+#[test]
+fn rejects_unsafe_or_oversized_deploy_requests() {
+    let request = |name: &str, image: &str| sentinel_protocol::control::v1::WorkloadDeployRequest {
+        name: name.into(),
+        image: image.into(),
+        restart_policy: "unless-stopped".into(),
+        ..Default::default()
+    };
+
+    assert!(crate::commands::podman_deploy_args(&request("bad name", "alpine")).is_err());
+    assert!(crate::commands::podman_deploy_args(&request("safe-name", "")).is_err());
+    assert!(crate::commands::podman_deploy_args(&request("safe-name", "alpine;rm")).is_err());
 }

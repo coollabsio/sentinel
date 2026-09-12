@@ -8,10 +8,12 @@ use axum::routing::post;
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    Command, CommandStatus, ContainerListRequest, SystemInfoRequest, SystemPingRequest,
+    Command, CommandStatus, ContainerListRequest, ContainerPort, SystemInfoRequest,
+    SystemPingRequest, WorkloadDeployRequest, WorkloadEnvironmentVariable, WorkloadLabel,
 };
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
+    CAPABILITY_WORKLOAD_DEPLOY,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -19,6 +21,7 @@ use uuid::Uuid;
 use crate::{CommandDispatchError, ConnectionRegistry, now_millis};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const DEPLOY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone)]
 struct ApiState {
@@ -39,6 +42,31 @@ struct SystemInfoApiRequest {
 #[derive(Deserialize)]
 struct ContainerListApiRequest {
     server_id: String,
+}
+
+#[derive(Deserialize)]
+struct WorkloadDeployApiRequest {
+    server_id: String,
+    command_id: String,
+    name: String,
+    image: String,
+    #[serde(default)]
+    command: Vec<String>,
+    #[serde(default)]
+    environment: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    ports: Vec<DeployPort>,
+    #[serde(default)]
+    labels: std::collections::HashMap<String, String>,
+    restart_policy: String,
+}
+
+#[derive(Deserialize)]
+struct DeployPort {
+    host_ip: Option<String>,
+    host_port: Option<u32>,
+    container_port: u32,
+    protocol: String,
 }
 
 #[derive(Serialize)]
@@ -78,6 +106,15 @@ pub struct ContainerListResponse {
 }
 
 #[derive(Serialize)]
+pub struct WorkloadDeployResponse {
+    command_id: String,
+    observed_at_unix_ms: i64,
+    runtime_id: String,
+    name: String,
+    image: String,
+}
+
+#[derive(Serialize)]
 struct ContainerResponse {
     runtime_id: String,
     name: String,
@@ -108,10 +145,95 @@ pub async fn serve(
         .route("/v1/commands/system.ping", post(ping))
         .route("/v1/commands/system.info", post(system_info))
         .route("/v1/commands/container.list", post(container_list))
+        .route("/v1/commands/workload.deploy", post(workload_deploy))
         .with_state(ApiState { registry, token });
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "Flux internal command API is listening");
     axum::serve(listener, router).await
+}
+
+async fn workload_deploy(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<WorkloadDeployApiRequest>,
+) -> Result<Json<WorkloadDeployResponse>, (StatusCode, &'static str)> {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    if authorization != Some(&format!("Bearer {}", state.token)) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if request.server_id.is_empty()
+        || request.server_id.len() > 255
+        || request.command_id.is_empty()
+        || request.command_id.len() > 128
+        || !request
+            .command_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
+    {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request"));
+    }
+    let now = now_millis();
+    let result = state
+        .registry
+        .dispatch(
+            &request.server_id,
+            Command {
+                command_id: request.command_id.clone(),
+                command_type: CAPABILITY_WORKLOAD_DEPLOY.into(),
+                payload_version: 1,
+                created_at_unix_ms: now,
+                payload: Some(Payload::WorkloadDeploy(WorkloadDeployRequest {
+                    name: request.name,
+                    image: request.image,
+                    command: request.command,
+                    environment: sorted_pairs(request.environment)
+                        .into_iter()
+                        .map(|(key, value)| WorkloadEnvironmentVariable { key, value })
+                        .collect(),
+                    ports: request
+                        .ports
+                        .into_iter()
+                        .map(|port| ContainerPort {
+                            host_ip: port.host_ip,
+                            host_port: port.host_port,
+                            container_port: port.container_port,
+                            protocol: port.protocol,
+                        })
+                        .collect(),
+                    labels: sorted_pairs(request.labels)
+                        .into_iter()
+                        .map(|(key, value)| WorkloadLabel { key, value })
+                        .collect(),
+                    restart_policy: request.restart_policy,
+                })),
+                expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
+            },
+            DEPLOY_TIMEOUT,
+        )
+        .await
+        .map_err(dispatch_error)?;
+    if result.status != CommandStatus::Succeeded as i32 {
+        return Err((StatusCode::BAD_GATEWAY, "Sentinel command failed"));
+    }
+    let observed_at_unix_ms = result.observed_at_unix_ms;
+    let Some(command_result::Payload::WorkloadDeploy(deployed)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    };
+    Ok(Json(WorkloadDeployResponse {
+        command_id: request.command_id,
+        observed_at_unix_ms,
+        runtime_id: deployed.runtime_id,
+        name: deployed.name,
+        image: deployed.image,
+    }))
+}
+
+fn sorted_pairs(values: std::collections::HashMap<String, String>) -> Vec<(String, String)> {
+    let mut values: Vec<_> = values.into_iter().collect();
+    values.sort_by(|left, right| left.0.cmp(&right.0));
+    values
 }
 
 async fn container_list(

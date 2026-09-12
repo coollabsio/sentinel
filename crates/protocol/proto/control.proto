@@ -57,6 +57,7 @@ message Command {
     SystemPingRequest system_ping = 10;
     SystemInfoRequest system_info = 11;
     ContainerListRequest container_list = 12;
+    WorkloadDeployRequest workload_deploy = 13;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -82,6 +83,7 @@ message CommandResult {
     SystemPingResult system_ping = 10;
     SystemInfoResult system_info = 11;
     ContainerListResult container_list = 12;
+    WorkloadDeployResult workload_deploy = 13;
     CommandError error = 20;
   }
 }
@@ -149,6 +151,32 @@ message ContainerPort {
   optional uint32 host_port = 2;
   uint32 container_port = 3;
   string protocol = 4;
+}
+
+message WorkloadDeployRequest {
+  string name = 1;
+  string image = 2;
+  repeated string command = 3;
+  repeated WorkloadEnvironmentVariable environment = 4;
+  repeated ContainerPort ports = 5;
+  repeated WorkloadLabel labels = 6;
+  string restart_policy = 7;
+}
+
+message WorkloadEnvironmentVariable {
+  string key = 1;
+  string value = 2;
+}
+
+message WorkloadLabel {
+  string key = 1;
+  string value = 2;
+}
+
+message WorkloadDeployResult {
+  string runtime_id = 1;
+  string name = 2;
+  string image = 3;
 }
 
 message CommandError {
