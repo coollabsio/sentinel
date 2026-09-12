@@ -35,6 +35,7 @@ fn assignment_client(
     token: &str,
     version: &str,
     control_tls: Option<&config::ControlTlsConfig>,
+    command_journal: store::CommandJournal,
 ) -> Option<control::AssignmentClient> {
     if !enabled {
         return None;
@@ -45,7 +46,7 @@ fn assignment_client(
     };
 
     match control::AssignmentClient::new(endpoint, token, version, control_tls.clone()) {
-        Ok(client) => Some(client),
+        Ok(client) => Some(client.with_command_journal(command_journal)),
         Err(error) => {
             tracing::error!(%error, "Sentinel control task could not start; existing services remain active");
             None
@@ -119,6 +120,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // collector and pusher, so it is opened *after* the listener binds —
     // keeping the path to `/api/health` as short as possible.
     let store = store::Store::open(&config.metrics_file)?;
+    let command_journal = if config.control_plane_enabled {
+        store::CommandJournal::open(
+            &config.command_journal_file,
+            config.command_retention_days,
+            config.command_max_records,
+        )?
+    } else {
+        store::CommandJournal::open_in_memory(
+            config.command_retention_days,
+            config.command_max_records,
+        )?
+    };
 
     // Traffic analytics DB, opened early (AppState carries it) but cheap — the
     // GeoIP download and log tail are deferred to the end of this function. A
@@ -267,6 +280,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &config.token,
         &config.version,
         config.control_tls.as_ref(),
+        command_journal.clone(),
     ) {
         let rx = shutdown_rx.clone();
         control_services.spawn(async move {
@@ -277,6 +291,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Retention: cleanup + downsample, daily, with one pass at startup.
     {
         let store = store.clone();
+        let command_journal = command_journal.clone();
         let days = config.collector_retention_period_days;
         let mut rx = shutdown_rx.clone();
         services.spawn(async move {
@@ -286,16 +301,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     _ = rx.changed() => return Ok::<(), String>(()),
                     _ = ticker.tick() => {
                         let s = store.clone();
+                        let command_journal = command_journal.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             let now = collector::now_millis();
                             let deleted = s.cleanup(days, now)?;
                             let collapsed = s.downsample(now)?;
-                            Ok::<_, store::StoreError>((deleted, collapsed))
+                            let commands_deleted = command_journal.cleanup(now)?;
+                            Ok::<_, store::StoreError>((deleted, collapsed, commands_deleted))
                         })
                         .await;
                         match result {
-                            Ok(Ok((deleted, collapsed))) => tracing::info!(
-                                deleted, collapsed, retention_days = days, "retention pass complete"
+                            Ok(Ok((deleted, collapsed, commands_deleted))) => tracing::info!(
+                                deleted, collapsed, commands_deleted, retention_days = days, "retention pass complete"
                             ),
                             Ok(Err(e)) => tracing::warn!(error = %e, "retention pass failed"),
                             Err(e) => tracing::warn!(error = %e, "retention task panicked"),

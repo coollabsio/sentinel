@@ -10,6 +10,10 @@ fn control_tls_config() -> config::ControlTlsConfig {
     }
 }
 
+fn command_journal() -> store::CommandJournal {
+    store::CommandJournal::open_in_memory(7, 100_000).unwrap()
+}
+
 #[test]
 fn a_clean_service_exit_is_still_unexpected_before_shutdown() {
     let result = unexpected_service_exit(Some(Ok(Ok(()))));
@@ -29,7 +33,7 @@ fn a_service_error_is_propagated() {
 
 #[test]
 fn control_assignment_stays_dormant_when_disabled() {
-    let client = assignment_client(false, "", "", "", None);
+    let client = assignment_client(false, "", "", "", None, command_journal());
 
     assert!(client.is_none());
 }
@@ -42,6 +46,7 @@ fn control_assignment_client_is_created_when_enabled() {
         "token",
         "main",
         Some(&control_tls_config()),
+        command_journal(),
     );
 
     assert!(client.is_some());
@@ -55,6 +60,7 @@ fn invalid_control_assignment_configuration_does_not_fail_startup() {
         "token",
         "main",
         Some(&control_tls_config()),
+        command_journal(),
     );
 
     assert!(client.is_none());

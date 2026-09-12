@@ -84,6 +84,9 @@ pub struct Config {
     pub token: String,
     pub endpoint: String,
     pub metrics_file: PathBuf,
+    pub command_journal_file: PathBuf,
+    pub command_retention_days: u32,
+    pub command_max_records: u32,
     pub collector_enabled: bool,
     pub collector_retention_period_days: u32,
     pub bind_addr: SocketAddr,
@@ -102,6 +105,13 @@ impl Config {
         } else {
             PathBuf::from("/app/db/metrics.sqlite")
         };
+        let command_journal_file = if development {
+            PathBuf::from("./db/commands.sqlite")
+        } else {
+            PathBuf::from("/app/db/commands.sqlite")
+        };
+        let command_retention_days = u32_from_env("SENTINEL_COMMAND_RETENTION_DAYS", 7)?;
+        let command_max_records = u32_from_env("SENTINEL_COMMAND_MAX_RECORDS", 100_000)?;
 
         let debug = bool_from_env("DEBUG", false)?;
         let control_plane_enabled = bool_from_env("CONTROL_PLANE_ENABLED", false)?;
@@ -206,6 +216,9 @@ impl Config {
             token,
             endpoint,
             metrics_file,
+            command_journal_file,
+            command_retention_days,
+            command_max_records,
             collector_enabled,
             collector_retention_period_days,
             bind_addr,
@@ -233,6 +246,9 @@ impl Config {
             token: "test-token".to_string(),
             endpoint: "http://localhost:8000".to_string(),
             metrics_file: PathBuf::from(":memory:"),
+            command_journal_file: PathBuf::from(":memory:"),
+            command_retention_days: 7,
+            command_max_records: 100_000,
             collector_enabled: false,
             collector_retention_period_days: 7,
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 8888)),

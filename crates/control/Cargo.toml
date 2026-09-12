@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 config = { path = "../config" }
 protocol = { path = "../protocol" }
+store = { path = "../store" }
 futures-util.workspace = true
 prost.workspace = true
 reqwest.workspace = true

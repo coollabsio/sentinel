@@ -7,6 +7,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::http::{Request, Response, StatusCode};
+use prost::Message;
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose};
 use serde_json::{Value, json};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -910,4 +911,82 @@ fn parses_podman_container_inventory() {
 fn rejects_invalid_podman_container_inventory() {
     assert!(crate::commands::parse_podman_containers(b"not-json").is_err());
     assert!(crate::commands::parse_podman_containers(br#"[{"Image":"alpine"}]"#).is_err());
+}
+
+fn durable_ping_command(command_id: &str, nonce: &str) -> sentinel_protocol::control::v1::Command {
+    sentinel_protocol::control::v1::Command {
+        command_id: command_id.into(),
+        command_type: sentinel_protocol::CAPABILITY_SYSTEM_PING.into(),
+        payload_version: 1,
+        payload: Some(
+            sentinel_protocol::control::v1::command::Payload::SystemPing(
+                sentinel_protocol::control::v1::SystemPingRequest {
+                    nonce: nonce.into(),
+                },
+            ),
+        ),
+        expires_at_unix_ms: i64::MAX,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn command_results_replay_from_the_durable_journal_after_restart() {
+    let journal = store::CommandJournal::open_in_memory(7, 100_000).unwrap();
+    let command = durable_ping_command("durable-command", "durable-nonce");
+    let first = crate::commands::CommandExecutor::with_journal("dev", journal.clone())
+        .execute(command.clone(), true);
+    let replayed =
+        crate::commands::CommandExecutor::with_journal("dev", journal).execute(command, true);
+
+    assert!(first.accepted);
+    assert!(replayed.accepted);
+    assert_eq!(first.result, replayed.result);
+}
+
+#[test]
+fn interrupted_durable_commands_are_not_executed_again() {
+    let journal = store::CommandJournal::open_in_memory(7, 100_000).unwrap();
+    let command = durable_ping_command("interrupted-command", "nonce");
+    journal
+        .start(&command.command_id, &command.encode_to_vec(), 1)
+        .unwrap();
+
+    let execution =
+        crate::commands::CommandExecutor::with_journal("dev", journal).execute(command, true);
+    let Some(sentinel_protocol::control::v1::command_result::Payload::Error(error)) =
+        execution.result.payload
+    else {
+        panic!("expected command error");
+    };
+
+    assert!(execution.accepted);
+    assert_eq!(error.code, "command_interrupted");
+}
+
+#[test]
+fn completed_commands_replay_after_the_request_expired() {
+    let journal = store::CommandJournal::open_in_memory(7, 100_000).unwrap();
+    let mut command = durable_ping_command("expired-replay", "nonce");
+    command.expires_at_unix_ms = 1;
+    let result = sentinel_protocol::control::v1::CommandResult {
+        command_id: command.command_id.clone(),
+        status: sentinel_protocol::control::v1::CommandStatus::Succeeded.into(),
+        ..Default::default()
+    };
+    journal
+        .start(&command.command_id, &command.encode_to_vec(), 1)
+        .unwrap();
+    journal
+        .finish(&command.command_id, &result.encode_to_vec(), 2)
+        .unwrap();
+
+    let execution =
+        crate::commands::CommandExecutor::with_journal("dev", journal).execute(command, true);
+
+    assert!(execution.accepted);
+    assert_eq!(
+        execution.result.status,
+        sentinel_protocol::control::v1::CommandStatus::Succeeded as i32
+    );
 }

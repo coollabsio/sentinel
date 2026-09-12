@@ -9,6 +9,7 @@ use sentinel_protocol::{
     PROTOCOL_MIN, select_protocol,
 };
 use serde::{Deserialize, Serialize};
+use store::CommandJournal;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use url::Url;
@@ -178,6 +179,7 @@ pub struct AssignmentClient {
     token: String,
     sentinel_version: String,
     control_tls: ControlTlsConfig,
+    command_journal: CommandJournal,
 }
 
 impl AssignmentClient {
@@ -209,7 +211,15 @@ impl AssignmentClient {
             token: token.to_string(),
             sentinel_version: sentinel_version.to_string(),
             control_tls,
+            command_journal: CommandJournal::open_in_memory(7, 100_000).map_err(|_| {
+                AssignmentError::InvalidConfiguration("command journal could not start")
+            })?,
         })
+    }
+
+    pub fn with_command_journal(mut self, command_journal: CommandJournal) -> Self {
+        self.command_journal = command_journal;
+        self
     }
 
     pub async fn request(&self) -> Result<AssignmentOutcome, AssignmentError> {
@@ -281,7 +291,10 @@ impl AssignmentClient {
         let mut temporary_attempt = 0;
         let mut connection_attempt = 0;
         let command_executor = Arc::new(tokio::sync::Mutex::new(
-            crate::commands::CommandExecutor::new(&self.sentinel_version),
+            crate::commands::CommandExecutor::with_journal(
+                &self.sentinel_version,
+                self.command_journal.clone(),
+            ),
         ));
 
         loop {

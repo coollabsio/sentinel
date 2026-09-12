@@ -246,6 +246,8 @@ fn defaults_match_go_implementation() {
         ("STORAGE_VOLUMES_ENABLED", ""),
         ("STORAGE_VOLUMES_REFRESH_RATE_SECONDS", ""),
         ("HOST_MOUNT_PREFIX", ""),
+        ("SENTINEL_COMMAND_RETENTION_DAYS", ""),
+        ("SENTINEL_COMMAND_MAX_RECORDS", ""),
     ]);
     let c = Config::load(false).unwrap();
     assert_eq!(c.refresh_rate_seconds, 5);
@@ -255,6 +257,12 @@ fn defaults_match_go_implementation() {
     assert!(!c.debug);
     assert_eq!(c.bind_addr.port(), 8888);
     assert_eq!(c.metrics_file.to_str().unwrap(), "/app/db/metrics.sqlite");
+    assert_eq!(
+        c.command_journal_file.to_str().unwrap(),
+        "/app/db/commands.sqlite"
+    );
+    assert_eq!(c.command_retention_days, 7);
+    assert_eq!(c.command_max_records, 100_000);
     // Storage collection defaults on; the expensive volume walk too, but is
     // inert until host paths are mounted (see HOST_MOUNT_PREFIX).
     assert!(c.storage_enabled);

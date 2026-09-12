@@ -1,6 +1,3 @@
-use std::collections::{HashMap, VecDeque};
-use std::time::Duration;
-
 use prost::Message;
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
@@ -11,18 +8,10 @@ use sentinel_protocol::control::v1::{
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
 };
+use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
 
 pub(crate) const CONTAINER_RUNTIMES: [&str; 2] = ["podman", "docker"];
-
-const MAX_CACHED_RESULTS: usize = 1_000;
-const RESULT_TTL: Duration = Duration::from_secs(30 * 60);
-
-struct CachedCommand {
-    request: Vec<u8>,
-    result: CommandResult,
-    cached_at_unix_ms: i64,
-}
 
 pub(crate) struct CommandExecution {
     pub(crate) accepted: bool,
@@ -31,16 +20,22 @@ pub(crate) struct CommandExecution {
 
 pub(crate) struct CommandExecutor {
     sentinel_version: String,
-    results: HashMap<String, CachedCommand>,
-    order: VecDeque<String>,
+    journal: CommandJournal,
 }
 
 impl CommandExecutor {
+    #[cfg(test)]
     pub(crate) fn new(sentinel_version: &str) -> Self {
+        Self::with_journal(
+            sentinel_version,
+            CommandJournal::open_in_memory(7, 100_000).expect("in-memory command journal"),
+        )
+    }
+
+    pub(crate) fn with_journal(sentinel_version: &str, journal: CommandJournal) -> Self {
         Self {
             sentinel_version: sentinel_version.into(),
-            results: HashMap::new(),
-            order: VecDeque::new(),
+            journal,
         }
     }
 
@@ -49,24 +44,55 @@ impl CommandExecutor {
         command: Command,
         capability_accepted: bool,
     ) -> CommandExecution {
-        self.prune();
         let request = command.encode_to_vec();
-        if let Some(cached) = self.results.get(&command.command_id) {
-            return if cached.request == request {
-                CommandExecution {
-                    accepted: true,
-                    result: cached.result.clone(),
-                }
-            } else {
-                CommandExecution {
+        match self.journal.lookup(&command.command_id, &request) {
+            Ok(CommandLookup::Completed(result)) => {
+                return match CommandResult::decode(result.as_slice()) {
+                    Ok(result) => CommandExecution {
+                        accepted: true,
+                        result,
+                    },
+                    Err(_) => CommandExecution {
+                        accepted: false,
+                        result: failed(
+                            &command.command_id,
+                            "command_journal_corrupt",
+                            "The stored command result is invalid.",
+                        ),
+                    },
+                };
+            }
+            Ok(CommandLookup::Conflict) => {
+                return CommandExecution {
                     accepted: false,
                     result: failed(
                         &command.command_id,
                         "command_id_conflict",
                         "Command ID was already used for another request.",
                     ),
-                }
-            };
+                };
+            }
+            Ok(CommandLookup::Interrupted) => {
+                return CommandExecution {
+                    accepted: true,
+                    result: failed(
+                        &command.command_id,
+                        "command_interrupted",
+                        "The prior execution was interrupted and was not repeated.",
+                    ),
+                };
+            }
+            Err(_) => {
+                return CommandExecution {
+                    accepted: false,
+                    result: failed(
+                        &command.command_id,
+                        "command_journal_unavailable",
+                        "The durable command journal is unavailable.",
+                    ),
+                };
+            }
+            Ok(CommandLookup::Missing) => {}
         }
         let has_valid_payload = match (command.command_type.as_str(), command.payload.as_ref()) {
             (CAPABILITY_SYSTEM_PING, Some(Payload::SystemPing(ping))) => !ping.nonce.is_empty(),
@@ -83,13 +109,71 @@ impl CommandExecutor {
             || command.expires_at_unix_ms <= now_millis()
             || !capability_accepted)
             && has_valid_payload;
-        let result = if !accepted {
-            failed(
-                &command.command_id,
-                "invalid_command",
-                "Command is invalid or expired.",
-            )
-        } else if let Some(Payload::SystemPing(ping)) = command.payload {
+        if !accepted {
+            return CommandExecution {
+                accepted: false,
+                result: failed(
+                    &command.command_id,
+                    "invalid_command",
+                    "Command is invalid or expired.",
+                ),
+            };
+        }
+
+        match self
+            .journal
+            .start(&command.command_id, &request, now_millis())
+        {
+            Ok(CommandStart::Completed(result)) => {
+                return match CommandResult::decode(result.as_slice()) {
+                    Ok(result) => CommandExecution {
+                        accepted: true,
+                        result,
+                    },
+                    Err(_) => CommandExecution {
+                        accepted: false,
+                        result: failed(
+                            &command.command_id,
+                            "command_journal_corrupt",
+                            "The stored command result is invalid.",
+                        ),
+                    },
+                };
+            }
+            Ok(CommandStart::Conflict) => {
+                return CommandExecution {
+                    accepted: false,
+                    result: failed(
+                        &command.command_id,
+                        "command_id_conflict",
+                        "Command ID was already used for another request.",
+                    ),
+                };
+            }
+            Ok(CommandStart::Interrupted) => {
+                return CommandExecution {
+                    accepted: true,
+                    result: failed(
+                        &command.command_id,
+                        "command_interrupted",
+                        "The prior execution was interrupted and was not repeated.",
+                    ),
+                };
+            }
+            Err(_) => {
+                return CommandExecution {
+                    accepted: false,
+                    result: failed(
+                        &command.command_id,
+                        "command_journal_unavailable",
+                        "The durable command journal is unavailable.",
+                    ),
+                };
+            }
+            Ok(CommandStart::Started) => {}
+        }
+
+        let result = if let Some(Payload::SystemPing(ping)) = command.payload {
             CommandResult {
                 event_id: format!("{}:result", command.command_id),
                 command_id: command.command_id.clone(),
@@ -132,39 +216,15 @@ impl CommandExecutor {
                 "Ping payload is missing.",
             )
         };
-        self.remember(command.command_id, request, result.clone());
-        CommandExecution { accepted, result }
-    }
-
-    fn remember(&mut self, command_id: String, request: Vec<u8>, result: CommandResult) {
-        if self.results.len() >= MAX_CACHED_RESULTS
-            && let Some(oldest) = self.order.pop_front()
+        if let Err(error) =
+            self.journal
+                .finish(&command.command_id, &result.encode_to_vec(), now_millis())
         {
-            self.results.remove(&oldest);
+            tracing::warn!(%error, command_id = %command.command_id, "could not persist command result");
         }
-        self.order.push_back(command_id.clone());
-        self.results.insert(
-            command_id,
-            CachedCommand {
-                request,
-                result,
-                cached_at_unix_ms: now_millis(),
-            },
-        );
-    }
-
-    fn prune(&mut self) {
-        let cutoff = now_millis() - RESULT_TTL.as_millis() as i64;
-        while let Some(oldest) = self.order.front() {
-            if self
-                .results
-                .get(oldest)
-                .is_some_and(|cached| cached.cached_at_unix_ms >= cutoff)
-            {
-                break;
-            }
-            let oldest = self.order.pop_front().expect("front exists");
-            self.results.remove(&oldest);
+        CommandExecution {
+            accepted: true,
+            result,
         }
     }
 }

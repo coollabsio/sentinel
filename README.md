@@ -83,6 +83,8 @@ Sentinel is configured using environment variables:
 | `HOST_MOUNT_PREFIX` | *(empty)* | Path prefix under which host paths are mounted into Sentinel's container, used to resolve volume/bind sources |
 | `DEBUG` | `false` | Enable verbose logging, `human_friendly_time` fields, and the `/api/stats` route |
 | `PORT` | `8888` | HTTP server port |
+| `SENTINEL_COMMAND_RETENTION_DAYS` | 7 | Days to keep completed control-command results for replay |
+| `SENTINEL_COMMAND_MAX_RECORDS` | 100000 | Maximum completed control-command results; active records are not removed |
 
 #### Traffic Analytics Variables
 

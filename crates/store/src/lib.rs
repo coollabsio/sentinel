@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod command_journal;
 pub mod metrics;
 pub mod retention;
 pub mod schema;
@@ -9,6 +10,7 @@ pub mod traffic;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+pub use command_journal::{CommandJournal, CommandLookup, CommandStart};
 pub use metrics::{
     ContainerDiskRow, ContainerDiskSample, ContainerSample, CpuRow, DiskRow, DiskSample, MemRow,
 };
