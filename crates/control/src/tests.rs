@@ -73,6 +73,11 @@ fn executes_system_info_commands() {
 }
 
 #[test]
+fn system_info_prefers_podman_when_a_docker_compatibility_command_is_also_present() {
+    assert_eq!(crate::commands::CONTAINER_RUNTIMES, ["podman", "docker"]);
+}
+
+#[test]
 fn rejects_a_command_type_and_payload_mismatch() {
     use sentinel_protocol::control::v1::command::Payload;
     use sentinel_protocol::control::v1::{Command, SystemInfoRequest};

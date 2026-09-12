@@ -10,6 +10,8 @@ use sentinel_protocol::control::v1::{
 use sentinel_protocol::{CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING};
 use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
 
+pub(crate) const CONTAINER_RUNTIMES: [&str; 2] = ["podman", "docker"];
+
 const MAX_CACHED_RESULTS: usize = 1_000;
 const RESULT_TTL: Duration = Duration::from_secs(30 * 60);
 
@@ -183,7 +185,7 @@ fn system_info(sentinel_version: &str) -> SystemInfoResult {
 }
 
 fn container_runtime() -> (Option<String>, Option<String>) {
-    for runtime in ["docker", "podman"] {
+    for runtime in CONTAINER_RUNTIMES {
         let output = std::process::Command::new(runtime)
             .args(["version", "--format", "{{.Server.Version}}"])
             .output();
