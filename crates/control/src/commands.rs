@@ -45,7 +45,7 @@ impl CommandExecutor {
         command: Command,
         capability_accepted: bool,
     ) -> CommandExecution {
-        let request = command.encode_to_vec();
+        let request = journal_request(&command);
         match self.journal.lookup(&command.command_id, &request) {
             Ok(CommandLookup::Completed(result)) => {
                 return match CommandResult::decode(result.as_slice()) {
@@ -245,6 +245,13 @@ impl CommandExecutor {
             result,
         }
     }
+}
+
+pub(crate) fn journal_request(command: &Command) -> Vec<u8> {
+    let mut command = command.clone();
+    command.created_at_unix_ms = 0;
+    command.expires_at_unix_ms = 0;
+    command.encode_to_vec()
 }
 
 fn workload_deploy(request: &WorkloadDeployRequest) -> Result<WorkloadDeployResult, String> {

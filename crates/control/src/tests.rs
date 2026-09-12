@@ -950,11 +950,32 @@ fn command_results_replay_from_the_durable_journal_after_restart() {
 }
 
 #[test]
+fn command_recovery_ignores_dispatch_timestamps() {
+    let journal = store::CommandJournal::open_in_memory(7, 100_000).unwrap();
+    let first_command = durable_ping_command("recovered-command", "nonce");
+    let first = crate::commands::CommandExecutor::with_journal("dev", journal.clone())
+        .execute(first_command, true);
+    let mut recovery_command = durable_ping_command("recovered-command", "nonce");
+    recovery_command.created_at_unix_ms = 123_456;
+    recovery_command.expires_at_unix_ms = i64::MAX - 1;
+
+    let recovered = crate::commands::CommandExecutor::with_journal("dev", journal)
+        .execute(recovery_command, true);
+
+    assert!(recovered.accepted);
+    assert_eq!(first.result, recovered.result);
+}
+
+#[test]
 fn interrupted_durable_commands_are_not_executed_again() {
     let journal = store::CommandJournal::open_in_memory(7, 100_000).unwrap();
     let command = durable_ping_command("interrupted-command", "nonce");
     journal
-        .start(&command.command_id, &command.encode_to_vec(), 1)
+        .start(
+            &command.command_id,
+            &crate::commands::journal_request(&command),
+            1,
+        )
         .unwrap();
 
     let execution =
@@ -980,7 +1001,11 @@ fn completed_commands_replay_after_the_request_expired() {
         ..Default::default()
     };
     journal
-        .start(&command.command_id, &command.encode_to_vec(), 1)
+        .start(
+            &command.command_id,
+            &crate::commands::journal_request(&command),
+            1,
+        )
         .unwrap();
     journal
         .finish(&command.command_id, &result.encode_to_vec(), 2)
