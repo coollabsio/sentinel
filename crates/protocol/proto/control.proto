@@ -66,6 +66,7 @@ message Command {
     FirewallReconcileRequest firewall_reconcile = 19;
     CorrosionInspectRequest corrosion_inspect = 21;
     CorrosionReconcileRequest corrosion_reconcile = 22;
+    CorrosionEndpointReconcileRequest corrosion_endpoint_reconcile = 23;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -100,6 +101,7 @@ message CommandResult {
     FirewallReconcileResult firewall_reconcile = 19;
     CorrosionInspectResult corrosion_inspect = 21;
     CorrosionReconcileResult corrosion_reconcile = 22;
+    CorrosionEndpointReconcileResult corrosion_endpoint_reconcile = 23;
     CommandError error = 20;
   }
 }
@@ -230,6 +232,18 @@ message CorrosionInspectRequest {}
 message CorrosionInspectResult { string version = 1; string member_state = 2; uint64 endpoint_count = 3; optional int64 last_convergence_unix_seconds = 4; }
 message CorrosionReconcileRequest { string version = 1; string cluster_id = 2; string bind_address = 3; repeated string peers = 4; }
 message CorrosionReconcileResult { CorrosionInspectResult state = 1; bool changed = 2; }
+message WorkloadEndpoint {
+  string workload_id = 1;
+  string namespace = 2;
+  string owner_node_ip = 3;
+  string container_ip = 4;
+  string state = 5;
+  string health = 6;
+  int64 updated_at_unix_seconds = 7;
+  int64 expires_at_unix_seconds = 8;
+}
+message CorrosionEndpointReconcileRequest { string owner_node_ip = 1; repeated WorkloadEndpoint endpoints = 2; }
+message CorrosionEndpointReconcileResult { string owner_node_ip = 1; uint64 endpoint_count = 2; }
 
 message CommandError {
   string code = 1;

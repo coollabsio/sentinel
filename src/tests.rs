@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use super::{assignment_client, unexpected_service_exit};
+use clap::Parser;
+
+use super::{Cli, CliCommand, assignment_client, unexpected_service_exit};
 
 fn control_tls_config() -> config::ControlTlsConfig {
     config::ControlTlsConfig {
@@ -64,4 +66,24 @@ fn invalid_control_assignment_configuration_does_not_fail_startup() {
     );
 
     assert!(client.is_none());
+}
+
+#[test]
+fn parses_the_private_discovery_dns_process_mode() {
+    let cli = Cli::try_parse_from([
+        "sentinel",
+        "discovery-dns",
+        "--bind",
+        "10.240.0.2:53",
+        "--zone",
+        "coolify.internal",
+        "--corrosion-config",
+        "/etc/corrosion/config.toml",
+    ])
+    .unwrap();
+
+    assert!(matches!(
+        cli.command,
+        Some(CliCommand::DiscoveryDns { bind, .. }) if bind.to_string() == "10.240.0.2:53"
+    ));
 }

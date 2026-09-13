@@ -3,8 +3,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::sync::{Mutex, Semaphore, watch};
+
+mod discovery_dns;
 
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -16,7 +18,23 @@ const GEOIP_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 #[derive(Parser)]
 #[command(version = config::VERSION, about = "Collect and push server metrics")]
-struct Cli {}
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    /// Serve private workload discovery records from the local Corrosion view.
+    DiscoveryDns {
+        #[arg(long)]
+        bind: SocketAddr,
+        #[arg(long, default_value = "coolify.internal")]
+        zone: String,
+        #[arg(long, default_value = "/etc/corrosion/config.toml")]
+        corrosion_config: std::path::PathBuf,
+    },
+}
 
 fn unexpected_service_exit(
     result: Option<Result<Result<(), String>, tokio::task::JoinError>>,
@@ -71,7 +89,22 @@ async fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListe
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    Cli::parse();
+    let cli = Cli::parse();
+
+    if let Some(CliCommand::DiscoveryDns {
+        bind,
+        zone,
+        corrosion_config,
+    }) = cli.command
+    {
+        return match discovery_dns::run(bind, &zone, &corrosion_config) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("sentinel discovery-dns: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
 
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,

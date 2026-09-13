@@ -8,17 +8,19 @@ use axum::routing::post;
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    Command, CommandStatus, ContainerListRequest, ContainerPort, CorrosionInspectRequest,
-    CorrosionReconcileRequest, FirewallInspectRequest, FirewallReconcileRequest, FirewallRule,
-    SystemInfoRequest, SystemPingRequest, WireguardInspectRequest, WireguardKeyEnsureRequest,
-    WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest, WorkloadEnvironmentVariable,
-    WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
+    Command, CommandStatus, ContainerListRequest, ContainerPort, CorrosionEndpointReconcileRequest,
+    CorrosionInspectRequest, CorrosionReconcileRequest, FirewallInspectRequest,
+    FirewallReconcileRequest, FirewallRule, SystemInfoRequest, SystemPingRequest,
+    WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest,
+    WorkloadDeployRequest, WorkloadEndpoint, WorkloadEnvironmentVariable, WorkloadLabel,
+    WorkloadLifecycleAction, WorkloadLifecycleRequest,
 };
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE,
-    CAPABILITY_FIREWALL_INSPECT, CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_SYSTEM_INFO,
-    CAPABILITY_SYSTEM_PING, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
-    CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
+    CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT,
+    CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
+    CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -155,6 +157,27 @@ struct CorrosionReconcileApiRequest {
     bind_address: String,
     #[serde(default)]
     peers: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkloadEndpointApiRequest {
+    workload_id: String,
+    namespace: String,
+    owner_node_ip: String,
+    container_ip: String,
+    state: String,
+    health: String,
+    updated_at_unix_seconds: i64,
+    expires_at_unix_seconds: i64,
+}
+
+#[derive(Deserialize)]
+struct CorrosionEndpointReconcileApiRequest {
+    server_id: String,
+    command_id: String,
+    owner_node_ip: String,
+    #[serde(default)]
+    endpoints: Vec<WorkloadEndpointApiRequest>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -298,6 +321,10 @@ pub async fn serve(
         .route(
             "/v1/commands/discovery.corrosion.reconcile",
             post(corrosion_reconcile),
+        )
+        .route(
+            "/v1/commands/discovery.corrosion.endpoints.reconcile",
+            post(corrosion_endpoint_reconcile),
         )
         .with_state(ApiState { registry, token });
     let listen = listener.local_addr()?;
@@ -561,6 +588,48 @@ async fn corrosion_reconcile(
     Ok(Json(
         serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "changed": value.changed, "version": discovery.version, "member_state": discovery.member_state, "endpoint_count": discovery.endpoint_count, "last_convergence_unix_seconds": discovery.last_convergence_unix_seconds}),
     ))
+}
+
+async fn corrosion_endpoint_reconcile(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CorrosionEndpointReconcileApiRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    let endpoints = request
+        .endpoints
+        .into_iter()
+        .map(|endpoint| WorkloadEndpoint {
+            workload_id: endpoint.workload_id,
+            namespace: endpoint.namespace,
+            owner_node_ip: endpoint.owner_node_ip,
+            container_ip: endpoint.container_ip,
+            state: endpoint.state,
+            health: endpoint.health,
+            updated_at_unix_seconds: endpoint.updated_at_unix_seconds,
+            expires_at_unix_seconds: endpoint.expires_at_unix_seconds,
+        })
+        .collect();
+    let result = dispatch_network(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
+        Payload::CorrosionEndpointReconcile(CorrosionEndpointReconcileRequest {
+            owner_node_ip: request.owner_node_ip,
+            endpoints,
+        }),
+    )
+    .await?;
+    let Some(command_result::Payload::CorrosionEndpointReconcile(value)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    };
+    Ok(Json(serde_json::json!({
+        "command_id": request.command_id,
+        "observed_at_unix_ms": result.observed_at_unix_ms,
+        "owner_node_ip": value.owner_node_ip,
+        "endpoint_count": value.endpoint_count,
+    })))
 }
 
 async fn workload_lifecycle(

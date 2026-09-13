@@ -475,7 +475,8 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "network.firewall.inspect.v1",
             "network.firewall.reconcile.v1",
             "discovery.corrosion.inspect.v1",
-            "discovery.corrosion.reconcile.v1"
+            "discovery.corrosion.reconcile.v1",
+            "discovery.corrosion.endpoints.reconcile.v1"
         ])
     );
 }
@@ -1006,6 +1007,95 @@ fn command_recovery_ignores_dispatch_timestamps() {
 
     assert!(recovered.accepted);
     assert_eq!(first.result, recovered.result);
+}
+
+#[test]
+fn reconciles_an_owned_corrosion_endpoint_snapshot_through_the_durable_command_path() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("etc/corrosion")).unwrap();
+    std::fs::write(
+        root.path().join("etc/corrosion/coolify-owner"),
+        "10.240.0.2\n",
+    )
+    .unwrap();
+    let command = sentinel_protocol::control::v1::Command {
+        command_id: "endpoint-snapshot-1".into(),
+        command_type: sentinel_protocol::CAPABILITY_CORROSION_ENDPOINT_RECONCILE.into(),
+        payload_version: 1,
+        payload: Some(
+            sentinel_protocol::control::v1::command::Payload::CorrosionEndpointReconcile(
+                sentinel_protocol::control::v1::CorrosionEndpointReconcileRequest {
+                    owner_node_ip: "10.240.0.2".into(),
+                    endpoints: vec![sentinel_protocol::control::v1::WorkloadEndpoint {
+                        workload_id: "web".into(),
+                        namespace: "default".into(),
+                        owner_node_ip: "10.240.0.2".into(),
+                        container_ip: "10.240.0.2".into(),
+                        state: "running".into(),
+                        health: "unknown".into(),
+                        updated_at_unix_seconds: 1_700_000_000,
+                        expires_at_unix_seconds: 1_700_000_300,
+                    }],
+                },
+            ),
+        ),
+        expires_at_unix_ms: i64::MAX,
+        ..Default::default()
+    };
+
+    let execution = crate::commands::CommandExecutor::new("dev")
+        .with_network_root(root.path())
+        .execute(command, true);
+
+    assert!(execution.accepted);
+    assert_eq!(
+        execution.result.status,
+        sentinel_protocol::control::v1::CommandStatus::Succeeded as i32
+    );
+    let Some(sentinel_protocol::control::v1::command_result::Payload::CorrosionEndpointReconcile(
+        result,
+    )) = execution.result.payload
+    else {
+        panic!("expected endpoint reconcile result");
+    };
+    assert_eq!(result.owner_node_ip, "10.240.0.2");
+    assert_eq!(result.endpoint_count, 1);
+}
+
+#[test]
+fn rejects_a_corrosion_endpoint_payload_with_mixed_owners_before_journaling() {
+    let command = sentinel_protocol::control::v1::Command {
+        command_id: "endpoint-snapshot-forged".into(),
+        command_type: sentinel_protocol::CAPABILITY_CORROSION_ENDPOINT_RECONCILE.into(),
+        payload_version: 1,
+        payload: Some(
+            sentinel_protocol::control::v1::command::Payload::CorrosionEndpointReconcile(
+                sentinel_protocol::control::v1::CorrosionEndpointReconcileRequest {
+                    owner_node_ip: "10.240.0.2".into(),
+                    endpoints: vec![sentinel_protocol::control::v1::WorkloadEndpoint {
+                        workload_id: "web".into(),
+                        namespace: "default".into(),
+                        owner_node_ip: "10.240.0.3".into(),
+                        container_ip: "10.240.0.3".into(),
+                        state: "running".into(),
+                        health: "healthy".into(),
+                        updated_at_unix_seconds: 1_700_000_000,
+                        expires_at_unix_seconds: 1_700_000_300,
+                    }],
+                },
+            ),
+        ),
+        expires_at_unix_ms: i64::MAX,
+        ..Default::default()
+    };
+
+    let execution = crate::commands::CommandExecutor::new("dev").execute(command, true);
+
+    assert!(!execution.accepted);
+    assert_eq!(
+        execution.result.status,
+        sentinel_protocol::control::v1::CommandStatus::Failed as i32
+    );
 }
 
 #[test]

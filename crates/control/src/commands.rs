@@ -10,10 +10,11 @@ use sentinel_protocol::control::v1::{
     WorkloadLifecycleRequest, WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE,
-    CAPABILITY_FIREWALL_INSPECT, CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_SYSTEM_INFO,
-    CAPABILITY_SYSTEM_PING, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
-    CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
+    CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT,
+    CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
+    CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
@@ -136,6 +137,10 @@ impl CommandExecutor {
             (CAPABILITY_CORROSION_RECONCILE, Some(Payload::CorrosionReconcile(request))) => {
                 crate::network::render_corrosion(request).is_ok()
             }
+            (
+                CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
+                Some(Payload::CorrosionEndpointReconcile(request)),
+            ) => crate::network::validate_corrosion_endpoints(request).is_ok(),
             _ => false,
         };
         let accepted = !(command.command_id.is_empty()
@@ -153,6 +158,7 @@ impl CommandExecutor {
                     | CAPABILITY_FIREWALL_RECONCILE
                     | CAPABILITY_CORROSION_INSPECT
                     | CAPABILITY_CORROSION_RECONCILE
+                    | CAPABILITY_CORROSION_ENDPOINT_RECONCILE
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
@@ -341,6 +347,18 @@ impl CommandExecutor {
                     command_result::Payload::CorrosionReconcile(result),
                 ),
                 Err(message) => failed(&command.command_id, "corrosion_reconcile_failed", &message),
+            }
+        } else if let Some(Payload::CorrosionEndpointReconcile(request)) = command.payload {
+            match crate::network::reconcile_corrosion_endpoints(&self.network_root, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::CorrosionEndpointReconcile(result),
+                ),
+                Err(message) => failed(
+                    &command.command_id,
+                    "corrosion_endpoint_reconcile_failed",
+                    &message,
+                ),
             }
         } else {
             failed(

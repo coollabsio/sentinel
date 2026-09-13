@@ -229,6 +229,34 @@ async fn registry_times_out_when_sentinel_does_not_return_a_result() {
     assert_eq!(result.unwrap_err(), CommandDispatchError::Timeout);
 }
 
+#[tokio::test]
+async fn endpoint_reconcile_route_requires_internal_authentication() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        ConnectionRegistry::default(),
+        "internal-secret".into(),
+    ));
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{address}/v1/commands/discovery.corrosion.endpoints.reconcile"
+        ))
+        .json(&serde_json::json!({
+            "server_id": "server-1",
+            "command_id": "endpoint-1",
+            "owner_node_ip": "10.240.0.2",
+            "endpoints": []
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    server.abort();
+}
+
 struct TestTlsMaterial {
     certificate: String,
     private_key: String,
