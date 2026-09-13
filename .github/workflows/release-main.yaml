@@ -6,6 +6,7 @@ name: Sentinel Release Main
 # (`release.yaml`), and Docker Hub only carries released/`next` images.
 
 on:
+  workflow_dispatch:
   push:
     branches: ['main']
 
