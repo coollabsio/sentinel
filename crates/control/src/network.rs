@@ -512,12 +512,16 @@ pub(crate) fn reconcile_wireguard(
         .is_some_and(|state| state.0 == request.revision && state.1 == configuration_hash)
     {
         return Ok(WireguardReconcileResult {
-            state: Some(wireguard_state(
-                request,
-                public_key,
-                configuration_hash,
-                false,
-            )),
+            state: Some(if root == Path::new("/") {
+                inspect_wireguard(
+                    root,
+                    &request.interface,
+                    request.revision,
+                    &configuration_hash,
+                )
+            } else {
+                wireguard_state(request, public_key, configuration_hash, false)
+            }),
             changed: false,
             rollback_cancelled: true,
         });
@@ -579,7 +583,16 @@ fn wireguard_state(
         interface: request.interface.clone(),
         public_key,
         listen_port: request.listen_port,
-        peers: Vec::new(),
+        peers: request
+            .peers
+            .iter()
+            .map(|peer| WireguardPeerState {
+                public_key: peer.public_key.clone(),
+                endpoint: peer.endpoint.clone(),
+                allowed_ips: vec![peer.allowed_ip.clone()],
+                latest_handshake_unix_seconds: 0,
+            })
+            .collect(),
         applied_revision: request.revision,
         configuration_hash,
         drifted,
@@ -1294,6 +1307,8 @@ mod tests {
         assert!(first.changed);
         assert!(!second.changed);
         assert!(first.rollback_cancelled && second.rollback_cancelled);
+        assert_eq!(first.state.as_ref().unwrap().peers.len(), 1);
+        assert_eq!(second.state.as_ref().unwrap().peers.len(), 1);
         assert_eq!(
             fs::metadata(temp.path().join("etc/wireguard/coolify0.conf"))
                 .unwrap()
