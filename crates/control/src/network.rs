@@ -661,14 +661,28 @@ fn activate_wireguard(
             )
         }
     })
-    .and_then(|_| configure_discovery_resolver(&request.interface, &request.address));
+    .and_then(|_| {
+        let peer_addresses = request
+            .peers
+            .iter()
+            .map(|peer| peer.allowed_ip.as_str())
+            .collect::<Vec<_>>();
+        configure_discovery_resolver(&request.interface, &request.address, &peer_addresses)
+    });
     if healthy.is_err() {
         let rollback_service = format!("{rollback_unit}.service");
         let rollback = run(
             Command::new("systemctl").args(rollback_start_arguments(&rollback_service)),
             "WireGuard rollback failed.",
         )
-        .and_then(|_| configure_discovery_resolver(&request.interface, &request.address));
+        .and_then(|_| {
+            let peer_addresses = request
+                .peers
+                .iter()
+                .map(|peer| peer.allowed_ip.as_str())
+                .collect::<Vec<_>>();
+            configure_discovery_resolver(&request.interface, &request.address, &peer_addresses)
+        });
         let _ = Command::new("systemctl")
             .args(["stop", &format!("{rollback_unit}.timer")])
             .status();
@@ -924,7 +938,12 @@ pub(crate) fn reconcile_corrosion(
             ]),
             "The Coolify discovery DNS service did not become active.",
         )?;
-        configure_discovery_resolver("coolify0", &request.bind_address)?;
+        let peer_addresses = request
+            .peers
+            .iter()
+            .filter_map(|peer| peer.rsplit_once(':').map(|(address, _)| address))
+            .collect::<Vec<_>>();
+        configure_discovery_resolver("coolify0", &request.bind_address, &peer_addresses)?;
     }
     Ok(CorrosionReconcileResult {
         state: Some(inspect_corrosion(root)),
@@ -1071,7 +1090,11 @@ fn set_corrosion_cluster_id(cluster_id: u16) -> Result<(), String> {
     Err(last_error)
 }
 
-fn discovery_resolver_commands(interface: &str, address: &str) -> Result<[[String; 3]; 2], String> {
+fn discovery_resolver_commands(
+    interface: &str,
+    address: &str,
+    peer_addresses: &[&str],
+) -> Result<Vec<Vec<String>>, String> {
     validate_interface(interface)?;
     let bind_address = address.strip_suffix("/32").unwrap_or(address);
     let bind_address = bind_address
@@ -1081,18 +1104,38 @@ fn discovery_resolver_commands(interface: &str, address: &str) -> Result<[[Strin
         .ok_or("The discovery DNS address is invalid.")?
         .to_string();
 
-    Ok([
-        ["dns".into(), interface.into(), bind_address],
-        [
-            "domain".into(),
-            interface.into(),
-            "~coolify.internal".into(),
-        ],
+    let mut addresses = peer_addresses
+        .iter()
+        .copied()
+        .chain(std::iter::once(bind_address.as_str()))
+        .filter_map(|address| address.strip_suffix("/32").unwrap_or(address).parse().ok())
+        .collect::<Vec<std::net::Ipv4Addr>>();
+    addresses.sort_unstable();
+    addresses.dedup();
+    let reverse_zones = addresses.into_iter().map(|address| {
+        let octets = address.octets();
+        format!(
+            "~{}.{}.{}.{}.in-addr.arpa",
+            octets[3], octets[2], octets[1], octets[0]
+        )
+    });
+
+    Ok(vec![
+        vec!["dns".into(), interface.into(), bind_address],
+        std::iter::once("domain".into())
+            .chain(std::iter::once(interface.into()))
+            .chain(std::iter::once("~coolify.internal".into()))
+            .chain(reverse_zones)
+            .collect(),
     ])
 }
 
-fn configure_discovery_resolver(interface: &str, address: &str) -> Result<(), String> {
-    for arguments in discovery_resolver_commands(interface, address)? {
+fn configure_discovery_resolver(
+    interface: &str,
+    address: &str,
+    peer_addresses: &[&str],
+) -> Result<(), String> {
+    for arguments in discovery_resolver_commands(interface, address, peer_addresses)? {
         run(
             Command::new("resolvectl").args(arguments),
             "The Coolify discovery resolver could not be configured.",
@@ -1404,13 +1447,25 @@ mod tests {
 
     #[test]
     fn discovery_resolver_configuration_tracks_a_recreated_wireguard_link() {
-        let commands = discovery_resolver_commands("mesh0", "10.240.0.2/32").unwrap();
+        let commands = discovery_resolver_commands(
+            "mesh0",
+            "10.0.0.130/32",
+            &["10.0.0.129/32", "10.0.0.131/32"],
+        )
+        .unwrap();
 
         assert_eq!(
             commands,
-            [
-                ["dns", "mesh0", "10.240.0.2"],
-                ["domain", "mesh0", "~coolify.internal"],
+            vec![
+                vec!["dns", "mesh0", "10.0.0.130"],
+                vec![
+                    "domain",
+                    "mesh0",
+                    "~coolify.internal",
+                    "~129.0.0.10.in-addr.arpa",
+                    "~130.0.0.10.in-addr.arpa",
+                    "~131.0.0.10.in-addr.arpa",
+                ],
             ]
         );
     }
