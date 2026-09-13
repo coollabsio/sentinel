@@ -656,12 +656,14 @@ fn activate_wireguard(
                 "Flux connectivity validation failed.",
             )
         }
-    });
+    })
+    .and_then(|_| configure_discovery_resolver(&request.interface, &request.address));
     if healthy.is_err() {
         let rollback = run(
             Command::new("systemctl").args(["start", &rollback_unit]),
             "WireGuard rollback failed.",
-        );
+        )
+        .and_then(|_| configure_discovery_resolver(&request.interface, &request.address));
         let _ = Command::new("systemctl")
             .args(["stop", &format!("{rollback_unit}.timer")])
             .status();
@@ -915,7 +917,7 @@ pub(crate) fn reconcile_corrosion(
             ]),
             "The Coolify discovery DNS service did not become active.",
         )?;
-        configure_discovery_resolver(&request.bind_address);
+        configure_discovery_resolver("coolify0", &request.bind_address)?;
     }
     Ok(CorrosionReconcileResult {
         state: Some(inspect_corrosion(root)),
@@ -1062,13 +1064,35 @@ fn set_corrosion_cluster_id(cluster_id: u16) -> Result<(), String> {
     Err(last_error)
 }
 
-fn configure_discovery_resolver(bind_address: &str) {
-    let _ = Command::new("resolvectl")
-        .args(["dns", "coolify0", bind_address])
-        .status();
-    let _ = Command::new("resolvectl")
-        .args(["domain", "coolify0", "~coolify.internal"])
-        .status();
+fn discovery_resolver_commands(interface: &str, address: &str) -> Result<[[String; 3]; 2], String> {
+    validate_interface(interface)?;
+    let bind_address = address.strip_suffix("/32").unwrap_or(address);
+    let bind_address = bind_address
+        .parse::<std::net::Ipv4Addr>()
+        .ok()
+        .filter(|address| !address.is_unspecified())
+        .ok_or("The discovery DNS address is invalid.")?
+        .to_string();
+
+    Ok([
+        ["dns".into(), interface.into(), bind_address],
+        [
+            "domain".into(),
+            interface.into(),
+            "~coolify.internal".into(),
+        ],
+    ])
+}
+
+fn configure_discovery_resolver(interface: &str, address: &str) -> Result<(), String> {
+    for arguments in discovery_resolver_commands(interface, address)? {
+        run(
+            Command::new("resolvectl").args(arguments),
+            "The Coolify discovery resolver could not be configured.",
+        )?;
+    }
+
+    Ok(())
 }
 
 fn corrosion_schema() -> &'static str {
@@ -1369,6 +1393,19 @@ mod tests {
         observed.listen_port = 51820;
         observed.peers.clear();
         assert!(!wireguard_state_matches(&request, &observed));
+    }
+
+    #[test]
+    fn discovery_resolver_configuration_tracks_a_recreated_wireguard_link() {
+        let commands = discovery_resolver_commands("mesh0", "10.240.0.2/32").unwrap();
+
+        assert_eq!(
+            commands,
+            [
+                ["dns", "mesh0", "10.240.0.2"],
+                ["domain", "mesh0", "~coolify.internal"],
+            ]
+        );
     }
 
     #[test]
