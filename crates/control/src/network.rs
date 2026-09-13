@@ -501,9 +501,16 @@ fn activate_wireguard(
         }
     });
     if healthy.is_err() {
+        let rollback = run(
+            Command::new("systemctl").args(["start", &rollback_unit]),
+            "WireGuard rollback failed.",
+        );
         let _ = Command::new("systemctl")
-            .args(["start", &rollback_unit])
+            .args(["stop", &format!("{rollback_unit}.timer")])
             .status();
+        if rollback.is_err() {
+            return Err("WireGuard activation and rollback failed.".into());
+        }
         return Err("WireGuard activation failed and rollback was requested.".into());
     }
     run(
@@ -621,9 +628,16 @@ fn activate_firewall(root: &Path, snapshot: &str, flux_probe_host: &str) -> Resu
         }
     });
     if let Err(error) = activated {
+        let rollback = run(
+            Command::new("systemctl").args(["start", "coolify-firewall-rollback.service"]),
+            "Firewall rollback failed.",
+        );
         let _ = Command::new("systemctl")
-            .args(["start", "coolify-firewall-rollback.service"])
+            .args(["stop", "coolify-firewall-rollback.timer"])
             .status();
+        if rollback.is_err() {
+            return Err("Firewall activation and rollback failed.".into());
+        }
         return Err(error);
     }
     run(
