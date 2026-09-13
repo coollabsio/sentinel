@@ -9,6 +9,7 @@ const DNS_TTL_SECONDS: u32 = 30;
 struct Question {
     workload: String,
     namespace: String,
+    record_type: u16,
     end: usize,
 }
 
@@ -48,7 +49,9 @@ fn parse_question(packet: &[u8], zone: &str) -> Result<Question, &'static str> {
     let fields = packet
         .get(offset..question_end)
         .ok_or("truncated DNS question")?;
-    if fields != [0, 1, 0, 1] {
+    let record_type = u16::from_be_bytes([fields[0], fields[1]]);
+    let class = u16::from_be_bytes([fields[2], fields[3]]);
+    if !matches!(record_type, 1 | 28) || class != 1 {
         return Err("unsupported DNS question");
     }
     let zone_labels = zone
@@ -67,14 +70,20 @@ fn parse_question(packet: &[u8], zone: &str) -> Result<Question, &'static str> {
     Ok(Question {
         workload: labels[0].clone(),
         namespace: labels[1].clone(),
+        record_type,
         end: question_end,
     })
 }
 
 fn build_response(packet: &[u8], question: &Question, endpoints: &[Ipv4Addr]) -> Vec<u8> {
+    let endpoints = if question.record_type == 1 {
+        endpoints
+    } else {
+        &[]
+    };
     let mut response = Vec::with_capacity(question.end + endpoints.len() * 16);
     response.extend_from_slice(&packet[0..2]);
-    response.extend_from_slice(if endpoints.is_empty() {
+    response.extend_from_slice(if endpoints.is_empty() && question.record_type == 1 {
         &[0x85, 0x83]
     } else {
         &[0x85, 0x80]
@@ -154,8 +163,12 @@ pub(crate) fn run(bind: SocketAddr, zone: &str, corrosion_config: &Path) -> Resu
         let Ok(question) = parse_question(request, &zone) else {
             continue;
         };
-        let endpoints = lookup_endpoints(corrosion_config, &question.workload, &question.namespace)
-            .unwrap_or_default();
+        let endpoints = if question.record_type == 1 {
+            lookup_endpoints(corrosion_config, &question.workload, &question.namespace)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let response = build_response(request, &question, &endpoints);
         socket
             .send_to(&response, source)
@@ -168,13 +181,18 @@ mod tests {
     use std::net::Ipv4Addr;
 
     fn query(name: &str) -> Vec<u8> {
+        query_with_type(name, 1)
+    }
+
+    fn query_with_type(name: &str, record_type: u16) -> Vec<u8> {
         let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
         for label in name.trim_end_matches('.').split('.') {
             packet.push(label.len() as u8);
             packet.extend_from_slice(label.as_bytes());
         }
         packet.push(0);
-        packet.extend_from_slice(&[0, 1, 0, 1]);
+        packet.extend_from_slice(&record_type.to_be_bytes());
+        packet.extend_from_slice(&[0, 1]);
         packet
     }
 
@@ -209,6 +227,16 @@ mod tests {
         assert_eq!(&response[0..2], &[0x12, 0x34]);
         assert_eq!(&response[6..8], &[0, 2]);
         assert_eq!(&response[response.len() - 4..], &[10, 240, 0, 3]);
+    }
+
+    #[test]
+    fn builds_an_empty_authoritative_response_for_aaaa_queries() {
+        let packet = query_with_type("web.default.coolify.internal.", 28);
+        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let response = super::build_response(&packet, &question, &[]);
+
+        assert_eq!(&response[2..4], &[0x85, 0x80]);
+        assert_eq!(&response[6..8], &[0, 0]);
     }
 
     #[test]
