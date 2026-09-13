@@ -41,24 +41,18 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
         credential_protocol,
     )
     .ok_or("protocol mismatch")?;
-    let capabilities = intersect_capabilities(
-        &claims.capabilities,
-        &hello.capabilities,
-        &[
-            CAPABILITY_SYSTEM_PING,
-            CAPABILITY_SYSTEM_INFO,
-            CAPABILITY_CONTAINER_LIST,
-            CAPABILITY_WORKLOAD_DEPLOY,
-            CAPABILITY_WORKLOAD_LIFECYCLE,
-            NETWORK_CAPABILITIES[0],
-            NETWORK_CAPABILITIES[1],
-            NETWORK_CAPABILITIES[2],
-            NETWORK_CAPABILITIES[3],
-            NETWORK_CAPABILITIES[4],
-            NETWORK_CAPABILITIES[5],
-            NETWORK_CAPABILITIES[6],
-        ],
-    );
+    let supported = [
+        CAPABILITY_SYSTEM_PING,
+        CAPABILITY_SYSTEM_INFO,
+        CAPABILITY_CONTAINER_LIST,
+        CAPABILITY_WORKLOAD_DEPLOY,
+        CAPABILITY_WORKLOAD_LIFECYCLE,
+    ]
+    .into_iter()
+    .chain(NETWORK_CAPABILITIES)
+    .collect::<Vec<_>>();
+    let capabilities =
+        intersect_capabilities(&claims.capabilities, &hello.capabilities, &supported);
     Ok(Negotiated {
         protocol_version,
         capabilities,

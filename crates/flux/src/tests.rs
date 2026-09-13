@@ -6,7 +6,9 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use rcgen::{CertificateParams, KeyPair};
-use sentinel_protocol::{CAPABILITY_SYSTEM_PING, PROTOCOL_MAX, PROTOCOL_MIN};
+use sentinel_protocol::{
+    CAPABILITY_CORROSION_ENDPOINT_RECONCILE, CAPABILITY_SYSTEM_PING, PROTOCOL_MAX, PROTOCOL_MIN,
+};
 use tonic::transport::Server;
 
 use super::*;
@@ -96,7 +98,10 @@ fn rejects_wrong_key_id_subject_and_excessive_lifetime() {
 fn selects_protocol_and_capabilities_for_valid_hello() {
     let claims = CredentialClaims {
         subject: "server-1".into(),
-        capabilities: vec![CAPABILITY_SYSTEM_PING.into()],
+        capabilities: vec![
+            CAPABILITY_SYSTEM_PING.into(),
+            CAPABILITY_CORROSION_ENDPOINT_RECONCILE.into(),
+        ],
         protocol_min: 1,
         protocol_max: 1,
         expires_at: i64::MAX,
@@ -106,7 +111,10 @@ fn selects_protocol_and_capabilities_for_valid_hello() {
         sentinel_version: "main".into(),
         protocol_min: 1,
         protocol_max: 1,
-        capabilities: vec![CAPABILITY_SYSTEM_PING.into()],
+        capabilities: vec![
+            CAPABILITY_SYSTEM_PING.into(),
+            CAPABILITY_CORROSION_ENDPOINT_RECONCILE.into(),
+        ],
         boot_id: "boot-1".into(),
         trust_bundle_version: 1,
     };
@@ -114,7 +122,13 @@ fn selects_protocol_and_capabilities_for_valid_hello() {
     let negotiated = negotiate(&claims, &hello).unwrap();
 
     assert_eq!(negotiated.protocol_version, 1);
-    assert_eq!(negotiated.capabilities, vec![CAPABILITY_SYSTEM_PING]);
+    assert_eq!(
+        negotiated.capabilities,
+        vec![
+            CAPABILITY_SYSTEM_PING,
+            CAPABILITY_CORROSION_ENDPOINT_RECONCILE
+        ]
+    );
 }
 
 #[tokio::test]
