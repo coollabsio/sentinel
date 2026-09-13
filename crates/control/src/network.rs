@@ -226,6 +226,11 @@ pub(crate) fn read_applied_state(root: &Path, interface: &str) -> Option<(u64, S
     Some((revision.parse().ok()?, hash.to_string()))
 }
 
+fn staged_wireguard_path(root: &Path, interface: &str) -> PathBuf {
+    root.join("etc/wireguard/.coolify-stage")
+        .join(format!("{interface}.conf"))
+}
+
 pub(crate) fn inspect_wireguard(
     root: &Path,
     interface: &str,
@@ -343,9 +348,7 @@ pub(crate) fn reconcile_wireguard(
             .map_err(|_| "The current WireGuard configuration could not be read.")?;
         atomic_write(&last_good_path, &old, 0o600)?;
     }
-    let mut staged_name = config_path.as_os_str().to_os_string();
-    staged_name.push(".coolify-stage");
-    let staged_path = PathBuf::from(staged_name);
+    let staged_path = staged_wireguard_path(root, &request.interface);
     atomic_write(&staged_path, config.as_bytes(), 0o600)?;
     if root == Path::new("/") {
         activate_wireguard(
@@ -888,6 +891,16 @@ mod tests {
             0o600
         );
         assert!(!format!("{first:?}").contains("private-secret"));
+    }
+
+    #[test]
+    fn wireguard_stage_keeps_a_valid_wg_quick_filename() {
+        let staged = staged_wireguard_path(Path::new("/"), "coolify0");
+
+        assert_eq!(
+            staged,
+            Path::new("/etc/wireguard/.coolify-stage/coolify0.conf")
+        );
     }
 
     #[test]
