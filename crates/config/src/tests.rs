@@ -251,6 +251,7 @@ fn defaults_match_go_implementation() {
     ]);
     let c = Config::load(false).unwrap();
     assert_eq!(c.refresh_rate_seconds, 5);
+    assert!(c.push_enabled);
     assert_eq!(c.push_interval_seconds, 60);
     assert_eq!(c.collector_retention_period_days, 7);
     assert!(!c.collector_enabled);
@@ -270,6 +271,18 @@ fn defaults_match_go_implementation() {
     assert!(c.storage_volumes_enabled);
     assert_eq!(c.storage_volumes_refresh_rate_seconds, 900);
     assert_eq!(c.host_mount_prefix, "");
+}
+
+#[test]
+fn push_can_be_disabled_for_control_only_hosts() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "https://example.com"),
+        ("PUSH_ENABLED", "false"),
+    ]);
+
+    assert!(!Config::load(false).unwrap().push_enabled);
 }
 
 #[test]

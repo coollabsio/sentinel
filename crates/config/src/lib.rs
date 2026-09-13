@@ -132,6 +132,7 @@ impl Config {
             None
         };
         let collector_enabled = bool_from_env("COLLECTOR_ENABLED", false)?;
+        let push_enabled = bool_from_env("PUSH_ENABLED", true)?;
         let push_interval_seconds = positive_from_env("PUSH_INTERVAL_SECONDS", 60)?;
         let refresh_rate_seconds = positive_from_env("COLLECTOR_REFRESH_RATE_SECONDS", 5)?;
         let collector_retention_period_days =
@@ -209,7 +210,7 @@ impl Config {
             control_plane_enabled,
             control_tls,
             refresh_rate_seconds,
-            push_enabled: true,
+            push_enabled,
             push_interval_seconds,
             push_path,
             push_url,

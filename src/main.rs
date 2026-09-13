@@ -263,13 +263,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Pusher
-    {
+    if config.push_enabled {
         let pusher = push::Pusher::new(config.clone(), docker.clone(), store.clone())?;
         let rx = shutdown_rx.clone();
         services.spawn(async move {
             pusher.run(rx).await;
             Ok::<(), String>(())
         });
+    } else {
+        tracing::info!("push disabled");
     }
 
     // V5 control assignment discovery. This remains fully dormant unless the
