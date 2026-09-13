@@ -307,9 +307,11 @@ pub(crate) fn reconcile_wireguard(
     let key_path = root
         .join("etc/coolify/network")
         .join(format!("{}.key", request.interface));
-    if root == Path::new("/") && !key_path.exists() {
-        ensure_key(root, &request.interface)?;
-    }
+    let public_key = if root == Path::new("/") {
+        ensure_key(root, &request.interface)?
+    } else {
+        String::new()
+    };
     let private_key = fs::read_to_string(&key_path)
         .map_err(|_| "The WireGuard private key is missing.".to_string())?;
     let config = render_wireguard(request, private_key.trim())?;
@@ -320,7 +322,12 @@ pub(crate) fn reconcile_wireguard(
         .is_some_and(|state| state.0 == request.revision && state.1 == configuration_hash)
     {
         return Ok(WireguardReconcileResult {
-            state: Some(wireguard_state(request, configuration_hash, false)),
+            state: Some(wireguard_state(
+                request,
+                public_key,
+                configuration_hash,
+                false,
+            )),
             changed: false,
             rollback_cancelled: true,
         });
@@ -359,7 +366,16 @@ pub(crate) fn reconcile_wireguard(
         0o600,
     )?;
     Ok(WireguardReconcileResult {
-        state: Some(wireguard_state(request, configuration_hash, false)),
+        state: Some(if root == Path::new("/") {
+            inspect_wireguard(
+                root,
+                &request.interface,
+                request.revision,
+                &configuration_hash,
+            )
+        } else {
+            wireguard_state(request, public_key, configuration_hash, false)
+        }),
         changed: true,
         rollback_cancelled: true,
     })
@@ -367,12 +383,13 @@ pub(crate) fn reconcile_wireguard(
 
 fn wireguard_state(
     request: &WireguardReconcileRequest,
+    public_key: String,
     configuration_hash: String,
     drifted: bool,
 ) -> WireguardInspectResult {
     WireguardInspectResult {
         interface: request.interface.clone(),
-        public_key: String::new(),
+        public_key,
         listen_port: request.listen_port,
         peers: Vec::new(),
         applied_revision: request.revision,

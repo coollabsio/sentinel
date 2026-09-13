@@ -395,8 +395,9 @@ async fn wireguard_inspect(
     let Some(command_result::Payload::WireguardInspect(value)) = result.payload else {
         return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
     };
+    let peers = value.peers.into_iter().map(|peer| serde_json::json!({"public_key": peer.public_key, "endpoint": peer.endpoint, "allowed_ips": peer.allowed_ips, "latest_handshake_unix_seconds": peer.latest_handshake_unix_seconds})).collect::<Vec<_>>();
     Ok(Json(
-        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "interface": value.interface, "public_key": value.public_key, "listen_port": value.listen_port, "applied_revision": value.applied_revision, "configuration_hash": value.configuration_hash, "drifted": value.drifted, "peer_count": value.peers.len()}),
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "interface": value.interface, "public_key": value.public_key, "listen_port": value.listen_port, "applied_revision": value.applied_revision, "configuration_hash": value.configuration_hash, "drifted": value.drifted, "peers": peers}),
     ))
 }
 
@@ -437,8 +438,9 @@ async fn wireguard_reconcile(
     let network = value
         .state
         .ok_or((StatusCode::BAD_GATEWAY, "invalid Sentinel response"))?;
+    let peers = network.peers.into_iter().map(|peer| serde_json::json!({"public_key": peer.public_key, "endpoint": peer.endpoint, "allowed_ips": peer.allowed_ips, "latest_handshake_unix_seconds": peer.latest_handshake_unix_seconds})).collect::<Vec<_>>();
     Ok(Json(
-        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "changed": value.changed, "rollback_cancelled": value.rollback_cancelled, "applied_revision": network.applied_revision, "configuration_hash": network.configuration_hash, "drifted": network.drifted}),
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "changed": value.changed, "rollback_cancelled": value.rollback_cancelled, "public_key": network.public_key, "listen_port": network.listen_port, "applied_revision": network.applied_revision, "configuration_hash": network.configuration_hash, "drifted": network.drifted, "peers": peers}),
     ))
 }
 
