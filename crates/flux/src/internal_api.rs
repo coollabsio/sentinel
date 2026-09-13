@@ -67,6 +67,12 @@ struct WorkloadDeployApiRequest {
     #[serde(default)]
     labels: std::collections::HashMap<String, String>,
     restart_policy: String,
+    #[serde(default)]
+    network_name: String,
+    #[serde(default)]
+    network_subnet: String,
+    #[serde(default)]
+    container_ip: String,
 }
 
 #[derive(Deserialize)]
@@ -97,7 +103,7 @@ struct WireguardInspectApiRequest {
 struct WireguardPeerApiRequest {
     public_key: String,
     endpoint: String,
-    allowed_ip: String,
+    allowed_ips: Vec<String>,
     #[serde(default = "default_keepalive")]
     persistent_keepalive_seconds: u32,
 }
@@ -127,8 +133,10 @@ struct FirewallInspectApiRequest {
 }
 #[derive(Deserialize)]
 struct FirewallRuleApiRequest {
-    chain: String,
-    expression: String,
+    source_ip: String,
+    destination_ip: String,
+    protocol: String,
+    port: u32,
 }
 #[derive(Deserialize)]
 struct FirewallReconcileApiRequest {
@@ -142,6 +150,8 @@ struct FirewallReconcileApiRequest {
     rules: Vec<FirewallRuleApiRequest>,
     #[serde(default)]
     flux_probe_host: String,
+    #[serde(default)]
+    workload_cidrs: Vec<String>,
 }
 #[derive(Deserialize)]
 struct CorrosionInspectApiRequest {
@@ -441,7 +451,7 @@ async fn wireguard_reconcile(
         .map(|peer| WireguardPeer {
             public_key: peer.public_key,
             endpoint: peer.endpoint,
-            allowed_ip: peer.allowed_ip,
+            allowed_ips: peer.allowed_ips,
             persistent_keepalive_seconds: peer.persistent_keepalive_seconds,
         })
         .collect();
@@ -507,8 +517,10 @@ async fn firewall_reconcile(
         .rules
         .into_iter()
         .map(|rule| FirewallRule {
-            chain: rule.chain,
-            expression: rule.expression,
+            source_ip: rule.source_ip,
+            destination_ip: rule.destination_ip,
+            protocol: rule.protocol,
+            port: rule.port,
         })
         .collect();
     let result = dispatch_network(
@@ -524,6 +536,7 @@ async fn firewall_reconcile(
             rules,
             wireguard_interface: request.wireguard_interface,
             flux_probe_host: request.flux_probe_host,
+            workload_cidrs: request.workload_cidrs,
         }),
     )
     .await?;
@@ -748,6 +761,9 @@ async fn workload_deploy(
                         .map(|(key, value)| WorkloadLabel { key, value })
                         .collect(),
                     restart_policy: request.restart_policy,
+                    network_name: request.network_name,
+                    network_subnet: request.network_subnet,
+                    container_ip: request.container_ip,
                 })),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },

@@ -28,6 +28,38 @@ pub(crate) fn validate_interface(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn valid_ipv4_cidr(value: &str) -> bool {
+    let Some((address, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    address.parse::<std::net::Ipv4Addr>().is_ok()
+        && prefix.parse::<u8>().is_ok_and(|prefix| prefix <= 32)
+}
+
+fn ipv4_in_cidr(address: &str, cidr: &str) -> bool {
+    let Ok(address) = address.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let Some((network, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(network) = network.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u32>() else {
+        return false;
+    };
+    if prefix > 32 {
+        return false;
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    u32::from(address) & mask == u32::from(network) & mask
+}
+
 pub(crate) fn validate_wireguard(request: &WireguardReconcileRequest) -> Result<(), String> {
     validate_interface(&request.interface)?;
     if request.listen_port == 0
@@ -40,7 +72,12 @@ pub(crate) fn validate_wireguard(request: &WireguardReconcileRequest) -> Result<
     for peer in &request.peers {
         if peer.public_key.is_empty()
             || peer.endpoint.is_empty()
-            || !peer.allowed_ip.ends_with("/32")
+            || peer.allowed_ips.is_empty()
+            || peer.allowed_ips.len() > 128
+            || peer
+                .allowed_ips
+                .iter()
+                .any(|allowed| !valid_ipv4_cidr(allowed))
             || peer.persistent_keepalive_seconds > 300
         {
             return Err("A WireGuard peer is invalid.".into());
@@ -58,7 +95,7 @@ pub(crate) fn render_wireguard(
         return Err("The WireGuard private key is invalid.".into());
     }
     let mut peers = request.peers.clone();
-    peers.sort_by(|a, b| a.allowed_ip.cmp(&b.allowed_ip));
+    peers.sort_by(|a, b| a.allowed_ips.cmp(&b.allowed_ips));
     let mut output = format!(
         "[Interface]\nAddress = {}\nListenPort = {}\nPrivateKey = {}\n\n",
         request.address,
@@ -74,51 +111,84 @@ pub(crate) fn render_wireguard(
 fn render_peer(peer: &WireguardPeer) -> String {
     format!(
         "[Peer]\nPublicKey = {}\nEndpoint = {}\nAllowedIPs = {}\nPersistentKeepalive = {}\n\n",
-        peer.public_key, peer.endpoint, peer.allowed_ip, peer.persistent_keepalive_seconds
+        peer.public_key,
+        peer.endpoint,
+        peer.allowed_ips.join(", "),
+        peer.persistent_keepalive_seconds
     )
 }
 
 pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<String, String> {
     if request.revision == 0
         || request.wireguard_port == 0
-        || request.cluster_cidr.is_empty()
+        || !valid_ipv4_cidr(&request.cluster_cidr)
         || validate_interface(&request.wireguard_interface).is_err()
+        || request.workload_cidrs.is_empty()
+        || request.workload_cidrs.len() > 10_000
+        || request
+            .workload_cidrs
+            .iter()
+            .any(|cidr| !valid_ipv4_cidr(cidr))
+        || request.rules.len() > 100_000
         || request.rules.iter().any(|rule| {
-            !matches!(rule.chain.as_str(), "input" | "forward" | "output")
-                || rule.expression.contains(';')
-                || rule.expression.contains('\n')
+            rule.source_ip.parse::<std::net::Ipv4Addr>().is_err()
+                || rule.destination_ip.parse::<std::net::Ipv4Addr>().is_err()
+                || !matches!(rule.protocol.as_str(), "tcp" | "udp")
+                || rule.port == 0
+                || rule.port > 65_535
+                || !request
+                    .workload_cidrs
+                    .iter()
+                    .any(|cidr| ipv4_in_cidr(&rule.source_ip, cidr))
+                || !request
+                    .workload_cidrs
+                    .iter()
+                    .any(|cidr| ipv4_in_cidr(&rule.destination_ip, cidr))
         })
     {
         return Err("The firewall configuration is invalid.".into());
     }
-    let mut chains = [
+
+    let mut workload_cidrs = request.workload_cidrs.clone();
+    workload_cidrs.sort();
+    workload_cidrs.dedup();
+    let elements = workload_cidrs.join(", ");
+    let mut rules = request.rules.clone();
+    rules.sort_by(|left, right| {
         (
-            "input",
+            &left.source_ip,
+            &left.destination_ip,
+            &left.protocol,
+            left.port,
+        )
+            .cmp(&(
+                &right.source_ip,
+                &right.destination_ip,
+                &right.protocol,
+                right.port,
+            ))
+    });
+    let allow_rules = rules
+        .into_iter()
+        .map(|rule| {
             format!(
-                "ct state established,related accept; udp dport {} accept; iifname \"{}\" ip saddr != {} drop;",
-                request.wireguard_port, request.wireguard_interface, request.cluster_cidr
-            ),
-        ),
-        (
-            "forward",
-            format!(
-                "ct state established,related accept; iifname \"{}\" ip saddr {} accept; iifname \"{}\" drop;",
-                request.wireguard_interface, request.cluster_cidr, request.wireguard_interface
-            ),
-        ),
-        ("output", String::new()),
-    ];
-    for rule in &request.rules {
-        if let Some((_, expressions)) = chains.iter_mut().find(|chain| chain.0 == rule.chain) {
-            expressions.push_str(&format!(" {} ;", rule.expression));
-        }
-    }
-    let mut output = format!("table inet {COOLIFY_NFT_TABLE} {{\n");
-    for (chain, expressions) in chains {
-        output.push_str(&format!(" chain {chain} {{ type filter hook {chain} priority -5; policy accept; {expressions} }}\n"));
-    }
-    output.push_str("}\n");
-    Ok(output)
+                "ip saddr {} ip daddr {} {} dport {} accept;",
+                rule.source_ip, rule.destination_ip, rule.protocol, rule.port
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    Ok(format!(
+        "table inet {COOLIFY_NFT_TABLE} {{
+ set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
+ chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
+ chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; }}
+ chain output {{ type filter hook output priority -5; policy accept; }}
+}}
+",
+        request.wireguard_port, request.wireguard_interface, request.cluster_cidr, request.cluster_cidr
+    ))
 }
 
 pub(crate) fn render_corrosion(request: &CorrosionReconcileRequest) -> Result<String, String> {
@@ -458,9 +528,13 @@ fn wireguard_state_matches(
         && observed.peers.len() == request.peers.len()
         && request.peers.iter().all(|expected| {
             observed.peers.iter().any(|peer| {
-                peer.public_key == expected.public_key
-                    && peer.allowed_ips.len() == 1
-                    && peer.allowed_ips[0] == expected.allowed_ip
+                peer.public_key == expected.public_key && {
+                    let mut observed = peer.allowed_ips.clone();
+                    let mut expected = expected.allowed_ips.clone();
+                    observed.sort();
+                    expected.sort();
+                    observed == expected
+                }
             })
         })
 }
@@ -589,7 +663,7 @@ fn wireguard_state(
             .map(|peer| WireguardPeerState {
                 public_key: peer.public_key.clone(),
                 endpoint: peer.endpoint.clone(),
-                allowed_ips: vec![peer.allowed_ip.clone()],
+                allowed_ips: peer.allowed_ips.clone(),
                 latest_handshake_unix_seconds: 0,
             })
             .collect(),
@@ -665,7 +739,7 @@ fn activate_wireguard(
         let peer_addresses = request
             .peers
             .iter()
-            .map(|peer| peer.allowed_ip.as_str())
+            .filter_map(|peer| peer.allowed_ips.first().map(String::as_str))
             .collect::<Vec<_>>();
         configure_discovery_resolver(&request.interface, &request.address, &peer_addresses)
     });
@@ -679,7 +753,7 @@ fn activate_wireguard(
             let peer_addresses = request
                 .peers
                 .iter()
-                .map(|peer| peer.allowed_ip.as_str())
+                .filter_map(|peer| peer.allowed_ips.first().map(String::as_str))
                 .collect::<Vec<_>>();
             configure_discovery_resolver(&request.interface, &request.address, &peer_addresses)
         });
@@ -745,6 +819,20 @@ fn nft_transaction(snapshot: &str, table_exists: bool) -> String {
 }
 
 fn activate_firewall(root: &Path, snapshot: &str, flux_probe_host: &str) -> Result<(), String> {
+    let sysctl_path = root.join("etc/sysctl.d/90-coolify-workload-firewall.conf");
+    atomic_write(
+        &sysctl_path,
+        b"net.ipv4.ip_forward=1\nnet.bridge.bridge-nf-call-iptables=1\n",
+        0o644,
+    )?;
+    run(
+        Command::new("modprobe").arg("br_netfilter"),
+        "The bridge firewall module could not be loaded.",
+    )?;
+    run(
+        Command::new("sysctl").arg("--load").arg(&sysctl_path),
+        "The bridge firewall settings could not be activated.",
+    )?;
     let current = Command::new("nft")
         .args(["list", "table", "inet", COOLIFY_NFT_TABLE])
         .output()
@@ -1299,7 +1387,7 @@ mod tests {
             peers: vec![WireguardPeer {
                 public_key: "b".into(),
                 endpoint: "192.0.2.2:51820".into(),
-                allowed_ip: "10.240.0.3/32".into(),
+                allowed_ips: vec!["10.240.0.3/32".into()],
                 persistent_keepalive_seconds: 25,
             }],
             flux_probe_host: "10.240.0.1".into(),
@@ -1317,16 +1405,22 @@ mod tests {
             wireguard_port: 51820,
             cluster_cidr: "10.240.0.0/24".into(),
             rules: vec![FirewallRule {
-                chain: "forward".into(),
-                expression: "ip saddr 10.240.0.0/24 accept".into(),
+                source_ip: "100.64.0.2".into(),
+                destination_ip: "100.64.1.2".into(),
+                protocol: "tcp".into(),
+                port: 5432,
             }],
             wireguard_interface: "coolify0".into(),
+            workload_cidrs: vec!["100.64.0.0/24".into(), "100.64.1.0/24".into()],
             flux_probe_host: "10.240.0.1".into(),
         })
         .unwrap();
         assert!(rendered.contains("table inet coolify_cluster"));
         assert!(!rendered.contains("flush ruleset"));
         assert!(!rendered.contains("delete table"));
+        assert!(rendered.contains("ip saddr @workload_networks ip daddr @workload_networks drop"));
+        assert!(rendered.contains("ip saddr 100.64.0.2 ip daddr 100.64.1.2 tcp dport 5432 accept"));
+        assert!(rendered.contains("policy accept"));
     }
 
     #[test]
@@ -1371,7 +1465,7 @@ mod tests {
             peers: vec![WireguardPeer {
                 public_key: "peer-public".into(),
                 endpoint: "192.0.2.2:51820".into(),
-                allowed_ip: "10.240.0.3/32".into(),
+                allowed_ips: vec!["10.240.0.3/32".into()],
                 persistent_keepalive_seconds: 25,
             }],
             flux_probe_host: String::new(),
@@ -1414,7 +1508,7 @@ mod tests {
             peers: vec![WireguardPeer {
                 public_key: "peer-public".into(),
                 endpoint: "192.0.2.2:51820".into(),
-                allowed_ip: "10.240.0.3/32".into(),
+                allowed_ips: vec!["10.240.0.3/32".into()],
                 persistent_keepalive_seconds: 25,
             }],
             flux_probe_host: "192.0.2.1".into(),
@@ -1491,6 +1585,7 @@ mod tests {
             rules: vec![],
             wireguard_interface: "coolify0".into(),
             flux_probe_host: String::new(),
+            workload_cidrs: vec!["100.64.0.0/24".into()],
         };
         let first = reconcile_firewall(temp.path(), &request).unwrap();
         let second = reconcile_firewall(temp.path(), &request).unwrap();

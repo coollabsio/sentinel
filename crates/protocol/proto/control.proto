@@ -179,6 +179,9 @@ message WorkloadDeployRequest {
   repeated ContainerPort ports = 5;
   repeated WorkloadLabel labels = 6;
   string restart_policy = 7;
+  string network_name = 8;
+  string network_subnet = 9;
+  string container_ip = 10;
 }
 
 message WorkloadEnvironmentVariable {
@@ -218,15 +221,15 @@ message WorkloadLifecycleResult {
 message WireguardKeyEnsureRequest { string interface = 1; }
 message WireguardKeyEnsureResult { string public_key = 1; }
 message WireguardInspectRequest { string interface = 1; uint64 expected_revision = 2; string expected_hash = 3; }
-message WireguardPeer { string public_key = 1; string endpoint = 2; string allowed_ip = 3; uint32 persistent_keepalive_seconds = 4; }
+message WireguardPeer { string public_key = 1; string endpoint = 2; repeated string allowed_ips = 3; uint32 persistent_keepalive_seconds = 4; }
 message WireguardPeerState { string public_key = 1; string endpoint = 2; repeated string allowed_ips = 3; int64 latest_handshake_unix_seconds = 4; }
 message WireguardInspectResult { string interface = 1; string public_key = 2; uint32 listen_port = 3; repeated WireguardPeerState peers = 4; uint64 applied_revision = 5; string configuration_hash = 6; bool drifted = 7; }
 message WireguardReconcileRequest { string interface = 1; string address = 2; uint32 listen_port = 3; uint64 revision = 4; repeated WireguardPeer peers = 5; string flux_probe_host = 6; }
 message WireguardReconcileResult { WireguardInspectResult state = 1; bool changed = 2; bool rollback_cancelled = 3; }
 message FirewallInspectRequest { uint64 expected_revision = 1; string expected_hash = 2; }
 message FirewallInspectResult { uint64 applied_revision = 1; string configuration_hash = 2; bool drifted = 3; string table = 4; }
-message FirewallRule { string chain = 1; string expression = 2; }
-message FirewallReconcileRequest { uint64 revision = 1; uint32 wireguard_port = 2; string cluster_cidr = 3; repeated FirewallRule rules = 4; string wireguard_interface = 5; string flux_probe_host = 6; }
+message FirewallRule { string source_ip = 1; string destination_ip = 2; string protocol = 3; uint32 port = 4; }
+message FirewallReconcileRequest { uint64 revision = 1; uint32 wireguard_port = 2; string cluster_cidr = 3; repeated FirewallRule rules = 4; string wireguard_interface = 5; string flux_probe_host = 6; repeated string workload_cidrs = 7; }
 message FirewallReconcileResult { FirewallInspectResult state = 1; bool changed = 2; bool rollback_cancelled = 3; }
 message CorrosionInspectRequest {}
 message CorrosionInspectResult { string version = 1; string member_state = 2; uint64 endpoint_count = 3; optional int64 last_convergence_unix_seconds = 4; }

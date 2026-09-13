@@ -28,7 +28,7 @@ fn network_capabilities_are_typed_and_versioned() {
                 peers: vec![control::v1::WireguardPeer {
                     public_key: "public".into(),
                     endpoint: "192.0.2.2:51820".into(),
-                    allowed_ip: "10.240.0.3/32".into(),
+                    allowed_ips: vec!["10.240.0.3/32".into()],
                     persistent_keepalive_seconds: 25,
                 }],
                 flux_probe_host: "10.240.0.1".into(),
@@ -48,6 +48,7 @@ fn network_capabilities_are_typed_and_versioned() {
         rules: vec![],
         wireguard_interface: "coolify0".into(),
         flux_probe_host: "10.240.0.1".into(),
+        workload_cidrs: vec!["100.64.0.0/24".into()],
     };
     assert_eq!(firewall.flux_probe_host, "10.240.0.1");
 

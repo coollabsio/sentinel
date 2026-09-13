@@ -456,8 +456,12 @@ pub(crate) fn journal_request(command: &Command) -> Vec<u8> {
 }
 
 fn workload_deploy(request: &WorkloadDeployRequest) -> Result<WorkloadDeployResult, String> {
+    let arguments = podman_deploy_args(request)?;
+    if !request.network_name.is_empty() {
+        ensure_workload_network(&request.network_name, &request.network_subnet)?;
+    }
     let output = std::process::Command::new("podman")
-        .args(podman_deploy_args(request)?)
+        .args(arguments)
         .output()
         .map_err(|_| "Podman is unavailable.".to_string())?;
     if !output.status.success() {
@@ -477,6 +481,91 @@ fn workload_deploy(request: &WorkloadDeployRequest) -> Result<WorkloadDeployResu
         name: request.name.clone(),
         image: request.image.clone(),
     })
+}
+
+fn ensure_workload_network(name: &str, subnet: &str) -> Result<(), String> {
+    let inspected = std::process::Command::new("podman")
+        .args(["network", "inspect", name])
+        .output()
+        .map_err(|_| "Podman is unavailable.".to_string())?;
+    if inspected.status.success() {
+        return network_inspect_has_subnet(&inspected.stdout, subnet)
+            .then_some(())
+            .ok_or_else(|| "The existing workload network uses a different subnet.".to_string());
+    }
+    let created = std::process::Command::new("podman")
+        .args(["network", "create", "--subnet", subnet, name])
+        .output()
+        .map_err(|_| "Podman is unavailable.".to_string())?;
+    if created.status.success() {
+        return Ok(());
+    }
+    let raced = std::process::Command::new("podman")
+        .args(["network", "inspect", name])
+        .output();
+    if raced.is_ok_and(|output| {
+        output.status.success() && network_inspect_has_subnet(&output.stdout, subnet)
+    }) {
+        return Ok(());
+    }
+    let message = String::from_utf8_lossy(&created.stderr).trim().to_string();
+    Err(if message.is_empty() {
+        "Podman could not create the workload network.".into()
+    } else {
+        message.chars().take(2_000).collect()
+    })
+}
+
+pub(crate) fn network_inspect_has_subnet(output: &[u8], subnet: &str) -> bool {
+    serde_json::from_slice::<Vec<serde_json::Value>>(output)
+        .ok()
+        .and_then(|networks| networks.into_iter().next())
+        .and_then(|network| {
+            network
+                .get("subnets")
+                .or_else(|| network.get("Subnets"))
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .is_some_and(|subnets| {
+            subnets.iter().any(|value| {
+                value
+                    .get("subnet")
+                    .or_else(|| value.get("Subnet"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(subnet)
+            })
+        })
+}
+
+fn valid_network_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+}
+
+fn valid_ipv4_subnet_and_address(subnet: &str, address: &str) -> bool {
+    let Some((network, prefix)) = subnet.split_once('/') else {
+        return false;
+    };
+    let Ok(network) = network.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(address) = address.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u32>() else {
+        return false;
+    };
+    if prefix > 30 {
+        return false;
+    }
+    let mask = u32::MAX << (32 - prefix);
+    u32::from(network) & mask == u32::from(network)
+        && u32::from(address) & mask == u32::from(network)
+        && address != network
 }
 
 pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<String>, String> {
@@ -511,6 +600,15 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
     {
         return Err("The workload configuration is too large.".into());
     }
+    let uses_managed_network = !request.network_name.is_empty()
+        || !request.network_subnet.is_empty()
+        || !request.container_ip.is_empty();
+    if uses_managed_network
+        && (!valid_network_name(&request.network_name)
+            || !valid_ipv4_subnet_and_address(&request.network_subnet, &request.container_ip))
+    {
+        return Err("The workload network configuration is invalid.".into());
+    }
     let mut args = vec![
         "run".into(),
         "--detach".into(),
@@ -522,6 +620,10 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
         "--restart".into(),
         request.restart_policy.clone(),
     ];
+    if uses_managed_network {
+        args.extend(["--network".into(), request.network_name.clone()]);
+        args.extend(["--ip".into(), request.container_ip.clone()]);
+    }
     for variable in &request.environment {
         let key = &variable.key;
         let value = &variable.value;

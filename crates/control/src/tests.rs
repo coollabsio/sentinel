@@ -1176,6 +1176,9 @@ fn builds_shell_free_podman_deploy_arguments() {
             value: "true".into(),
         }],
         restart_policy: "unless-stopped".into(),
+        network_name: "coolify-node-1".into(),
+        network_subnet: "100.64.0.0/24".into(),
+        container_ip: "100.64.0.2".into(),
     };
 
     let arguments = crate::commands::podman_deploy_args(&request).unwrap();
@@ -1186,6 +1189,12 @@ fn builds_shell_free_podman_deploy_arguments() {
             .windows(2)
             .any(|v| v == ["--name", "coolify-test-web"])
     );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--network", "coolify-node-1"])
+    );
+    assert!(arguments.windows(2).any(|v| v == ["--ip", "100.64.0.2"]));
     assert!(
         arguments
             .windows(2)
@@ -1205,6 +1214,25 @@ fn builds_shell_free_podman_deploy_arguments() {
         &arguments[arguments.len() - 3..],
         ["docker.io/library/alpine:latest", "sleep", "3600"]
     );
+}
+
+#[test]
+fn validates_the_existing_podman_network_subnet() {
+    let correct = br#"[{"name":"coolify-node-1","subnets":[{"subnet":"100.64.0.0/24","gateway":"100.64.0.1"}]}]"#;
+    let wrong = br#"[{"name":"coolify-node-1","subnets":[{"subnet":"100.65.0.0/24"}]}]"#;
+
+    assert!(crate::commands::network_inspect_has_subnet(
+        correct,
+        "100.64.0.0/24"
+    ));
+    assert!(!crate::commands::network_inspect_has_subnet(
+        wrong,
+        "100.64.0.0/24"
+    ));
+    assert!(!crate::commands::network_inspect_has_subnet(
+        b"not-json",
+        "100.64.0.0/24"
+    ));
 }
 
 #[test]
