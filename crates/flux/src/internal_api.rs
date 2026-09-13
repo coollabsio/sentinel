@@ -8,13 +8,17 @@ use axum::routing::post;
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    Command, CommandStatus, ContainerListRequest, ContainerPort, SystemInfoRequest,
-    SystemPingRequest, WorkloadDeployRequest, WorkloadEnvironmentVariable, WorkloadLabel,
-    WorkloadLifecycleAction, WorkloadLifecycleRequest,
+    Command, CommandStatus, ContainerListRequest, ContainerPort, CorrosionInspectRequest,
+    CorrosionReconcileRequest, FirewallInspectRequest, FirewallReconcileRequest, FirewallRule,
+    SystemInfoRequest, SystemPingRequest, WireguardInspectRequest, WireguardKeyEnsureRequest,
+    WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest, WorkloadEnvironmentVariable,
+    WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
 };
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE,
+    CAPABILITY_FIREWALL_INSPECT, CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_SYSTEM_INFO,
+    CAPABILITY_SYSTEM_PING, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
+    CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -69,6 +73,86 @@ struct WorkloadLifecycleApiRequest {
     command_id: String,
     name: String,
     action: WorkloadLifecycleApiAction,
+}
+
+#[derive(Deserialize)]
+struct WireguardKeyApiRequest {
+    server_id: String,
+    command_id: String,
+    interface: String,
+}
+#[derive(Deserialize)]
+struct WireguardInspectApiRequest {
+    server_id: String,
+    command_id: String,
+    interface: String,
+    #[serde(default)]
+    expected_revision: u64,
+    #[serde(default)]
+    expected_hash: String,
+}
+#[derive(Deserialize)]
+struct WireguardPeerApiRequest {
+    public_key: String,
+    endpoint: String,
+    allowed_ip: String,
+    #[serde(default = "default_keepalive")]
+    persistent_keepalive_seconds: u32,
+}
+fn default_keepalive() -> u32 {
+    25
+}
+#[derive(Deserialize)]
+struct WireguardReconcileApiRequest {
+    server_id: String,
+    command_id: String,
+    interface: String,
+    address: String,
+    listen_port: u32,
+    revision: u64,
+    peers: Vec<WireguardPeerApiRequest>,
+    #[serde(default)]
+    flux_probe_host: String,
+}
+#[derive(Deserialize)]
+struct FirewallInspectApiRequest {
+    server_id: String,
+    command_id: String,
+    #[serde(default)]
+    expected_revision: u64,
+    #[serde(default)]
+    expected_hash: String,
+}
+#[derive(Deserialize)]
+struct FirewallRuleApiRequest {
+    chain: String,
+    expression: String,
+}
+#[derive(Deserialize)]
+struct FirewallReconcileApiRequest {
+    server_id: String,
+    command_id: String,
+    revision: u64,
+    wireguard_port: u32,
+    cluster_cidr: String,
+    wireguard_interface: String,
+    #[serde(default)]
+    rules: Vec<FirewallRuleApiRequest>,
+}
+#[derive(Deserialize)]
+struct CorrosionInspectApiRequest {
+    server_id: String,
+    command_id: String,
+}
+#[derive(Deserialize)]
+struct CorrosionReconcileApiRequest {
+    server_id: String,
+    command_id: String,
+    version: String,
+    cluster_id: String,
+    bind_address: String,
+    #[serde(default)]
+    peers: Vec<String>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -185,10 +269,293 @@ pub async fn serve(
         .route("/v1/commands/container.list", post(container_list))
         .route("/v1/commands/workload.deploy", post(workload_deploy))
         .route("/v1/commands/workload.lifecycle", post(workload_lifecycle))
+        .route(
+            "/v1/commands/network.wireguard.key.ensure",
+            post(wireguard_key_ensure),
+        )
+        .route(
+            "/v1/commands/network.wireguard.inspect",
+            post(wireguard_inspect),
+        )
+        .route(
+            "/v1/commands/network.wireguard.reconcile",
+            post(wireguard_reconcile),
+        )
+        .route(
+            "/v1/commands/network.firewall.inspect",
+            post(firewall_inspect),
+        )
+        .route(
+            "/v1/commands/network.firewall.reconcile",
+            post(firewall_reconcile),
+        )
+        .route(
+            "/v1/commands/discovery.corrosion.inspect",
+            post(corrosion_inspect),
+        )
+        .route(
+            "/v1/commands/discovery.corrosion.reconcile",
+            post(corrosion_reconcile),
+        )
         .with_state(ApiState { registry, token });
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "Flux internal command API is listening");
     axum::serve(listener, router).await
+}
+
+async fn dispatch_network(
+    state: &ApiState,
+    headers: &HeaderMap,
+    server_id: &str,
+    command_id: &str,
+    command_type: &str,
+    payload: Payload,
+) -> Result<sentinel_protocol::control::v1::CommandResult, (StatusCode, &'static str)> {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    if authorization != Some(&format!("Bearer {}", state.token)) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if server_id.is_empty()
+        || server_id.len() > 255
+        || command_id.is_empty()
+        || command_id.len() > 128
+        || !command_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
+    {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request"));
+    }
+    let now = now_millis();
+    let result = state
+        .registry
+        .dispatch(
+            server_id,
+            Command {
+                command_id: command_id.into(),
+                command_type: command_type.into(),
+                payload_version: 1,
+                created_at_unix_ms: now,
+                payload: Some(payload),
+                expires_at_unix_ms: now + LIFECYCLE_TIMEOUT.as_millis() as i64,
+            },
+            LIFECYCLE_TIMEOUT,
+        )
+        .await
+        .map_err(dispatch_error)?;
+    if result.status != CommandStatus::Succeeded as i32 {
+        return Err((StatusCode::BAD_GATEWAY, "Sentinel command failed"));
+    }
+    Ok(result)
+}
+
+async fn wireguard_key_ensure(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<WireguardKeyApiRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    let result = dispatch_network(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_WIREGUARD_KEY_ENSURE,
+        Payload::WireguardKeyEnsure(WireguardKeyEnsureRequest {
+            interface: request.interface,
+        }),
+    )
+    .await?;
+    let Some(command_result::Payload::WireguardKeyEnsure(value)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    };
+    Ok(Json(
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "public_key": value.public_key}),
+    ))
+}
+
+async fn wireguard_inspect(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<WireguardInspectApiRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    let result = dispatch_network(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_WIREGUARD_INSPECT,
+        Payload::WireguardInspect(WireguardInspectRequest {
+            interface: request.interface,
+            expected_revision: request.expected_revision,
+            expected_hash: request.expected_hash,
+        }),
+    )
+    .await?;
+    let Some(command_result::Payload::WireguardInspect(value)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    };
+    Ok(Json(
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "interface": value.interface, "public_key": value.public_key, "listen_port": value.listen_port, "applied_revision": value.applied_revision, "configuration_hash": value.configuration_hash, "drifted": value.drifted, "peer_count": value.peers.len()}),
+    ))
+}
+
+async fn wireguard_reconcile(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<WireguardReconcileApiRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    let peers = request
+        .peers
+        .into_iter()
+        .map(|peer| WireguardPeer {
+            public_key: peer.public_key,
+            endpoint: peer.endpoint,
+            allowed_ip: peer.allowed_ip,
+            persistent_keepalive_seconds: peer.persistent_keepalive_seconds,
+        })
+        .collect();
+    let result = dispatch_network(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_WIREGUARD_RECONCILE,
+        Payload::WireguardReconcile(WireguardReconcileRequest {
+            interface: request.interface,
+            address: request.address,
+            listen_port: request.listen_port,
+            revision: request.revision,
+            peers,
+            flux_probe_host: request.flux_probe_host,
+        }),
+    )
+    .await?;
+    let Some(command_result::Payload::WireguardReconcile(value)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    };
+    let network = value
+        .state
+        .ok_or((StatusCode::BAD_GATEWAY, "invalid Sentinel response"))?;
+    Ok(Json(
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "changed": value.changed, "rollback_cancelled": value.rollback_cancelled, "applied_revision": network.applied_revision, "configuration_hash": network.configuration_hash, "drifted": network.drifted}),
+    ))
+}
+
+async fn firewall_inspect(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<FirewallInspectApiRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    let result = dispatch_network(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_FIREWALL_INSPECT,
+        Payload::FirewallInspect(FirewallInspectRequest {
+            expected_revision: request.expected_revision,
+            expected_hash: request.expected_hash,
+        }),
+    )
+    .await?;
+    let Some(command_result::Payload::FirewallInspect(value)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    };
+    Ok(Json(
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "applied_revision": value.applied_revision, "configuration_hash": value.configuration_hash, "drifted": value.drifted, "table": value.table}),
+    ))
+}
+
+async fn firewall_reconcile(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<FirewallReconcileApiRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    let rules = request
+        .rules
+        .into_iter()
+        .map(|rule| FirewallRule {
+            chain: rule.chain,
+            expression: rule.expression,
+        })
+        .collect();
+    let result = dispatch_network(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_FIREWALL_RECONCILE,
+        Payload::FirewallReconcile(FirewallReconcileRequest {
+            revision: request.revision,
+            wireguard_port: request.wireguard_port,
+            cluster_cidr: request.cluster_cidr,
+            rules,
+            wireguard_interface: request.wireguard_interface,
+        }),
+    )
+    .await?;
+    let Some(command_result::Payload::FirewallReconcile(value)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    };
+    let network = value
+        .state
+        .ok_or((StatusCode::BAD_GATEWAY, "invalid Sentinel response"))?;
+    Ok(Json(
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "changed": value.changed, "rollback_cancelled": value.rollback_cancelled, "applied_revision": network.applied_revision, "configuration_hash": network.configuration_hash, "drifted": network.drifted, "table": network.table}),
+    ))
+}
+
+async fn corrosion_inspect(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CorrosionInspectApiRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    let result = dispatch_network(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_CORROSION_INSPECT,
+        Payload::CorrosionInspect(CorrosionInspectRequest {}),
+    )
+    .await?;
+    let Some(command_result::Payload::CorrosionInspect(value)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    };
+    Ok(Json(
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "version": value.version, "member_state": value.member_state, "endpoint_count": value.endpoint_count, "last_convergence_unix_seconds": value.last_convergence_unix_seconds}),
+    ))
+}
+
+async fn corrosion_reconcile(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CorrosionReconcileApiRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    let result = dispatch_network(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_CORROSION_RECONCILE,
+        Payload::CorrosionReconcile(CorrosionReconcileRequest {
+            version: request.version,
+            cluster_id: request.cluster_id,
+            bind_address: request.bind_address,
+            peers: request.peers,
+        }),
+    )
+    .await?;
+    let Some(command_result::Payload::CorrosionReconcile(value)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    };
+    let discovery = value
+        .state
+        .ok_or((StatusCode::BAD_GATEWAY, "invalid Sentinel response"))?;
+    Ok(Json(
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "changed": value.changed, "version": discovery.version, "member_state": discovery.member_state, "endpoint_count": discovery.endpoint_count, "last_convergence_unix_seconds": discovery.last_convergence_unix_seconds}),
+    ))
 }
 
 async fn workload_lifecycle(

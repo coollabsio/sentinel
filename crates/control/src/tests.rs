@@ -45,6 +45,40 @@ fn executes_and_deduplicates_system_ping_commands() {
 }
 
 #[test]
+fn executes_typed_wireguard_inspection_without_exposing_a_private_key() {
+    use sentinel_protocol::control::v1::command::Payload;
+    use sentinel_protocol::control::v1::command_result;
+    use sentinel_protocol::control::v1::{Command, CommandStatus, WireguardInspectRequest};
+
+    let root = tempfile::tempdir().unwrap();
+    let mut executor = crate::commands::CommandExecutor::new("dev").with_network_root(root.path());
+    let execution = executor.execute(
+        Command {
+            command_id: "network-inspect-1".into(),
+            command_type: sentinel_protocol::CAPABILITY_WIREGUARD_INSPECT.into(),
+            payload_version: 1,
+            created_at_unix_ms: 1,
+            payload: Some(Payload::WireguardInspect(WireguardInspectRequest {
+                interface: "coolify0".into(),
+                expected_revision: 1,
+                expected_hash: "expected".into(),
+            })),
+            expires_at_unix_ms: i64::MAX,
+        },
+        true,
+    );
+
+    assert!(execution.accepted);
+    assert_eq!(execution.result.status, CommandStatus::Succeeded as i32);
+    let Some(command_result::Payload::WireguardInspect(state)) = execution.result.payload else {
+        panic!("missing inspection result")
+    };
+    assert_eq!(state.interface, "coolify0");
+    assert!(state.drifted);
+    assert!(!format!("{state:?}").to_lowercase().contains("private"));
+}
+
+#[test]
 fn executes_system_info_commands() {
     use sentinel_protocol::control::v1::command::Payload;
     use sentinel_protocol::control::v1::command_result;
@@ -434,7 +468,14 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "system.info.v1",
             "container.list.v1",
             "workload.deploy.v1",
-            "workload.lifecycle.v1"
+            "workload.lifecycle.v1",
+            "network.wireguard.key.ensure.v1",
+            "network.wireguard.inspect.v1",
+            "network.wireguard.reconcile.v1",
+            "network.firewall.inspect.v1",
+            "network.firewall.reconcile.v1",
+            "discovery.corrosion.inspect.v1",
+            "discovery.corrosion.reconcile.v1"
         ])
     );
 }

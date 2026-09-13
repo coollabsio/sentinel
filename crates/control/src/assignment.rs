@@ -6,8 +6,8 @@ use config::ControlTlsConfig;
 use reqwest::StatusCode;
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, PROTOCOL_MAX, PROTOCOL_MIN,
-    select_protocol,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, NETWORK_CAPABILITIES, PROTOCOL_MAX,
+    PROTOCOL_MIN, select_protocol,
 };
 use serde::{Deserialize, Serialize};
 use store::CommandJournal;
@@ -228,13 +228,16 @@ impl AssignmentClient {
             sentinel_version: &self.sentinel_version,
             protocol_min: PROTOCOL_MIN,
             protocol_max: PROTOCOL_MAX,
-            capabilities: [
+            capabilities: vec![
                 CAPABILITY_SYSTEM_PING,
                 CAPABILITY_SYSTEM_INFO,
                 CAPABILITY_CONTAINER_LIST,
                 CAPABILITY_WORKLOAD_DEPLOY,
                 CAPABILITY_WORKLOAD_LIFECYCLE,
-            ],
+            ]
+            .into_iter()
+            .chain(NETWORK_CAPABILITIES)
+            .collect(),
         };
         let mut response = self
             .client
@@ -400,7 +403,7 @@ struct AssignmentRequest<'a> {
     sentinel_version: &'a str,
     protocol_min: u32,
     protocol_max: u32,
-    capabilities: [&'static str; 5],
+    capabilities: Vec<&'static str>,
 }
 
 #[derive(Deserialize)]

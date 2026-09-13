@@ -3,6 +3,7 @@
 mod assignment;
 mod commands;
 mod connection;
+mod network;
 
 pub use assignment::{
     Assignment, AssignmentClient, AssignmentError, AssignmentErrorKind, AssignmentOutcome,

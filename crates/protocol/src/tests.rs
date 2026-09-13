@@ -5,6 +5,44 @@ use prost::Message;
 use super::*;
 
 #[test]
+fn network_capabilities_are_typed_and_versioned() {
+    let capabilities = NETWORK_CAPABILITIES;
+    assert_eq!(capabilities.len(), 7);
+    assert!(
+        capabilities
+            .iter()
+            .all(|capability| capability.ends_with(".v1"))
+    );
+
+    let command = control::v1::Command {
+        command_id: "network-1".into(),
+        command_type: CAPABILITY_WIREGUARD_RECONCILE.into(),
+        payload_version: 1,
+        created_at_unix_ms: 1,
+        payload: Some(control::v1::command::Payload::WireguardReconcile(
+            control::v1::WireguardReconcileRequest {
+                interface: "coolify0".into(),
+                address: "10.240.0.2/32".into(),
+                listen_port: 51820,
+                revision: 2,
+                peers: vec![control::v1::WireguardPeer {
+                    public_key: "public".into(),
+                    endpoint: "192.0.2.2:51820".into(),
+                    allowed_ip: "10.240.0.3/32".into(),
+                    persistent_keepalive_seconds: 25,
+                }],
+                flux_probe_host: "10.240.0.1".into(),
+            },
+        )),
+        expires_at_unix_ms: 2,
+    };
+    assert!(matches!(
+        command.payload,
+        Some(control::v1::command::Payload::WireguardReconcile(_))
+    ));
+}
+
+#[test]
 fn publishes_version_one_and_initial_capabilities() {
     assert_eq!(PROTOCOL_MIN, 1);
     assert_eq!(PROTOCOL_MAX, 1);

@@ -1,8 +1,8 @@
 use sentinel_protocol::control::v1::Hello;
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, PROTOCOL_MAX, PROTOCOL_MIN,
-    intersect_capabilities, select_protocol,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, NETWORK_CAPABILITIES, PROTOCOL_MAX,
+    PROTOCOL_MIN, intersect_capabilities, select_protocol,
 };
 
 use crate::CredentialClaims;
@@ -50,6 +50,13 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
             CAPABILITY_CONTAINER_LIST,
             CAPABILITY_WORKLOAD_DEPLOY,
             CAPABILITY_WORKLOAD_LIFECYCLE,
+            NETWORK_CAPABILITIES[0],
+            NETWORK_CAPABILITIES[1],
+            NETWORK_CAPABILITIES[2],
+            NETWORK_CAPABILITIES[3],
+            NETWORK_CAPABILITIES[4],
+            NETWORK_CAPABILITIES[5],
+            NETWORK_CAPABILITIES[6],
         ],
     );
     Ok(Negotiated {

@@ -1,14 +1,19 @@
+use std::path::{Path, PathBuf};
+
 use prost::Message;
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
     Command, CommandError, CommandResult, CommandStatus, ContainerListResult, ContainerObservation,
-    ContainerPort, SystemInfoResult, SystemPingResult, WorkloadDeployRequest, WorkloadDeployResult,
-    WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadLifecycleResult,
+    ContainerPort, SystemInfoResult, SystemPingResult, WireguardInspectResult,
+    WireguardKeyEnsureResult, WorkloadDeployRequest, WorkloadDeployResult, WorkloadLifecycleAction,
+    WorkloadLifecycleRequest, WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE,
+    CAPABILITY_FIREWALL_INSPECT, CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_SYSTEM_INFO,
+    CAPABILITY_SYSTEM_PING, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
+    CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
@@ -23,6 +28,7 @@ pub(crate) struct CommandExecution {
 pub(crate) struct CommandExecutor {
     sentinel_version: String,
     journal: CommandJournal,
+    network_root: PathBuf,
 }
 
 impl CommandExecutor {
@@ -38,7 +44,14 @@ impl CommandExecutor {
         Self {
             sentinel_version: sentinel_version.into(),
             journal,
+            network_root: PathBuf::from("/"),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_network_root(mut self, root: &Path) -> Self {
+        self.network_root = root.to_path_buf();
+        self
     }
 
     pub(crate) fn execute(
@@ -106,6 +119,23 @@ impl CommandExecutor {
             (CAPABILITY_WORKLOAD_LIFECYCLE, Some(Payload::WorkloadLifecycle(request))) => {
                 podman_lifecycle_args(request).is_ok()
             }
+            (CAPABILITY_WIREGUARD_KEY_ENSURE, Some(Payload::WireguardKeyEnsure(request))) => {
+                crate::network::validate_interface(&request.interface).is_ok()
+            }
+            (CAPABILITY_WIREGUARD_INSPECT, Some(Payload::WireguardInspect(request))) => {
+                crate::network::validate_interface(&request.interface).is_ok()
+            }
+            (CAPABILITY_WIREGUARD_RECONCILE, Some(Payload::WireguardReconcile(request))) => {
+                crate::network::validate_wireguard(request).is_ok()
+            }
+            (CAPABILITY_FIREWALL_INSPECT, Some(Payload::FirewallInspect(_))) => true,
+            (CAPABILITY_FIREWALL_RECONCILE, Some(Payload::FirewallReconcile(request))) => {
+                crate::network::render_firewall(request).is_ok()
+            }
+            (CAPABILITY_CORROSION_INSPECT, Some(Payload::CorrosionInspect(_))) => true,
+            (CAPABILITY_CORROSION_RECONCILE, Some(Payload::CorrosionReconcile(request))) => {
+                crate::network::render_corrosion(request).is_ok()
+            }
             _ => false,
         };
         let accepted = !(command.command_id.is_empty()
@@ -116,6 +146,13 @@ impl CommandExecutor {
                     | CAPABILITY_CONTAINER_LIST
                     | CAPABILITY_WORKLOAD_DEPLOY
                     | CAPABILITY_WORKLOAD_LIFECYCLE
+                    | CAPABILITY_WIREGUARD_KEY_ENSURE
+                    | CAPABILITY_WIREGUARD_INSPECT
+                    | CAPABILITY_WIREGUARD_RECONCILE
+                    | CAPABILITY_FIREWALL_INSPECT
+                    | CAPABILITY_FIREWALL_RECONCILE
+                    | CAPABILITY_CORROSION_INSPECT
+                    | CAPABILITY_CORROSION_RECONCILE
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
@@ -243,6 +280,68 @@ impl CommandExecutor {
                 },
                 Err(message) => failed(&command.command_id, "workload_lifecycle_failed", &message),
             }
+        } else if let Some(Payload::WireguardKeyEnsure(request)) = command.payload {
+            match crate::network::ensure_key(&self.network_root, &request.interface) {
+                Ok(public_key) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::WireguardKeyEnsure(WireguardKeyEnsureResult {
+                        public_key,
+                    }),
+                ),
+                Err(message) => {
+                    failed(&command.command_id, "wireguard_key_ensure_failed", &message)
+                }
+            }
+        } else if let Some(Payload::WireguardInspect(request)) = command.payload {
+            succeeded(
+                &command.command_id,
+                command_result::Payload::WireguardInspect(wireguard_inspect(
+                    &self.network_root,
+                    &request.interface,
+                    request.expected_revision,
+                    &request.expected_hash,
+                )),
+            )
+        } else if let Some(Payload::WireguardReconcile(request)) = command.payload {
+            match crate::network::reconcile_wireguard(&self.network_root, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::WireguardReconcile(result),
+                ),
+                Err(message) => failed(&command.command_id, "wireguard_reconcile_failed", &message),
+            }
+        } else if let Some(Payload::FirewallInspect(request)) = command.payload {
+            succeeded(
+                &command.command_id,
+                command_result::Payload::FirewallInspect(crate::network::inspect_firewall(
+                    &self.network_root,
+                    request.expected_revision,
+                    &request.expected_hash,
+                )),
+            )
+        } else if let Some(Payload::FirewallReconcile(request)) = command.payload {
+            match crate::network::reconcile_firewall(&self.network_root, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::FirewallReconcile(result),
+                ),
+                Err(message) => failed(&command.command_id, "firewall_reconcile_failed", &message),
+            }
+        } else if let Some(Payload::CorrosionInspect(_)) = command.payload {
+            succeeded(
+                &command.command_id,
+                command_result::Payload::CorrosionInspect(crate::network::inspect_corrosion(
+                    &self.network_root,
+                )),
+            )
+        } else if let Some(Payload::CorrosionReconcile(request)) = command.payload {
+            match crate::network::reconcile_corrosion(&self.network_root, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::CorrosionReconcile(result),
+                ),
+                Err(message) => failed(&command.command_id, "corrosion_reconcile_failed", &message),
+            }
         } else {
             failed(
                 &command.command_id,
@@ -261,6 +360,25 @@ impl CommandExecutor {
             result,
         }
     }
+}
+
+fn succeeded(command_id: &str, payload: command_result::Payload) -> CommandResult {
+    CommandResult {
+        event_id: format!("{command_id}:result"),
+        command_id: command_id.into(),
+        status: CommandStatus::Succeeded.into(),
+        observed_at_unix_ms: now_millis(),
+        payload: Some(payload),
+    }
+}
+
+fn wireguard_inspect(
+    root: &Path,
+    interface: &str,
+    expected_revision: u64,
+    expected_hash: &str,
+) -> WireguardInspectResult {
+    crate::network::inspect_wireguard(root, interface, expected_revision, expected_hash)
 }
 
 fn workload_lifecycle(

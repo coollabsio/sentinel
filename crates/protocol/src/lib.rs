@@ -9,6 +9,22 @@ pub const CAPABILITY_SYSTEM_INFO: &str = "system.info.v1";
 pub const CAPABILITY_CONTAINER_LIST: &str = "container.list.v1";
 pub const CAPABILITY_WORKLOAD_DEPLOY: &str = "workload.deploy.v1";
 pub const CAPABILITY_WORKLOAD_LIFECYCLE: &str = "workload.lifecycle.v1";
+pub const CAPABILITY_WIREGUARD_KEY_ENSURE: &str = "network.wireguard.key.ensure.v1";
+pub const CAPABILITY_WIREGUARD_INSPECT: &str = "network.wireguard.inspect.v1";
+pub const CAPABILITY_WIREGUARD_RECONCILE: &str = "network.wireguard.reconcile.v1";
+pub const CAPABILITY_FIREWALL_INSPECT: &str = "network.firewall.inspect.v1";
+pub const CAPABILITY_FIREWALL_RECONCILE: &str = "network.firewall.reconcile.v1";
+pub const CAPABILITY_CORROSION_INSPECT: &str = "discovery.corrosion.inspect.v1";
+pub const CAPABILITY_CORROSION_RECONCILE: &str = "discovery.corrosion.reconcile.v1";
+pub const NETWORK_CAPABILITIES: [&str; 7] = [
+    CAPABILITY_WIREGUARD_KEY_ENSURE,
+    CAPABILITY_WIREGUARD_INSPECT,
+    CAPABILITY_WIREGUARD_RECONCILE,
+    CAPABILITY_FIREWALL_INSPECT,
+    CAPABILITY_FIREWALL_RECONCILE,
+    CAPABILITY_CORROSION_INSPECT,
+    CAPABILITY_CORROSION_RECONCILE,
+];
 
 pub mod control {
     pub mod v1 {
