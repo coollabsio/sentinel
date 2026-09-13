@@ -739,7 +739,7 @@ fn activate_wireguard(
         let peer_addresses = request
             .peers
             .iter()
-            .filter_map(|peer| peer.allowed_ips.first().map(String::as_str))
+            .flat_map(|peer| peer.allowed_ips.iter().map(String::as_str))
             .collect::<Vec<_>>();
         configure_discovery_resolver(&request.interface, &request.address, &peer_addresses)
     });
@@ -753,7 +753,7 @@ fn activate_wireguard(
             let peer_addresses = request
                 .peers
                 .iter()
-                .filter_map(|peer| peer.allowed_ips.first().map(String::as_str))
+                .flat_map(|peer| peer.allowed_ips.iter().map(String::as_str))
                 .collect::<Vec<_>>();
             configure_discovery_resolver(&request.interface, &request.address, &peer_addresses)
         });
@@ -1192,21 +1192,14 @@ fn discovery_resolver_commands(
         .ok_or("The discovery DNS address is invalid.")?
         .to_string();
 
-    let mut addresses = peer_addresses
+    let mut reverse_zones = peer_addresses
         .iter()
         .copied()
         .chain(std::iter::once(bind_address.as_str()))
-        .filter_map(|address| address.strip_suffix("/32").unwrap_or(address).parse().ok())
-        .collect::<Vec<std::net::Ipv4Addr>>();
-    addresses.sort_unstable();
-    addresses.dedup();
-    let reverse_zones = addresses.into_iter().map(|address| {
-        let octets = address.octets();
-        format!(
-            "~{}.{}.{}.{}.in-addr.arpa",
-            octets[3], octets[2], octets[1], octets[0]
-        )
-    });
+        .filter_map(reverse_dns_zone)
+        .collect::<Vec<_>>();
+    reverse_zones.sort();
+    reverse_zones.dedup();
 
     Ok(vec![
         vec!["dns".into(), interface.into(), bind_address],
@@ -1216,6 +1209,26 @@ fn discovery_resolver_commands(
             .chain(reverse_zones)
             .collect(),
     ])
+}
+
+fn reverse_dns_zone(cidr: &str) -> Option<String> {
+    let (address, prefix) = cidr.split_once('/').unwrap_or((cidr, "32"));
+    let address = address.parse::<std::net::Ipv4Addr>().ok()?;
+    let prefix = prefix.parse::<u8>().ok()?;
+    let octets = address.octets();
+    match prefix {
+        8 => Some(format!("~{}.in-addr.arpa", octets[0])),
+        16 => Some(format!("~{}.{}.in-addr.arpa", octets[1], octets[0])),
+        24 => Some(format!(
+            "~{}.{}.{}.in-addr.arpa",
+            octets[2], octets[1], octets[0]
+        )),
+        32 => Some(format!(
+            "~{}.{}.{}.{}.in-addr.arpa",
+            octets[3], octets[2], octets[1], octets[0]
+        )),
+        _ => None,
+    }
 }
 
 fn configure_discovery_resolver(
@@ -1544,7 +1557,7 @@ mod tests {
         let commands = discovery_resolver_commands(
             "mesh0",
             "10.0.0.130/32",
-            &["10.0.0.129/32", "10.0.0.131/32"],
+            &["10.0.0.129/32", "10.0.0.131/32", "100.64.1.0/24"],
         )
         .unwrap();
 
@@ -1556,6 +1569,7 @@ mod tests {
                     "domain",
                     "mesh0",
                     "~coolify.internal",
+                    "~1.64.100.in-addr.arpa",
                     "~129.0.0.10.in-addr.arpa",
                     "~130.0.0.10.in-addr.arpa",
                     "~131.0.0.10.in-addr.arpa",
