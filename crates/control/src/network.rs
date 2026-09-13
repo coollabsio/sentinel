@@ -599,6 +599,10 @@ fn wireguard_state(
     }
 }
 
+fn rollback_start_arguments(unit: &str) -> [&str; 3] {
+    ["start", "--wait", unit]
+}
+
 fn activate_wireguard(
     request: &WireguardReconcileRequest,
     staged_path: &Path,
@@ -659,8 +663,9 @@ fn activate_wireguard(
     })
     .and_then(|_| configure_discovery_resolver(&request.interface, &request.address));
     if healthy.is_err() {
+        let rollback_service = format!("{rollback_unit}.service");
         let rollback = run(
-            Command::new("systemctl").args(["start", &rollback_unit]),
+            Command::new("systemctl").args(rollback_start_arguments(&rollback_service)),
             "WireGuard rollback failed.",
         )
         .and_then(|_| configure_discovery_resolver(&request.interface, &request.address));
@@ -788,7 +793,9 @@ fn activate_firewall(root: &Path, snapshot: &str, flux_probe_host: &str) -> Resu
     });
     if let Err(error) = activated {
         let rollback = run(
-            Command::new("systemctl").args(["start", "coolify-firewall-rollback.service"]),
+            Command::new("systemctl").args(rollback_start_arguments(
+                "coolify-firewall-rollback.service",
+            )),
             "Firewall rollback failed.",
         );
         let _ = Command::new("systemctl")
@@ -1405,6 +1412,14 @@ mod tests {
                 ["dns", "mesh0", "10.240.0.2"],
                 ["domain", "mesh0", "~coolify.internal"],
             ]
+        );
+    }
+
+    #[test]
+    fn transient_rollbacks_are_started_synchronously() {
+        assert_eq!(
+            rollback_start_arguments("coolify-network-rollback-mesh0.service"),
+            ["start", "--wait", "coolify-network-rollback-mesh0.service"]
         );
     }
 
