@@ -304,6 +304,47 @@ fn parse_wireguard_dump(interface: &str, dump: &[u8]) -> Result<WireguardInspect
     })
 }
 
+fn wireguard_state_matches(
+    request: &WireguardReconcileRequest,
+    observed: &WireguardInspectResult,
+) -> bool {
+    observed.interface == request.interface
+        && !observed.public_key.is_empty()
+        && observed.listen_port == request.listen_port
+        && observed.peers.len() == request.peers.len()
+        && request.peers.iter().all(|expected| {
+            observed.peers.iter().any(|peer| {
+                peer.public_key == expected.public_key
+                    && peer.allowed_ips.len() == 1
+                    && peer.allowed_ips[0] == expected.allowed_ip
+            })
+        })
+}
+
+fn validate_live_wireguard(request: &WireguardReconcileRequest) -> Result<(), String> {
+    let output = Command::new("wg")
+        .args(["show", &request.interface, "dump"])
+        .output()
+        .map_err(|_| "WireGuard health validation failed.".to_string())?;
+    if !output.status.success() {
+        return Err("WireGuard health validation failed.".into());
+    }
+    let observed = parse_wireguard_dump(&request.interface, &output.stdout)?;
+    if !wireguard_state_matches(request, &observed) {
+        return Err("WireGuard does not match the expected peer state.".into());
+    }
+    let address = Command::new("ip")
+        .args(["-4", "-o", "address", "show", "dev", &request.interface])
+        .output()
+        .map_err(|_| "WireGuard address validation failed.".to_string())?;
+    if !address.status.success()
+        || !String::from_utf8_lossy(&address.stdout).contains(&format!("inet {}", request.address))
+    {
+        return Err("WireGuard does not have the expected address.".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn reconcile_wireguard(
     root: &Path,
     request: &WireguardReconcileRequest,
@@ -448,12 +489,7 @@ fn activate_wireguard(
         Command::new("wg-quick").args(["up", &request.interface]),
         "WireGuard activation failed.",
     )
-    .and_then(|_| {
-        run(
-            Command::new("wg").args(["show", &request.interface]),
-            "WireGuard health validation failed.",
-        )
-    })
+    .and_then(|_| validate_live_wireguard(request))
     .and_then(|_| {
         if request.flux_probe_host.is_empty() {
             Ok(())
@@ -497,7 +533,7 @@ pub(crate) fn reconcile_firewall(
     let snapshot_path = state_path(root, "firewall.nft");
     atomic_write(&snapshot_path, snapshot.as_bytes(), 0o600)?;
     if root == Path::new("/") {
-        activate_firewall(root, &snapshot)?;
+        activate_firewall(root, &snapshot, &request.flux_probe_host)?;
     }
     atomic_write(
         &state_file,
@@ -523,7 +559,7 @@ fn nft_transaction(snapshot: &str, table_exists: bool) -> String {
     )
 }
 
-fn activate_firewall(root: &Path, snapshot: &str) -> Result<(), String> {
+fn activate_firewall(root: &Path, snapshot: &str, flux_probe_host: &str) -> Result<(), String> {
     let current = Command::new("nft")
         .args(["list", "table", "inet", COOLIFY_NFT_TABLE])
         .output()
@@ -573,6 +609,16 @@ fn activate_firewall(root: &Path, snapshot: &str) -> Result<(), String> {
             Command::new("nft").args(["list", "table", "inet", COOLIFY_NFT_TABLE]),
             "The Coolify firewall table is not active.",
         )
+    })
+    .and_then(|_| {
+        if flux_probe_host.is_empty() {
+            Ok(())
+        } else {
+            run(
+                Command::new("ping").args(["-c", "1", "-W", "5", flux_probe_host]),
+                "Flux connectivity validation failed.",
+            )
+        }
     });
     if let Err(error) = activated {
         let _ = Command::new("systemctl")
@@ -831,6 +877,7 @@ mod tests {
                 expression: "ip saddr 10.240.0.0/24 accept".into(),
             }],
             wireguard_interface: "coolify0".into(),
+            flux_probe_host: "10.240.0.1".into(),
         })
         .unwrap();
         assert!(rendered.contains("table inet coolify_cluster"));
@@ -912,6 +959,47 @@ mod tests {
     }
 
     #[test]
+    fn wireguard_health_requires_the_complete_expected_peer_state() {
+        let request = WireguardReconcileRequest {
+            interface: "coolify0".into(),
+            address: "10.240.0.2/32".into(),
+            listen_port: 51820,
+            revision: 7,
+            peers: vec![WireguardPeer {
+                public_key: "peer-public".into(),
+                endpoint: "192.0.2.2:51820".into(),
+                allowed_ip: "10.240.0.3/32".into(),
+                persistent_keepalive_seconds: 25,
+            }],
+            flux_probe_host: "192.0.2.1".into(),
+        };
+        let mut observed = WireguardInspectResult {
+            interface: "coolify0".into(),
+            public_key: "local-public".into(),
+            listen_port: 51820,
+            peers: vec![WireguardPeerState {
+                public_key: "peer-public".into(),
+                endpoint: "192.0.2.2:51820".into(),
+                allowed_ips: vec!["10.240.0.3/32".into()],
+                latest_handshake_unix_seconds: 0,
+            }],
+            applied_revision: 0,
+            configuration_hash: String::new(),
+            drifted: false,
+        };
+
+        assert!(wireguard_state_matches(&request, &observed));
+        observed.peers[0].allowed_ips = vec!["10.240.0.99/32".into()];
+        assert!(!wireguard_state_matches(&request, &observed));
+        observed.peers[0].allowed_ips = vec!["10.240.0.3/32".into()];
+        observed.listen_port = 51821;
+        assert!(!wireguard_state_matches(&request, &observed));
+        observed.listen_port = 51820;
+        observed.peers.clear();
+        assert!(!wireguard_state_matches(&request, &observed));
+    }
+
+    #[test]
     fn firewall_reconciliation_never_changes_unrelated_rules() {
         let temp = tempfile::tempdir().unwrap();
         let unrelated = temp.path().join("etc/nftables.conf");
@@ -923,6 +1011,7 @@ mod tests {
             cluster_cidr: "10.240.0.0/24".into(),
             rules: vec![],
             wireguard_interface: "coolify0".into(),
+            flux_probe_host: String::new(),
         };
         let first = reconcile_firewall(temp.path(), &request).unwrap();
         let second = reconcile_firewall(temp.path(), &request).unwrap();

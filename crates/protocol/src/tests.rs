@@ -40,6 +40,16 @@ fn network_capabilities_are_typed_and_versioned() {
         command.payload,
         Some(control::v1::command::Payload::WireguardReconcile(_))
     ));
+
+    let firewall = control::v1::FirewallReconcileRequest {
+        revision: 2,
+        wireguard_port: 51820,
+        cluster_cidr: "10.240.0.0/24".into(),
+        rules: vec![],
+        wireguard_interface: "coolify0".into(),
+        flux_probe_host: "10.240.0.1".into(),
+    };
+    assert_eq!(firewall.flux_probe_host, "10.240.0.1");
 }
 
 #[test]

@@ -138,6 +138,8 @@ struct FirewallReconcileApiRequest {
     wireguard_interface: String,
     #[serde(default)]
     rules: Vec<FirewallRuleApiRequest>,
+    #[serde(default)]
+    flux_probe_host: String,
 }
 #[derive(Deserialize)]
 struct CorrosionInspectApiRequest {
@@ -494,6 +496,7 @@ async fn firewall_reconcile(
             cluster_cidr: request.cluster_cidr,
             rules,
             wireguard_interface: request.wireguard_interface,
+            flux_probe_host: request.flux_probe_host,
         }),
     )
     .await?;

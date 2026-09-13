@@ -224,7 +224,7 @@ message WireguardReconcileResult { WireguardInspectResult state = 1; bool change
 message FirewallInspectRequest { uint64 expected_revision = 1; string expected_hash = 2; }
 message FirewallInspectResult { uint64 applied_revision = 1; string configuration_hash = 2; bool drifted = 3; string table = 4; }
 message FirewallRule { string chain = 1; string expression = 2; }
-message FirewallReconcileRequest { uint64 revision = 1; uint32 wireguard_port = 2; string cluster_cidr = 3; repeated FirewallRule rules = 4; string wireguard_interface = 5; }
+message FirewallReconcileRequest { uint64 revision = 1; uint32 wireguard_port = 2; string cluster_cidr = 3; repeated FirewallRule rules = 4; string wireguard_interface = 5; string flux_probe_host = 6; }
 message FirewallReconcileResult { FirewallInspectResult state = 1; bool changed = 2; bool rollback_cancelled = 3; }
 message CorrosionInspectRequest {}
 message CorrosionInspectResult { string version = 1; string member_state = 2; uint64 endpoint_count = 3; optional int64 last_convergence_unix_seconds = 4; }
