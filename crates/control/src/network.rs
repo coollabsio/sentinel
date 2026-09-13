@@ -648,8 +648,16 @@ pub(crate) fn reconcile_corrosion(
             "Systemd could not reload Corrosion.",
         )?;
         run(
-            Command::new("systemctl").args(["enable", "--now", "corrosion.service"]),
+            Command::new("systemctl").args(["enable", "corrosion.service"]),
+            "Corrosion could not be enabled.",
+        )?;
+        run(
+            Command::new("systemctl").args(["restart", "corrosion.service"]),
             "Corrosion could not start.",
+        )?;
+        run(
+            Command::new("systemctl").args(["is-active", "--quiet", "corrosion.service"]),
+            "Corrosion did not become active.",
         )?;
     }
     Ok(CorrosionReconcileResult {
@@ -677,11 +685,11 @@ pub(crate) fn inspect_corrosion(root: &Path) -> CorrosionInspectResult {
 }
 
 fn corrosion_schema() -> &'static str {
-    "CREATE TABLE IF NOT EXISTS workload_endpoints (workload_id TEXT NOT NULL, namespace TEXT NOT NULL, owner_node_ip TEXT NOT NULL, container_ip TEXT NOT NULL, state TEXT NOT NULL, health TEXT NOT NULL, updated_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY (namespace, workload_id, owner_node_ip, container_ip));\n"
+    "CREATE TABLE IF NOT EXISTS workload_endpoints (workload_id TEXT NOT NULL, namespace TEXT NOT NULL, owner_node_ip TEXT NOT NULL, container_ip TEXT NOT NULL, state TEXT NOT NULL DEFAULT '', health TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (namespace, workload_id, owner_node_ip, container_ip));\n"
 }
 
 fn corrosion_unit() -> &'static str {
-    "[Unit]\nDescription=Coolify Corrosion discovery\nAfter=network-online.target wg-quick@coolify0.service\nWants=network-online.target\nRequires=wg-quick@coolify0.service\n[Service]\nExecStart=/usr/local/bin/corrosion agent --config /etc/corrosion/config.toml\nUser=corrosion\nGroup=corrosion\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\nStateDirectory=corrosion\nRuntimeDirectory=corrosion\nReadWritePaths=/var/lib/corrosion /run/corrosion\nRestart=on-failure\nRestartSec=2s\n[Install]\nWantedBy=multi-user.target\n"
+    "[Unit]\nDescription=Coolify Corrosion discovery\nAfter=network-online.target\nWants=network-online.target\n[Service]\nExecStart=/usr/local/bin/corrosion agent --config /etc/corrosion/config.toml\nUser=corrosion\nGroup=corrosion\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\nStateDirectory=corrosion\nRuntimeDirectory=corrosion\nReadWritePaths=/var/lib/corrosion /run/corrosion\nRestart=on-failure\nRestartSec=2s\n[Install]\nWantedBy=multi-user.target\n"
 }
 
 fn corrosion_download(version: &str, architecture: &str) -> Result<String, String> {
@@ -953,7 +961,12 @@ mod tests {
             fs::read_to_string(temp.path().join("etc/corrosion/schemas/coolify.sql")).unwrap();
         assert!(config.contains("10.240.0.2:8787") && config.contains("10.240.0.2:8080"));
         assert!(unit.contains("NoNewPrivileges=true") && unit.contains("ProtectSystem=strict"));
+        assert!(!unit.contains("wg-quick@coolify0.service"));
         assert!(schema.contains("owner_node_ip") && schema.contains("expires_at"));
+        assert!(schema.contains("state TEXT NOT NULL DEFAULT ''"));
+        assert!(schema.contains("health TEXT NOT NULL DEFAULT ''"));
+        assert!(schema.contains("updated_at INTEGER NOT NULL DEFAULT 0"));
+        assert!(schema.contains("expires_at INTEGER NOT NULL DEFAULT 0"));
     }
 
     #[test]
