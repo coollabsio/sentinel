@@ -8,6 +8,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "#[allow(clippy::large_enum_variant)]",
     );
     prost.enum_attribute(
+        ".coolify.sentinel.control.v1.ControlMessage.message",
+        "#[allow(clippy::large_enum_variant)]",
+    );
+    prost.enum_attribute(
         ".coolify.sentinel.control.v1.CommandResult.payload",
         "#[allow(clippy::large_enum_variant)]",
     );
