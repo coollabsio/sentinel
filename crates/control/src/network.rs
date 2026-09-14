@@ -1026,12 +1026,6 @@ pub(crate) fn reconcile_corrosion(
             ]),
             "The Coolify discovery DNS service did not become active.",
         )?;
-        let peer_addresses = request
-            .peers
-            .iter()
-            .filter_map(|peer| peer.rsplit_once(':').map(|(address, _)| address))
-            .collect::<Vec<_>>();
-        configure_discovery_resolver("coolify0", &request.bind_address, &peer_addresses)?;
     }
     Ok(CorrosionReconcileResult {
         state: Some(inspect_corrosion(root)),
