@@ -130,6 +130,7 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
             .iter()
             .any(|cidr| !valid_ipv4_cidr(cidr))
         || request.rules.len() > 100_000
+        || request.ingress_rules.len() > 100_000
         || request.rules.iter().any(|rule| {
             rule.source_ip.parse::<std::net::Ipv4Addr>().is_err()
                 || rule.destination_ip.parse::<std::net::Ipv4Addr>().is_err()
@@ -140,6 +141,16 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
                     .workload_cidrs
                     .iter()
                     .any(|cidr| ipv4_in_cidr(&rule.source_ip, cidr))
+                || !request
+                    .workload_cidrs
+                    .iter()
+                    .any(|cidr| ipv4_in_cidr(&rule.destination_ip, cidr))
+        })
+        || request.ingress_rules.iter().any(|rule| {
+            rule.destination_ip.parse::<std::net::Ipv4Addr>().is_err()
+                || !matches!(rule.protocol.as_str(), "tcp" | "udp")
+                || rule.port == 0
+                || rule.port > 65_535
                 || !request
                     .workload_cidrs
                     .iter()
@@ -178,13 +189,41 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
         })
         .collect::<Vec<_>>()
         .join(" ");
+    let mut ingress_rules = request.ingress_rules.clone();
+    ingress_rules.sort_by(|left, right| {
+        (&left.destination_ip, &left.protocol, left.port).cmp(&(
+            &right.destination_ip,
+            &right.protocol,
+            right.port,
+        ))
+    });
+    let forward_ingress_rules = ingress_rules
+        .iter()
+        .map(|rule| {
+            format!(
+                "ip saddr != @workload_networks ip daddr {} {} dport {} accept;",
+                rule.destination_ip, rule.protocol, rule.port
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let output_ingress_rules = ingress_rules
+        .iter()
+        .map(|rule| {
+            format!(
+                "ip daddr {} {} dport {} accept;",
+                rule.destination_ip, rule.protocol, rule.port
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
 
     Ok(format!(
         "table inet {COOLIFY_NFT_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
  chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
- chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; }}
- chain output {{ type filter hook output priority -5; policy accept; }}
+ chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} {forward_ingress_rules} ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; ip saddr != @workload_networks ip daddr @workload_networks drop; }}
+ chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; {output_ingress_rules} ip daddr @workload_networks drop; }}
 }}
 ",
         request.wireguard_port, request.wireguard_interface, request.cluster_cidr, request.cluster_cidr
@@ -930,6 +969,7 @@ pub(crate) fn inspect_firewall(
             .as_ref()
             .is_none_or(|state| state.0 != expected_revision || state.1 != expected_hash),
         table: COOLIFY_NFT_TABLE.into(),
+        ingress_enforced: true,
     }
 }
 
@@ -943,6 +983,7 @@ fn firewall_state(
         configuration_hash,
         drifted,
         table: COOLIFY_NFT_TABLE.into(),
+        ingress_enforced: true,
     }
 }
 
@@ -1382,7 +1423,7 @@ fn read_state_file(path: &Path) -> Option<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_protocol::control::v1::{FirewallRule, WireguardPeer};
+    use sentinel_protocol::control::v1::{FirewallIngressRule, FirewallRule, WireguardPeer};
 
     #[test]
     fn renders_deterministic_full_mesh_without_peer_secrets() {
@@ -1417,6 +1458,11 @@ mod tests {
                 protocol: "tcp".into(),
                 port: 5432,
             }],
+            ingress_rules: vec![FirewallIngressRule {
+                destination_ip: "100.64.1.2".into(),
+                protocol: "tcp".into(),
+                port: 8080,
+            }],
             wireguard_interface: "coolify0".into(),
             workload_cidrs: vec!["100.64.0.0/24".into(), "100.64.1.0/24".into()],
             flux_probe_host: "10.240.0.1".into(),
@@ -1427,6 +1473,17 @@ mod tests {
         assert!(!rendered.contains("delete table"));
         assert!(rendered.contains("ip saddr @workload_networks ip daddr @workload_networks drop"));
         assert!(rendered.contains("ip saddr 100.64.0.2 ip daddr 100.64.1.2 tcp dport 5432 accept"));
+        assert!(
+            rendered.contains(
+                "ip saddr != @workload_networks ip daddr 100.64.1.2 tcp dport 8080 accept"
+            )
+        );
+        assert!(
+            rendered.contains("ip saddr != @workload_networks ip daddr @workload_networks drop")
+        );
+        assert!(rendered.contains("ip daddr 100.64.1.2 tcp dport 8080 accept"));
+        assert!(rendered.contains("chain output { type filter hook output priority -5; policy accept; ct state established,related accept;"));
+        assert!(rendered.contains("ip daddr @workload_networks drop"));
         assert!(rendered.contains("policy accept"));
     }
 
@@ -1594,6 +1651,7 @@ mod tests {
             wireguard_interface: "coolify0".into(),
             flux_probe_host: String::new(),
             workload_cidrs: vec!["100.64.0.0/24".into()],
+            ingress_rules: vec![],
         };
         let first = reconcile_firewall(temp.path(), &request).unwrap();
         let second = reconcile_firewall(temp.path(), &request).unwrap();

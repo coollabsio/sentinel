@@ -9,11 +9,11 @@ use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
     Command, CommandStatus, ContainerListRequest, ContainerPort, CorrosionEndpointReconcileRequest,
-    CorrosionInspectRequest, CorrosionReconcileRequest, FirewallInspectRequest,
-    FirewallReconcileRequest, FirewallRule, SystemInfoRequest, SystemPingRequest,
-    WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest,
-    WorkloadDeployRequest, WorkloadEndpoint, WorkloadEnvironmentVariable, WorkloadLabel,
-    WorkloadLifecycleAction, WorkloadLifecycleRequest,
+    CorrosionInspectRequest, CorrosionReconcileRequest, FirewallIngressRule,
+    FirewallInspectRequest, FirewallReconcileRequest, FirewallRule, SystemInfoRequest,
+    SystemPingRequest, WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer,
+    WireguardReconcileRequest, WorkloadDeployRequest, WorkloadEndpoint,
+    WorkloadEnvironmentVariable, WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
 };
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
@@ -139,6 +139,12 @@ struct FirewallRuleApiRequest {
     port: u32,
 }
 #[derive(Deserialize)]
+struct FirewallIngressRuleApiRequest {
+    destination_ip: String,
+    protocol: String,
+    port: u32,
+}
+#[derive(Deserialize)]
 struct FirewallReconcileApiRequest {
     server_id: String,
     command_id: String,
@@ -152,6 +158,8 @@ struct FirewallReconcileApiRequest {
     flux_probe_host: String,
     #[serde(default)]
     workload_cidrs: Vec<String>,
+    #[serde(default)]
+    ingress_rules: Vec<FirewallIngressRuleApiRequest>,
 }
 #[derive(Deserialize)]
 struct CorrosionInspectApiRequest {
@@ -504,7 +512,7 @@ async fn firewall_inspect(
         return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
     };
     Ok(Json(
-        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "applied_revision": value.applied_revision, "configuration_hash": value.configuration_hash, "drifted": value.drifted, "table": value.table}),
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "applied_revision": value.applied_revision, "configuration_hash": value.configuration_hash, "drifted": value.drifted, "table": value.table, "ingress_enforced": value.ingress_enforced}),
     ))
 }
 
@@ -518,6 +526,15 @@ async fn firewall_reconcile(
         .into_iter()
         .map(|rule| FirewallRule {
             source_ip: rule.source_ip,
+            destination_ip: rule.destination_ip,
+            protocol: rule.protocol,
+            port: rule.port,
+        })
+        .collect();
+    let ingress_rules = request
+        .ingress_rules
+        .into_iter()
+        .map(|rule| FirewallIngressRule {
             destination_ip: rule.destination_ip,
             protocol: rule.protocol,
             port: rule.port,
@@ -537,6 +554,7 @@ async fn firewall_reconcile(
             wireguard_interface: request.wireguard_interface,
             flux_probe_host: request.flux_probe_host,
             workload_cidrs: request.workload_cidrs,
+            ingress_rules,
         }),
     )
     .await?;
@@ -547,7 +565,7 @@ async fn firewall_reconcile(
         .state
         .ok_or((StatusCode::BAD_GATEWAY, "invalid Sentinel response"))?;
     Ok(Json(
-        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "changed": value.changed, "rollback_cancelled": value.rollback_cancelled, "applied_revision": network.applied_revision, "configuration_hash": network.configuration_hash, "drifted": network.drifted, "table": network.table}),
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "changed": value.changed, "rollback_cancelled": value.rollback_cancelled, "applied_revision": network.applied_revision, "configuration_hash": network.configuration_hash, "drifted": network.drifted, "table": network.table, "ingress_enforced": network.ingress_enforced}),
     ))
 }
 
