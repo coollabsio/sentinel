@@ -151,6 +151,7 @@ struct FirewallReconcileApiRequest {
     revision: u64,
     wireguard_port: u32,
     cluster_cidr: String,
+    local_node_ip: String,
     wireguard_interface: String,
     #[serde(default)]
     rules: Vec<FirewallRuleApiRequest>,
@@ -550,6 +551,7 @@ async fn firewall_reconcile(
             revision: request.revision,
             wireguard_port: request.wireguard_port,
             cluster_cidr: request.cluster_cidr,
+            local_node_ip: request.local_node_ip,
             rules,
             wireguard_interface: request.wireguard_interface,
             flux_probe_host: request.flux_probe_host,

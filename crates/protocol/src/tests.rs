@@ -45,6 +45,7 @@ fn network_capabilities_are_typed_and_versioned() {
         revision: 2,
         wireguard_port: 51820,
         cluster_cidr: "10.240.0.0/24".into(),
+        local_node_ip: "10.240.0.2".into(),
         rules: vec![],
         wireguard_interface: "coolify0".into(),
         flux_probe_host: "10.240.0.1".into(),
