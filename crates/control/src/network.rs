@@ -134,9 +134,11 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
         || request.rules.iter().any(|rule| {
             rule.source_ip.parse::<std::net::Ipv4Addr>().is_err()
                 || rule.destination_ip.parse::<std::net::Ipv4Addr>().is_err()
-                || !matches!(rule.protocol.as_str(), "tcp" | "udp")
-                || rule.port == 0
-                || rule.port > 65_535
+                || match rule.protocol.as_str() {
+                    "tcp" | "udp" => rule.port == 0,
+                    "icmp" => rule.port != 0,
+                    _ => true,
+                }
                 || !request
                     .workload_cidrs
                     .iter()
@@ -182,10 +184,17 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
     let allow_rules = rules
         .into_iter()
         .map(|rule| {
-            format!(
-                "ip saddr {} ip daddr {} {} dport {} accept;",
-                rule.source_ip, rule.destination_ip, rule.protocol, rule.port
-            )
+            if rule.protocol == "icmp" {
+                format!(
+                    "ip saddr {} ip daddr {} ip protocol icmp accept;",
+                    rule.source_ip, rule.destination_ip
+                )
+            } else {
+                format!(
+                    "ip saddr {} ip daddr {} {} dport {} accept;",
+                    rule.source_ip, rule.destination_ip, rule.protocol, rule.port
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -226,7 +235,10 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
  chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; {output_ingress_rules} ip daddr @workload_networks drop; }}
 }}
 ",
-        request.wireguard_port, request.wireguard_interface, request.cluster_cidr, request.cluster_cidr
+        request.wireguard_port,
+        request.wireguard_interface,
+        request.cluster_cidr,
+        request.cluster_cidr
     ))
 }
 
@@ -1452,12 +1464,20 @@ mod tests {
             revision: 1,
             wireguard_port: 51820,
             cluster_cidr: "10.240.0.0/24".into(),
-            rules: vec![FirewallRule {
-                source_ip: "100.64.0.2".into(),
-                destination_ip: "100.64.1.2".into(),
-                protocol: "tcp".into(),
-                port: 5432,
-            }],
+            rules: vec![
+                FirewallRule {
+                    source_ip: "100.64.0.2".into(),
+                    destination_ip: "100.64.1.2".into(),
+                    protocol: "tcp".into(),
+                    port: 5432,
+                },
+                FirewallRule {
+                    source_ip: "100.64.0.3".into(),
+                    destination_ip: "100.64.1.3".into(),
+                    protocol: "icmp".into(),
+                    port: 0,
+                },
+            ],
             ingress_rules: vec![FirewallIngressRule {
                 destination_ip: "100.64.1.2".into(),
                 protocol: "tcp".into(),
@@ -1472,6 +1492,12 @@ mod tests {
         assert!(!rendered.contains("flush ruleset"));
         assert!(!rendered.contains("delete table"));
         assert!(rendered.contains("ip saddr @workload_networks ip daddr @workload_networks drop"));
+        assert!(
+            rendered.contains("ip saddr 100.64.0.3 ip daddr 100.64.1.3 ip protocol icmp accept")
+        );
+        assert!(!rendered.contains(
+            "ip saddr @workload_networks ip daddr @workload_networks ip protocol icmp accept"
+        ));
         assert!(rendered.contains("ip saddr 100.64.0.2 ip daddr 100.64.1.2 tcp dport 5432 accept"));
         assert!(
             rendered.contains(
