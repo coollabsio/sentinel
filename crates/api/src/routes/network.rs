@@ -55,7 +55,10 @@ async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuer
     };
 
     let debug = state.config.debug;
-    let out: Vec<NetworkUsage> = rows.into_iter().map(|r| to_network_usage(r, debug)).collect();
+    let out: Vec<NetworkUsage> = rows
+        .into_iter()
+        .map(|r| to_network_usage(r, debug))
+        .collect();
     Json(out).into_response()
 }
 

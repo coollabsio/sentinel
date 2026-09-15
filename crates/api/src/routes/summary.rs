@@ -67,7 +67,8 @@ async fn summary(State(state): State<Arc<AppState>>) -> Response {
         disk: Some(disk)
             .filter(|rows| !rows.is_empty())
             .map(|rows| rows.into_iter().map(|r| to_disk_usage(r, debug)).collect()),
-        network: network.map(|r| to_network_usage(r.time, r.rx_bytes_per_sec, r.tx_bytes_per_sec, debug)),
+        network: network
+            .map(|r| to_network_usage(r.time, r.rx_bytes_per_sec, r.tx_bytes_per_sec, debug)),
         load: load.map(|r| LoadAverage {
             time: r.time.to_string(),
             load1: r.load1,

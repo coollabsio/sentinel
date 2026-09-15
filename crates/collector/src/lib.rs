@@ -138,11 +138,7 @@ impl Collector {
         self.collect_containers(time, net_prev).await;
     }
 
-    async fn collect_containers(
-        &self,
-        time: i64,
-        net_prev: &mut HashMap<String, (u64, u64, i64)>,
-    ) {
+    async fn collect_containers(&self, time: i64, net_prev: &mut HashMap<String, (u64, u64, i64)>) {
         let containers = match self.docker.list_containers().await {
             Ok(c) => c,
             Err(e) => {
@@ -186,8 +182,7 @@ impl Collector {
         let mut status_samples = Vec::with_capacity(fetched.len());
         for f in fetched {
             let name = f.sample.container_id.clone();
-            let (rx_rate, tx_rate) =
-                net_rate(net_prev.get(&name), f.net_rx, f.net_tx, time);
+            let (rx_rate, tx_rate) = net_rate(net_prev.get(&name), f.net_rx, f.net_tx, time);
             net_prev.insert(name.clone(), (f.net_rx, f.net_tx, time));
             net_samples.push(ContainerNetworkSample {
                 container_id: name.clone(),
@@ -241,10 +236,7 @@ fn net_rate(prev: Option<&(u64, u64, i64)>, cur_rx: u64, cur_tx: u64, now: i64) 
     match prev {
         Some(&(prx, ptx, pt)) if now > pt && cur_rx >= prx && cur_tx >= ptx => {
             let dt = (now - pt) as f64 / 1000.0;
-            (
-                (cur_rx - prx) as f64 / dt,
-                (cur_tx - ptx) as f64 / dt,
-            )
+            ((cur_rx - prx) as f64 / dt, (cur_tx - ptx) as f64 / dt)
         }
         _ => (0.0, 0.0),
     }

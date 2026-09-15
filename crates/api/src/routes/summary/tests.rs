@@ -144,10 +144,16 @@ async fn containers_current_returns_latest_per_container() {
     let store = Store::open_in_memory().unwrap();
     // Two cycles: the second must win for both containers.
     store
-        .insert_container_batch(1000, &[container("alpha", 5.0, 10), container("beta", 1.0, 2)])
+        .insert_container_batch(
+            1000,
+            &[container("alpha", 5.0, 10), container("beta", 1.0, 2)],
+        )
         .unwrap();
     store
-        .insert_container_batch(2000, &[container("alpha", 88.0, 40), container("beta", 3.0, 6)])
+        .insert_container_batch(
+            2000,
+            &[container("alpha", 88.0, 40), container("beta", 3.0, 6)],
+        )
         .unwrap();
     // alpha also has a disk sample at a later time than its cpu/memory.
     store

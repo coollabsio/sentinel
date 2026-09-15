@@ -65,11 +65,16 @@ async fn network_history(
     let debug = state.config.debug;
     let out: Vec<NetworkUsage> = rows
         .into_iter()
-        .map(|r| to_network_usage(store::NetworkRow {
-            time: r.time,
-            rx_bytes_per_sec: r.rx_bytes_per_sec,
-            tx_bytes_per_sec: r.tx_bytes_per_sec,
-        }, debug))
+        .map(|r| {
+            to_network_usage(
+                store::NetworkRow {
+                    time: r.time,
+                    rx_bytes_per_sec: r.rx_bytes_per_sec,
+                    tx_bytes_per_sec: r.tx_bytes_per_sec,
+                },
+                debug,
+            )
+        })
         .collect();
     Json(out).into_response()
 }

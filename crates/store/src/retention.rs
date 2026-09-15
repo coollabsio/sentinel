@@ -36,10 +36,7 @@ impl Store {
             // name; its `time` is a last-seen stamp. A container not seen since
             // the cutoff is gone, so drop its stale status row (no per-row "keep
             // last 10" — each container already has at most one row).
-            deleted += c.execute(
-                "DELETE FROM container_status WHERE time < ?1",
-                (cutoff,),
-            )? as u64;
+            deleted += c.execute("DELETE FROM container_status WHERE time < ?1", (cutoff,))? as u64;
             Ok(deleted)
         })
     }

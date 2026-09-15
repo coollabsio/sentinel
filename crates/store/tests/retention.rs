@@ -196,7 +196,10 @@ fn cleanup_covers_new_series_and_container_status() {
 
     assert_eq!(s.network_history(0, i64::MAX).unwrap().len(), 10);
     assert_eq!(s.load_history(0, i64::MAX).unwrap().len(), 10);
-    assert_eq!(s.container_network_history("c", 0, i64::MAX).unwrap().len(), 10);
+    assert_eq!(
+        s.container_network_history("c", 0, i64::MAX).unwrap().len(),
+        10
+    );
     // Stale container is gone from the current view.
     assert!(
         s.latest_container_metrics()

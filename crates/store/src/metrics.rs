@@ -445,7 +445,12 @@ impl Store {
                      VALUES (?1, ?2, ?3, ?4)",
                 )?;
                 for r in rows {
-                    stmt.execute((time, &r.container_id, r.rx_bytes_per_sec, r.tx_bytes_per_sec))?;
+                    stmt.execute((
+                        time,
+                        &r.container_id,
+                        r.rx_bytes_per_sec,
+                        r.tx_bytes_per_sec,
+                    ))?;
                 }
             }
             tx.commit()?;
