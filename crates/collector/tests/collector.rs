@@ -65,6 +65,8 @@ fn container_memory_percent_is_rounded_to_two_decimals() {
         mem_usage: 12_345_678,
         mem_limit: 100_000_000,
         inactive_file: 0,
+        net_rx: 0,
+        net_tx: 0,
     };
     let raw = docker::calc::memory_percent(&stats);
     assert!((raw - 12.345_678).abs() < 1e-9, "raw percent: {raw}");

@@ -316,6 +316,10 @@ fn base_endpoints() -> Vec<Endpoint> {
         Endpoint::new("/api/memory/history", 2, 40, false),
         Endpoint::new("/api/disk/current", 3, 80, true),
         Endpoint::new("/api/disk/history", 2, 40, false),
+        Endpoint::new("/api/network/current", 3, 80, true),
+        Endpoint::new("/api/network/history", 2, 40, false),
+        Endpoint::new("/api/load/current", 2, 80, false),
+        Endpoint::new("/api/load/history", 1, 40, false),
         Endpoint::new("/api/summary", 3, 80, true),
         Endpoint::new("/api/containers/current", 3, 80, true),
     ]
@@ -329,6 +333,7 @@ fn container_endpoints(id: &str) -> Vec<Endpoint> {
         Endpoint::new(format!("/api/container/{id}/memory/history"), 1, 40, false),
         Endpoint::new(format!("/api/container/{id}/disk/current"), 1, 60, false),
         Endpoint::new(format!("/api/container/{id}/disk/history"), 1, 40, false),
+        Endpoint::new(format!("/api/container/{id}/network/history"), 1, 40, false),
     ]
 }
 

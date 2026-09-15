@@ -3,7 +3,10 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use store::{ContainerDiskSample, ContainerSample, DiskSample, MemRow, Store};
+use store::{
+    ContainerDiskSample, ContainerNetworkSample, ContainerSample, ContainerStatusSample,
+    DiskSample, HostStatusRow, MemRow, Store,
+};
 use tower::ServiceExt;
 
 use crate::AppState;
@@ -211,11 +214,169 @@ async fn containers_current_empty_db_is_empty_array() {
 /// Both endpoints sit under the global auth middleware: no bearer token → 401.
 #[tokio::test]
 async fn bulk_endpoints_require_auth() {
-    for uri in ["/api/summary", "/api/containers/current"] {
+    for uri in [
+        "/api/summary",
+        "/api/containers/current",
+        "/api/network/current",
+        "/api/network/history",
+        "/api/load/current",
+        "/api/load/history",
+    ] {
         let res = crate::router(state(Store::open_in_memory().unwrap()))
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{uri}");
     }
+}
+
+/// `/api/summary` carries the latest network rate, load average and host
+/// status (uptime + swap) alongside cpu/memory/disk.
+#[tokio::test]
+async fn summary_includes_network_load_and_host() {
+    let store = Store::open_in_memory().unwrap();
+    store.insert_network(1000, 100.0, 50.0).unwrap();
+    store.insert_network(2000, 123.5, 67.25).unwrap(); // newer wins
+    store.insert_load(2000, 0.75, 1.5, 2.25).unwrap();
+    store
+        .upsert_host_status(&HostStatusRow {
+            uptime_seconds: 86_400,
+            swap_total: 2_000_000_000,
+            swap_used: 500_000_000,
+            swap_free: 1_500_000_000,
+            swap_used_percent: 25.0,
+            time: 2000,
+        })
+        .unwrap();
+
+    let (s, j) = get_with(state(store), "/api/summary").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j["network"]["time"], "2000");
+    assert_eq!(j["network"]["rxBytesPerSec"], 123.5);
+    assert_eq!(j["network"]["txBytesPerSec"], 67.25);
+    assert_eq!(j["load"]["load1"], 0.75);
+    assert_eq!(j["load"]["load15"], 2.25);
+    assert_eq!(j["host"]["uptimeSeconds"], 86_400);
+    assert_eq!(j["host"]["swapUsedPercent"], 25.0);
+    assert_eq!(j["host"]["swapUsed"], 500_000_000_u64);
+}
+
+/// The new host keys are `null` on an empty database, like the others.
+#[tokio::test]
+async fn summary_nulls_new_series_when_empty() {
+    let (s, j) = get_with(state(Store::open_in_memory().unwrap()), "/api/summary").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(j["network"].is_null());
+    assert!(j["load"].is_null());
+    assert!(j["host"].is_null());
+}
+
+/// `/api/containers/current` rows carry the latest network rate and current
+/// status; a container with only status (no metric samples) still appears.
+#[tokio::test]
+async fn containers_current_includes_network_and_status() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .insert_container_batch(2000, &[container("alpha", 5.0, 10)])
+        .unwrap();
+    store
+        .insert_container_network_batch(
+            1000,
+            &[ContainerNetworkSample {
+                container_id: "alpha".into(),
+                rx_bytes_per_sec: 10.0,
+                tx_bytes_per_sec: 20.0,
+            }],
+        )
+        .unwrap();
+    store
+        .insert_container_network_batch(
+            3000,
+            &[ContainerNetworkSample {
+                container_id: "alpha".into(),
+                rx_bytes_per_sec: 111.0,
+                tx_bytes_per_sec: 222.0,
+            }],
+        )
+        .unwrap();
+    store
+        .upsert_container_status_batch(
+            2000,
+            &[
+                ContainerStatusSample {
+                    container_id: "alpha".into(),
+                    state: "running".into(),
+                    health_status: "healthy".into(),
+                    restart_count: 3,
+                },
+                // status-only container (never produced a metric sample).
+                ContainerStatusSample {
+                    container_id: "ghost".into(),
+                    state: "exited".into(),
+                    health_status: String::new(),
+                    restart_count: 0,
+                },
+            ],
+        )
+        .unwrap();
+
+    let (s, j) = get_with(state(store), "/api/containers/current").await;
+    assert_eq!(s, StatusCode::OK);
+    let rows = j.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "alpha + ghost");
+
+    let alpha = &rows[0];
+    assert_eq!(alpha["id"], "alpha");
+    assert_eq!(alpha["network"]["time"], "3000", "latest rate wins");
+    assert_eq!(alpha["network"]["rxBytesPerSec"], 111.0);
+    assert_eq!(alpha["status"]["state"], "running");
+    assert_eq!(alpha["status"]["health"], "healthy");
+    assert_eq!(alpha["status"]["restartCount"], 3);
+    // Top-level time is the newest metric sample (network 3000), not status.
+    assert_eq!(alpha["time"], 3000);
+
+    let ghost = &rows[1];
+    assert_eq!(ghost["id"], "ghost");
+    assert!(ghost["cpu"].is_null());
+    assert!(ghost["network"].is_null());
+    assert_eq!(ghost["status"]["state"], "exited");
+    // No metric sample, so the top-level time falls back to 0.
+    assert_eq!(ghost["time"], 0);
+}
+
+/// `/api/network/current` and `/api/load/current` return the latest row or
+/// `null`; the history endpoints return time-ordered arrays.
+#[tokio::test]
+async fn network_and_load_endpoints() {
+    let empty = Store::open_in_memory().unwrap();
+    let (s, j) = get_with(state(empty), "/api/network/current").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(j.is_null(), "empty network is null");
+
+    let store = Store::open_in_memory().unwrap();
+    store.insert_network(1000, 10.0, 20.0).unwrap();
+    store.insert_network(2000, 30.0, 40.0).unwrap();
+    store.insert_load(1000, 0.1, 0.2, 0.3).unwrap();
+    store.insert_load(2000, 0.4, 0.5, 0.6).unwrap();
+    let st = state(store);
+
+    let (s, j) = get_with(st.clone(), "/api/network/current").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j["rxBytesPerSec"], 30.0);
+    assert_eq!(j["txBytesPerSec"], 40.0);
+
+    let (s, j) = get_with(st.clone(), "/api/network/history").await;
+    assert_eq!(s, StatusCode::OK);
+    let rows = j.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["time"], "1000");
+    assert_eq!(rows[1]["rxBytesPerSec"], 30.0);
+
+    let (s, j) = get_with(st.clone(), "/api/load/current").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j["load1"], 0.4);
+
+    let (s, j) = get_with(st, "/api/load/history").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j.as_array().unwrap().len(), 2);
 }

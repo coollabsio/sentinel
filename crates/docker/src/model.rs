@@ -71,6 +71,12 @@ pub struct ContainerStats {
     pub mem_usage: u64,
     pub mem_limit: u64,
     pub inactive_file: u64,
+    /// Cumulative received bytes summed across every interface in the stats
+    /// `networks` block. A counter, not a rate — the collector derives the
+    /// bytes/sec rate from the delta between consecutive samples.
+    pub net_rx: u64,
+    /// Cumulative transmitted bytes summed across every interface.
+    pub net_tx: u64,
 }
 
 #[cfg(test)]

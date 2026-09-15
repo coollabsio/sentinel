@@ -201,12 +201,17 @@ Default samples (HTTP 200 only for latency stats):
 | `/api/memory/history` | 40 |
 | `/api/disk/current` | 80 |
 | `/api/disk/history` | 40 |
+| `/api/network/current` | 80 |
+| `/api/network/history` | 40 |
+| `/api/load/current` | 80 |
+| `/api/load/history` | 40 |
 | `/api/summary` | 80 |
 | `/api/containers/current` | 80 |
 | `/api/container/{id}/cpu/history` † | 40 |
 | `/api/container/{id}/memory/history` † | 40 |
 | `/api/container/{id}/disk/current` † | 60 |
 | `/api/container/{id}/disk/history` † | 40 |
+| `/api/container/{id}/network/history` † | 40 |
 
 † Per-container endpoints run only when a container id is resolved — either
 `--container-id` / `SENTINEL_BENCH_CONTAINER_ID`, or the first row of
@@ -239,6 +244,7 @@ Fixed grid: each path × each concurrency for a timed window.
 | `/api/memory/current` | 1, 10, 32 | 8 s each |
 | `/api/cpu/history` | 1, 10, 32 | 8 s each |
 | `/api/disk/current` | 1, 10, 32 | 8 s each |
+| `/api/network/current` | 1, 10, 32 | 8 s each |
 | `/api/summary` | 1, 10, 32 | 8 s each |
 | `/api/containers/current` | 1, 10, 32 | 8 s each |
 
@@ -281,7 +287,7 @@ Stress answers: *“Under a nasty concurrent read mix, does the agent stay corre
 | `--max-p99-ms` | `0` (off) | Optional p99 ceiling |
 | `--health-every-secs` | `2` | Mid-run `/api/health` probes (0 = off) |
 
-**Traffic mix (weighted):** health 4, version 1, cpu/current 3, memory/current 3, cpu/history 2, memory/history 2, disk/current 3, disk/history 2, summary 3, containers/current 3. When a container id resolves, each per-container endpoint (cpu/history, memory/history, disk/current, disk/history) also joins the mix at weight 1.
+**Traffic mix (weighted):** health 4, version 1, cpu/current 3, memory/current 3, cpu/history 2, memory/history 2, disk/current 3, disk/history 2, network/current 3, network/history 2, load/current 2, load/history 1, summary 3, containers/current 3. When a container id resolves, each per-container endpoint (cpu/history, memory/history, disk/current, disk/history, network/history) also joins the mix at weight 1.
 
 **Pass criteria (default):**
 

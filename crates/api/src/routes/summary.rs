@@ -14,7 +14,8 @@ use crate::AppState;
 use crate::routes::cpu::internal_error;
 use crate::time::format_millis;
 use crate::types::{
-    ContainerCurrent, ContainerDiskUsage, CpuCurrent, CpuUsage, DiskUsage, HostSummary, MemUsage,
+    ContainerCurrent, ContainerDiskUsage, ContainerStatus, CpuCurrent, CpuUsage, DiskUsage,
+    HostInfo, HostSummary, LoadAverage, MemUsage, NetworkUsage,
 };
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -33,7 +34,14 @@ async fn summary(State(state): State<Arc<AppState>>) -> Response {
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || store.host_summary()).await;
     drop(permit);
-    let store::HostSummaryRows { cpu, memory, disk } = match result {
+    let store::HostSummaryRows {
+        cpu,
+        memory,
+        disk,
+        network,
+        load,
+        host,
+    } = match result {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return internal_error(e),
         Err(e) => return internal_error(e),
@@ -55,10 +63,27 @@ async fn summary(State(state): State<Arc<AppState>>) -> Response {
             free: r.free,
             human_friendly_time: debug.then(|| format_millis(r.time)),
         }),
-        // Empty snapshot serializes as `null`, like the other two keys.
+        // Empty snapshot serializes as `null`, like the other keys.
         disk: Some(disk)
             .filter(|rows| !rows.is_empty())
             .map(|rows| rows.into_iter().map(|r| to_disk_usage(r, debug)).collect()),
+        network: network.map(|r| to_network_usage(r.time, r.rx_bytes_per_sec, r.tx_bytes_per_sec, debug)),
+        load: load.map(|r| LoadAverage {
+            time: r.time.to_string(),
+            load1: r.load1,
+            load5: r.load5,
+            load15: r.load15,
+            human_friendly_time: debug.then(|| format_millis(r.time)),
+        }),
+        host: host.map(|r| HostInfo {
+            time: r.time.to_string(),
+            uptime_seconds: r.uptime_seconds,
+            swap_total: r.swap_total,
+            swap_used: r.swap_used,
+            swap_free: r.swap_free,
+            swap_used_percent: r.swap_used_percent,
+            human_friendly_time: debug.then(|| format_millis(r.time)),
+        }),
     };
     Json(body).into_response()
 }
@@ -104,10 +129,27 @@ async fn containers_current(State(state): State<Arc<AppState>>) -> Response {
                 volumes_total: r.volumes_total,
                 human_friendly_time: debug.then(|| format_millis(r.time)),
             }),
+            network: m
+                .network
+                .map(|r| to_network_usage(r.time, r.rx_bytes_per_sec, r.tx_bytes_per_sec, debug)),
+            status: m.status.map(|r| ContainerStatus {
+                state: r.state,
+                health: r.health_status,
+                restart_count: r.restart_count,
+            }),
             time: m.latest_time,
         })
         .collect();
     Json(out).into_response()
+}
+
+fn to_network_usage(time: i64, rx: f64, tx: f64, debug: bool) -> NetworkUsage {
+    NetworkUsage {
+        time: time.to_string(),
+        rx_bytes_per_sec: rx,
+        tx_bytes_per_sec: tx,
+        human_friendly_time: debug.then(|| format_millis(time)),
+    }
 }
 
 fn to_disk_usage(r: store::DiskRow, debug: bool) -> DiskUsage {

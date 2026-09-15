@@ -279,6 +279,96 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/network/current:
+    get:
+      summary: Get current network usage
+      description: Latest host network throughput rate (bytes/sec), or null when none recorded
+      tags:
+        - System Metrics
+      responses:
+        '200':
+          description: Current network rate (or null)
+          content:
+            application/json:
+              schema:
+                nullable: true
+                allOf:
+                  - $ref: '#/components/schemas/NetworkUsage'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/network/history:
+    get:
+      summary: Get network usage history
+      description: Historical host network throughput rate with optional date range filtering
+      tags:
+        - System Metrics
+      parameters:
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Historical network rate data
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/NetworkUsage'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/load/current:
+    get:
+      summary: Get current load average
+      description: Latest host load average (1/5/15 minute), or null when none recorded
+      tags:
+        - System Metrics
+      responses:
+        '200':
+          description: Current load average (or null)
+          content:
+            application/json:
+              schema:
+                nullable: true
+                allOf:
+                  - $ref: '#/components/schemas/LoadAverage'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/load/history:
+    get:
+      summary: Get load average history
+      description: Historical host load average with optional date range filtering
+      tags:
+        - System Metrics
+      parameters:
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Historical load average data
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/LoadAverage'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /api/container/{containerId}/disk/current:
     get:
       summary: Get current container storage
@@ -334,6 +424,39 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/ContainerDiskUsage'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/container/{containerId}/network/history:
+    get:
+      summary: Get container network history
+      description: Historical per-container network throughput rate (bytes/sec)
+      tags:
+        - Container Metrics
+      parameters:
+        - name: containerId
+          in: path
+          required: true
+          description: Exact container display name recorded by Sentinel
+          schema:
+            type: string
+            pattern: '^[a-zA-Z0-9._-]+$'
+          example: postgres-db
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Container network history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/NetworkUsage'
         '400':
           $ref: '#/components/responses/BadRequestError'
         '401':
@@ -1137,6 +1260,129 @@ components:
           items:
             $ref: '#/components/schemas/DiskUsage'
           description: Latest disk cycle (one entry per mountpoint), or null when no disk rows exist
+        network:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/NetworkUsage'
+          description: Latest network rate, or null when no network rows exist
+        load:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/LoadAverage'
+          description: Latest load average, or null when no load rows exist
+        host:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/HostInfo'
+          description: Current-only host status (uptime + swap), or null when none recorded
+
+    NetworkUsage:
+      type: object
+      properties:
+        time:
+          type: string
+          description: Unix timestamp in milliseconds
+          example: "1700000000000"
+        rxBytesPerSec:
+          type: number
+          format: double
+          description: Received bytes per second
+          example: 125000.0
+        txBytesPerSec:
+          type: number
+          format: double
+          description: Transmitted bytes per second
+          example: 64000.0
+        human_friendly_time:
+          type: string
+          format: date-time
+          description: ISO 8601 formatted timestamp (only in debug mode)
+          example: "2024-01-15T10:00:00Z"
+
+    LoadAverage:
+      type: object
+      properties:
+        time:
+          type: string
+          description: Unix timestamp in milliseconds
+          example: "1700000000000"
+        load1:
+          type: number
+          format: double
+          description: 1-minute load average
+          example: 0.42
+        load5:
+          type: number
+          format: double
+          description: 5-minute load average
+          example: 0.55
+        load15:
+          type: number
+          format: double
+          description: 15-minute load average
+          example: 0.61
+        human_friendly_time:
+          type: string
+          format: date-time
+          description: ISO 8601 formatted timestamp (only in debug mode)
+          example: "2024-01-15T10:00:00Z"
+
+    HostInfo:
+      type: object
+      description: Current-only host status (uptime + swap)
+      properties:
+        time:
+          type: string
+          description: Unix timestamp in milliseconds
+          example: "1700000000000"
+        uptimeSeconds:
+          type: integer
+          format: int64
+          description: Host uptime in seconds
+          example: 864000
+        swapTotal:
+          type: integer
+          format: int64
+          description: Total swap in bytes
+          example: 2000000000
+        swapUsed:
+          type: integer
+          format: int64
+          description: Used swap in bytes
+          example: 500000000
+        swapFree:
+          type: integer
+          format: int64
+          description: Free swap in bytes
+          example: 1500000000
+        swapUsedPercent:
+          type: number
+          format: float
+          description: Swap usage percentage (0-100)
+          example: 25.00
+        human_friendly_time:
+          type: string
+          format: date-time
+          description: ISO 8601 formatted timestamp (only in debug mode)
+          example: "2024-01-15T10:00:00Z"
+
+    ContainerStatus:
+      type: object
+      description: Current-only container status from Docker state + inspect
+      properties:
+        state:
+          type: string
+          description: Docker container state
+          example: running
+        health:
+          type: string
+          description: Docker health status (healthy / unhealthy / starting / empty)
+          example: healthy
+        restartCount:
+          type: integer
+          format: int64
+          description: Container restart count
+          example: 0
 
     ContainerCurrent:
       type: object
@@ -1160,10 +1406,20 @@ components:
           allOf:
             - $ref: '#/components/schemas/ContainerDiskUsage'
           description: Latest storage sample, or null when none recorded
+        network:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/NetworkUsage'
+          description: Latest network rate, or null when none recorded
+        status:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/ContainerStatus'
+          description: Current container status, or null when not inspected yet
         time:
           type: integer
           format: int64
-          description: Newest Unix millisecond timestamp across the container's present samples
+          description: Newest Unix millisecond timestamp across the container's present metric samples
           example: 1700000000000
 
     TrafficStatusBreakdown:

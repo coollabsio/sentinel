@@ -297,6 +297,112 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ---
 
+### Network Metrics
+
+Host network throughput as a **rate** in bytes/sec, summed across all non-loopback interfaces. Values are derived from the delta between consecutive samples, so they are stored as a rate (not a raw counter).
+
+#### Get Current Network Usage
+
+**Endpoint:** `GET /api/network/current`
+
+Returns the latest network rate, or `null` when nothing has been recorded yet.
+
+**Response:**
+```json
+{
+  "time": "1700000000000",
+  "rxBytesPerSec": 125000.0,
+  "txBytesPerSec": 64000.0
+}
+```
+
+**Fields:**
+- `time` (string): Unix timestamp in milliseconds
+- `rxBytesPerSec` (number): Received bytes per second
+- `txBytesPerSec` (number): Transmitted bytes per second
+- `human_friendly_time` (string): ISO 8601 formatted timestamp (debug mode only)
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  http://localhost:8888/api/network/current
+```
+
+---
+
+#### Get Network Usage History
+
+**Endpoint:** `GET /api/network/history`
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from` | string | No | `1970-01-01T00:00:00Z` | Start date in ISO 8601 format |
+| `to` | string | No | Current time | End date in ISO 8601 format |
+
+Response items use the same shape as `/api/network/current`.
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/network/history?from=2024-01-15T00:00:00Z&to=2024-01-15T12:00:00Z"
+```
+
+---
+
+### Load Average
+
+#### Get Current Load Average
+
+**Endpoint:** `GET /api/load/current`
+
+Returns the latest load average, or `null` when nothing has been recorded yet.
+
+**Response:**
+```json
+{
+  "time": "1700000000000",
+  "load1": 0.42,
+  "load5": 0.55,
+  "load15": 0.61
+}
+```
+
+**Fields:**
+- `time` (string): Unix timestamp in milliseconds
+- `load1` (number): 1-minute load average
+- `load5` (number): 5-minute load average
+- `load15` (number): 15-minute load average
+- `human_friendly_time` (string): ISO 8601 formatted timestamp (debug mode only)
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  http://localhost:8888/api/load/current
+```
+
+---
+
+#### Get Load Average History
+
+**Endpoint:** `GET /api/load/history`
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from` | string | No | `1970-01-01T00:00:00Z` | Start date in ISO 8601 format |
+| `to` | string | No | Current time | End date in ISO 8601 format |
+
+Response items use the same shape as `/api/load/current`.
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/load/history?from=2024-01-15T00:00:00Z&to=2024-01-15T12:00:00Z"
+```
+
+---
+
 ## Docker Container Metrics
 
 ### Get Container CPU History
@@ -450,6 +556,48 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ---
 
+### Get Container Network History
+
+Retrieve per-container network throughput history (bytes/sec rate, summed across the container's interfaces).
+
+**Endpoint:** `GET /api/container/:containerId/network/history`
+
+**Path Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `containerId` | string | Yes | Exact container display name recorded by Sentinel |
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `from` | string | No | `1970-01-01T00:00:01Z` | Start date in ISO 8601 format |
+| `to` | string | No | Current time | End date in ISO 8601 format |
+
+**Response:**
+```json
+[
+  {
+    "time": "1700000000000",
+    "rxBytesPerSec": 4200.0,
+    "txBytesPerSec": 1800.0
+  }
+]
+```
+
+**Fields:**
+- `time` (string): Unix timestamp in milliseconds
+- `rxBytesPerSec` (number): Received bytes per second
+- `txBytesPerSec` (number): Transmitted bytes per second
+- `human_friendly_time` (string): ISO 8601 formatted timestamp (debug mode only)
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/container/postgres-db/network/history?from=2024-01-15T00:00:00Z"
+```
+
+---
+
 ## Bulk Snapshots
 
 Current-value bundles that let a fleet-wide dashboard read a server's whole metric snapshot in one request instead of one call per series or per container. Both read the latest stored rows only.
@@ -484,7 +632,26 @@ Retrieve the latest stored host CPU, memory and disk usage in a single response.
       "available": 250000000000,
       "usedPercent": 50.00
     }
-  ]
+  ],
+  "network": {
+    "time": "1700000000000",
+    "rxBytesPerSec": 125000.0,
+    "txBytesPerSec": 64000.0
+  },
+  "load": {
+    "time": "1700000000000",
+    "load1": 0.42,
+    "load5": 0.55,
+    "load15": 0.61
+  },
+  "host": {
+    "time": "1700000000000",
+    "uptimeSeconds": 864000,
+    "swapTotal": 2000000000,
+    "swapUsed": 500000000,
+    "swapFree": 1500000000,
+    "swapUsedPercent": 25.00
+  }
 }
 ```
 
@@ -492,6 +659,9 @@ Retrieve the latest stored host CPU, memory and disk usage in a single response.
 - `cpu` (object | null): Latest CPU sample, same shape as [`/api/cpu/current`](#get-current-cpu-usage) (numeric `percent`); `null` when no CPU rows exist
 - `memory` (object | null): Latest memory sample, same shape as [`/api/memory/current`](#get-current-memory-usage); `null` when no memory rows exist
 - `disk` (array | null): Latest disk cycle, same shape as [`/api/disk/current`](#get-current-disk-usage) (one entry per mountpoint); `null` when no disk rows exist
+- `network` (object | null): Latest network rate, same shape as [`/api/network/current`](#get-current-network-usage); `null` when no network rows exist
+- `load` (object | null): Latest load average, same shape as [`/api/load/current`](#get-current-load-average); `null` when no load rows exist
+- `host` (object | null): Current-only host status — `uptimeSeconds` plus swap totals (`swapTotal`/`swapUsed`/`swapFree`/`swapUsedPercent`); `null` when no host status has been recorded
 
 **Example:**
 ```bash
@@ -529,6 +699,16 @@ Retrieve the latest CPU, memory and storage sample for every container in one re
       "writableLayer": 12000000,
       "volumesTotal": 340000000
     },
+    "network": {
+      "time": "1700000000000",
+      "rxBytesPerSec": 4200.0,
+      "txBytesPerSec": 1800.0
+    },
+    "status": {
+      "state": "running",
+      "health": "healthy",
+      "restartCount": 0
+    },
     "time": 1700000000000
   }
 ]
@@ -539,7 +719,9 @@ Retrieve the latest CPU, memory and storage sample for every container in one re
 - `cpu` (object | null): Latest CPU sample, same shape as [`/api/container/:containerId/cpu/history`](#get-container-cpu-history) items (string `percent`); `null` when none recorded
 - `memory` (object | null): Latest memory sample, same shape as [`/api/container/:containerId/memory/history`](#get-container-memory-history) items; `null` when none recorded
 - `disk` (object | null): Latest storage sample, same shape as [`/api/container/:containerId/disk/current`](#get-container-storage-current); `null` when none recorded
-- `time` (number): Newest Unix millisecond timestamp across the container's present samples
+- `network` (object | null): Latest network rate, same shape as [`/api/container/:containerId/network/history`](#get-container-network-history) items; `null` when none recorded
+- `status` (object | null): Current container status — `state` (Docker state, e.g. `running`), `health` (Docker health, e.g. `healthy`/`unhealthy`/`starting`/empty), `restartCount`; `null` when not inspected yet
+- `time` (number): Newest Unix millisecond timestamp across the container's present metric samples (`status` is current-only and does not affect it)
 
 **Example:**
 ```bash
