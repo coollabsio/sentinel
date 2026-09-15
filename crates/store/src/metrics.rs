@@ -66,6 +66,28 @@ pub struct ContainerDiskSample {
     pub volumes_total: u64,
 }
 
+/// Latest host CPU, memory and disk rows for `/api/summary`. Each is absent
+/// when its table holds no rows; `disk` is empty rather than `None` for an
+/// empty snapshot (the handler maps an empty vec to a `null` disk key).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostSummaryRows {
+    pub cpu: Option<CpuRow>,
+    pub memory: Option<MemRow>,
+    pub disk: Vec<DiskRow>,
+}
+
+/// One container's latest sample of each metric, joined by id in Rust from
+/// three latest-row-per-id queries. Any metric with no rows for the container
+/// is `None`; `latest_time` is the newest `time` across whichever are present.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContainerMetrics {
+    pub container_id: String,
+    pub cpu: Option<CpuRow>,
+    pub memory: Option<MemRow>,
+    pub disk: Option<ContainerDiskRow>,
+    pub latest_time: i64,
+}
+
 const CPU_COLS: &str = "time, percent";
 const MEM_COLS: &str = "time, total, available, used, used_percent, free";
 const DISK_COLS: &str = "time, mount, total, used, available, used_percent";
@@ -278,17 +300,7 @@ impl Store {
     /// All mounts from the most recent disk cycle (every mount in a cycle shares
     /// one timestamp, so `MAX(time)` selects the whole latest snapshot).
     pub fn disk_latest(&self) -> Result<Vec<DiskRow>, StoreError> {
-        self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {DISK_COLS} FROM disk_usage
-                 WHERE time = (SELECT MAX(time) FROM disk_usage) ORDER BY mount ASC"
-            );
-            let mut stmt = c.prepare_cached(&sql)?;
-            let rows = stmt
-                .query_map([], map_disk_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+        self.with_reader(|c| Ok(latest_disk_rows(c)?))
     }
 
     pub fn disk_history(&self, from: i64, to: i64) -> Result<Vec<DiskRow>, StoreError> {
@@ -355,6 +367,155 @@ impl Store {
             Ok(rows)
         })
     }
+
+    /// Latest host CPU, memory and disk snapshot in a single reader-lock hold.
+    ///
+    /// The store exposes one read-only connection, so every API read serializes
+    /// on its `Mutex`. Reading the three host series under one `with_reader`
+    /// gives `/api/summary` a single lock acquisition instead of three, which is
+    /// what keeps this hot fleet-dashboard endpoint cheap under concurrency. All
+    /// three are index tail reads (`cpu`/`memory` on their PK `time`, disk via
+    /// `MAX(time)` on its PK), not scans.
+    pub fn host_summary(&self) -> Result<HostSummaryRows, StoreError> {
+        self.with_reader(|c| {
+            let cpu = {
+                let sql = format!("SELECT {CPU_COLS} FROM cpu_usage ORDER BY time DESC LIMIT 1");
+                let mut stmt = c.prepare_cached(&sql)?;
+                stmt.query_row([], |r| {
+                    Ok(CpuRow {
+                        time: r.get(0)?,
+                        percent: r.get(1)?,
+                    })
+                })
+                .optional()?
+            };
+            let memory = {
+                let sql = format!("SELECT {MEM_COLS} FROM memory_usage ORDER BY time DESC LIMIT 1");
+                let mut stmt = c.prepare_cached(&sql)?;
+                stmt.query_row([], map_mem_row).optional()?
+            };
+            let disk = latest_disk_rows(c)?;
+            Ok(HostSummaryRows { cpu, memory, disk })
+        })
+    }
+
+    /// Latest cpu, memory and disk sample for every container that has ever
+    /// recorded any of them, joined by id in Rust. One reader lock covers all
+    /// three latest-row-per-id queries; the `(container_id, time)` indexes make
+    /// each `GROUP BY container_id` max an index read rather than a table scan.
+    pub fn latest_container_metrics(&self) -> Result<Vec<ContainerMetrics>, StoreError> {
+        use std::collections::{BTreeSet, HashMap};
+
+        self.with_reader(|c| {
+            let mut cpu: HashMap<String, CpuRow> = HashMap::new();
+            {
+                let mut stmt = c.prepare_cached(
+                    "SELECT t.container_id, t.time, t.percent FROM container_cpu_usage t
+                     JOIN (SELECT container_id, MAX(time) AS mt
+                           FROM container_cpu_usage GROUP BY container_id) m
+                       ON t.container_id = m.container_id AND t.time = m.mt",
+                )?;
+                let mut rows = stmt.query([])?;
+                while let Some(r) = rows.next()? {
+                    let id: String = r.get(0)?;
+                    cpu.insert(
+                        id,
+                        CpuRow {
+                            time: r.get(1)?,
+                            percent: r.get(2)?,
+                        },
+                    );
+                }
+            }
+
+            let mut mem: HashMap<String, MemRow> = HashMap::new();
+            {
+                let mut stmt = c.prepare_cached(
+                    "SELECT t.container_id, t.time, t.total, t.available, t.used,
+                            t.used_percent, t.free
+                     FROM container_memory_usage t
+                     JOIN (SELECT container_id, MAX(time) AS mt
+                           FROM container_memory_usage GROUP BY container_id) m
+                       ON t.container_id = m.container_id AND t.time = m.mt",
+                )?;
+                let mut rows = stmt.query([])?;
+                while let Some(r) = rows.next()? {
+                    let id: String = r.get(0)?;
+                    mem.insert(
+                        id,
+                        MemRow {
+                            time: r.get(1)?,
+                            total: r.get::<_, i64>(2)? as u64,
+                            available: r.get::<_, i64>(3)? as u64,
+                            used: r.get::<_, i64>(4)? as u64,
+                            used_percent: r.get(5)?,
+                            free: r.get::<_, i64>(6)? as u64,
+                        },
+                    );
+                }
+            }
+
+            let mut disk: HashMap<String, ContainerDiskRow> = HashMap::new();
+            {
+                let mut stmt = c.prepare_cached(
+                    "SELECT t.time, t.container_id, t.writable_layer, t.volumes_total
+                     FROM container_disk_usage t
+                     JOIN (SELECT container_id, MAX(time) AS mt
+                           FROM container_disk_usage GROUP BY container_id) m
+                       ON t.container_id = m.container_id AND t.time = m.mt",
+                )?;
+                let mut rows = stmt.query([])?;
+                while let Some(r) = rows.next()? {
+                    let row = map_container_disk_row(r)?;
+                    disk.insert(row.container_id.clone(), row);
+                }
+            }
+
+            let ids: BTreeSet<String> = cpu
+                .keys()
+                .chain(mem.keys())
+                .chain(disk.keys())
+                .cloned()
+                .collect();
+
+            let out = ids
+                .into_iter()
+                .map(|id| {
+                    let cpu = cpu.remove(&id);
+                    let memory = mem.remove(&id);
+                    let disk = disk.remove(&id);
+                    let latest_time = [
+                        cpu.as_ref().map(|r| r.time),
+                        memory.as_ref().map(|r| r.time),
+                        disk.as_ref().map(|r| r.time),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .max()
+                    .unwrap_or(0);
+                    ContainerMetrics {
+                        container_id: id,
+                        cpu,
+                        memory,
+                        disk,
+                        latest_time,
+                    }
+                })
+                .collect();
+            Ok(out)
+        })
+    }
+}
+
+/// The newest disk cycle's rows, one per mountpoint. Shared by `disk_latest`
+/// and `host_summary` so both hit the same SQL from either lock hold.
+fn latest_disk_rows(c: &rusqlite::Connection) -> rusqlite::Result<Vec<DiskRow>> {
+    let sql = format!(
+        "SELECT {DISK_COLS} FROM disk_usage
+         WHERE time = (SELECT MAX(time) FROM disk_usage) ORDER BY mount ASC"
+    );
+    let mut stmt = c.prepare_cached(&sql)?;
+    stmt.query_map([], map_disk_row)?.collect()
 }
 
 fn map_disk_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DiskRow> {

@@ -57,6 +57,36 @@ pub struct ErrorBody {
     pub error: String,
 }
 
+/// CPU snapshot with a NUMERIC `percent`, matching `/api/cpu/current` (not the
+/// stringified `CpuUsage` the history endpoints return). Used by `/api/summary`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CpuCurrent {
+    pub time: String,
+    pub percent: f64,
+}
+
+/// Host current snapshot bundle for `GET /api/summary`: the latest stored CPU,
+/// memory and disk rows in one response. Any series with no rows is `null`.
+#[derive(Debug, Clone, Serialize)]
+pub struct HostSummary {
+    pub cpu: Option<CpuCurrent>,
+    pub memory: Option<MemUsage>,
+    pub disk: Option<Vec<DiskUsage>>,
+}
+
+/// One container's latest snapshot for `GET /api/containers/current`. Each
+/// metric reuses the same shape its per-container history endpoint returns and
+/// is `null` when that series has no rows for the container. `time` is the
+/// newest millisecond timestamp across whichever metrics are present.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerCurrent {
+    pub id: String,
+    pub cpu: Option<CpuUsage>,
+    pub memory: Option<MemUsage>,
+    pub disk: Option<ContainerDiskUsage>,
+    pub time: i64,
+}
+
 // --- Traffic analytics (design spec §7) -------------------------------------
 //
 // These four types are NEW wire format — nothing in the frozen Go API

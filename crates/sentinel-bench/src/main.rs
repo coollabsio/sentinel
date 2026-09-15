@@ -192,6 +192,11 @@ struct TargetOpts {
     /// Request timeout seconds.
     #[arg(long, default_value_t = 5)]
     timeout_secs: u64,
+    /// Container id for the per-container endpoint benchmarks. Auto-discovered
+    /// from `/api/containers/current` when omitted; those endpoints are skipped
+    /// if no container id can be resolved.
+    #[arg(long, env = "SENTINEL_BENCH_CONTAINER_ID")]
+    container_id: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -275,57 +280,106 @@ struct StorageCli {
     stress: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Endpoint {
-    path: &'static str,
+    path: String,
     /// Relative weight for mixed stress traffic.
     weight: u32,
     /// Sequential latency sample count (0 = skip in latency mode).
     latency_n: u32,
+    /// Included in the concurrent throughput grid (`load` mode).
+    in_load: bool,
 }
 
-const ENDPOINTS: &[Endpoint] = &[
-    Endpoint {
-        path: "/api/health",
-        weight: 4,
-        latency_n: 80,
-    },
-    Endpoint {
-        path: "/api/version",
-        weight: 1,
-        latency_n: 80,
-    },
-    Endpoint {
-        path: "/api/cpu/current",
-        weight: 3,
-        latency_n: 80,
-    },
-    Endpoint {
-        path: "/api/memory/current",
-        weight: 3,
-        latency_n: 80,
-    },
-    Endpoint {
-        path: "/api/cpu/history",
-        weight: 2,
-        latency_n: 40,
-    },
-    Endpoint {
-        path: "/api/memory/history",
-        weight: 2,
-        latency_n: 40,
-    },
-    Endpoint {
-        path: "/api/disk/current",
-        weight: 3,
-        latency_n: 80,
-    },
-    Endpoint {
-        path: "/api/disk/history",
-        weight: 2,
-        latency_n: 40,
-    },
-];
+impl Endpoint {
+    fn new(path: impl Into<String>, weight: u32, latency_n: u32, in_load: bool) -> Self {
+        Self {
+            path: path.into(),
+            weight,
+            latency_n,
+            in_load,
+        }
+    }
+}
+
+/// Parameter-free endpoints, benchmarked on every run. `/api/summary` and
+/// `/api/containers/current` are the bulk fleet-dashboard reads (one request
+/// each replacing many per-series / per-container round-trips), so they carry
+/// real stress weight and sit in the load grid.
+fn base_endpoints() -> Vec<Endpoint> {
+    vec![
+        Endpoint::new("/api/health", 4, 80, true),
+        Endpoint::new("/api/version", 1, 80, false),
+        Endpoint::new("/api/cpu/current", 3, 80, true),
+        Endpoint::new("/api/memory/current", 3, 80, true),
+        Endpoint::new("/api/cpu/history", 2, 40, true),
+        Endpoint::new("/api/memory/history", 2, 40, false),
+        Endpoint::new("/api/disk/current", 3, 80, true),
+        Endpoint::new("/api/disk/history", 2, 40, false),
+        Endpoint::new("/api/summary", 3, 80, true),
+        Endpoint::new("/api/containers/current", 3, 80, true),
+    ]
+}
+
+/// Per-container endpoints, appended only when a container id is resolved. They
+/// join the latency and stress mixes; the load grid stays on the id-free set.
+fn container_endpoints(id: &str) -> Vec<Endpoint> {
+    vec![
+        Endpoint::new(format!("/api/container/{id}/cpu/history"), 1, 40, false),
+        Endpoint::new(format!("/api/container/{id}/memory/history"), 1, 40, false),
+        Endpoint::new(format!("/api/container/{id}/disk/current"), 1, 60, false),
+        Endpoint::new(format!("/api/container/{id}/disk/history"), 1, 40, false),
+    ]
+}
+
+/// Resolves a container id for the per-container endpoints: the explicit
+/// `--container-id`, else the first row of `/api/containers/current`. `None`
+/// when neither is available (server has no containers, or is unreachable).
+async fn resolve_container_id(
+    client: &Client,
+    base: &str,
+    token: &str,
+    provided: Option<String>,
+) -> Option<String> {
+    if let Some(id) = provided.filter(|s| !s.is_empty()) {
+        return Some(id);
+    }
+    let url = format!("{base}/api/containers/current");
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.as_array()?
+        .iter()
+        .find_map(|row| row.get("id")?.as_str().map(str::to_string))
+}
+
+/// The full endpoint set for a run: the id-free base plus, when a container id
+/// resolves, the per-container endpoints.
+async fn resolve_endpoints(target: &TargetOpts) -> Vec<Endpoint> {
+    let mut endpoints = base_endpoints();
+    let Ok(client) = build_client(target.timeout_secs) else {
+        return endpoints;
+    };
+    let base = normalize_base(&target.base);
+    match resolve_container_id(&client, &base, &target.token, target.container_id.clone()).await {
+        Some(id) => {
+            eprintln!("per-container endpoints target container id: {id}");
+            endpoints.extend(container_endpoints(&id));
+        }
+        None => eprintln!(
+            "no container id available (none provided, none from /api/containers/current); \
+             skipping per-container endpoint benchmarks"
+        ),
+    }
+    endpoints
+}
 
 struct Stats {
     ok: AtomicU64,
@@ -496,13 +550,16 @@ fn print_latency_row(label: &str, snap: &Snapshot) {
     );
 }
 
-async fn run_latency(opts: &TargetOpts) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_latency(
+    opts: &TargetOpts,
+    endpoints: &[Endpoint],
+) -> Result<(), Box<dyn std::error::Error>> {
     let base = normalize_base(&opts.base);
     let client = build_client(opts.timeout_secs)?;
     println!("=== Sequential latency ===");
     println!("base={base}");
 
-    for ep in ENDPOINTS.iter().filter(|e| e.latency_n > 0) {
+    for ep in endpoints.iter().filter(|e| e.latency_n > 0) {
         let url = format!("{base}{}", ep.path);
         let stats = Stats::new(ep.latency_n as usize * 2);
         for _ in 0..ep.latency_n {
@@ -511,7 +568,7 @@ async fn run_latency(opts: &TargetOpts) -> Result<(), Box<dyn std::error::Error>
                 Ok(_) | Err(_) => stats.record_fail(),
             }
         }
-        print_latency_row(ep.path, &stats.snapshot());
+        print_latency_row(&ep.path, &stats.snapshot());
     }
     Ok(())
 }
@@ -557,7 +614,10 @@ async fn run_load_cell(
     stats.snapshot()
 }
 
-async fn run_load(opts: &LoadOpts) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_load(
+    opts: &LoadOpts,
+    endpoints: &[Endpoint],
+) -> Result<(), Box<dyn std::error::Error>> {
     let base = normalize_base(&opts.target.base);
     let client = build_client(opts.target.timeout_secs)?;
     let duration = Duration::from_secs(opts.duration);
@@ -573,19 +633,10 @@ async fn run_load(opts: &LoadOpts) -> Result<(), Box<dyn std::error::Error>> {
         opts.duration, opts.warmup
     );
 
-    let paths: Vec<&str> = ENDPOINTS
+    let paths: Vec<&str> = endpoints
         .iter()
-        .filter(|e| {
-            matches!(
-                e.path,
-                "/api/health"
-                    | "/api/cpu/current"
-                    | "/api/memory/current"
-                    | "/api/cpu/history"
-                    | "/api/disk/current"
-            )
-        })
-        .map(|e| e.path)
+        .filter(|e| e.in_load)
+        .map(|e| e.path.as_str())
         .collect();
 
     for path in paths {
@@ -602,16 +653,19 @@ async fn run_load(opts: &LoadOpts) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn pick_endpoint(tick: u64) -> &'static Endpoint {
-    let total: u32 = ENDPOINTS.iter().map(|e| e.weight).sum();
+fn pick_endpoint(tick: u64, endpoints: &[Endpoint]) -> &Endpoint {
+    let total: u32 = endpoints.iter().map(|e| e.weight).sum();
+    if total == 0 {
+        return &endpoints[0];
+    }
     let mut r = (tick.wrapping_mul(0x9E37_79B9) % total as u64) as u32;
-    for ep in ENDPOINTS {
+    for ep in endpoints {
         if r < ep.weight {
             return ep;
         }
         r -= ep.weight;
     }
-    &ENDPOINTS[0]
+    &endpoints[0]
 }
 
 /// Effective concurrency at `elapsed` for the given stress profile.
@@ -639,9 +693,13 @@ fn stress_target_concurrency(
     }
 }
 
-async fn run_stress(opts: &StressOpts) -> Result<bool, Box<dyn std::error::Error>> {
+async fn run_stress(
+    opts: &StressOpts,
+    endpoints: &[Endpoint],
+) -> Result<bool, Box<dyn std::error::Error>> {
     let base = normalize_base(&opts.target.base);
     let client = build_client(opts.target.timeout_secs)?;
+    let endpoints = Arc::new(endpoints.to_vec());
     let peak = opts.concurrency.max(1);
     let total = Duration::from_secs(opts.duration.max(1));
     let stats = Arc::new(Stats::new(500_000));
@@ -710,6 +768,7 @@ async fn run_stress(opts: &StressOpts) -> Result<bool, Box<dyn std::error::Error
         let stop = stop.clone();
         let active = active.clone();
         let tick = tick.clone();
+        let endpoints = endpoints.clone();
         let profile = opts.profile;
         let peak_c = peak;
         let total_d = total;
@@ -734,7 +793,7 @@ async fn run_stress(opts: &StressOpts) -> Result<bool, Box<dyn std::error::Error
                 active.fetch_add(1, Ordering::Relaxed);
 
                 let n = tick.fetch_add(1, Ordering::Relaxed);
-                let ep = pick_endpoint(n);
+                let ep = pick_endpoint(n, &endpoints);
                 let url = format!("{base}{}", ep.path);
 
                 match one_get(&client, &url, &token).await {
@@ -861,10 +920,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Command::Sys => unreachable!("handled above"),
-        Command::Latency(t) => run_latency(&t).await?,
-        Command::Load(l) => run_load(&l).await?,
+        Command::Latency(t) => {
+            let endpoints = resolve_endpoints(&t).await;
+            run_latency(&t, &endpoints).await?
+        }
+        Command::Load(l) => {
+            let endpoints = resolve_endpoints(&l.target).await;
+            run_load(&l, &endpoints).await?
+        }
         Command::Stress(s) => {
-            stress_pass = run_stress(&s).await?;
+            let endpoints = resolve_endpoints(&s.target).await;
+            stress_pass = run_stress(&s, &endpoints).await?;
         }
         Command::Storage(s) => {
             let opts = storage_bench::StorageOpts {
@@ -890,26 +956,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             analytics,
             analytics_access_log,
         } => {
-            run_latency(&target).await?;
+            let endpoints = resolve_endpoints(&target).await;
+            run_latency(&target, &endpoints).await?;
             println!();
-            run_load(&LoadOpts {
-                target: target.clone(),
-                duration: 8,
-                warmup: 20,
-                concurrency: vec![1, 10, 32],
-            })
+            run_load(
+                &LoadOpts {
+                    target: target.clone(),
+                    duration: 8,
+                    warmup: 20,
+                    concurrency: vec![1, 10, 32],
+                },
+                &endpoints,
+            )
             .await?;
             println!();
-            stress_pass = run_stress(&StressOpts {
-                target: target.clone(),
-                concurrency: stress_concurrency,
-                duration: stress_duration,
-                warmup: 50,
-                profile: stress_profile,
-                max_error_pct: 1.0,
-                max_p99_ms: 0.0,
-                health_every_secs: 2,
-            })
+            stress_pass = run_stress(
+                &StressOpts {
+                    target: target.clone(),
+                    concurrency: stress_concurrency,
+                    duration: stress_duration,
+                    warmup: 50,
+                    profile: stress_profile,
+                    max_error_pct: 1.0,
+                    max_p99_ms: 0.0,
+                    health_every_secs: 2,
+                },
+                &endpoints,
+            )
             .await?;
             if analytics {
                 println!();

@@ -114,7 +114,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(routes::cpu::routes())
         .merge(routes::memory::routes())
         .merge(routes::disk::routes())
-        .merge(routes::container::routes());
+        .merge(routes::container::routes())
+        .merge(routes::summary::routes());
 
     // Compile-time gate only. Whether the routes have anything to serve is a
     // runtime question (`AppState::analytics`), which each handler answers

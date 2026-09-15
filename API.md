@@ -12,6 +12,7 @@ Sentinel provides a REST API for retrieving system and Docker container metrics.
   - [CPU Metrics](#cpu-metrics)
   - [Memory Metrics](#memory-metrics)
 - [Docker Container Metrics](#docker-container-metrics)
+- [Bulk Snapshots](#bulk-snapshots)
 - [Traffic Analytics](#traffic-analytics)
 - [Debug Endpoints](#debug-endpoints)
 - [Error Responses](#error-responses)
@@ -445,6 +446,105 @@ Response items use the same shape as `/api/container/:containerId/disk/current`.
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" \
   "http://localhost:8888/api/container/postgres-db/disk/history?from=2024-01-15T00:00:00Z"
+```
+
+---
+
+## Bulk Snapshots
+
+Current-value bundles that let a fleet-wide dashboard read a server's whole metric snapshot in one request instead of one call per series or per container. Both read the latest stored rows only.
+
+### Get Host Summary
+
+Retrieve the latest stored host CPU, memory and disk usage in a single response.
+
+**Endpoint:** `GET /api/summary`
+
+**Response:**
+```json
+{
+  "cpu": {
+    "time": "1700000000000",
+    "percent": 25.5
+  },
+  "memory": {
+    "time": "1700000000000",
+    "total": 16000000000,
+    "available": 8000000000,
+    "used": 8000000000,
+    "usedPercent": 50.00,
+    "free": 8000000000
+  },
+  "disk": [
+    {
+      "time": "1700000000000",
+      "mount": "/",
+      "total": 500000000000,
+      "used": 250000000000,
+      "available": 250000000000,
+      "usedPercent": 50.00
+    }
+  ]
+}
+```
+
+**Fields:**
+- `cpu` (object | null): Latest CPU sample, same shape as [`/api/cpu/current`](#get-current-cpu-usage) (numeric `percent`); `null` when no CPU rows exist
+- `memory` (object | null): Latest memory sample, same shape as [`/api/memory/current`](#get-current-memory-usage); `null` when no memory rows exist
+- `disk` (array | null): Latest disk cycle, same shape as [`/api/disk/current`](#get-current-disk-usage) (one entry per mountpoint); `null` when no disk rows exist
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  http://localhost:8888/api/summary
+```
+
+---
+
+### Get All Containers (Current)
+
+Retrieve the latest CPU, memory and storage sample for every container in one response. Returns an empty array when nothing has been recorded yet.
+
+**Endpoint:** `GET /api/containers/current`
+
+**Response:**
+```json
+[
+  {
+    "id": "postgres-db",
+    "cpu": {
+      "time": "1700000000000",
+      "percent": "12.50"
+    },
+    "memory": {
+      "time": "1700000000000",
+      "total": 4000000000,
+      "available": 2000000000,
+      "used": 2000000000,
+      "usedPercent": 50.00,
+      "free": 2000000000
+    },
+    "disk": {
+      "time": "1700000000000",
+      "writableLayer": 12000000,
+      "volumesTotal": 340000000
+    },
+    "time": 1700000000000
+  }
+]
+```
+
+**Fields:**
+- `id` (string): Container display name recorded by Sentinel
+- `cpu` (object | null): Latest CPU sample, same shape as [`/api/container/:containerId/cpu/history`](#get-container-cpu-history) items (string `percent`); `null` when none recorded
+- `memory` (object | null): Latest memory sample, same shape as [`/api/container/:containerId/memory/history`](#get-container-memory-history) items; `null` when none recorded
+- `disk` (object | null): Latest storage sample, same shape as [`/api/container/:containerId/disk/current`](#get-container-storage-current); `null` when none recorded
+- `time` (number): Newest Unix millisecond timestamp across the container's present samples
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  http://localhost:8888/api/containers/current
 ```
 
 ---
