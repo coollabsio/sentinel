@@ -57,6 +57,94 @@ pub struct ErrorBody {
     pub error: String,
 }
 
+/// CPU snapshot with a NUMERIC `percent`, matching `/api/cpu/current` (not the
+/// stringified `CpuUsage` the history endpoints return). Used by `/api/summary`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CpuCurrent {
+    pub time: String,
+    pub percent: f64,
+}
+
+/// Network throughput as a rate (bytes/sec), for host and per-container network
+/// endpoints. Rates rather than raw counters, so they downsample by mean.
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkUsage {
+    pub time: String,
+    #[serde(rename = "rxBytesPerSec")]
+    pub rx_bytes_per_sec: f64,
+    #[serde(rename = "txBytesPerSec")]
+    pub tx_bytes_per_sec: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub human_friendly_time: Option<String>,
+}
+
+/// Host load average (1 / 5 / 15 minute).
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadAverage {
+    pub time: String,
+    pub load1: f64,
+    pub load5: f64,
+    pub load15: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub human_friendly_time: Option<String>,
+}
+
+/// Current-only host status: uptime plus swap (no history series).
+#[derive(Debug, Clone, Serialize)]
+pub struct HostInfo {
+    pub time: String,
+    #[serde(rename = "uptimeSeconds")]
+    pub uptime_seconds: u64,
+    #[serde(rename = "swapTotal")]
+    pub swap_total: u64,
+    #[serde(rename = "swapUsed")]
+    pub swap_used: u64,
+    #[serde(rename = "swapFree")]
+    pub swap_free: u64,
+    #[serde(rename = "swapUsedPercent")]
+    pub swap_used_percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub human_friendly_time: Option<String>,
+}
+
+/// Current-only container status from Docker `state` + inspect.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerStatus {
+    pub state: String,
+    pub health: String,
+    #[serde(rename = "restartCount")]
+    pub restart_count: u64,
+}
+
+/// Host current snapshot bundle for `GET /api/summary`: the latest stored CPU,
+/// memory, disk, network and load rows plus current host status, in one
+/// response. Any series with no rows is `null`.
+#[derive(Debug, Clone, Serialize)]
+pub struct HostSummary {
+    pub cpu: Option<CpuCurrent>,
+    pub memory: Option<MemUsage>,
+    pub disk: Option<Vec<DiskUsage>>,
+    pub network: Option<NetworkUsage>,
+    pub load: Option<LoadAverage>,
+    pub host: Option<HostInfo>,
+}
+
+/// One container's latest snapshot for `GET /api/containers/current`. Each
+/// metric reuses the same shape its per-container history endpoint returns and
+/// is `null` when that series has no rows for the container. `time` is the
+/// newest millisecond timestamp across whichever metric samples are present
+/// (`status` is a current-only row and does not affect it).
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerCurrent {
+    pub id: String,
+    pub cpu: Option<CpuUsage>,
+    pub memory: Option<MemUsage>,
+    pub disk: Option<ContainerDiskUsage>,
+    pub network: Option<NetworkUsage>,
+    pub status: Option<ContainerStatus>,
+    pub time: i64,
+}
+
 // --- Traffic analytics (design spec §7) -------------------------------------
 //
 // These four types are NEW wire format — nothing in the frozen Go API

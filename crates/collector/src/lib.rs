@@ -9,9 +9,11 @@ pub use storage::StorageCollector;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::collections::HashMap;
+
 use config::Config;
 use docker::{DockerClient, calc};
-use store::{ContainerSample, Store};
+use store::{ContainerNetworkSample, ContainerSample, ContainerStatusSample, Store};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
@@ -55,6 +57,10 @@ impl Collector {
         );
 
         let mut sampler = HostSampler::new();
+        // Previous cumulative network counters per container display name, so
+        // each cycle can derive a bytes/sec rate from the delta. Kept in the run
+        // loop (not the store) because it is transient rate state, not history.
+        let mut net_prev: HashMap<String, (u64, u64, i64)> = HashMap::new();
         // tokio::time::interval's first tick fires immediately, unlike Go's
         // time.NewTicker (which waits a full period before the first tick).
         // interval_at with an explicit first-tick deadline restores that
@@ -74,13 +80,17 @@ impl Collector {
                     // step inside `cycle` logs and continues, so there is no
                     // error to surface here. This replaces the Go
                     // implementation's panic/recover block.
-                    self.cycle(&mut sampler).await;
+                    self.cycle(&mut sampler, &mut net_prev).await;
                 }
             }
         }
     }
 
-    async fn cycle(&self, sampler: &mut HostSampler) {
+    async fn cycle(
+        &self,
+        sampler: &mut HostSampler,
+        net_prev: &mut HashMap<String, (u64, u64, i64)>,
+    ) {
         let time = now_millis();
 
         // Go stored host CPU with fmt.Sprintf("%.2f", ...) (collector.go), so
@@ -93,6 +103,14 @@ impl Collector {
         let cpu = round2(sampler.sample_cpu());
         let mut mem = sampler.sample_memory();
         mem.time = time;
+        // Network is a rate; round to whole bytes/sec (sub-byte precision is
+        // meaningless). Load is rounded to 2 decimals to match its wire display.
+        let net = sampler.sample_network();
+        let net_rx = round2(net.rx_bytes_per_sec);
+        let net_tx = round2(net.tx_bytes_per_sec);
+        let (load1, load5, load15) = sampler.sample_load();
+        let (load1, load5, load15) = (round2(load1), round2(load5), round2(load15));
+        let host_status = sampler.sample_host_status(time);
 
         let store = self.store.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
@@ -102,16 +120,25 @@ impl Collector {
             if let Err(e) = store.insert_memory(&mem) {
                 tracing::warn!(error = %e, "failed to record host memory");
             }
+            if let Err(e) = store.insert_network(time, net_rx, net_tx) {
+                tracing::warn!(error = %e, "failed to record host network");
+            }
+            if let Err(e) = store.insert_load(time, load1, load5, load15) {
+                tracing::warn!(error = %e, "failed to record host load average");
+            }
+            if let Err(e) = store.upsert_host_status(&host_status) {
+                tracing::warn!(error = %e, "failed to record host status");
+            }
         })
         .await
         {
             tracing::warn!(error = %e, "host metrics insert task panicked");
         }
 
-        self.collect_containers(time).await;
+        self.collect_containers(time, net_prev).await;
     }
 
-    async fn collect_containers(&self, time: i64) {
+    async fn collect_containers(&self, time: i64, net_prev: &mut HashMap<String, (u64, u64, i64)>) {
         let containers = match self.docker.list_containers().await {
             Ok(c) => c,
             Err(e) => {
@@ -124,7 +151,7 @@ impl Collector {
             return;
         }
 
-        let mut samples = Vec::with_capacity(containers.len());
+        let mut fetched = Vec::with_capacity(containers.len());
         let mut tasks = JoinSet::new();
         let mut queue = containers.into_iter();
 
@@ -142,15 +169,47 @@ impl Collector {
                 tasks.spawn(fetch(self.docker.clone(), c));
             }
             match joined {
-                Ok(Some(sample)) => samples.push(sample),
+                Ok(Some(f)) => fetched.push(f),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = %e, "stats task panicked"),
             }
         }
 
+        // Split the fetched data into the three series, deriving each container's
+        // network rate from the previous cycle's counter for the same name.
+        let mut samples = Vec::with_capacity(fetched.len());
+        let mut net_samples = Vec::with_capacity(fetched.len());
+        let mut status_samples = Vec::with_capacity(fetched.len());
+        for f in fetched {
+            let name = f.sample.container_id.clone();
+            let (rx_rate, tx_rate) = net_rate(net_prev.get(&name), f.net_rx, f.net_tx, time);
+            net_prev.insert(name.clone(), (f.net_rx, f.net_tx, time));
+            net_samples.push(ContainerNetworkSample {
+                container_id: name.clone(),
+                rx_bytes_per_sec: round2(rx_rate),
+                tx_bytes_per_sec: round2(tx_rate),
+            });
+            status_samples.push(ContainerStatusSample {
+                container_id: name,
+                state: f.state,
+                health_status: f.health_status,
+                restart_count: f.restart_count,
+            });
+            samples.push(f.sample);
+        }
+        // Drop prev-counter state for containers that are gone, so the map does
+        // not grow without bound across the process lifetime.
+        let live: std::collections::HashSet<&String> =
+            samples.iter().map(|s| &s.container_id).collect();
+        net_prev.retain(|k, _| live.contains(k));
+
         let store = self.store.clone();
-        match tokio::task::spawn_blocking(move || store.insert_container_batch(time, &samples))
-            .await
+        match tokio::task::spawn_blocking(move || {
+            store.insert_container_batch(time, &samples)?;
+            store.insert_container_network_batch(time, &net_samples)?;
+            store.upsert_container_status_batch(time, &status_samples)
+        })
+        .await
         {
             Ok(Err(e)) => tracing::warn!(error = %e, "failed to record container metrics"),
             Err(e) => tracing::warn!(error = %e, "container insert task panicked"),
@@ -159,10 +218,34 @@ impl Collector {
     }
 }
 
+/// Everything one cycle needs from a single container: cpu/mem sample, the raw
+/// cumulative network counters (rate derived later), and inspect-derived status.
+struct FetchedContainer {
+    sample: ContainerSample,
+    net_rx: u64,
+    net_tx: u64,
+    state: String,
+    health_status: String,
+    restart_count: u64,
+}
+
+/// Bytes/sec from the counter delta since the previous cycle. Returns 0 on the
+/// first sample and on a counter reset (a container restart makes `cur < prev`),
+/// so a restart never emits a huge spurious spike.
+fn net_rate(prev: Option<&(u64, u64, i64)>, cur_rx: u64, cur_tx: u64, now: i64) -> (f64, f64) {
+    match prev {
+        Some(&(prx, ptx, pt)) if now > pt && cur_rx >= prx && cur_tx >= ptx => {
+            let dt = (now - pt) as f64 / 1000.0;
+            ((cur_rx - prx) as f64 / dt, (cur_tx - ptx) as f64 / dt)
+        }
+        _ => (0.0, 0.0),
+    }
+}
+
 async fn fetch(
     docker: DockerClient,
     container: docker::ContainerSummary,
-) -> Option<ContainerSample> {
+) -> Option<FetchedContainer> {
     let name = container.display_name();
     let stats = match docker.stats(&container.id).await {
         Ok(s) => s,
@@ -171,6 +254,19 @@ async fn fetch(
             return None;
         }
     };
+
+    // One inspect per container per cycle for health + restart count. A failure
+    // here must not drop the whole container (its cpu/mem/net are still valid),
+    // so fall back to empty health / zero restarts. `state` is free from the
+    // list, so it survives an inspect failure.
+    let (health_status, restart_count) =
+        match docker.inspect_health_and_restart_count(&container.id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(container = %name, error = %e, "failed to inspect container");
+                (String::new(), 0)
+            }
+        };
 
     let mem_used = calc::memory_used(&stats);
     let mem_limit = stats.mem_limit;
@@ -185,15 +281,55 @@ async fn fetch(
     let mem_used_percent = round2(calc::memory_percent(&stats));
     let cpu_percent = round2(calc::cpu_percent(&stats));
 
-    Some(ContainerSample {
-        // Preserve the exact display name. Sanitizing punctuation is lossy:
-        // distinct names such as `app-a` and `appa` otherwise share history.
-        container_id: name,
-        cpu_percent,
-        mem_total: mem_limit,
-        mem_available: free,
-        mem_used,
-        mem_used_percent,
-        mem_free: free,
+    Some(FetchedContainer {
+        sample: ContainerSample {
+            // Preserve the exact display name. Sanitizing punctuation is lossy:
+            // distinct names such as `app-a` and `appa` otherwise share history.
+            container_id: name,
+            cpu_percent,
+            mem_total: mem_limit,
+            mem_available: free,
+            mem_used,
+            mem_used_percent,
+            mem_free: free,
+        },
+        net_rx: stats.net_rx,
+        net_tx: stats.net_tx,
+        state: container.state,
+        health_status,
+        restart_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::net_rate;
+
+    #[test]
+    fn first_sample_is_zero() {
+        assert_eq!(net_rate(None, 1_000, 2_000, 5_000), (0.0, 0.0));
+    }
+
+    #[test]
+    fn rate_is_counter_delta_over_seconds() {
+        // +5000 rx and +10000 tx over a 5s gap → 1000 and 2000 bytes/sec.
+        let prev = (1_000u64, 2_000u64, 0i64);
+        assert_eq!(
+            net_rate(Some(&prev), 6_000, 12_000, 5_000),
+            (1_000.0, 2_000.0)
+        );
+    }
+
+    #[test]
+    fn counter_reset_clamps_to_zero() {
+        // A container restart resets the counter, so cur < prev → 0, not a spike.
+        let prev = (10_000u64, 20_000u64, 0i64);
+        assert_eq!(net_rate(Some(&prev), 5, 5, 5_000), (0.0, 0.0));
+    }
+
+    #[test]
+    fn non_advancing_clock_is_zero() {
+        let prev = (0u64, 0u64, 5_000i64);
+        assert_eq!(net_rate(Some(&prev), 100, 100, 5_000), (0.0, 0.0));
+    }
 }
