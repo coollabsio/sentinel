@@ -244,12 +244,14 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
         .collect::<Vec<_>>()
         .join(" ");
 
+    let local_node_ip = &request.local_node_ip;
+
     Ok(format!(
         "table inet {COOLIFY_NFT_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
- chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; ip saddr {} udp dport 8787 accept; ip saddr {} drop; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
+ chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; ip saddr {} udp dport 8787 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 8080 accept; ip saddr {} drop; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
  chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} {forward_ingress_rules} ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; ip saddr != @workload_networks ip daddr @workload_networks drop; }}
- chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; {output_allow_rules} {output_ingress_rules} ip daddr {} drop; ip daddr @workload_networks drop; }}
+ chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; ip daddr {local_node_ip} tcp dport 8080 accept; {output_allow_rules} {output_ingress_rules} ip daddr {} drop; ip daddr @workload_networks drop; }}
 }}
 ",
         request.wireguard_port,
@@ -1534,6 +1536,8 @@ mod tests {
         assert!(rendered.contains("ip saddr 10.240.0.0/24 udp dport 8787 accept"));
         assert!(rendered.contains("ip saddr 10.240.0.0/24 drop"));
         assert!(rendered.contains("ip daddr 10.240.0.0/24 udp dport 8787 accept"));
+        assert!(rendered.contains("ip saddr 10.240.0.2 ip daddr 10.240.0.2 tcp dport 8080 accept"));
+        assert!(rendered.contains("ip daddr 10.240.0.2 tcp dport 8080 accept"));
         assert!(rendered.contains("ip daddr 10.240.0.0/24 drop"));
         assert!(!rendered.contains("ip saddr 10.240.0.0/24 tcp dport 8080 accept"));
         assert!(!rendered.contains("ip daddr 10.240.0.0/24 ip protocol icmp accept"));
