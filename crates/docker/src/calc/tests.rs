@@ -11,6 +11,8 @@ fn stats() -> ContainerStats {
         mem_usage: 0,
         mem_limit: 0,
         inactive_file: 0,
+        net_rx: 0,
+        net_tx: 0,
     }
 }
 

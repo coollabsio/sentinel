@@ -105,6 +105,23 @@ impl DockerClient {
             .or_else(|| mem_detail.and_then(|st| st.get("inactive_file").copied()))
             .unwrap_or(0);
 
+        // Sum cumulative rx/tx across every interface in the stats block. Docker
+        // omits `networks` entirely for containers on `network_mode: host` (or
+        // `none`), which reads as zero traffic here — correct, since there is no
+        // per-container interface to account.
+        let (net_rx, net_tx) = s
+            .networks
+            .as_ref()
+            .map(|nets| {
+                nets.values().fold((0u64, 0u64), |(rx, tx), n| {
+                    (
+                        rx.saturating_add(n.rx_bytes.unwrap_or(0)),
+                        tx.saturating_add(n.tx_bytes.unwrap_or(0)),
+                    )
+                })
+            })
+            .unwrap_or((0, 0));
+
         Ok(ContainerStats {
             cpu_total: cpu
                 .and_then(|c| c.cpu_usage.as_ref())
@@ -125,6 +142,8 @@ impl DockerClient {
             mem_usage: mem.and_then(|m| m.usage).unwrap_or(0),
             mem_limit: mem.and_then(|m| m.limit).unwrap_or(0),
             inactive_file,
+            net_rx,
+            net_tx,
         })
     }
 
