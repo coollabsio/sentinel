@@ -132,8 +132,9 @@ pub struct HostSummary {
 /// One container's latest snapshot for `GET /api/containers/current`. Each
 /// metric reuses the same shape its per-container history endpoint returns and
 /// is `null` when that series has no rows for the container. `time` is the
-/// newest millisecond timestamp across whichever metric samples are present
-/// (`status` is a current-only row and does not affect it).
+/// newest millisecond timestamp (as a string, like every other `time`) across
+/// whichever metric samples are present (`status` is a current-only row and
+/// does not affect it).
 #[derive(Debug, Clone, Serialize)]
 pub struct ContainerCurrent {
     pub id: String,
@@ -142,7 +143,7 @@ pub struct ContainerCurrent {
     pub disk: Option<ContainerDiskUsage>,
     pub network: Option<NetworkUsage>,
     pub status: Option<ContainerStatus>,
-    pub time: i64,
+    pub time: String,
 }
 
 // --- Traffic analytics (design spec §7) -------------------------------------

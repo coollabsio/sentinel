@@ -467,7 +467,7 @@ paths:
   /api/summary:
     get:
       summary: Get host summary
-      description: Latest stored host CPU, memory and disk usage in one response. Any series with no rows is null.
+      description: Latest stored host CPU, memory, disk, network and load average usage, plus host status (uptime and swap), in one response. Any series with no rows is null.
       tags:
         - Bulk Snapshots
       responses:
@@ -485,7 +485,7 @@ paths:
   /api/containers/current:
     get:
       summary: Get all containers (current)
-      description: Latest CPU, memory and storage sample for every container in one response. Empty array when nothing recorded.
+      description: Latest CPU, memory, storage and network sample, plus container status, for every container in one response. Empty array when nothing recorded.
       tags:
         - Bulk Snapshots
       responses:
@@ -1376,7 +1376,7 @@ components:
           example: running
         health:
           type: string
-          description: Docker health status (healthy / unhealthy / starting / empty)
+          description: Docker health status (healthy / unhealthy / starting / none), or unknown when the container has no healthcheck
           example: healthy
         restartCount:
           type: integer
@@ -1417,10 +1417,9 @@ components:
             - $ref: '#/components/schemas/ContainerStatus'
           description: Current container status, or null when not inspected yet
         time:
-          type: integer
-          format: int64
-          description: Newest Unix millisecond timestamp across the container's present metric samples
-          example: 1700000000000
+          type: string
+          description: Newest Unix millisecond timestamp across the container's present metric samples ("0" when only a status row exists)
+          example: "1700000000000"
 
     TrafficStatusBreakdown:
       type: object

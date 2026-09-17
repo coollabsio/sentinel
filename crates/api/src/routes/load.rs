@@ -59,7 +59,7 @@ async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuer
     Json(out).into_response()
 }
 
-fn to_load(r: store::LoadRow, debug: bool) -> LoadAverage {
+pub(crate) fn to_load(r: store::LoadRow, debug: bool) -> LoadAverage {
     LoadAverage {
         time: r.time.to_string(),
         load1: r.load1,

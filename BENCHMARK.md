@@ -219,8 +219,9 @@ Default samples (HTTP 200 only for latency stats):
 one-line notice) and every other row is unaffected.
 
 `/api/summary` and `/api/containers/current` are the bulk fleet-dashboard reads:
-one request each replaces, respectively, the three host `current` calls and the
-per-container fan-out a dashboard would otherwise make.
+one request each replaces, respectively, the five host `current` calls (cpu,
+memory, disk, network, load) and the per-container fan-out a dashboard would
+otherwise make.
 
 Report: ok, fail, avg, p50, p95, p99, min, max (ms).
 
@@ -318,7 +319,7 @@ Runs **latency → load → stress** with the shared target.
 | Item | Status |
 |------|--------|
 | Push payload success rate against a real Coolify mock | Not in default suite |
-| Container history endpoints (cpu/memory/disk) | Covered when a container id resolves (auto-discovered from `/api/containers/current`, or `--container-id`) |
+| Container history endpoints (cpu/memory/disk/network) | Covered when a container id resolves (auto-discovered from `/api/containers/current`, or `--container-id`) |
 | Multi-host / noisy neighbor | Not required |
 | Absolute production capacity | Not claimed |
 | Writing load outside metrics and analytics | Storage is covered by §4.9; analytics by §4.10 |

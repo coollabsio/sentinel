@@ -57,8 +57,10 @@ impl Collector {
         );
 
         let mut sampler = HostSampler::new();
-        // Previous cumulative network counters per container display name, so
-        // each cycle can derive a bytes/sec rate from the delta. Kept in the run
+        // Previous cumulative network counters per Docker container id, so each
+        // cycle can derive a bytes/sec rate from the delta. Keyed on the id, not
+        // the display name: a re-created container reuses the name but starts
+        // new counters. Kept in the run
         // loop (not the store) because it is transient rate state, not history.
         let mut net_prev: HashMap<String, (u64, u64, i64)> = HashMap::new();
         // tokio::time::interval's first tick fires immediately, unlike Go's
@@ -103,8 +105,8 @@ impl Collector {
         let cpu = round2(sampler.sample_cpu());
         let mut mem = sampler.sample_memory();
         mem.time = time;
-        // Network is a rate; round to whole bytes/sec (sub-byte precision is
-        // meaningless). Load is rounded to 2 decimals to match its wire display.
+        // Network rates and load averages are rounded to 2 decimals, like the
+        // percentages.
         let net = sampler.sample_network();
         let net_rx = round2(net.rx_bytes_per_sec);
         let net_tx = round2(net.tx_bytes_per_sec);
@@ -176,44 +178,54 @@ impl Collector {
         }
 
         // Split the fetched data into the three series, deriving each container's
-        // network rate from the previous cycle's counter for the same name.
+        // network rate from the previous cycle's counter for the same Docker id.
+        let live_ids: std::collections::HashSet<String> =
+            fetched.iter().map(|f| f.docker_id.clone()).collect();
         let mut samples = Vec::with_capacity(fetched.len());
         let mut net_samples = Vec::with_capacity(fetched.len());
         let mut status_samples = Vec::with_capacity(fetched.len());
         for f in fetched {
             let name = f.sample.container_id.clone();
-            let (rx_rate, tx_rate) = net_rate(net_prev.get(&name), f.net_rx, f.net_tx, time);
-            net_prev.insert(name.clone(), (f.net_rx, f.net_tx, time));
+            let (rx_rate, tx_rate) = net_rate(net_prev.get(&f.docker_id), f.net_rx, f.net_tx, time);
+            net_prev.insert(f.docker_id, (f.net_rx, f.net_tx, time));
             net_samples.push(ContainerNetworkSample {
                 container_id: name.clone(),
                 rx_bytes_per_sec: round2(rx_rate),
                 tx_bytes_per_sec: round2(tx_rate),
             });
-            status_samples.push(ContainerStatusSample {
-                container_id: name,
-                state: f.state,
-                health_status: f.health_status,
-                restart_count: f.restart_count,
-            });
+            // No status row on an inspect failure: the previous row stays rather
+            // than being overwritten with made-up values.
+            if let Some((health_status, restart_count)) = f.inspect {
+                status_samples.push(ContainerStatusSample {
+                    container_id: name,
+                    state: f.state,
+                    health_status,
+                    restart_count,
+                });
+            }
             samples.push(f.sample);
         }
         // Drop prev-counter state for containers that are gone, so the map does
         // not grow without bound across the process lifetime.
-        let live: std::collections::HashSet<&String> =
-            samples.iter().map(|s| &s.container_id).collect();
-        net_prev.retain(|k, _| live.contains(k));
+        net_prev.retain(|k, _| live_ids.contains(k));
 
         let store = self.store.clone();
-        match tokio::task::spawn_blocking(move || {
-            store.insert_container_batch(time, &samples)?;
-            store.insert_container_network_batch(time, &net_samples)?;
-            store.upsert_container_status_batch(time, &status_samples)
+        // Each series is written on its own, so one failed insert does not drop
+        // the others.
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            if let Err(e) = store.insert_container_batch(time, &samples) {
+                tracing::warn!(error = %e, "failed to record container metrics");
+            }
+            if let Err(e) = store.insert_container_network_batch(time, &net_samples) {
+                tracing::warn!(error = %e, "failed to record container network");
+            }
+            if let Err(e) = store.upsert_container_status_batch(time, &status_samples) {
+                tracing::warn!(error = %e, "failed to record container status");
+            }
         })
         .await
         {
-            Ok(Err(e)) => tracing::warn!(error = %e, "failed to record container metrics"),
-            Err(e) => tracing::warn!(error = %e, "container insert task panicked"),
-            Ok(Ok(())) => {}
+            tracing::warn!(error = %e, "container insert task panicked");
         }
     }
 }
@@ -221,12 +233,13 @@ impl Collector {
 /// Everything one cycle needs from a single container: cpu/mem sample, the raw
 /// cumulative network counters (rate derived later), and inspect-derived status.
 struct FetchedContainer {
+    docker_id: String,
     sample: ContainerSample,
     net_rx: u64,
     net_tx: u64,
     state: String,
-    health_status: String,
-    restart_count: u64,
+    /// `(health_status, restart_count)`; `None` when inspect failed.
+    inspect: Option<(String, u64)>,
 }
 
 /// Bytes/sec from the counter delta since the previous cycle. Returns 0 on the
@@ -256,17 +269,15 @@ async fn fetch(
     };
 
     // One inspect per container per cycle for health + restart count. A failure
-    // here must not drop the whole container (its cpu/mem/net are still valid),
-    // so fall back to empty health / zero restarts. `state` is free from the
-    // list, so it survives an inspect failure.
-    let (health_status, restart_count) =
-        match docker.inspect_health_and_restart_count(&container.id).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(container = %name, error = %e, "failed to inspect container");
-                (String::new(), 0)
-            }
-        };
+    // here must not drop the whole container (its cpu/mem/net are still valid);
+    // only its status write is skipped.
+    let inspect = match docker.inspect_health_and_restart_count(&container.id).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(container = %name, error = %e, "failed to inspect container");
+            None
+        }
+    };
 
     let mem_used = calc::memory_used(&stats);
     let mem_limit = stats.mem_limit;
@@ -293,11 +304,11 @@ async fn fetch(
             mem_used_percent,
             mem_free: free,
         },
+        docker_id: container.id,
         net_rx: stats.net_rx,
         net_tx: stats.net_tx,
         state: container.state,
-        health_status,
-        restart_count,
+        inspect,
     })
 }
 

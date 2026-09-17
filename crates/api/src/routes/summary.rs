@@ -11,11 +11,14 @@ use axum::routing::get;
 use axum::{Json, Router};
 
 use crate::AppState;
+use crate::routes::container::to_container_disk;
 use crate::routes::cpu::internal_error;
+use crate::routes::disk::to_disk_usage;
+use crate::routes::load::to_load;
+use crate::routes::network::to_network_usage;
 use crate::time::format_millis;
 use crate::types::{
-    ContainerCurrent, ContainerDiskUsage, ContainerStatus, CpuCurrent, CpuUsage, DiskUsage,
-    HostInfo, HostSummary, LoadAverage, MemUsage, NetworkUsage,
+    ContainerCurrent, ContainerStatus, CpuCurrent, CpuUsage, HostInfo, HostSummary, MemUsage,
 };
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -24,7 +27,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/containers/current", get(containers_current))
 }
 
-/// Latest host CPU, memory and disk in one payload. Each key is `null` when its
+/// Latest host cpu, memory, disk, network, load and host status in one payload. Each key is `null` when its
 /// table holds no rows yet.
 async fn summary(State(state): State<Arc<AppState>>) -> Response {
     let permit = match state.history_queries.clone().acquire_owned().await {
@@ -67,15 +70,8 @@ async fn summary(State(state): State<Arc<AppState>>) -> Response {
         disk: Some(disk)
             .filter(|rows| !rows.is_empty())
             .map(|rows| rows.into_iter().map(|r| to_disk_usage(r, debug)).collect()),
-        network: network
-            .map(|r| to_network_usage(r.time, r.rx_bytes_per_sec, r.tx_bytes_per_sec, debug)),
-        load: load.map(|r| LoadAverage {
-            time: r.time.to_string(),
-            load1: r.load1,
-            load5: r.load5,
-            load15: r.load15,
-            human_friendly_time: debug.then(|| format_millis(r.time)),
-        }),
+        network: network.map(|r| to_network_usage(r, debug)),
+        load: load.map(|r| to_load(r, debug)),
         host: host.map(|r| HostInfo {
             time: r.time.to_string(),
             uptime_seconds: r.uptime_seconds,
@@ -89,7 +85,8 @@ async fn summary(State(state): State<Arc<AppState>>) -> Response {
     Json(body).into_response()
 }
 
-/// One row per container, each carrying its latest cpu/memory/disk sample.
+/// One row per container, each carrying its latest cpu/memory/disk/network
+/// sample and its status.
 async fn containers_current(State(state): State<Arc<AppState>>) -> Response {
     let permit = match state.history_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
@@ -124,45 +121,17 @@ async fn containers_current(State(state): State<Arc<AppState>>) -> Response {
                 free: r.free,
                 human_friendly_time: debug.then(|| format_millis(r.time)),
             }),
-            disk: m.disk.map(|r| ContainerDiskUsage {
-                time: r.time.to_string(),
-                writable_layer: r.writable_layer,
-                volumes_total: r.volumes_total,
-                human_friendly_time: debug.then(|| format_millis(r.time)),
-            }),
-            network: m
-                .network
-                .map(|r| to_network_usage(r.time, r.rx_bytes_per_sec, r.tx_bytes_per_sec, debug)),
+            disk: m.disk.map(|r| to_container_disk(r, debug)),
+            network: m.network.map(|r| to_network_usage(r.into(), debug)),
             status: m.status.map(|r| ContainerStatus {
                 state: r.state,
                 health: r.health_status,
                 restart_count: r.restart_count,
             }),
-            time: m.latest_time,
+            time: m.latest_time.to_string(),
         })
         .collect();
     Json(out).into_response()
-}
-
-fn to_network_usage(time: i64, rx: f64, tx: f64, debug: bool) -> NetworkUsage {
-    NetworkUsage {
-        time: time.to_string(),
-        rx_bytes_per_sec: rx,
-        tx_bytes_per_sec: tx,
-        human_friendly_time: debug.then(|| format_millis(time)),
-    }
-}
-
-fn to_disk_usage(r: store::DiskRow, debug: bool) -> DiskUsage {
-    DiskUsage {
-        time: r.time.to_string(),
-        mount: r.mount,
-        total: r.total,
-        used: r.used,
-        available: r.available,
-        used_percent: r.used_percent,
-        human_friendly_time: debug.then(|| format_millis(r.time)),
-    }
 }
 
 #[cfg(test)]

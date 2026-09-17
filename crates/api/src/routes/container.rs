@@ -65,16 +65,7 @@ async fn network_history(
     let debug = state.config.debug;
     let out: Vec<NetworkUsage> = rows
         .into_iter()
-        .map(|r| {
-            to_network_usage(
-                store::NetworkRow {
-                    time: r.time,
-                    rx_bytes_per_sec: r.rx_bytes_per_sec,
-                    tx_bytes_per_sec: r.tx_bytes_per_sec,
-                },
-                debug,
-            )
-        })
+        .map(|r| to_network_usage(r.into(), debug))
         .collect();
     Json(out).into_response()
 }
@@ -213,7 +204,7 @@ async fn disk_history(
     Json(out).into_response()
 }
 
-fn to_container_disk(r: store::ContainerDiskRow, debug: bool) -> ContainerDiskUsage {
+pub(crate) fn to_container_disk(r: store::ContainerDiskRow, debug: bool) -> ContainerDiskUsage {
     ContainerDiskUsage {
         time: r.time.to_string(),
         writable_layer: r.writable_layer,

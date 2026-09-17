@@ -60,7 +60,7 @@ async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuer
     Json(out).into_response()
 }
 
-fn to_disk_usage(r: store::DiskRow, debug: bool) -> DiskUsage {
+pub(crate) fn to_disk_usage(r: store::DiskRow, debug: bool) -> DiskUsage {
     DiskUsage {
         time: r.time.to_string(),
         mount: r.mount,

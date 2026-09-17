@@ -176,14 +176,14 @@ async fn containers_current_returns_latest_per_container() {
     assert_eq!(alpha["disk"]["writableLayer"], 12);
     assert_eq!(alpha["disk"]["volumesTotal"], 24);
     // Top-level time is the newest across the three (disk at 3000).
-    assert_eq!(alpha["time"], 3000);
+    assert_eq!(alpha["time"], "3000");
 
     let beta = &rows[1];
     assert_eq!(beta["id"], "beta");
     assert_eq!(beta["cpu"]["percent"], "3.00");
     // beta has no disk sample recorded.
     assert!(beta["disk"].is_null());
-    assert_eq!(beta["time"], 2000);
+    assert_eq!(beta["time"], "2000");
 }
 
 /// A container with only a disk sample still appears, with cpu/memory `null`.
@@ -202,7 +202,7 @@ async fn containers_current_includes_disk_only_container() {
     assert!(rows[0]["cpu"].is_null());
     assert!(rows[0]["memory"].is_null());
     assert_eq!(rows[0]["disk"]["writableLayer"], 7);
-    assert_eq!(rows[0]["time"], 1500);
+    assert_eq!(rows[0]["time"], "1500");
 }
 
 /// An empty database yields an empty array, not an error.
@@ -339,7 +339,7 @@ async fn containers_current_includes_network_and_status() {
     assert_eq!(alpha["status"]["health"], "healthy");
     assert_eq!(alpha["status"]["restartCount"], 3);
     // Top-level time is the newest metric sample (network 3000), not status.
-    assert_eq!(alpha["time"], 3000);
+    assert_eq!(alpha["time"], "3000");
 
     let ghost = &rows[1];
     assert_eq!(ghost["id"], "ghost");
@@ -347,7 +347,7 @@ async fn containers_current_includes_network_and_status() {
     assert!(ghost["network"].is_null());
     assert_eq!(ghost["status"]["state"], "exited");
     // No metric sample, so the top-level time falls back to 0.
-    assert_eq!(ghost["time"], 0);
+    assert_eq!(ghost["time"], "0");
 }
 
 /// `/api/network/current` and `/api/load/current` return the latest row or

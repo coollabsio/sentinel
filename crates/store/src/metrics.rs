@@ -95,6 +95,16 @@ pub struct ContainerNetworkRow {
     pub tx_bytes_per_sec: f64,
 }
 
+impl From<ContainerNetworkRow> for NetworkRow {
+    fn from(r: ContainerNetworkRow) -> Self {
+        NetworkRow {
+            time: r.time,
+            rx_bytes_per_sec: r.rx_bytes_per_sec,
+            tx_bytes_per_sec: r.tx_bytes_per_sec,
+        }
+    }
+}
+
 /// Collector input for a single container's network rate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContainerNetworkSample {
@@ -618,14 +628,14 @@ impl Store {
         })
     }
 
-    /// Latest host CPU, memory and disk snapshot in a single reader-lock hold.
+    /// Latest host cpu, memory, disk, network, load and host-status snapshot in
+    /// a single reader-lock hold.
     ///
     /// The store exposes one read-only connection, so every API read serializes
-    /// on its `Mutex`. Reading the three host series under one `with_reader`
-    /// gives `/api/summary` a single lock acquisition instead of three, which is
-    /// what keeps this hot fleet-dashboard endpoint cheap under concurrency. All
-    /// three are index tail reads (`cpu`/`memory` on their PK `time`, disk via
-    /// `MAX(time)` on its PK), not scans.
+    /// on its `Mutex`. Reading every host series under one `with_reader` gives
+    /// `/api/summary` a single lock acquisition, which is what keeps this hot
+    /// fleet-dashboard endpoint cheap under concurrency. Each read is an index
+    /// tail read or a singleton lookup, not a scan.
     pub fn host_summary(&self) -> Result<HostSummaryRows, StoreError> {
         self.with_reader(|c| {
             let cpu = {
@@ -659,22 +669,18 @@ impl Store {
         })
     }
 
-    /// Latest cpu, memory and disk sample for every container that has ever
-    /// recorded any of them, joined by id in Rust. One reader lock covers all
-    /// three latest-row-per-id queries; the `(container_id, time)` indexes make
-    /// each `GROUP BY container_id` max an index read rather than a table scan.
+    /// Latest cpu, memory, disk, network and status for every container that has
+    /// recorded any of them, joined by id in Rust. One reader lock covers every
+    /// query; see [`latest_per_container_sql`] for why they stay index seeks.
     pub fn latest_container_metrics(&self) -> Result<Vec<ContainerMetrics>, StoreError> {
         use std::collections::{BTreeSet, HashMap};
 
         self.with_reader(|c| {
             let mut cpu: HashMap<String, CpuRow> = HashMap::new();
             {
-                let mut stmt = c.prepare_cached(
-                    "SELECT t.container_id, t.time, t.percent FROM container_cpu_usage t
-                     JOIN (SELECT container_id, MAX(time) AS mt
-                           FROM container_cpu_usage GROUP BY container_id) m
-                       ON t.container_id = m.container_id AND t.time = m.mt",
-                )?;
+                let sql =
+                    latest_per_container_sql("container_cpu_usage", "container_id, time, percent");
+                let mut stmt = c.prepare_cached(&sql)?;
                 let mut rows = stmt.query([])?;
                 while let Some(r) = rows.next()? {
                     let id: String = r.get(0)?;
@@ -690,14 +696,11 @@ impl Store {
 
             let mut mem: HashMap<String, MemRow> = HashMap::new();
             {
-                let mut stmt = c.prepare_cached(
-                    "SELECT t.container_id, t.time, t.total, t.available, t.used,
-                            t.used_percent, t.free
-                     FROM container_memory_usage t
-                     JOIN (SELECT container_id, MAX(time) AS mt
-                           FROM container_memory_usage GROUP BY container_id) m
-                       ON t.container_id = m.container_id AND t.time = m.mt",
-                )?;
+                let sql = latest_per_container_sql(
+                    "container_memory_usage",
+                    &format!("container_id, {MEM_COLS}"),
+                );
+                let mut stmt = c.prepare_cached(&sql)?;
                 let mut rows = stmt.query([])?;
                 while let Some(r) = rows.next()? {
                     let id: String = r.get(0)?;
@@ -717,13 +720,8 @@ impl Store {
 
             let mut disk: HashMap<String, ContainerDiskRow> = HashMap::new();
             {
-                let mut stmt = c.prepare_cached(
-                    "SELECT t.time, t.container_id, t.writable_layer, t.volumes_total
-                     FROM container_disk_usage t
-                     JOIN (SELECT container_id, MAX(time) AS mt
-                           FROM container_disk_usage GROUP BY container_id) m
-                       ON t.container_id = m.container_id AND t.time = m.mt",
-                )?;
+                let sql = latest_per_container_sql("container_disk_usage", CONTAINER_DISK_COLS);
+                let mut stmt = c.prepare_cached(&sql)?;
                 let mut rows = stmt.query([])?;
                 while let Some(r) = rows.next()? {
                     let row = map_container_disk_row(r)?;
@@ -733,13 +731,9 @@ impl Store {
 
             let mut net: HashMap<String, ContainerNetworkRow> = HashMap::new();
             {
-                let mut stmt = c.prepare_cached(
-                    "SELECT t.time, t.container_id, t.rx_bytes_per_sec, t.tx_bytes_per_sec
-                     FROM container_network_usage t
-                     JOIN (SELECT container_id, MAX(time) AS mt
-                           FROM container_network_usage GROUP BY container_id) m
-                       ON t.container_id = m.container_id AND t.time = m.mt",
-                )?;
+                let sql =
+                    latest_per_container_sql("container_network_usage", CONTAINER_NETWORK_COLS);
+                let mut stmt = c.prepare_cached(&sql)?;
                 let mut rows = stmt.query([])?;
                 while let Some(r) = rows.next()? {
                     let row = map_container_network_row(r)?;
@@ -805,6 +799,25 @@ impl Store {
             Ok(out)
         })
     }
+}
+
+/// Newest row per container in `table`. A `GROUP BY container_id` + `MAX(time)`
+/// reads the whole `(container_id, time)` index (~130 ms per table at 1.3M rows,
+/// under the shared reader lock). Instead, a recursive CTE skips from one
+/// distinct id to the next through that index, and each id seeks its own
+/// `MAX(time)`, so the cost scales with the container count, not the row count.
+fn latest_per_container_sql(table: &str, cols: &str) -> String {
+    format!(
+        "WITH RECURSIVE ids(id) AS (
+             SELECT MIN(container_id) FROM {table}
+             UNION ALL
+             SELECT (SELECT MIN(container_id) FROM {table} WHERE container_id > ids.id)
+             FROM ids WHERE ids.id IS NOT NULL
+         )
+         SELECT {cols} FROM ids JOIN {table}
+           ON container_id = ids.id
+          AND time = (SELECT MAX(time) FROM {table} WHERE container_id = ids.id)"
+    )
 }
 
 /// The newest disk cycle's rows, one per mountpoint. Shared by `disk_latest`

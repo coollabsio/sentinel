@@ -604,7 +604,7 @@ Current-value bundles that let a fleet-wide dashboard read a server's whole metr
 
 ### Get Host Summary
 
-Retrieve the latest stored host CPU, memory and disk usage in a single response.
+Retrieve the latest stored host CPU, memory, disk, network and load average usage, plus host status (uptime and swap), in a single response.
 
 **Endpoint:** `GET /api/summary`
 
@@ -673,7 +673,7 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ### Get All Containers (Current)
 
-Retrieve the latest CPU, memory and storage sample for every container in one response. Returns an empty array when nothing has been recorded yet.
+Retrieve the latest CPU, memory, storage and network sample, plus container status, for every container in one response. Returns an empty array when nothing has been recorded yet.
 
 **Endpoint:** `GET /api/containers/current`
 
@@ -709,7 +709,7 @@ Retrieve the latest CPU, memory and storage sample for every container in one re
       "health": "healthy",
       "restartCount": 0
     },
-    "time": 1700000000000
+    "time": "1700000000000"
   }
 ]
 ```
@@ -720,8 +720,8 @@ Retrieve the latest CPU, memory and storage sample for every container in one re
 - `memory` (object | null): Latest memory sample, same shape as [`/api/container/:containerId/memory/history`](#get-container-memory-history) items; `null` when none recorded
 - `disk` (object | null): Latest storage sample, same shape as [`/api/container/:containerId/disk/current`](#get-container-storage-current); `null` when none recorded
 - `network` (object | null): Latest network rate, same shape as [`/api/container/:containerId/network/history`](#get-container-network-history) items; `null` when none recorded
-- `status` (object | null): Current container status — `state` (Docker state, e.g. `running`), `health` (Docker health, e.g. `healthy`/`unhealthy`/`starting`/empty), `restartCount`; `null` when not inspected yet
-- `time` (number): Newest Unix millisecond timestamp across the container's present metric samples (`status` is current-only and does not affect it)
+- `status` (object | null): Current container status — `state` (Docker state, e.g. `running`), `health` (Docker health status `healthy`/`unhealthy`/`starting`/`none`, or `unknown` when the container has no healthcheck), `restartCount`; `null` when not inspected yet
+- `time` (string): Newest Unix millisecond timestamp across the container's present metric samples (`status` is current-only and does not affect it); `"0"` when only a status row exists
 
 **Example:**
 ```bash
