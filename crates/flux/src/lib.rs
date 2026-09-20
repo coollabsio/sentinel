@@ -12,7 +12,7 @@ pub use credential::{CredentialClaims, CredentialError, CredentialErrorKind, Cre
 pub use internal_api::serve as serve_internal_api;
 pub use negotiation::{Negotiated, negotiate};
 pub use registry::{CommandDispatchError, ConnectionInfo, ConnectionRegistry, now_millis};
-pub use reporter::EventReporter;
+pub use reporter::{ConnectedEvent, EventReporter};
 pub use service::AgentService;
 pub use tls::{TlsConfigurationError, load_server_tls};
 

@@ -7,6 +7,16 @@ pub struct EventReporter {
     token: Option<String>,
 }
 
+pub struct ConnectedEvent<'a> {
+    pub server_id: &'a str,
+    pub connection_id: &'a str,
+    pub sentinel_version: &'a str,
+    pub protocol_version: u32,
+    pub trust_bundle_version: u64,
+    pub transport: &'a str,
+    pub capabilities: &'a [String],
+}
+
 #[derive(Serialize)]
 struct Event<'a> {
     event: &'a str,
@@ -24,6 +34,8 @@ struct Event<'a> {
     transport: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     event_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<&'a [String]>,
 }
 
 impl EventReporter {
@@ -38,25 +50,18 @@ impl EventReporter {
         }
     }
 
-    pub async fn connected(
-        &self,
-        server_id: &str,
-        connection_id: &str,
-        sentinel_version: &str,
-        protocol_version: u32,
-        trust_bundle_version: u64,
-        transport: &str,
-    ) {
+    pub async fn connected(&self, connection: ConnectedEvent<'_>) {
         self.send(Event {
             event: "connected",
-            server_id,
-            connection_id,
-            sentinel_version: Some(sentinel_version),
-            protocol_version: Some(protocol_version),
+            server_id: connection.server_id,
+            connection_id: connection.connection_id,
+            sentinel_version: Some(connection.sentinel_version),
+            protocol_version: Some(connection.protocol_version),
             observed_at_unix_ms: None,
-            trust_bundle_version: Some(trust_bundle_version),
-            transport: Some(transport),
+            trust_bundle_version: Some(connection.trust_bundle_version),
+            transport: Some(connection.transport),
             event_id: None,
+            capabilities: Some(connection.capabilities),
         })
         .await;
     }
@@ -72,6 +77,7 @@ impl EventReporter {
             trust_bundle_version: None,
             transport: None,
             event_id: None,
+            capabilities: None,
         })
         .await;
     }
@@ -87,6 +93,7 @@ impl EventReporter {
             trust_bundle_version: None,
             transport: None,
             event_id: None,
+            capabilities: None,
         })
         .await;
     }
@@ -108,6 +115,7 @@ impl EventReporter {
             trust_bundle_version: None,
             transport: None,
             event_id: Some(event_id),
+            capabilities: None,
         })
         .await;
     }
@@ -146,6 +154,7 @@ mod tests {
             trust_bundle_version: None,
             transport: None,
             event_id: Some("runtime-1"),
+            capabilities: None,
         })
         .unwrap();
 
@@ -154,5 +163,31 @@ mod tests {
         assert_eq!(value["connection_id"], "connection-1");
         assert_eq!(value["event_id"], "runtime-1");
         assert_eq!(value["observed_at_unix_ms"], 1_700_000_000_000_i64);
+    }
+
+    #[test]
+    fn serializes_negotiated_capabilities_for_laravel() {
+        let capabilities = vec![
+            "container.list.v1".to_string(),
+            "workload.deploy.v1".to_string(),
+        ];
+        let value = serde_json::to_value(Event {
+            event: "connected",
+            server_id: "node-1",
+            connection_id: "connection-1",
+            sentinel_version: Some("main"),
+            protocol_version: Some(1),
+            observed_at_unix_ms: None,
+            trust_bundle_version: Some(1),
+            transport: Some("tls"),
+            event_id: None,
+            capabilities: Some(&capabilities),
+        })
+        .unwrap();
+
+        assert_eq!(
+            value["capabilities"],
+            serde_json::json!(["container.list.v1", "workload.deploy.v1"])
+        );
     }
 }

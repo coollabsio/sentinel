@@ -13,7 +13,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::{ConnectionRegistry, CredentialVerifier, EventReporter, negotiate, now_millis};
+use crate::{
+    ConnectedEvent, ConnectionRegistry, CredentialVerifier, EventReporter, negotiate, now_millis,
+};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -97,14 +99,15 @@ impl Agent for AgentService {
             .await
             .map_err(|_| Status::unavailable("stream closed"))?;
         self.reporter
-            .connected(
-                &hello.server_id,
-                &connection_id,
-                &hello.sentinel_version,
-                negotiated.protocol_version,
-                hello.trust_bundle_version,
-                self.transport,
-            )
+            .connected(ConnectedEvent {
+                server_id: &hello.server_id,
+                connection_id: &connection_id,
+                sentinel_version: &hello.sentinel_version,
+                protocol_version: negotiated.protocol_version,
+                trust_bundle_version: hello.trust_bundle_version,
+                transport: self.transport,
+                capabilities: &negotiated.capabilities,
+            })
             .await;
 
         let registry = self.registry.clone();
