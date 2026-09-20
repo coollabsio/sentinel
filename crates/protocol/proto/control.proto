@@ -149,6 +149,12 @@ message SystemInfoResult {
   optional uint64 uptime_seconds = 12;
   optional string container_runtime = 13;
   optional string container_runtime_version = 14;
+  optional double cpu_usage_percent = 15;
+  optional uint64 memory_used_bytes = 16;
+  optional uint64 memory_available_bytes = 17;
+  optional double load_average_one = 18;
+  optional double load_average_five = 19;
+  optional double load_average_fifteen = 20;
 }
 
 message ContainerListRequest {}

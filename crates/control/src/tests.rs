@@ -125,6 +125,10 @@ fn executes_system_info_commands() {
             if result.sentinel_version == "dev"
                 && result.cpu_count.is_some_and(|count| count > 0)
                 && result.memory_bytes.is_some_and(|bytes| bytes > 0)
+                && result.cpu_usage_percent.is_some_and(|value| (0.0..=100.0).contains(&value))
+                && result.memory_used_bytes.is_some()
+                && result.memory_available_bytes.is_some()
+                && result.load_average_one.is_some_and(|value| value >= 0.0)
     ));
 }
 

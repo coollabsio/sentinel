@@ -17,7 +17,7 @@ use sentinel_protocol::{
     CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use store::{CommandJournal, CommandLookup, CommandStart};
-use sysinfo::{Disks, MemoryRefreshKind, RefreshKind, System};
+use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 
 pub(crate) const CONTAINER_RUNTIMES: [&str; 2] = ["podman", "docker"];
 
@@ -30,6 +30,7 @@ pub(crate) struct CommandExecutor {
     sentinel_version: String,
     journal: CommandJournal,
     network_root: PathBuf,
+    system: System,
 }
 
 impl CommandExecutor {
@@ -46,6 +47,7 @@ impl CommandExecutor {
             sentinel_version: sentinel_version.into(),
             journal,
             network_root: PathBuf::from("/"),
+            system: host_system(),
         }
     }
 
@@ -249,6 +251,7 @@ impl CommandExecutor {
                 observed_at_unix_ms: now_millis(),
                 payload: Some(command_result::Payload::SystemInfo(system_info(
                     &self.sentinel_version,
+                    &mut self.system,
                 ))),
             }
         } else if let Some(Payload::ContainerList(_)) = command.payload {
@@ -805,10 +808,20 @@ fn container_port(value: &serde_json::Value) -> Option<ContainerPort> {
     })
 }
 
-fn system_info(sentinel_version: &str) -> SystemInfoResult {
+fn host_system() -> System {
     let mut system = System::new_with_specifics(
-        RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+        RefreshKind::nothing()
+            .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+            .with_memory(MemoryRefreshKind::nothing().with_ram()),
     );
+    system.refresh_cpu_usage();
+    system.refresh_memory();
+
+    system
+}
+
+fn system_info(sentinel_version: &str, system: &mut System) -> SystemInfoResult {
+    system.refresh_cpu_usage();
     system.refresh_memory();
     let disks = Disks::new_with_refreshed_list();
     let root_disk = disks
@@ -816,6 +829,7 @@ fn system_info(sentinel_version: &str) -> SystemInfoResult {
         .iter()
         .find(|disk| disk.mount_point() == std::path::Path::new("/"));
     let (container_runtime, container_runtime_version) = container_runtime();
+    let load = System::load_average();
 
     SystemInfoResult {
         hostname: System::host_name(),
@@ -834,6 +848,12 @@ fn system_info(sentinel_version: &str) -> SystemInfoResult {
         uptime_seconds: Some(System::uptime()),
         container_runtime,
         container_runtime_version,
+        cpu_usage_percent: Some(f64::from(system.global_cpu_usage()).clamp(0.0, 100.0)),
+        memory_used_bytes: Some(system.used_memory()),
+        memory_available_bytes: Some(system.available_memory()),
+        load_average_one: Some(load.one),
+        load_average_five: Some(load.five),
+        load_average_fifteen: Some(load.fifteen),
     }
 }
 

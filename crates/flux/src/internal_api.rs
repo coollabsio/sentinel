@@ -256,6 +256,12 @@ pub struct SystemInfoResponse {
     uptime_seconds: Option<u64>,
     container_runtime: Option<String>,
     container_runtime_version: Option<String>,
+    cpu_usage_percent: Option<f64>,
+    memory_used_bytes: Option<u64>,
+    memory_available_bytes: Option<u64>,
+    load_average_one: Option<f64>,
+    load_average_five: Option<f64>,
+    load_average_fifteen: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -945,6 +951,12 @@ async fn system_info(
         uptime_seconds: info.uptime_seconds,
         container_runtime: info.container_runtime,
         container_runtime_version: info.container_runtime_version,
+        cpu_usage_percent: info.cpu_usage_percent,
+        memory_used_bytes: info.memory_used_bytes,
+        memory_available_bytes: info.memory_available_bytes,
+        load_average_one: info.load_average_one,
+        load_average_five: info.load_average_five,
+        load_average_fifteen: info.load_average_fifteen,
     }))
 }
 
