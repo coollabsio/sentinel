@@ -1175,16 +1175,29 @@ pub(crate) fn inspect_firewall(
     expected_hash: &str,
 ) -> FirewallInspectResult {
     let state = read_state_file(&state_path(root, "firewall.state"));
+    let tables_active = root != Path::new("/")
+        || [
+            ["list", "table", "inet", COOLIFY_NFT_TABLE],
+            ["list", "table", "bridge", COOLIFY_NFT_BRIDGE_TABLE],
+        ]
+        .iter()
+        .all(|arguments| {
+            Command::new("nft")
+                .args(arguments)
+                .status()
+                .is_ok_and(|status| status.success())
+        });
     FirewallInspectResult {
         applied_revision: state.as_ref().map_or(0, |state| state.0),
         configuration_hash: state
             .as_ref()
             .map_or_else(String::new, |state| state.1.clone()),
-        drifted: state
-            .as_ref()
-            .is_none_or(|state| state.0 != expected_revision || state.1 != expected_hash),
+        drifted: !tables_active
+            || state
+                .as_ref()
+                .is_none_or(|state| state.0 != expected_revision || state.1 != expected_hash),
         table: COOLIFY_NFT_TABLE.into(),
-        ingress_enforced: true,
+        ingress_enforced: tables_active,
     }
 }
 
@@ -1312,10 +1325,24 @@ pub(crate) fn inspect_corrosion(root: &Path) -> CorrosionInspectResult {
         .unwrap_or_default()
         .trim()
         .to_string();
-    let active = Command::new("systemctl")
+    let corrosion_active = Command::new("systemctl")
         .args(["is-active", "--quiet", "corrosion.service"])
         .status()
         .is_ok_and(|status| status.success());
+    let dns_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", "coolify-discovery-dns.service"])
+        .status()
+        .is_ok_and(|status| status.success());
+    let owner_ip = fs::read_to_string("/etc/corrosion/coolify-owner").unwrap_or_default();
+    let resolver_active = Command::new("resolvectl")
+        .arg("status")
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(owner_ip.trim())
+                && String::from_utf8_lossy(&output.stdout).contains("~coolify.internal")
+        });
+    let active = corrosion_active && dns_active && resolver_active;
     let cluster_id = read_trimmed_u64("/etc/corrosion/coolify-cluster-id")
         .and_then(|value| u16::try_from(value).ok())
         .unwrap_or_default();
