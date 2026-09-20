@@ -5,7 +5,9 @@ use std::time::Duration;
 use futures_util::Stream;
 use sentinel_protocol::control::v1::agent_message;
 use sentinel_protocol::control::v1::agent_server::Agent;
-use sentinel_protocol::control::v1::{AgentMessage, ControlMessage, Welcome, control_message};
+use sentinel_protocol::control::v1::{
+    AgentMessage, ControlMessage, EventAck, Welcome, control_message,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -109,6 +111,7 @@ impl Agent for AgentService {
         let reporter = self.reporter.clone();
         let server_id = hello.server_id;
         let task_connection_id = connection_id.clone();
+        let event_sender = sender.clone();
         let credential_lifetime = Duration::from_secs(
             claims
                 .expires_at
@@ -144,6 +147,27 @@ impl Agent for AgentService {
                     Some(agent_message::Message::CommandAccepted(_)) => {}
                     Some(agent_message::Message::CommandResult(result)) => {
                         registry.complete(&server_id, result).await;
+                    }
+                    Some(agent_message::Message::RuntimeChanged(event)) => {
+                        reporter
+                            .runtime_changed(
+                                &server_id,
+                                &task_connection_id,
+                                &event.event_id,
+                                event.observed_at_unix_ms,
+                            )
+                            .await;
+                        if event_sender
+                            .send(ControlMessage {
+                                message: Some(control_message::Message::EventAck(EventAck {
+                                    event_id: event.event_id,
+                                })),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                     _ => break,
                 }

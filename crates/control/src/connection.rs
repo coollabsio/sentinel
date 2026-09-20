@@ -1,14 +1,19 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config::ControlTlsConfig;
 use sentinel_protocol::control::v1::agent_message;
 use sentinel_protocol::control::v1::control_message;
-use sentinel_protocol::control::v1::{AgentMessage, CommandAccepted, Heartbeat, Hello};
+use sentinel_protocol::control::v1::{
+    AgentMessage, CommandAccepted, Heartbeat, Hello, RuntimeChanged,
+};
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
     CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, NETWORK_CAPABILITIES,
 };
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
@@ -21,6 +26,15 @@ use crate::commands::CommandExecutor;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MESSAGE_LIMIT: usize = 16 * 1024 * 1024;
+static RUNTIME_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+struct RuntimeWatcherGuard(watch::Sender<bool>);
+
+impl Drop for RuntimeWatcherGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FluxTransport {
@@ -143,6 +157,12 @@ pub async fn connect(
             .iter()
             .any(|capability| capability == required)
     };
+    let (runtime_shutdown, runtime_shutdown_receiver) = watch::channel(false);
+    let _runtime_watcher = RuntimeWatcherGuard(runtime_shutdown);
+    tokio::spawn(watch_runtime_changes(
+        sender.clone(),
+        runtime_shutdown_receiver,
+    ));
     ticker.tick().await;
     loop {
         tokio::select! {
@@ -180,6 +200,86 @@ pub async fn connect(
                 _ => return Err(FluxConnectionError::Connection),
             }
         }
+    }
+}
+
+async fn watch_runtime_changes(
+    sender: mpsc::Sender<AgentMessage>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        let mut child = match TokioCommand::new("podman")
+            .args(podman_event_args())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                tracing::warn!(%error, "Sentinel could not watch Podman events");
+                if wait_for_runtime_retry(&mut shutdown).await {
+                    return;
+                }
+                continue;
+            }
+        };
+        let Some(stdout) = child.stdout.take() else {
+            if wait_for_runtime_retry(&mut shutdown).await {
+                return;
+            }
+            continue;
+        };
+        let mut lines = BufReader::new(stdout).lines();
+        let mut last_sent = tokio::time::Instant::now() - Duration::from_secs(1);
+        loop {
+            let line = tokio::select! {
+                _ = shutdown.changed() => return,
+                line = lines.next_line() => line,
+            };
+            match line {
+                Ok(Some(line)) if !line.trim().is_empty() => {
+                    if last_sent.elapsed() < Duration::from_millis(250) {
+                        continue;
+                    }
+                    last_sent = tokio::time::Instant::now();
+                    let observed_at_unix_ms = now_millis();
+                    if sender
+                        .send(runtime_changed_message(observed_at_unix_ms))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        if wait_for_runtime_retry(&mut shutdown).await {
+            return;
+        }
+    }
+}
+
+pub(crate) fn podman_event_args() -> [&'static str; 5] {
+    ["events", "--filter", "type=container", "--format", "json"]
+}
+
+pub(crate) fn runtime_changed_message(observed_at_unix_ms: i64) -> AgentMessage {
+    let sequence = RUNTIME_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    AgentMessage {
+        message: Some(agent_message::Message::RuntimeChanged(RuntimeChanged {
+            event_id: format!("runtime-{observed_at_unix_ms}-{sequence}"),
+            observed_at_unix_ms,
+        })),
+    }
+}
+
+async fn wait_for_runtime_retry(shutdown: &mut watch::Receiver<bool>) -> bool {
+    tokio::select! {
+        _ = shutdown.changed() => true,
+        _ = tokio::time::sleep(Duration::from_secs(2)) => false,
     }
 }
 

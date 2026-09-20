@@ -12,6 +12,7 @@ message AgentMessage {
     Heartbeat heartbeat = 2;
     CommandAccepted command_accepted = 3;
     CommandResult command_result = 4;
+    RuntimeChanged runtime_changed = 5;
   }
 }
 
@@ -37,6 +38,11 @@ message Hello {
 message Heartbeat {
   string connection_id = 1;
   int64 sent_at_unix_ms = 2;
+}
+
+message RuntimeChanged {
+  string event_id = 1;
+  int64 observed_at_unix_ms = 2;
 }
 
 message Welcome {

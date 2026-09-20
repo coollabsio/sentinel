@@ -17,6 +17,21 @@ use url::Url;
 use super::*;
 
 #[test]
+fn watches_container_runtime_events_and_builds_typed_notifications() {
+    assert_eq!(
+        crate::connection::podman_event_args(),
+        ["events", "--filter", "type=container", "--format", "json"]
+    );
+    let message = crate::connection::runtime_changed_message(1_700_000_000_000);
+    assert!(matches!(
+        message.message,
+        Some(sentinel_protocol::control::v1::agent_message::Message::RuntimeChanged(event))
+            if event.observed_at_unix_ms == 1_700_000_000_000
+                && event.event_id.starts_with("runtime-1700000000000-")
+    ));
+}
+
+#[test]
 fn executes_and_deduplicates_system_ping_commands() {
     use sentinel_protocol::control::v1::command::Payload;
     use sentinel_protocol::control::v1::command_result;

@@ -22,6 +22,8 @@ struct Event<'a> {
     trust_bundle_version: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transport: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_id: Option<&'a str>,
 }
 
 impl EventReporter {
@@ -54,6 +56,7 @@ impl EventReporter {
             observed_at_unix_ms: None,
             trust_bundle_version: Some(trust_bundle_version),
             transport: Some(transport),
+            event_id: None,
         })
         .await;
     }
@@ -68,6 +71,7 @@ impl EventReporter {
             observed_at_unix_ms: Some(observed_at_unix_ms),
             trust_bundle_version: None,
             transport: None,
+            event_id: None,
         })
         .await;
     }
@@ -82,6 +86,28 @@ impl EventReporter {
             observed_at_unix_ms: None,
             trust_bundle_version: None,
             transport: None,
+            event_id: None,
+        })
+        .await;
+    }
+
+    pub async fn runtime_changed(
+        &self,
+        server_id: &str,
+        connection_id: &str,
+        event_id: &str,
+        observed_at_unix_ms: i64,
+    ) {
+        self.send(Event {
+            event: "runtime_changed",
+            server_id,
+            connection_id,
+            sentinel_version: None,
+            protocol_version: None,
+            observed_at_unix_ms: Some(observed_at_unix_ms),
+            trust_bundle_version: None,
+            transport: None,
+            event_id: Some(event_id),
         })
         .await;
     }
@@ -101,5 +127,32 @@ impl EventReporter {
         {
             tracing::warn!(%error, "Flux could not report connection event");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Event;
+
+    #[test]
+    fn serializes_runtime_change_events_for_laravel() {
+        let value = serde_json::to_value(Event {
+            event: "runtime_changed",
+            server_id: "node-1",
+            connection_id: "connection-1",
+            sentinel_version: None,
+            protocol_version: None,
+            observed_at_unix_ms: Some(1_700_000_000_000),
+            trust_bundle_version: None,
+            transport: None,
+            event_id: Some("runtime-1"),
+        })
+        .unwrap();
+
+        assert_eq!(value["event"], "runtime_changed");
+        assert_eq!(value["server_id"], "node-1");
+        assert_eq!(value["connection_id"], "connection-1");
+        assert_eq!(value["event_id"], "runtime-1");
+        assert_eq!(value["observed_at_unix_ms"], 1_700_000_000_000_i64);
     }
 }
