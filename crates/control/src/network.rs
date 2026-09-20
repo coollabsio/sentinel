@@ -789,6 +789,7 @@ pub(crate) fn reconcile_wireguard(
     if prior
         .as_ref()
         .is_some_and(|state| state.0 == request.revision && state.1 == configuration_hash)
+        && firewall_tables_active(root)
     {
         return Ok(WireguardReconcileResult {
             state: Some(if root == Path::new("/") {
@@ -1175,18 +1176,7 @@ pub(crate) fn inspect_firewall(
     expected_hash: &str,
 ) -> FirewallInspectResult {
     let state = read_state_file(&state_path(root, "firewall.state"));
-    let tables_active = root != Path::new("/")
-        || [
-            ["list", "table", "inet", COOLIFY_NFT_TABLE],
-            ["list", "table", "bridge", COOLIFY_NFT_BRIDGE_TABLE],
-        ]
-        .iter()
-        .all(|arguments| {
-            Command::new("nft")
-                .args(arguments)
-                .status()
-                .is_ok_and(|status| status.success())
-        });
+    let tables_active = firewall_tables_active(root);
     FirewallInspectResult {
         applied_revision: state.as_ref().map_or(0, |state| state.0),
         configuration_hash: state
@@ -1199,6 +1189,21 @@ pub(crate) fn inspect_firewall(
         table: COOLIFY_NFT_TABLE.into(),
         ingress_enforced: tables_active,
     }
+}
+
+fn firewall_tables_active(root: &Path) -> bool {
+    root != Path::new("/")
+        || [
+            ["list", "table", "inet", COOLIFY_NFT_TABLE],
+            ["list", "table", "bridge", COOLIFY_NFT_BRIDGE_TABLE],
+        ]
+        .iter()
+        .all(|arguments| {
+            Command::new("nft")
+                .args(arguments)
+                .status()
+                .is_ok_and(|status| status.success())
+        })
 }
 
 fn firewall_state(
