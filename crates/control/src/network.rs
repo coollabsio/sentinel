@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const COOLIFY_NFT_TABLE: &str = "coolify_cluster";
+const COOLIFY_NFT_BRIDGE_TABLE: &str = "coolify_cluster_bridge";
 pub(crate) const CORROSION_VERSION: &str = "v1.0.0";
 
 pub(crate) fn validate_interface(value: &str) -> Result<(), String> {
@@ -200,6 +201,29 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
         })
         .collect::<Vec<_>>()
         .join(" ");
+    let bridge_allow_rules = rules
+        .iter()
+        .filter(|rule| {
+            request
+                .workload_cidrs
+                .iter()
+                .any(|cidr| ipv4_in_cidr(&rule.source_ip, cidr))
+        })
+        .map(|rule| {
+            if rule.protocol == "icmp" {
+                format!(
+                    "ip saddr {} ip daddr {} ip protocol icmp accept;",
+                    rule.source_ip, rule.destination_ip
+                )
+            } else {
+                format!(
+                    "ip saddr {} ip daddr {} {} dport {} accept;",
+                    rule.source_ip, rule.destination_ip, rule.protocol, rule.port
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let output_allow_rules = rules
         .iter()
         .filter(|rule| rule.source_ip == request.local_node_ip)
@@ -252,6 +276,10 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
  chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; ip saddr {} udp dport 8787 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 8080 accept; ip saddr {} drop; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
  chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} {forward_ingress_rules} ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; ip saddr != @workload_networks ip daddr @workload_networks drop; }}
  chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; ip daddr {local_node_ip} tcp dport 8080 accept; {output_allow_rules} {output_ingress_rules} ip daddr {} drop; ip daddr @workload_networks drop; }}
+}}
+table bridge {COOLIFY_NFT_BRIDGE_TABLE} {{
+ set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
+ chain forward {{ type filter hook forward priority -200; policy accept; meta protocol != ip accept; ct state established,related accept; {bridge_allow_rules} ip saddr @workload_networks ip daddr @workload_networks drop; }}
 }}
 ",
         request.wireguard_port,
@@ -880,11 +908,16 @@ pub(crate) fn reconcile_firewall(
     })
 }
 
-fn nft_transaction(snapshot: &str, table_exists: bool) -> String {
+fn nft_transaction(snapshot: &str, inet_table_exists: bool, bridge_table_exists: bool) -> String {
     format!(
-        "{}{}",
-        if table_exists {
+        "{}{}{}",
+        if inet_table_exists {
             format!("delete table inet {COOLIFY_NFT_TABLE}\n")
+        } else {
+            String::new()
+        },
+        if bridge_table_exists {
+            format!("delete table bridge {COOLIFY_NFT_BRIDGE_TABLE}\n")
         } else {
             String::new()
         },
@@ -907,19 +940,26 @@ fn activate_firewall(root: &Path, snapshot: &str, flux_probe_host: &str) -> Resu
         Command::new("sysctl").arg("--load").arg(&sysctl_path),
         "The bridge firewall settings could not be activated.",
     )?;
-    let current = Command::new("nft")
+    let current_inet = Command::new("nft")
         .args(["list", "table", "inet", COOLIFY_NFT_TABLE])
         .output()
         .map_err(|_| "nftables is unavailable.")?;
-    let table_exists = current.status.success();
+    let current_bridge = Command::new("nft")
+        .args(["list", "table", "bridge", COOLIFY_NFT_BRIDGE_TABLE])
+        .output()
+        .map_err(|_| "nftables is unavailable.")?;
+    let inet_table_exists = current_inet.status.success();
+    let bridge_table_exists = current_bridge.status.success();
     let last_good = state_path(root, "firewall.last-good.nft");
-    if table_exists {
-        atomic_write(&last_good, &current.stdout, 0o600)?;
+    if inet_table_exists || bridge_table_exists {
+        let mut last_good_snapshot = current_inet.stdout;
+        last_good_snapshot.extend_from_slice(&current_bridge.stdout);
+        atomic_write(&last_good, &last_good_snapshot, 0o600)?;
     }
     let transaction_path = state_path(root, "firewall.transaction.nft");
     atomic_write(
         &transaction_path,
-        nft_transaction(snapshot, table_exists).as_bytes(),
+        nft_transaction(snapshot, inet_table_exists, bridge_table_exists).as_bytes(),
         0o600,
     )?;
     run(
@@ -928,13 +968,13 @@ fn activate_firewall(root: &Path, snapshot: &str, flux_probe_host: &str) -> Resu
             .arg(&transaction_path),
         "The firewall configuration is invalid.",
     )?;
-    let rollback = if table_exists {
-        format!(
-            "nft delete table inet {COOLIFY_NFT_TABLE} >/dev/null 2>&1 || true; nft --file '{}'",
-            last_good.display()
-        )
+    let delete_tables = format!(
+        "nft delete table inet {COOLIFY_NFT_TABLE} >/dev/null 2>&1 || true; nft delete table bridge {COOLIFY_NFT_BRIDGE_TABLE} >/dev/null 2>&1 || true"
+    );
+    let rollback = if inet_table_exists || bridge_table_exists {
+        format!("{delete_tables}; nft --file '{}'", last_good.display())
     } else {
-        format!("nft delete table inet {COOLIFY_NFT_TABLE} >/dev/null 2>&1 || true")
+        delete_tables
     };
     run(
         Command::new("systemd-run").args([
@@ -955,6 +995,12 @@ fn activate_firewall(root: &Path, snapshot: &str, flux_probe_host: &str) -> Resu
         run(
             Command::new("nft").args(["list", "table", "inet", COOLIFY_NFT_TABLE]),
             "The Coolify firewall table is not active.",
+        )
+    })
+    .and_then(|_| {
+        run(
+            Command::new("nft").args(["list", "table", "bridge", COOLIFY_NFT_BRIDGE_TABLE]),
+            "The Coolify bridge firewall table is not active.",
         )
     })
     .and_then(|_| {
@@ -1513,6 +1559,15 @@ mod tests {
         })
         .unwrap();
         assert!(rendered.contains("table inet coolify_cluster"));
+        let bridge = rendered
+            .split("table bridge coolify_cluster_bridge")
+            .nth(1)
+            .expect("the same-Node bridge policy must be rendered");
+        assert!(bridge.contains("ip saddr 100.64.0.2 ip daddr 100.64.1.2 tcp dport 5432 accept"));
+        assert!(bridge.contains("ip saddr @workload_networks ip daddr @workload_networks drop"));
+        assert!(
+            !bridge.contains("ip saddr 10.240.0.2 ip daddr 100.64.1.3 ip protocol icmp accept")
+        );
         assert!(!rendered.contains("flush ruleset"));
         assert!(!rendered.contains("delete table"));
         assert!(rendered.contains("ip saddr @workload_networks ip daddr @workload_networks drop"));
@@ -1726,8 +1781,9 @@ mod tests {
                 .unwrap()
                 .contains("flush ruleset")
         );
-        let transaction = nft_transaction(&render_firewall(&request).unwrap(), true);
+        let transaction = nft_transaction(&render_firewall(&request).unwrap(), true, true);
         assert!(transaction.starts_with("delete table inet coolify_cluster"));
+        assert!(transaction.contains("delete table bridge coolify_cluster_bridge"));
         assert!(!transaction.contains("flush ruleset"));
         assert!(!transaction.contains("user_owned"));
     }
