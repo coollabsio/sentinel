@@ -144,13 +144,10 @@ pub async fn connect(
     let interval =
         Duration::from_secs(u64::from(welcome.heartbeat_interval_seconds).clamp(10, 120));
     let mut ticker = tokio::time::interval(interval);
-    let refresh_after = std::time::Duration::try_from(
-        assignment.credential_expires_at()
-            - time::Duration::seconds(60)
-            - time::OffsetDateTime::now_utc(),
-    )
-    .unwrap_or(Duration::from_secs(1))
-    .max(Duration::from_secs(1));
+    let refresh_after = credential_refresh_delay(
+        assignment.credential_expires_at(),
+        time::OffsetDateTime::now_utc(),
+    );
     let refresh = tokio::time::sleep(refresh_after);
     tokio::pin!(refresh);
     let accepted_capabilities = welcome.accepted_capabilities.clone();
@@ -203,6 +200,15 @@ pub async fn connect(
             }
         }
     }
+}
+
+pub(crate) fn credential_refresh_delay(
+    expires_at: time::OffsetDateTime,
+    now: time::OffsetDateTime,
+) -> Duration {
+    std::time::Duration::try_from(expires_at - time::Duration::seconds(60) - now)
+        .unwrap_or(Duration::from_secs(1))
+        .max(Duration::from_secs(1))
 }
 
 async fn watch_runtime_changes(

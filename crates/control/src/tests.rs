@@ -964,6 +964,20 @@ async fn rejects_assignment_with_a_different_trust_bundle_version_before_connect
 }
 
 #[test]
+fn refreshes_flux_credentials_before_they_expire() {
+    let now = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+
+    assert_eq!(
+        crate::connection::credential_refresh_delay(now + time::Duration::minutes(15), now),
+        Duration::from_secs(14 * 60)
+    );
+    assert_eq!(
+        crate::connection::credential_refresh_delay(now + time::Duration::seconds(30), now),
+        Duration::from_secs(1)
+    );
+}
+
+#[test]
 fn parses_podman_container_inventory() {
     let containers = crate::commands::parse_podman_containers(
         br#"[{"Id":"container-1","Image":"docker.io/library/nginx:latest","Names":["web"],"State":"running","Health":"healthy","Restarts":2,"Created":1789237060,"StartedAt":1789237061,"Labels":{"coolify.managed":"true"},"Ports":[{"host_ip":"0.0.0.0","host_port":8080,"container_port":80,"protocol":"tcp"}]}]"#,
