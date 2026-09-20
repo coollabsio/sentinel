@@ -73,6 +73,7 @@ message Command {
     CorrosionInspectRequest corrosion_inspect = 21;
     CorrosionReconcileRequest corrosion_reconcile = 22;
     CorrosionEndpointReconcileRequest corrosion_endpoint_reconcile = 23;
+    ClusterLeaveRequest cluster_leave = 24;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -108,6 +109,7 @@ message CommandResult {
     CorrosionInspectResult corrosion_inspect = 21;
     CorrosionReconcileResult corrosion_reconcile = 22;
     CorrosionEndpointReconcileResult corrosion_endpoint_reconcile = 23;
+    ClusterLeaveResult cluster_leave = 24;
     CommandError error = 20;
   }
 }
@@ -237,6 +239,17 @@ message WorkloadLifecycleResult {
 
 message WireguardKeyEnsureRequest { string interface = 1; }
 message WireguardKeyEnsureResult { string public_key = 1; }
+message ClusterLeaveRequest {
+  string interface = 1;
+  string owner_node_ip = 2;
+  repeated string workload_cidrs = 3;
+}
+message ClusterLeaveResult {
+  bool wireguard_removed = 1;
+  bool firewall_removed = 2;
+  bool discovery_removed = 3;
+  bool resolver_reverted = 4;
+}
 message WireguardInspectRequest { string interface = 1; uint64 expected_revision = 2; string expected_hash = 3; }
 message WireguardPeer { string public_key = 1; string endpoint = 2; repeated string allowed_ips = 3; uint32 persistent_keepalive_seconds = 4; }
 message WireguardPeerState { string public_key = 1; string endpoint = 2; repeated string allowed_ips = 3; int64 latest_handshake_unix_seconds = 4; }

@@ -10,6 +10,7 @@ pub const CAPABILITY_CONTAINER_LIST: &str = "container.list.v1";
 pub const CAPABILITY_WORKLOAD_DEPLOY: &str = "workload.deploy.v1";
 pub const CAPABILITY_WORKLOAD_RESOURCES: &str = "workload.resources.v1";
 pub const CAPABILITY_WORKLOAD_LIFECYCLE: &str = "workload.lifecycle.v1";
+pub const CAPABILITY_CLUSTER_LEAVE: &str = "network.cluster.leave.v1";
 pub const CAPABILITY_WIREGUARD_KEY_ENSURE: &str = "network.wireguard.key.ensure.v1";
 pub const CAPABILITY_WIREGUARD_INSPECT: &str = "network.wireguard.inspect.v1";
 pub const CAPABILITY_WIREGUARD_RECONCILE: &str = "network.wireguard.reconcile.v1";
@@ -19,7 +20,8 @@ pub const CAPABILITY_CORROSION_INSPECT: &str = "discovery.corrosion.inspect.v1";
 pub const CAPABILITY_CORROSION_RECONCILE: &str = "discovery.corrosion.reconcile.v1";
 pub const CAPABILITY_CORROSION_ENDPOINT_RECONCILE: &str =
     "discovery.corrosion.endpoints.reconcile.v1";
-pub const NETWORK_CAPABILITIES: [&str; 8] = [
+pub const NETWORK_CAPABILITIES: [&str; 9] = [
+    CAPABILITY_CLUSTER_LEAVE,
     CAPABILITY_WIREGUARD_KEY_ENSURE,
     CAPABILITY_WIREGUARD_INSPECT,
     CAPABILITY_WIREGUARD_RECONCILE,

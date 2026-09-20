@@ -495,6 +495,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "workload.deploy.v1",
             "workload.resources.v1",
             "workload.lifecycle.v1",
+            "network.cluster.leave.v1",
             "network.wireguard.key.ensure.v1",
             "network.wireguard.inspect.v1",
             "network.wireguard.reconcile.v1",

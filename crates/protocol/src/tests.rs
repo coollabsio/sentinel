@@ -7,7 +7,7 @@ use super::*;
 #[test]
 fn network_capabilities_are_typed_and_versioned() {
     let capabilities = NETWORK_CAPABILITIES;
-    assert_eq!(capabilities.len(), 8);
+    assert_eq!(capabilities.len(), 9);
     assert!(
         capabilities
             .iter()

@@ -8,15 +8,15 @@ use axum::routing::post;
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    Command, CommandStatus, ContainerListRequest, ContainerPort, CorrosionEndpointReconcileRequest,
-    CorrosionInspectRequest, CorrosionReconcileRequest, FirewallIngressRule,
-    FirewallInspectRequest, FirewallReconcileRequest, FirewallRule, SystemInfoRequest,
-    SystemPingRequest, WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer,
-    WireguardReconcileRequest, WorkloadDeployRequest, WorkloadEndpoint,
+    ClusterLeaveRequest, Command, CommandStatus, ContainerListRequest, ContainerPort,
+    CorrosionEndpointReconcileRequest, CorrosionInspectRequest, CorrosionReconcileRequest,
+    FirewallIngressRule, FirewallInspectRequest, FirewallReconcileRequest, FirewallRule,
+    SystemInfoRequest, SystemPingRequest, WireguardInspectRequest, WireguardKeyEnsureRequest,
+    WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest, WorkloadEndpoint,
     WorkloadEnvironmentVariable, WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
 };
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
+    CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
     CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT,
     CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
@@ -50,6 +50,16 @@ struct SystemInfoApiRequest {
 #[derive(Deserialize)]
 struct ContainerListApiRequest {
     server_id: String,
+}
+
+#[derive(Deserialize)]
+struct ClusterLeaveApiRequest {
+    server_id: String,
+    command_id: String,
+    interface: String,
+    owner_node_ip: String,
+    #[serde(default)]
+    workload_cidrs: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -323,6 +333,7 @@ pub async fn serve(
         .route("/v1/commands/system.ping", post(ping))
         .route("/v1/commands/system.info", post(system_info))
         .route("/v1/commands/container.list", post(container_list))
+        .route("/v1/commands/network.cluster.leave", post(cluster_leave))
         .route("/v1/commands/workload.deploy", post(workload_deploy))
         .route("/v1/commands/workload.lifecycle", post(workload_lifecycle))
         .route(
@@ -361,6 +372,37 @@ pub async fn serve(
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "Flux internal command API is listening");
     axum::serve(listener, router).await
+}
+
+async fn cluster_leave(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ClusterLeaveApiRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    let result = dispatch_network(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_CLUSTER_LEAVE,
+        Payload::ClusterLeave(ClusterLeaveRequest {
+            interface: request.interface,
+            owner_node_ip: request.owner_node_ip,
+            workload_cidrs: request.workload_cidrs,
+        }),
+    )
+    .await?;
+    let Some(command_result::Payload::ClusterLeave(value)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+    };
+    Ok(Json(serde_json::json!({
+        "command_id": request.command_id,
+        "observed_at_unix_ms": result.observed_at_unix_ms,
+        "wireguard_removed": value.wireguard_removed,
+        "firewall_removed": value.firewall_removed,
+        "discovery_removed": value.discovery_removed,
+        "resolver_reverted": value.resolver_reverted,
+    })))
 }
 
 async fn dispatch_network(

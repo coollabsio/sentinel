@@ -4,13 +4,13 @@ use prost::Message;
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    Command, CommandError, CommandResult, CommandStatus, ContainerListResult, ContainerObservation,
-    ContainerPort, SystemInfoResult, SystemPingResult, WireguardInspectResult,
-    WireguardKeyEnsureResult, WorkloadDeployRequest, WorkloadDeployResult, WorkloadLifecycleAction,
-    WorkloadLifecycleRequest, WorkloadLifecycleResult,
+    ClusterLeaveResult, Command, CommandError, CommandResult, CommandStatus, ContainerListResult,
+    ContainerObservation, ContainerPort, SystemInfoResult, SystemPingResult,
+    WireguardInspectResult, WireguardKeyEnsureResult, WorkloadDeployRequest, WorkloadDeployResult,
+    WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
+    CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
     CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT,
     CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
@@ -116,6 +116,9 @@ impl CommandExecutor {
             (CAPABILITY_SYSTEM_PING, Some(Payload::SystemPing(ping))) => !ping.nonce.is_empty(),
             (CAPABILITY_SYSTEM_INFO, Some(Payload::SystemInfo(_))) => true,
             (CAPABILITY_CONTAINER_LIST, Some(Payload::ContainerList(_))) => true,
+            (CAPABILITY_CLUSTER_LEAVE, Some(Payload::ClusterLeave(request))) => {
+                crate::network::validate_cluster_leave(request).is_ok()
+            }
             (CAPABILITY_WORKLOAD_DEPLOY, Some(Payload::WorkloadDeploy(request))) => {
                 podman_deploy_args(request).is_ok()
             }
@@ -149,6 +152,7 @@ impl CommandExecutor {
             || !matches!(
                 command.command_type.as_str(),
                 CAPABILITY_SYSTEM_PING
+                    | CAPABILITY_CLUSTER_LEAVE
                     | CAPABILITY_SYSTEM_INFO
                     | CAPABILITY_CONTAINER_LIST
                     | CAPABILITY_WORKLOAD_DEPLOY
@@ -266,6 +270,19 @@ impl CommandExecutor {
                     )),
                 },
                 Err(message) => failed(&command.command_id, "container_list_failed", message),
+            }
+        } else if let Some(Payload::ClusterLeave(request)) = command.payload {
+            match crate::network::leave_cluster(&self.network_root, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::ClusterLeave(ClusterLeaveResult {
+                        wireguard_removed: result.wireguard_removed,
+                        firewall_removed: result.firewall_removed,
+                        discovery_removed: result.discovery_removed,
+                        resolver_reverted: result.resolver_reverted,
+                    }),
+                ),
+                Err(message) => failed(&command.command_id, "cluster_leave_failed", &message),
             }
         } else if let Some(Payload::WorkloadDeploy(request)) = command.payload {
             match workload_deploy(&request) {

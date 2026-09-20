@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use sentinel_protocol::control::v1::{
-    CorrosionEndpointReconcileRequest, CorrosionEndpointReconcileResult, CorrosionInspectResult,
-    CorrosionReconcileRequest, CorrosionReconcileResult, FirewallInspectResult,
-    FirewallReconcileRequest, FirewallReconcileResult, WireguardInspectResult, WireguardPeer,
-    WireguardPeerState, WireguardReconcileRequest, WireguardReconcileResult, WorkloadEndpoint,
+    ClusterLeaveRequest, ClusterLeaveResult, CorrosionEndpointReconcileRequest,
+    CorrosionEndpointReconcileResult, CorrosionInspectResult, CorrosionReconcileRequest,
+    CorrosionReconcileResult, FirewallInspectResult, FirewallReconcileRequest,
+    FirewallReconcileResult, WireguardInspectResult, WireguardPeer, WireguardPeerState,
+    WireguardReconcileRequest, WireguardReconcileResult, WorkloadEndpoint,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -27,6 +28,108 @@ pub(crate) fn validate_interface(value: &str) -> Result<(), String> {
         return Err("The WireGuard interface is invalid.".into());
     }
     Ok(())
+}
+
+pub(crate) fn validate_cluster_leave(request: &ClusterLeaveRequest) -> Result<(), String> {
+    validate_interface(&request.interface)?;
+    request
+        .owner_node_ip
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| "The Node owner address is invalid.".to_string())?;
+    if request.workload_cidrs.len() > 100
+        || request
+            .workload_cidrs
+            .iter()
+            .any(|cidr| !valid_ipv4_cidr(cidr))
+    {
+        return Err("A workload CIDR is invalid.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn leave_cluster(
+    root: &Path,
+    request: &ClusterLeaveRequest,
+) -> Result<ClusterLeaveResult, String> {
+    validate_cluster_leave(request)?;
+
+    if root == Path::new("/") {
+        let _ = Command::new("resolvectl")
+            .args(["revert", &request.interface])
+            .status();
+        for unit in ["coolify-discovery-dns.service", "corrosion.service"] {
+            let _ = Command::new("systemctl")
+                .args(["disable", "--now", unit])
+                .status();
+        }
+        let _ = Command::new("wg-quick")
+            .args(["down", &request.interface])
+            .status();
+        let _ = Command::new("nft")
+            .args(["delete", "table", "inet", COOLIFY_NFT_TABLE])
+            .status();
+        let _ = Command::new("nft")
+            .args(["delete", "table", "bridge", COOLIFY_NFT_BRIDGE_TABLE])
+            .status();
+        for cidr in &request.workload_cidrs {
+            let _ = Command::new("iptables")
+                .args(["-t", "nat", "-D", "POSTROUTING"])
+                .args(mesh_nat_rule_arguments(&request.interface, cidr))
+                .status();
+        }
+    }
+
+    let managed_files = [
+        root.join("etc/wireguard")
+            .join(format!("{}.conf", request.interface)),
+        state_path(root, &format!("{}.state", request.interface)),
+        state_path(root, &format!("{}.last-good.conf", request.interface)),
+        state_path(root, &format!("{}.key", request.interface)),
+        state_path(root, "firewall.state"),
+        state_path(root, "firewall.nft"),
+        state_path(root, "firewall.last-good.nft"),
+        state_path(root, "firewall.transaction.nft"),
+        root.join("etc/corrosion/config.toml"),
+        root.join("etc/corrosion/schemas/coolify.sql"),
+        root.join("etc/corrosion/coolify-owner"),
+        root.join("etc/corrosion/coolify-cluster-id"),
+        root.join("etc/corrosion/coolify-peer-count"),
+        root.join("etc/systemd/system/corrosion.service"),
+        root.join("etc/systemd/system/coolify-discovery-dns.service"),
+    ];
+    for path in managed_files {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("A managed cluster network file could not be removed.".into()),
+        }
+    }
+    let corrosion_state = root.join("var/lib/corrosion");
+    match fs::remove_dir_all(corrosion_state) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("The Corrosion state could not be removed.".into()),
+    }
+    if root == Path::new("/") {
+        run(
+            Command::new("systemctl").arg("daemon-reload"),
+            "Systemd could not reload after cluster cleanup.",
+        )?;
+        if Command::new("ip")
+            .args(["link", "show", "dev", &request.interface])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return Err("The WireGuard interface is still active after cleanup.".into());
+        }
+    }
+
+    Ok(ClusterLeaveResult {
+        wireguard_removed: true,
+        firewall_removed: true,
+        discovery_removed: true,
+        resolver_reverted: true,
+    })
 }
 
 fn valid_ipv4_cidr(value: &str) -> bool {
@@ -1972,5 +2075,64 @@ mod tests {
         let visible = format!("{state:?}");
         assert!(!visible.contains("private-secret"));
         assert!(!visible.contains("preshared-secret"));
+    }
+
+    #[test]
+    fn cluster_leave_removes_only_managed_network_state_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed = [
+            "etc/wireguard/coolify0.conf",
+            "var/lib/coolify/network/coolify0.state",
+            "var/lib/coolify/network/coolify0.last-good.conf",
+            "var/lib/coolify/network/coolify0.key",
+            "var/lib/coolify/network/firewall.state",
+            "etc/corrosion/config.toml",
+            "etc/corrosion/schemas/coolify.sql",
+            "etc/systemd/system/corrosion.service",
+            "etc/systemd/system/coolify-discovery-dns.service",
+            "var/lib/corrosion/db.sqlite",
+        ];
+        for relative in managed {
+            let path = temp.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "managed").unwrap();
+        }
+        let unrelated = temp.path().join("etc/systemd/system/example.service");
+        fs::write(&unrelated, "keep").unwrap();
+        let request = ClusterLeaveRequest {
+            interface: "coolify0".into(),
+            owner_node_ip: "10.240.0.2".into(),
+            workload_cidrs: vec!["100.64.0.0/24".into()],
+        };
+
+        let first = leave_cluster(temp.path(), &request).unwrap();
+        let second = leave_cluster(temp.path(), &request).unwrap();
+
+        assert!(first.wireguard_removed && first.firewall_removed && first.discovery_removed);
+        assert!(second.wireguard_removed && second.firewall_removed && second.discovery_removed);
+        assert!(unrelated.exists());
+        for relative in managed {
+            assert!(!temp.path().join(relative).exists());
+        }
+    }
+
+    #[test]
+    fn cluster_leave_rejects_untrusted_network_identifiers() {
+        assert!(
+            validate_cluster_leave(&ClusterLeaveRequest {
+                interface: "../../eth0".into(),
+                owner_node_ip: "10.240.0.2".into(),
+                workload_cidrs: vec![],
+            })
+            .is_err()
+        );
+        assert!(
+            validate_cluster_leave(&ClusterLeaveRequest {
+                interface: "coolify0".into(),
+                owner_node_ip: "not-an-ip".into(),
+                workload_cidrs: vec![],
+            })
+            .is_err()
+        );
     }
 }
