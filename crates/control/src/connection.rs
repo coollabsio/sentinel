@@ -263,7 +263,13 @@ async fn watch_runtime_changes(
 }
 
 pub(crate) fn podman_event_args() -> [&'static str; 5] {
-    ["events", "--filter", "type=container", "--format", "json"]
+    [
+        "events",
+        "--filter",
+        "type=container",
+        "--format",
+        "{{json .}}",
+    ]
 }
 
 pub(crate) fn runtime_changed_message(observed_at_unix_ms: i64) -> AgentMessage {

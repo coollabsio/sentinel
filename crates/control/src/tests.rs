@@ -20,7 +20,13 @@ use super::*;
 fn watches_container_runtime_events_and_builds_typed_notifications() {
     assert_eq!(
         crate::connection::podman_event_args(),
-        ["events", "--filter", "type=container", "--format", "json"]
+        [
+            "events",
+            "--filter",
+            "type=container",
+            "--format",
+            "{{json .}}"
+        ]
     );
     let message = crate::connection::runtime_changed_message(1_700_000_000_000);
     assert!(matches!(
