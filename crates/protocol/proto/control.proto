@@ -182,6 +182,7 @@ message WorkloadDeployRequest {
   string network_name = 8;
   string network_subnet = 9;
   string container_ip = 10;
+  string dns_server = 11;
 }
 
 message WorkloadEnvironmentVariable {

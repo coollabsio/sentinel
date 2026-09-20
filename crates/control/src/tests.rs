@@ -1179,6 +1179,7 @@ fn builds_shell_free_podman_deploy_arguments() {
         network_name: "coolify-node-1".into(),
         network_subnet: "100.64.0.0/24".into(),
         container_ip: "100.64.0.2".into(),
+        dns_server: "10.240.0.2".into(),
     };
 
     let arguments = crate::commands::podman_deploy_args(&request).unwrap();
@@ -1195,6 +1196,7 @@ fn builds_shell_free_podman_deploy_arguments() {
             .any(|v| v == ["--network", "coolify-node-1"])
     );
     assert!(arguments.windows(2).any(|v| v == ["--ip", "100.64.0.2"]));
+    assert!(arguments.windows(2).any(|v| v == ["--dns", "10.240.0.2"]));
     assert!(
         arguments
             .windows(2)

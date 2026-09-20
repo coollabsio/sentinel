@@ -1,11 +1,12 @@
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 const MAX_DNS_PACKET: usize = 1232;
 const DNS_TTL_SECONDS: u32 = 30;
+const SYSTEMD_RESOLVED_STUB: &str = "127.0.0.53:53";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Question {
@@ -54,7 +55,7 @@ fn parse_question(packet: &[u8], zone: &str) -> Result<Question, &'static str> {
         .ok_or("truncated DNS question")?;
     let record_type = u16::from_be_bytes([fields[0], fields[1]]);
     let class = u16::from_be_bytes([fields[2], fields[3]]);
-    if !matches!(record_type, 1 | 12 | 28) || class != 1 {
+    if class != 1 {
         return Err("unsupported DNS question");
     }
     if record_type == 12 {
@@ -294,6 +295,41 @@ fn answer_request(
     })
 }
 
+fn forward_udp(request: &[u8]) -> Option<Vec<u8>> {
+    let socket = UdpSocket::bind("127.0.0.1:0").ok()?;
+    socket.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
+    socket.send_to(request, SYSTEMD_RESOLVED_STUB).ok()?;
+    let mut response = vec![0_u8; MAX_DNS_PACKET];
+    let length = socket.recv(&mut response).ok()?;
+    response.truncate(length);
+    (response.get(..2) == request.get(..2)).then_some(response)
+}
+
+fn forward_tcp(request: &[u8]) -> Option<Vec<u8>> {
+    let address = SYSTEMD_RESOLVED_STUB.parse().ok()?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
+    stream
+        .write_all(&(request.len() as u16).to_be_bytes())
+        .ok()?;
+    stream.write_all(request).ok()?;
+    let mut length = [0_u8; 2];
+    stream.read_exact(&mut length).ok()?;
+    let length = u16::from_be_bytes(length) as usize;
+    if length == 0 {
+        return None;
+    }
+    let mut response = vec![0_u8; length];
+    stream.read_exact(&mut response).ok()?;
+    (response.get(..2) == request.get(..2)).then_some(response)
+}
+
 fn serve_tcp(listener: TcpListener, zone: String, corrosion_config: PathBuf) {
     for mut stream in listener.incoming().flatten() {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -311,6 +347,7 @@ fn serve_tcp(listener: TcpListener, zone: String, corrosion_config: PathBuf) {
             continue;
         }
         let Some(response) = answer_request(&request, &zone, &corrosion_config, u16::MAX as usize)
+            .or_else(|| forward_tcp(&request))
         else {
             continue;
         };
@@ -346,6 +383,7 @@ pub(crate) fn run(bind: SocketAddr, zone: &str, corrosion_config: &Path) -> Resu
             .map_err(|error| format!("Discovery DNS receive failed: {error}"))?;
         let request = &packet[..length];
         let Some(response) = answer_request(request, &zone, corrosion_config, MAX_DNS_PACKET)
+            .or_else(|| forward_udp(request))
         else {
             continue;
         };

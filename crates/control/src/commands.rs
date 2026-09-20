@@ -609,6 +609,9 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
     {
         return Err("The workload network configuration is invalid.".into());
     }
+    if !request.dns_server.is_empty() && request.dns_server.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err("The workload DNS server is invalid.".into());
+    }
     let mut args = vec![
         "run".into(),
         "--detach".into(),
@@ -623,6 +626,9 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
     if uses_managed_network {
         args.extend(["--network".into(), request.network_name.clone()]);
         args.extend(["--ip".into(), request.container_ip.clone()]);
+    }
+    if !request.dns_server.is_empty() {
+        args.extend(["--dns".into(), request.dns_server.clone()]);
     }
     for variable in &request.environment {
         let key = &variable.key;

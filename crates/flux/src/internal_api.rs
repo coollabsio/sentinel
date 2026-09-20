@@ -73,6 +73,8 @@ struct WorkloadDeployApiRequest {
     network_subnet: String,
     #[serde(default)]
     container_ip: String,
+    #[serde(default)]
+    dns_server: String,
 }
 
 #[derive(Deserialize)]
@@ -784,6 +786,7 @@ async fn workload_deploy(
                     network_name: request.network_name,
                     network_subnet: request.network_subnet,
                     container_ip: request.container_ip,
+                    dns_server: request.dns_server,
                 })),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },
