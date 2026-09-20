@@ -615,6 +615,21 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
     if !request.dns_server.is_empty() && request.dns_server.parse::<std::net::Ipv4Addr>().is_err() {
         return Err("The workload DNS server is invalid.".into());
     }
+    if request
+        .cpu_limit
+        .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1_024.0)
+        || request
+            .cpu_reservation
+            .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1_024.0)
+        || matches!((request.cpu_limit, request.cpu_reservation), (Some(limit), Some(reservation)) if reservation > limit)
+        || request.memory_limit_bytes.is_some_and(|value| value == 0)
+        || request
+            .memory_reservation_bytes
+            .is_some_and(|value| value == 0)
+        || matches!((request.memory_limit_bytes, request.memory_reservation_bytes), (Some(limit), Some(reservation)) if reservation > limit)
+    {
+        return Err("The workload resource configuration is invalid.".into());
+    }
     let mut args = vec![
         "run".into(),
         "--detach".into(),
@@ -632,6 +647,22 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
     }
     if !request.dns_server.is_empty() {
         args.extend(["--dns".into(), request.dns_server.clone()]);
+    }
+    if let Some(cpu_limit) = request.cpu_limit {
+        args.extend(["--cpus".into(), cpu_limit.to_string()]);
+    }
+    if let Some(cpu_reservation) = request.cpu_reservation {
+        let cpu_shares = (cpu_reservation * 1_024.0).round().clamp(2.0, 262_144.0) as u64;
+        args.extend(["--cpu-shares".into(), cpu_shares.to_string()]);
+    }
+    if let Some(memory_limit_bytes) = request.memory_limit_bytes {
+        args.extend(["--memory".into(), format!("{memory_limit_bytes}b")]);
+    }
+    if let Some(memory_reservation_bytes) = request.memory_reservation_bytes {
+        args.extend([
+            "--memory-reservation".into(),
+            format!("{memory_reservation_bytes}b"),
+        ]);
     }
     for variable in &request.environment {
         let key = &variable.key;

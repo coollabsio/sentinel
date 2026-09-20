@@ -85,6 +85,7 @@ fn publishes_version_one_and_initial_capabilities() {
     assert_eq!(CAPABILITY_SYSTEM_INFO, "system.info.v1");
     assert_eq!(CAPABILITY_CONTAINER_LIST, "container.list.v1");
     assert_eq!(CAPABILITY_WORKLOAD_DEPLOY, "workload.deploy.v1");
+    assert_eq!(CAPABILITY_WORKLOAD_RESOURCES, "workload.resources.v1");
     assert_eq!(CAPABILITY_WORKLOAD_LIFECYCLE, "workload.lifecycle.v1");
 }
 

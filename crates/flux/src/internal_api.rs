@@ -75,6 +75,10 @@ struct WorkloadDeployApiRequest {
     container_ip: String,
     #[serde(default)]
     dns_server: String,
+    cpu_limit: Option<f64>,
+    cpu_reservation: Option<f64>,
+    memory_limit_bytes: Option<u64>,
+    memory_reservation_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -793,6 +797,10 @@ async fn workload_deploy(
                     network_subnet: request.network_subnet,
                     container_ip: request.container_ip,
                     dns_server: request.dns_server,
+                    cpu_limit: request.cpu_limit,
+                    cpu_reservation: request.cpu_reservation,
+                    memory_limit_bytes: request.memory_limit_bytes,
+                    memory_reservation_bytes: request.memory_reservation_bytes,
                 })),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },

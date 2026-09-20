@@ -8,6 +8,7 @@ pub const CAPABILITY_SYSTEM_PING: &str = "system.ping.v1";
 pub const CAPABILITY_SYSTEM_INFO: &str = "system.info.v1";
 pub const CAPABILITY_CONTAINER_LIST: &str = "container.list.v1";
 pub const CAPABILITY_WORKLOAD_DEPLOY: &str = "workload.deploy.v1";
+pub const CAPABILITY_WORKLOAD_RESOURCES: &str = "workload.resources.v1";
 pub const CAPABILITY_WORKLOAD_LIFECYCLE: &str = "workload.lifecycle.v1";
 pub const CAPABILITY_WIREGUARD_KEY_ENSURE: &str = "network.wireguard.key.ensure.v1";
 pub const CAPABILITY_WIREGUARD_INSPECT: &str = "network.wireguard.inspect.v1";

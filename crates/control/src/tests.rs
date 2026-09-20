@@ -493,6 +493,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "system.info.v1",
             "container.list.v1",
             "workload.deploy.v1",
+            "workload.resources.v1",
             "workload.lifecycle.v1",
             "network.wireguard.key.ensure.v1",
             "network.wireguard.inspect.v1",
@@ -1205,6 +1206,10 @@ fn builds_shell_free_podman_deploy_arguments() {
         network_subnet: "100.64.0.0/24".into(),
         container_ip: "100.64.0.2".into(),
         dns_server: "10.240.0.2".into(),
+        cpu_limit: Some(2.5),
+        cpu_reservation: Some(1.25),
+        memory_limit_bytes: Some(1_073_741_824),
+        memory_reservation_bytes: Some(536_870_912),
     };
 
     let arguments = crate::commands::podman_deploy_args(&request).unwrap();
@@ -1222,6 +1227,18 @@ fn builds_shell_free_podman_deploy_arguments() {
     );
     assert!(arguments.windows(2).any(|v| v == ["--ip", "100.64.0.2"]));
     assert!(arguments.windows(2).any(|v| v == ["--dns", "10.240.0.2"]));
+    assert!(arguments.windows(2).any(|v| v == ["--cpus", "2.5"]));
+    assert!(arguments.windows(2).any(|v| v == ["--cpu-shares", "1280"]));
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--memory", "1073741824b"])
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--memory-reservation", "536870912b"])
+    );
     assert!(
         arguments
             .windows(2)
@@ -1274,6 +1291,34 @@ fn rejects_unsafe_or_oversized_deploy_requests() {
     assert!(crate::commands::podman_deploy_args(&request("bad name", "alpine")).is_err());
     assert!(crate::commands::podman_deploy_args(&request("safe-name", "")).is_err());
     assert!(crate::commands::podman_deploy_args(&request("safe-name", "alpine;rm")).is_err());
+}
+
+#[test]
+fn rejects_invalid_workload_resource_settings() {
+    let request = |cpu_limit, cpu_reservation, memory_limit_bytes, memory_reservation_bytes| {
+        sentinel_protocol::control::v1::WorkloadDeployRequest {
+            name: "safe-name".into(),
+            image: "docker.io/library/alpine:latest".into(),
+            restart_policy: "unless-stopped".into(),
+            cpu_limit,
+            cpu_reservation,
+            memory_limit_bytes,
+            memory_reservation_bytes,
+            ..Default::default()
+        }
+    };
+
+    assert!(crate::commands::podman_deploy_args(&request(Some(0.0), None, None, None)).is_err());
+    assert!(
+        crate::commands::podman_deploy_args(&request(Some(f64::NAN), None, None, None)).is_err()
+    );
+    assert!(
+        crate::commands::podman_deploy_args(&request(Some(1.0), Some(2.0), None, None)).is_err()
+    );
+    assert!(
+        crate::commands::podman_deploy_args(&request(None, None, Some(1024), Some(2048))).is_err()
+    );
+    assert!(crate::commands::podman_deploy_args(&request(None, None, Some(0), None)).is_err());
 }
 
 #[test]

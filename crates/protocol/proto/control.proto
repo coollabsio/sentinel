@@ -195,6 +195,10 @@ message WorkloadDeployRequest {
   string network_subnet = 9;
   string container_ip = 10;
   string dns_server = 11;
+  optional double cpu_limit = 12;
+  optional double cpu_reservation = 13;
+  optional uint64 memory_limit_bytes = 14;
+  optional uint64 memory_reservation_bytes = 15;
 }
 
 message WorkloadEnvironmentVariable {

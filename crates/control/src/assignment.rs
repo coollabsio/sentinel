@@ -6,8 +6,8 @@ use config::ControlTlsConfig;
 use reqwest::StatusCode;
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, NETWORK_CAPABILITIES, PROTOCOL_MAX,
-    PROTOCOL_MIN, select_protocol,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RESOURCES,
+    NETWORK_CAPABILITIES, PROTOCOL_MAX, PROTOCOL_MIN, select_protocol,
 };
 use serde::{Deserialize, Serialize};
 use store::CommandJournal;
@@ -233,6 +233,7 @@ impl AssignmentClient {
                 CAPABILITY_SYSTEM_INFO,
                 CAPABILITY_CONTAINER_LIST,
                 CAPABILITY_WORKLOAD_DEPLOY,
+                CAPABILITY_WORKLOAD_RESOURCES,
                 CAPABILITY_WORKLOAD_LIFECYCLE,
             ]
             .into_iter()
