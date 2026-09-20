@@ -894,7 +894,7 @@ pub(crate) fn reconcile_firewall(
     let snapshot_path = state_path(root, "firewall.nft");
     atomic_write(&snapshot_path, snapshot.as_bytes(), 0o600)?;
     if root == Path::new("/") {
-        activate_firewall(root, &snapshot, &request.flux_probe_host)?;
+        activate_firewall(root, &snapshot, request)?;
     }
     atomic_write(
         &state_file,
@@ -925,7 +925,11 @@ fn nft_transaction(snapshot: &str, inet_table_exists: bool, bridge_table_exists:
     )
 }
 
-fn activate_firewall(root: &Path, snapshot: &str, flux_probe_host: &str) -> Result<(), String> {
+fn activate_firewall(
+    root: &Path,
+    snapshot: &str,
+    request: &FirewallReconcileRequest,
+) -> Result<(), String> {
     let sysctl_path = root.join("etc/sysctl.d/90-coolify-workload-firewall.conf");
     atomic_write(
         &sysctl_path,
@@ -1004,15 +1008,16 @@ fn activate_firewall(root: &Path, snapshot: &str, flux_probe_host: &str) -> Resu
         )
     })
     .and_then(|_| {
-        if flux_probe_host.is_empty() {
+        if request.flux_probe_host.is_empty() {
             Ok(())
         } else {
             run(
-                Command::new("ping").args(["-c", "1", "-W", "5", flux_probe_host]),
+                Command::new("ping").args(["-c", "1", "-W", "5", &request.flux_probe_host]),
                 "Flux connectivity validation failed.",
             )
         }
-    });
+    })
+    .and_then(|_| configure_mesh_nat(&request.wireguard_interface, &request.workload_cidrs));
     if let Err(error) = activated {
         let rollback = run(
             Command::new("systemctl").args(rollback_start_arguments(
@@ -1033,6 +1038,32 @@ fn activate_firewall(root: &Path, snapshot: &str, flux_probe_host: &str) -> Resu
         "The firewall rollback could not be cancelled.",
     )?;
     atomic_write(&last_good, snapshot.as_bytes(), 0o600)
+}
+
+fn configure_mesh_nat(interface: &str, workload_cidrs: &[String]) -> Result<(), String> {
+    for cidr in workload_cidrs {
+        let rule = mesh_nat_rule_arguments(interface, cidr);
+        let exists = Command::new("iptables")
+            .args(["-t", "nat", "-C", "POSTROUTING"])
+            .args(rule)
+            .status()
+            .map_err(|_| "iptables is unavailable.")?
+            .success();
+        if !exists {
+            run(
+                Command::new("iptables")
+                    .args(["-t", "nat", "-I", "POSTROUTING", "1"])
+                    .args(rule),
+                "The workload mesh NAT exemption could not be activated.",
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn mesh_nat_rule_arguments<'a>(interface: &'a str, cidr: &'a str) -> [&'a str; 6] {
+    ["-s", cidr, "-o", interface, "-j", "RETURN"]
 }
 
 pub(crate) fn inspect_firewall(
@@ -1790,6 +1821,14 @@ mod tests {
         assert!(transaction.contains("delete table bridge coolify_cluster_bridge"));
         assert!(!transaction.contains("flush ruleset"));
         assert!(!transaction.contains("user_owned"));
+    }
+
+    #[test]
+    fn workload_mesh_nat_bypasses_netavark_masquerading() {
+        assert_eq!(
+            mesh_nat_rule_arguments("coolify0", "100.64.0.0/24"),
+            ["-s", "100.64.0.0/24", "-o", "coolify0", "-j", "RETURN",]
+        );
     }
 
     #[test]
