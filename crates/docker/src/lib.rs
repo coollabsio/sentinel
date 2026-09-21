@@ -10,6 +10,23 @@ use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions, 
 use futures_util::StreamExt;
 
 const SOCKET: &str = "/var/run/docker.sock";
+
+/// Socket resolution: the standard `DOCKER_HOST` env var when it points at a
+/// Unix socket (`unix:///run/user/1000/podman/podman.sock` or a bare path —
+/// e.g. a rootless Podman socket), falling back to the default Docker socket.
+/// Non-unix DOCKER_HOST schemes (tcp://, ssh://, ...) are ignored: sentinel
+/// only speaks to a local socket.
+fn socket_path() -> String {
+    match std::env::var("DOCKER_HOST") {
+        Ok(host)
+            if host.starts_with("unix://")
+                || (!host.contains("://") && host.starts_with('/')) =>
+        {
+            host
+        }
+        _ => SOCKET.to_string(),
+    }
+}
 // Matches the Go client's `http.Client{Timeout: 10s}` (pkg/dockerClient). A
 // single unresponsive container or a hung Docker daemon must not stall a whole
 // collection/push cycle for two minutes — the collector drops missed ticks
@@ -32,7 +49,7 @@ pub struct DockerClient {
 
 impl DockerClient {
     pub fn new() -> Result<Self, DockerError> {
-        let inner = Docker::connect_with_unix(SOCKET, TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)?;
+        let inner = Docker::connect_with_unix(&socket_path(), TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)?;
         Ok(Self { inner })
     }
 

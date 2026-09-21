@@ -81,6 +81,7 @@ Sentinel is configured using environment variables:
 | `STORAGE_VOLUMES_ENABLED` | `true` | Enable/disable the per-container volume `du`-walk |
 | `STORAGE_VOLUMES_REFRESH_RATE_SECONDS` | 900 | Interval for the expensive volume walk (kept separate so it can't hammer host I/O) |
 | `HOST_MOUNT_PREFIX` | *(empty)* | Path prefix under which host paths are mounted into Sentinel's container, used to resolve volume/bind sources |
+| `DOCKER_HOST` | `/var/run/docker.sock` | Docker Engine API socket; `unix://` URLs and bare paths only — e.g. `unix:///run/user/1000/podman/podman.sock` for rootless Podman |
 | `DEBUG` | `false` | Enable verbose logging, `human_friendly_time` fields, and the `/api/stats` route |
 | `PORT` | `8888` | HTTP server port |
 | `SENTINEL_COMMAND_RETENTION_DAYS` | 7 | Days to keep completed control-command results for replay |
