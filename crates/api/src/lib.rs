@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod docs;
 pub mod routes;
 pub mod time;
 pub mod types;
@@ -8,11 +9,14 @@ pub mod types;
 use std::sync::{Arc, RwLock};
 
 use axum::Router;
-use axum::routing::get;
+use axum::extract::State;
 use collector::HostSampler;
 use config::Config;
 use store::{MemRow, Store};
 use tokio::sync::{Mutex, Semaphore};
+use utoipa_axum::{router::OpenApiRouter, routes};
+use utoipa_scalar::{Scalar, Servable};
+use utoipa_swagger_ui::SwaggerUi;
 
 pub const MAX_CONCURRENT_HISTORY_QUERIES: usize = 8;
 pub const MAX_CONCURRENT_ANALYTICS_QUERIES: usize = 8;
@@ -99,18 +103,13 @@ pub struct AppState {
     pub geoip_attribution: Arc<std::sync::RwLock<Option<String>>>,
 }
 
-pub fn router(state: Arc<AppState>) -> Router {
-    let debug = state.config.debug;
-
-    let mut app = Router::new()
-        .route("/api/health", get(|| async { "ok" }))
-        .route(
-            "/api/version",
-            get({
-                let v = state.config.version.clone();
-                move || async move { v }
-            }),
-        )
+/// Everything except the debug-gated `/api/stats` *route*. Its documentation
+/// is merged into the spec separately (see [`openapi_document`]) so the spec
+/// always documents all endpoints regardless of the DEBUG flag.
+fn core_openapi_router() -> OpenApiRouter<Arc<AppState>> {
+    let open = OpenApiRouter::with_openapi(docs::base_openapi())
+        .routes(routes!(health))
+        .routes(routes!(version))
         .merge(routes::cpu::routes())
         .merge(routes::memory::routes())
         .merge(routes::disk::routes())
@@ -120,19 +119,75 @@ pub fn router(state: Arc<AppState>) -> Router {
     // runtime question (`AppState::analytics`), which each handler answers
     // with a 404 when the subsystem is compiled in but disabled.
     #[cfg(feature = "traffic")]
-    {
-        app = app.merge(routes::traffic::routes());
-    }
+    let open = open.merge(routes::traffic::routes());
+
+    open
+}
+
+/// The complete OpenAPI document for this build. `/api/stats` is included
+/// unconditionally — the route is DEBUG-gated at runtime, and the operation
+/// description says so. Traffic paths are present when compiled with the
+/// `traffic` feature (release builds always are).
+fn openapi_document() -> utoipa::openapi::OpenApi {
+    let (_, mut api) = core_openapi_router().split_for_parts();
+    let (_, stats_api) = routes::stats::routes().split_for_parts();
+    api.merge(stats_api);
+    api
+}
+
+pub fn router(state: Arc<AppState>) -> Router {
+    let debug = state.config.debug;
+
+    let (mut app, _) = core_openapi_router().split_for_parts();
+    let api = openapi_document();
 
     if debug {
         app = app.merge(routes::stats::routes());
     }
+
+    // Interactive docs and the spec JSON are public, like /api/health and
+    // /api/version (see auth::PUBLIC_PATHS / PUBLIC_PREFIXES).
+    let app = app
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api.clone()))
+        .merge(Router::from(Scalar::with_url("/scalar", api)));
 
     app.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         auth::require_token,
     ))
     .with_state(state)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/health",
+    tag = "Core",
+    summary = "Health check",
+    description = "Check if the service is running",
+    responses(
+        (status = 200, description = "Service is healthy", body = String, content_type = "text/plain", example = json!("ok"))
+    ),
+    security(())
+)]
+async fn health() -> &'static str {
+    "ok"
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/version",
+    tag = "Core",
+    summary = "Get version",
+    description = "Get the current version of Sentinel",
+    responses(
+        // No version literal in the example — that would reintroduce a manual
+        // bump location; the info block's version comes from config::VERSION.
+        (status = 200, description = "Current version", body = String, content_type = "text/plain")
+    ),
+    security(())
+)]
+async fn version(State(state): State<Arc<AppState>>) -> String {
+    state.config.version.clone()
 }
 
 #[cfg(test)]

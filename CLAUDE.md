@@ -24,6 +24,9 @@ The application follows a service-oriented architecture with these main componen
 1. **API Server** (`crates/api/`) - Axum-based HTTP server exposing metrics endpoints
    - Routes handle CPU, memory, and container metrics
    - Debug routes available when DEBUG=true
+   - OpenAPI spec is generated from `#[utoipa::path]` route annotations (utoipa-axum
+     `OpenApiRouter`); served at `/api-docs/openapi.json` with public interactive
+     docs at `/scalar` and `/swagger-ui`. Never hand-edit a spec file — annotate the route.
 
 2. **Collector Service** (`crates/collector/`) - Background service that periodically collects system and Docker metrics
    - Runs on configurable interval (COLLECTOR_REFRESH_RATE_SECONDS)
@@ -78,17 +81,14 @@ The application connects to Docker daemon via Unix socket to collect container s
 
 ## Release Process
 
-### Version Locations (all must be updated together)
-1. `Cargo.toml` — `[workspace.package] version = "X.Y.Z"`
-2. `openapi.yaml:12` — `version: X.Y.Z` (info block)
-3. `openapi.yaml:69` — `example: X.Y.Z` (version endpoint response)
-4. `API.md:74` — `X.Y.Z` (version endpoint example response)
+### Version Locations
+`Cargo.toml` — `[workspace.package] version = "X.Y.Z"` is the ONLY bump
+location. The served OpenAPI document derives its version from
+`config::VERSION` (which honors `SENTINEL_BUILD_VERSION`), so it always
+matches `/api/version` with no manual sync.
 
 ### Steps
-1. **Bump version** in all 4 locations above, then verify:
-   - `grep -r "OLD_VERSION" .` returns nothing
-   - `grep -r "NEW_VERSION" .` shows all 4 locations
-   - `cargo build --release --locked` passes
+1. **Bump version** in `Cargo.toml`, then verify `cargo build --release --locked` passes
 2. **Commit & push to `next`** — triggers `release-next.yaml` workflow
    - Builds multi-arch Docker images (amd64 + aarch64)
    - Pushes to Docker Hub & GHCR with `next` tag

@@ -1,8 +1,9 @@
 use serde::Serialize;
+use utoipa::{ToResponse, ToSchema};
 
 /// WIRE FORMAT IS FROZEN. `percent` is a string here (history endpoints) but a
 /// number in /api/cpu/current. Do not "fix" this — Coolify parses it as-is.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CpuUsage {
     pub time: String,
     pub percent: String,
@@ -10,8 +11,16 @@ pub struct CpuUsage {
     pub human_friendly_time: Option<String>,
 }
 
+/// Current CPU usage. WIRE FORMAT IS FROZEN: `percent` is a NUMBER here,
+/// unlike /api/cpu/history where it is a string. Do not "fix" this.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CpuCurrent {
+    pub time: String,
+    pub percent: f64,
+}
+
 /// WIRE FORMAT IS FROZEN. `usedPercent` is the only camelCase key in the API.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MemUsage {
     pub time: String,
     pub total: u64,
@@ -27,7 +36,7 @@ pub struct MemUsage {
 /// Server filesystem usage for one mountpoint. These endpoints are new (not
 /// part of the frozen Go wire format), so `time` is a stringified millis for
 /// consistency with the other series while byte fields stay numeric.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DiskUsage {
     pub time: String,
     pub mount: String,
@@ -41,7 +50,7 @@ pub struct DiskUsage {
 }
 
 /// Per-container storage: Docker writable-layer size plus summed volume sizes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ContainerDiskUsage {
     pub time: String,
     #[serde(rename = "writableLayer")]
@@ -52,9 +61,81 @@ pub struct ContainerDiskUsage {
     pub human_friendly_time: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ErrorBody {
     pub error: String,
+}
+
+// --- Reusable OpenAPI error responses ---------------------------------------
+//
+// Referenced in `#[utoipa::path]` annotations as
+// `(status = 401, response = UnauthorizedError)`. Never constructed — they
+// exist so the generated spec keeps named `components/responses` entries like
+// the old hand-written openapi.yaml instead of inlining the same body on
+// every operation.
+
+/// Bad request — invalid query parameters (date format, range, or limit).
+#[derive(Debug, ToResponse)]
+#[response(
+    description = "Bad request",
+    example = json!({"error": "Invalid 'from' date format. Use YYYY-MM-DDTHH:MM:SSZ"})
+)]
+pub struct BadRequestError(pub ErrorBody);
+
+/// Missing or invalid bearer token.
+#[derive(Debug, ToResponse)]
+#[response(
+    description = "Unauthorized",
+    example = json!({"error": "Unauthorized"})
+)]
+pub struct UnauthorizedError(pub ErrorBody);
+
+/// Not found — e.g. traffic analytics not enabled on this build/instance.
+#[derive(Debug, ToResponse)]
+#[response(
+    description = "Not found",
+    example = json!({"error": "traffic analytics not enabled"})
+)]
+pub struct NotFoundError(pub ErrorBody);
+
+/// Internal server error.
+#[derive(Debug, ToResponse)]
+#[response(
+    description = "Internal server error",
+    example = json!({"error": "Internal server error"})
+)]
+pub struct InternalServerError(pub ErrorBody);
+
+// --- Debug-only /api/stats ---------------------------------------------------
+
+/// Database storage statistics and estimated logical table sizes.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct StatsResponse {
+    pub row_count: i64,
+    /// Human-readable strings ("{:.2}"), part of the wire format.
+    pub storage_usage_kb: String,
+    pub storage_usage_mb: String,
+    pub memory_usage: StatsMemoryUsage,
+    pub table_sizes: Vec<StatsTableSize>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct StatsMemoryUsage {
+    pub total: u64,
+    pub available: u64,
+    pub used: u64,
+    #[serde(rename = "usedPercent")]
+    pub used_percent: f64,
+    pub free: u64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct StatsTableSize {
+    pub table_name: String,
+    pub row_count: i64,
+    /// Human-readable strings ("{:.2}"), part of the wire format.
+    pub size_mb: String,
+    pub size_kb: String,
 }
 
 // --- Traffic analytics (design spec §7) -------------------------------------
@@ -68,7 +149,7 @@ pub struct ErrorBody {
 
 /// App-level traffic totals for a query range, merged across *every* host
 /// that served the app (per-host detail is deliberately not exposed here).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficOverview {
     pub requests: i64,
     pub bytes_in: i64,
@@ -80,7 +161,7 @@ pub struct TrafficOverview {
 }
 
 /// Request counts by HTTP status class.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficStatusBreakdown {
     pub s2xx: i64,
     pub s3xx: i64,
@@ -90,7 +171,7 @@ pub struct TrafficStatusBreakdown {
 
 /// Approximate latency quantiles in milliseconds (t-digest estimate). `0.0`
 /// on every field when the range holds no decodable latency sketch.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficLatency {
     pub p50: f64,
     pub p95: f64,
@@ -100,7 +181,7 @@ pub struct TrafficLatency {
 /// One row of the top-paths table, summed over every bucket in the range.
 /// Carries only p50/p95 — p99 is omitted deliberately to keep a 50-row
 /// payload small, and the app-level p99 is available from the overview.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficPath {
     pub path: String,
     /// The app (Coolify app UUID, or host for Caddy) that served this path,
@@ -117,7 +198,7 @@ pub struct TrafficPath {
 
 /// One value of a breakdown dimension (country, device, status class, ...),
 /// summed over every bucket in the range.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficBreakdownEntry {
     pub value: String,
     pub requests: i64,
@@ -133,7 +214,7 @@ pub struct TrafficBreakdownEntry {
 /// sum of these will overcount a range's true distinct visitors. `p95` is the
 /// bucket's 95th-percentile latency in ms (t-digest estimate), `0.0` when the
 /// bucket holds no decodable latency sketch.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficSeriesBucket {
     pub bucket: i64,
     pub requests: i64,
@@ -150,7 +231,7 @@ pub struct TrafficSeriesBucket {
 /// The attribution string required by the license of whichever GeoIP source
 /// is currently active (design spec §6), or `null` when none applies (GeoIP
 /// disabled, not yet resolved, or an unrecognized `GEOIP_DB_URL` override).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficAttribution {
     pub attribution: Option<String>,
 }
@@ -159,7 +240,7 @@ pub struct TrafficAttribution {
 /// replace ~15 separate round-trips with a single request. Every member is the
 /// verbatim shape of its standalone endpoint — the same serializers and
 /// server-side sketch merges — bundled, never re-summed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficDashboard {
     pub overview: TrafficOverview,
     pub paths: Vec<TrafficPath>,
@@ -177,7 +258,7 @@ pub struct TrafficDashboard {
 /// The eleven breakdown dimensions Coolify renders, each a top-N list in the
 /// same shape as `GET /traffic/breakdown/{dim}`. A fixed struct rather than a
 /// map so the dimension set is the single source of truth and always complete.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficBreakdowns {
     pub country: Vec<TrafficBreakdownEntry>,
     pub referer: Vec<TrafficBreakdownEntry>,
@@ -194,7 +275,7 @@ pub struct TrafficBreakdowns {
 
 /// One row of the server-wide app leaderboard: an app UUID plus its overview,
 /// ranked by request count descending.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficAppEntry {
     pub uuid: String,
     pub overview: TrafficOverview,
