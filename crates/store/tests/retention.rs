@@ -131,6 +131,85 @@ fn downsample_rounds_percentages_to_two_decimals() {
     assert_eq!(rows[0].percent, 10.02);
 }
 
+/// Regression: the REAL rate/load columns must keep their fractional values
+/// through downsampling. Integer-casting them (as the byte columns are) would
+/// have turned a `load1` of 0.75 into 1 and truncated the network rates.
+#[test]
+fn downsample_preserves_real_network_and_load_decimals() {
+    let s = Store::open_in_memory().unwrap();
+    let now = 10 * DAY;
+    let bucket = now - 2 * DAY;
+    let bucket = bucket - (bucket % retention::BUCKET_MS);
+    for i in 0..3 {
+        let t = bucket + i * 5_000;
+        // Means: rx 12.5, tx 6.25, load1 0.75, load5 1.5, load15 2.25.
+        s.insert_network(t, 12.5, 6.25).unwrap();
+        s.insert_load(t, 0.75, 1.5, 2.25).unwrap();
+    }
+    s.downsample(now).unwrap();
+
+    let net = s.network_history(bucket, bucket).unwrap();
+    assert_eq!(net.len(), 1, "three raw rows collapse to one bucket");
+    assert_eq!(net[0].rx_bytes_per_sec, 12.5);
+    assert_eq!(net[0].tx_bytes_per_sec, 6.25);
+
+    let load = s.load_history(bucket, bucket).unwrap();
+    assert_eq!(load[0].load1, 0.75, "0.75 must not round to 1");
+    assert_eq!(load[0].load5, 1.5);
+    assert_eq!(load[0].load15, 2.25);
+}
+
+/// Cleanup covers the new time-series tables and drops stale container_status.
+#[test]
+fn cleanup_covers_new_series_and_container_status() {
+    use store::{ContainerNetworkSample, ContainerStatusSample};
+    let s = Store::open_in_memory().unwrap();
+    let now = 100 * DAY;
+    let old = now - 30 * DAY;
+    for i in 0..20 {
+        let t = old + i;
+        s.insert_network(t, 1.0, 1.0).unwrap();
+        s.insert_load(t, 1.0, 1.0, 1.0).unwrap();
+        s.insert_container_network_batch(
+            t,
+            &[ContainerNetworkSample {
+                container_id: "c".into(),
+                rx_bytes_per_sec: 1.0,
+                tx_bytes_per_sec: 1.0,
+            }],
+        )
+        .unwrap();
+    }
+    // A stale status row (last seen well before the cutoff) must be removed.
+    s.upsert_container_status_batch(
+        old,
+        &[ContainerStatusSample {
+            container_id: "gone".into(),
+            state: "exited".into(),
+            health_status: String::new(),
+            restart_count: 0,
+        }],
+    )
+    .unwrap();
+
+    s.cleanup(7, now).unwrap();
+
+    assert_eq!(s.network_history(0, i64::MAX).unwrap().len(), 10);
+    assert_eq!(s.load_history(0, i64::MAX).unwrap().len(), 10);
+    assert_eq!(
+        s.container_network_history("c", 0, i64::MAX).unwrap().len(),
+        10
+    );
+    // Stale container is gone from the current view.
+    assert!(
+        s.latest_container_metrics()
+            .unwrap()
+            .iter()
+            .all(|m| m.container_id != "gone"),
+        "stale container_status row should be cleaned up"
+    );
+}
+
 #[test]
 fn second_downsample_only_processes_newly_aged_rows() {
     let s = Store::open_in_memory().unwrap();

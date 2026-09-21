@@ -7,8 +7,9 @@ use axum::{Json, Router};
 
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
+use crate::routes::network::to_network_usage;
 use crate::time::format_millis;
-use crate::types::{ContainerDiskUsage, CpuUsage, MemUsage};
+use crate::types::{ContainerDiskUsage, CpuUsage, MemUsage, NetworkUsage};
 
 /// Container history defaults `from` one second later than the host endpoints.
 /// This asymmetry exists in the Go implementation and is preserved.
@@ -30,6 +31,43 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/container/{containerId}/disk/history",
             get(disk_history),
         )
+        .route(
+            "/api/container/{containerId}/network/history",
+            get(network_history),
+        )
+}
+
+async fn network_history(
+    Path(container_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
+    let id = container_id;
+    let (from, to) = match resolve_range(&q, DEFAULT_FROM) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let permit = match state.history_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
+    let store = state.store.clone();
+    let result =
+        tokio::task::spawn_blocking(move || store.container_network_history(&id, from, to)).await;
+    drop(permit);
+    let rows = match result {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => return internal_error(e),
+        Err(e) => return internal_error(e),
+    };
+
+    let debug = state.config.debug;
+    let out: Vec<NetworkUsage> = rows
+        .into_iter()
+        .map(|r| to_network_usage(r.into(), debug))
+        .collect();
+    Json(out).into_response()
 }
 
 async fn cpu_history(
@@ -166,7 +204,7 @@ async fn disk_history(
     Json(out).into_response()
 }
 
-fn to_container_disk(r: store::ContainerDiskRow, debug: bool) -> ContainerDiskUsage {
+pub(crate) fn to_container_disk(r: store::ContainerDiskRow, debug: bool) -> ContainerDiskUsage {
     ContainerDiskUsage {
         time: r.time.to_string(),
         writable_layer: r.writable_layer,

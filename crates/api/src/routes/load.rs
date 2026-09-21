@@ -8,32 +8,31 @@ use axum::{Json, Router};
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
 use crate::time::format_millis;
-use crate::types::DiskUsage;
+use crate::types::LoadAverage;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/disk/current", get(current))
-        .route("/api/disk/history", get(history))
+        .route("/api/load/current", get(current))
+        .route("/api/load/history", get(history))
 }
 
-/// Latest stored snapshot: one row per mountpoint from the most recent cycle.
+/// Latest host load average (`null` when nothing recorded yet).
 async fn current(State(state): State<Arc<AppState>>) -> Response {
     let permit = match state.history_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => return internal_error(e),
     };
     let store = state.store.clone();
-    let result = tokio::task::spawn_blocking(move || store.disk_latest()).await;
+    let result = tokio::task::spawn_blocking(move || store.load_latest()).await;
     drop(permit);
-    let rows = match result {
-        Ok(Ok(rows)) => rows,
+    let row = match result {
+        Ok(Ok(row)) => row,
         Ok(Err(e)) => return internal_error(e),
         Err(e) => return internal_error(e),
     };
 
     let debug = state.config.debug;
-    let out: Vec<DiskUsage> = rows.into_iter().map(|r| to_disk_usage(r, debug)).collect();
-    Json(out).into_response()
+    Json(row.map(|r| to_load(r, debug))).into_response()
 }
 
 async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuery>) -> Response {
@@ -47,7 +46,7 @@ async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuer
         Err(e) => return internal_error(e),
     };
     let store = state.store.clone();
-    let result = tokio::task::spawn_blocking(move || store.disk_history(from, to)).await;
+    let result = tokio::task::spawn_blocking(move || store.load_history(from, to)).await;
     drop(permit);
     let rows = match result {
         Ok(Ok(rows)) => rows,
@@ -56,18 +55,16 @@ async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuer
     };
 
     let debug = state.config.debug;
-    let out: Vec<DiskUsage> = rows.into_iter().map(|r| to_disk_usage(r, debug)).collect();
+    let out: Vec<LoadAverage> = rows.into_iter().map(|r| to_load(r, debug)).collect();
     Json(out).into_response()
 }
 
-pub(crate) fn to_disk_usage(r: store::DiskRow, debug: bool) -> DiskUsage {
-    DiskUsage {
+pub(crate) fn to_load(r: store::LoadRow, debug: bool) -> LoadAverage {
+    LoadAverage {
         time: r.time.to_string(),
-        mount: r.mount,
-        total: r.total,
-        used: r.used,
-        available: r.available,
-        used_percent: r.used_percent,
+        load1: r.load1,
+        load5: r.load5,
+        load15: r.load15,
         human_friendly_time: debug.then(|| format_millis(r.time)),
     }
 }
