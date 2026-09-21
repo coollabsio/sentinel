@@ -52,10 +52,14 @@
         in
           pkgs.mkShell {
             packages = with pkgs; [
-              rustToolchain
+              # keep-sorted start
               cargo-watch
               gcc
+              just
+              keep-sorted
               podman
+              rustToolchain
+              # keep-sorted end
             ];
           };
       };
