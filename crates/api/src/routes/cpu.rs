@@ -3,17 +3,24 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
+use utoipa::IntoParams;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
 use crate::time::{format_millis, now_layout, parse_bound};
-use crate::types::{CpuUsage, ErrorBody};
+use crate::types::{
+    BadRequestError, CpuCurrent, CpuUsage, ErrorBody, InternalServerError, UnauthorizedError,
+};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct HistoryQuery {
+    /// Start date in ISO 8601 format (UTC). Defaults to the Unix epoch
+    /// (all recorded history) when omitted.
     pub from: Option<String>,
+    /// End date in ISO 8601 format (UTC). Defaults to now when omitted.
     pub to: Option<String>,
 }
 
@@ -66,12 +73,25 @@ pub fn internal_error(e: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
-pub fn routes() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/api/cpu/current", get(current))
-        .route("/api/cpu/history", get(history))
+pub fn routes() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::new()
+        .routes(routes!(current))
+        .routes(routes!(history))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/cpu/current",
+    tag = "System Metrics",
+    summary = "Get current CPU usage",
+    description = "Retrieve the current CPU usage percentage",
+    responses(
+        (status = 200, description = "Current CPU usage", body = CpuCurrent),
+        (status = 401, response = UnauthorizedError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn current(State(state): State<Arc<AppState>>) -> Response {
     let time = collector::now_millis().to_string();
     let percent = {
@@ -82,6 +102,21 @@ async fn current(State(state): State<Arc<AppState>>) -> Response {
     Json(serde_json::json!({ "time": time, "percent": percent })).into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/cpu/history",
+    tag = "System Metrics",
+    summary = "Get CPU usage history",
+    description = "Retrieve historical CPU usage data with optional date range filtering",
+    params(HistoryQuery),
+    responses(
+        (status = 200, description = "Historical CPU usage data", body = Vec<CpuUsage>),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuery>) -> Response {
     let (from, to) = match resolve_range(&q, "1970-01-01T00:00:00Z") {
         Ok(r) => r,

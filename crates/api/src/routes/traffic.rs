@@ -7,19 +7,19 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Deserialize;
 use store::traffic::{AnalyticsStore, BreakdownRow, PathRow, StatsRow, Tier};
 use traffic::sketches::{LatencyDigest, Uniques};
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
 use crate::time::now_ms;
 use crate::types::{
-    ErrorBody, TrafficAppEntry, TrafficAttribution, TrafficBreakdownEntry, TrafficBreakdowns,
-    TrafficDashboard, TrafficLatency, TrafficOverview, TrafficPath, TrafficSeriesBucket,
-    TrafficStatusBreakdown,
+    BadRequestError, ErrorBody, InternalServerError, NotFoundError, TrafficAppEntry,
+    TrafficAttribution, TrafficBreakdownEntry, TrafficBreakdowns, TrafficDashboard, TrafficLatency,
+    TrafficOverview, TrafficPath, TrafficSeriesBucket, TrafficStatusBreakdown, UnauthorizedError,
 };
 
 const MIN_MS: i64 = 60_000;
@@ -60,26 +60,23 @@ fn warn_if_truncated(query: &str, app: &str, rows: usize, budget: usize) {
     }
 }
 
-pub fn routes() -> Router<Arc<AppState>> {
-    Router::new()
+pub fn routes() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::new()
         // axum 0.8 requires braced params; "/:uuid" panics at build time.
-        .route("/api/traffic/apps", get(apps))
-        .route("/api/app/{uuid}/traffic/overview", get(overview))
-        .route("/api/app/{uuid}/traffic/paths", get(paths))
-        .route(
-            "/api/app/{uuid}/traffic/breakdown/{dimension}",
-            get(breakdown),
-        )
-        .route("/api/app/{uuid}/traffic/series", get(app_series))
-        .route("/api/app/{uuid}/traffic/dashboard", get(app_dashboard))
+        .routes(routes!(apps))
+        .routes(routes!(overview))
+        .routes(routes!(paths))
+        .routes(routes!(breakdown))
+        .routes(routes!(app_series))
+        .routes(routes!(app_dashboard))
         // Server-wide variants: same shapes, merged across every app/host.
-        .route("/api/traffic/overview", get(server_overview))
-        .route("/api/traffic/paths", get(server_paths))
-        .route("/api/traffic/breakdown/{dimension}", get(server_breakdown))
-        .route("/api/traffic/series", get(series))
-        .route("/api/traffic/attribution", get(attribution))
+        .routes(routes!(server_overview))
+        .routes(routes!(server_paths))
+        .routes(routes!(server_breakdown))
+        .routes(routes!(series))
+        .routes(routes!(attribution))
         // One request that bundles every shape above, for Coolify's dashboard.
-        .route("/api/traffic/dashboard", get(server_dashboard))
+        .routes(routes!(server_dashboard))
 }
 
 /// `from`/`to` plus a top-N cap, for the two ranked endpoints.
@@ -87,13 +84,19 @@ pub fn routes() -> Router<Arc<AppState>> {
 /// A separate struct rather than an extension of `HistoryQuery`: that type is
 /// shared by every host and container history endpoint, none of which take a
 /// limit.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct TopQuery {
+    /// Start date in ISO 8601 format (UTC). Defaults to the Unix epoch
+    /// (all recorded history) when omitted.
     pub from: Option<String>,
+    /// End date in ISO 8601 format (UTC). Defaults to now when omitted.
     pub to: Option<String>,
     /// A `String`, not a `usize`, so `?limit=` (empty) can be treated as
     /// absent rather than rejected by the extractor — the same courtesy
     /// `resolve_range` extends to `?from=`.
+    ///
+    /// Positive integer, max 1000. Defaults to 50.
     pub limit: Option<String>,
 }
 
@@ -107,8 +110,10 @@ impl TopQuery {
 }
 
 /// The only knob for the series endpoints: `24h` (hourly) or `7d`/`30d` (daily).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SeriesQuery {
+    /// Time range: `24h` (hourly buckets, default), `7d` or `30d` (daily buckets).
     pub range: Option<String>,
 }
 
@@ -118,13 +123,22 @@ pub struct SeriesQuery {
 /// `Option<String>` so `?from=` / `?paths_limit=` (empty) fall back to the
 /// default rather than being rejected — the same courtesy the other endpoints
 /// extend.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct DashboardQuery {
+    /// Start date in ISO 8601 format (UTC). Defaults to the Unix epoch
+    /// (all recorded history) when omitted.
     pub from: Option<String>,
+    /// End date in ISO 8601 format (UTC). Defaults to now when omitted.
     pub to: Option<String>,
+    /// Time range for the series member: `24h` (default), `7d`, or `30d`.
     pub range: Option<String>,
+    /// Top-N cap for the paths member. Positive integer, max 1000, default 50.
     pub paths_limit: Option<String>,
+    /// Top-N cap for each breakdown member. Positive integer, max 1000, default 50.
     pub breakdown_limit: Option<String>,
+    /// Top-N cap for the apps leaderboard (server-wide dashboard only; ignored
+    /// on the per-app variant). Positive integer, max 1000, default 200.
     pub apps_limit: Option<String>,
 }
 
@@ -331,6 +345,20 @@ fn analytics_disabled() -> Response {
         .into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/traffic/apps",
+    tag = "Traffic Analytics",
+    summary = "Get recorded apps",
+    description = "List every app UUID (or host, for Caddy) that traffic analytics has\nrecorded data for.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    responses(
+        (status = 200, description = "Recorded app identifiers", body = Vec<String>),
+        (status = 401, response = UnauthorizedError),
+        (status = 404, response = NotFoundError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn apps(State(state): State<Arc<AppState>>) -> Response {
     let Some(analytics) = state.analytics.clone() else {
         return analytics_disabled();
@@ -349,11 +377,25 @@ async fn apps(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-/// Reports the license attribution string for whichever GeoIP source is
-/// currently active (design spec §6), so operators/UIs can surface it
-/// without grepping the boot log. Gated on `analytics` like every other
-/// route here, even though the value technically lives outside the
-/// analytics store, because GeoIP is part of the same opt-in subsystem.
+// Reports the license attribution string for whichever GeoIP source is
+// currently active (design spec §6), so operators/UIs can surface it
+// without grepping the boot log. Gated on `analytics` like every other
+// route here, even though the value technically lives outside the
+// analytics store, because GeoIP is part of the same opt-in subsystem.
+#[utoipa::path(
+    get,
+    path = "/api/traffic/attribution",
+    tag = "Traffic Analytics",
+    summary = "Get GeoIP attribution",
+    description = "License attribution string for whichever GeoIP data source is\ncurrently active (resolved at runtime — see README.md's GeoIP\nlicensing section).\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    responses(
+        (status = 200, description = "Active GeoIP source's attribution string, or null", body = TrafficAttribution),
+        (status = 401, response = UnauthorizedError),
+        (status = 404, response = NotFoundError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn attribution(State(state): State<Arc<AppState>>) -> Response {
     if state.analytics.is_none() {
         return analytics_disabled();
@@ -366,8 +408,26 @@ async fn attribution(State(state): State<Arc<AppState>>) -> Response {
     Json(TrafficAttribution { attribution }).into_response()
 }
 
-/// Server-wide status-class time series: per-bucket 2xx/3xx/4xx/5xx counts
-/// across every app/host, zero-filled to a fixed length by `range`.
+// Server-wide status-class time series: per-bucket 2xx/3xx/4xx/5xx counts
+// across every app/host, zero-filled to a fixed length by `range`.
+#[utoipa::path(
+    get,
+    path = "/api/traffic/series",
+    tag = "Traffic Analytics",
+    summary = "Get server-wide status-class time series",
+    description = "Per-bucket 2xx/3xx/4xx/5xx request counts across every app/host,\nzero-filled to a fixed length (see the per-app variant for granularity).\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    params(
+        SeriesQuery
+    ),
+    responses(
+        (status = 200, description = "Status-class time series", body = Vec<TrafficSeriesBucket>),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 404, response = NotFoundError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQuery>) -> Response {
     let Some(analytics) = state.analytics.clone() else {
         return analytics_disabled();
@@ -378,7 +438,26 @@ async fn series(State(state): State<Arc<AppState>>, Query(q): Query<SeriesQuery>
     .await
 }
 
-/// Per-app variant of [`series`], filtered to one app via `stats_range`.
+// Per-app variant of [`series`], filtered to one app via `stats_range`.
+#[utoipa::path(
+    get,
+    path = "/api/app/{uuid}/traffic/series",
+    tag = "Traffic Analytics",
+    summary = "Get app status-class time series",
+    description = "Per-bucket 2xx/3xx/4xx/5xx request counts for one app, zero-filled to\na fixed length: 24 hourly buckets for `range=24h`, 7 or 30 daily\nbuckets for `range=7d`/`range=30d`.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    params(
+        ("uuid" = String, Path, description = "App UUID"),
+        SeriesQuery
+    ),
+    responses(
+        (status = 200, description = "Status-class time series for the app", body = Vec<TrafficSeriesBucket>),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 404, response = NotFoundError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn app_series(
     Path(app): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -429,6 +508,25 @@ where
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/app/{uuid}/traffic/overview",
+    tag = "Traffic Analytics",
+    summary = "Get app traffic overview",
+    description = "Request/bandwidth totals, status-class counts, latency percentiles,\nand estimated unique visitors for one app, merged across every host\nit was served on. An app with no data in range returns 200 with\nevery counter zeroed, not 404.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    params(
+        ("uuid" = String, Path, description = "App UUID"),
+        HistoryQuery
+    ),
+    responses(
+        (status = 200, description = "App traffic overview", body = TrafficOverview),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 404, response = NotFoundError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn overview(
     Path(app): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -465,6 +563,25 @@ async fn overview(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/app/{uuid}/traffic/paths",
+    tag = "Traffic Analytics",
+    summary = "Get app top paths",
+    description = "Busiest request paths for one app, summed across every bucket in\nrange, with per-path latency. A synthetic `__other__` entry absorbs\nthe long tail past the server's top-N cap (TRAFFIC_TOPN).\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    params(
+        ("uuid" = String, Path, description = "App UUID"),
+        TopQuery
+    ),
+    responses(
+        (status = 200, description = "Top paths for the app", body = Vec<TrafficPath>),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 404, response = NotFoundError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn paths(
     Path(app): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -505,6 +622,26 @@ async fn paths(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/app/{uuid}/traffic/breakdown/{dimension}",
+    tag = "Traffic Analytics",
+    summary = "Get app dimension breakdown",
+    description = "Top values of one dimension for one app, summed across every bucket\nin range. A synthetic `__other__` entry absorbs the long tail past\nthe server's top-N cap (TRAFFIC_TOPN). An unrecognized dimension\nreturns an empty array, not an error.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    params(
+        ("uuid" = String, Path, description = "App UUID"),
+        ("dimension" = String, Path, description = "One of: status, method, country, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. The\n`agent` dimension holds the bot/AI-agent name (e.g. GPTBot,\nClaudeBot) and is only present for bot traffic. `ip` holds the\nresolved real client IP (respecting Cloudflare CF-Connecting-IP\nand X-Forwarded-For); `useragent` holds the raw User-Agent header."),
+        TopQuery
+    ),
+    responses(
+        (status = 200, description = "Top values of the dimension for the app", body = Vec<TrafficBreakdownEntry>),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 404, response = NotFoundError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn breakdown(
     Path((app, dimension)): Path<(String, String)>,
     State(state): State<Arc<AppState>>,
@@ -545,10 +682,28 @@ async fn breakdown(
     }
 }
 
-/// Server-wide overview: [`overview`] over every app/host on the box. Uses the
-/// un-app-filtered `stats_rows_between` scan (the same one compaction reads),
-/// then the identical `summarize_stats` merge — so the percentiles and visitor
-/// count are a true sketch merge across all apps, not a sum of per-app estimates.
+// Server-wide overview: [`overview`] over every app/host on the box. Uses the
+// un-app-filtered `stats_rows_between` scan (the same one compaction reads),
+// then the identical `summarize_stats` merge — so the percentiles and visitor
+// count are a true sketch merge across all apps, not a sum of per-app estimates.
+#[utoipa::path(
+    get,
+    path = "/api/traffic/overview",
+    tag = "Traffic Analytics",
+    summary = "Get server-wide traffic overview",
+    description = "Request/bandwidth totals, status-class counts, latency percentiles,\nand estimated unique visitors merged across every app and host on the\nbox. Sketches (t-digest, HyperLogLog) are merged server-side, so the\npercentiles and visitor estimate are a true cross-app merge, not a sum\nof per-app estimates. Same shape as the per-app overview.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    params(
+        HistoryQuery
+    ),
+    responses(
+        (status = 200, description = "Server-wide traffic overview", body = TrafficOverview),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 404, response = NotFoundError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn server_overview(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HistoryQuery>,
@@ -581,10 +736,28 @@ async fn server_overview(
     }
 }
 
-/// Server-wide top paths: [`paths`] across every app. `top_paths` groups by
-/// `(app, path)`, so the same path served by different apps (e.g. `/`) stays a
-/// separate row per app, each carrying its owning app — a correct top-N over
-/// all apps that preserves per-app attribution, not a merge of per-app lists.
+// Server-wide top paths: [`paths`] across every app. `top_paths` groups by
+// `(app, path)`, so the same path served by different apps (e.g. `/`) stays a
+// separate row per app, each carrying its owning app — a correct top-N over
+// all apps that preserves per-app attribution, not a merge of per-app lists.
+#[utoipa::path(
+    get,
+    path = "/api/traffic/paths",
+    tag = "Traffic Analytics",
+    summary = "Get server-wide top paths",
+    description = "Busiest request paths across every app on the box, summed over the\nrange with per-path latency. The same path served by multiple apps is\nmerged into one entry, giving a correct top-N across all apps rather\nthan a merge of per-app top-N lists.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    params(
+        TopQuery
+    ),
+    responses(
+        (status = 200, description = "Server-wide top paths", body = Vec<TrafficPath>),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 404, response = NotFoundError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn server_paths(State(state): State<Arc<AppState>>, Query(q): Query<TopQuery>) -> Response {
     let Some(analytics) = state.analytics.clone() else {
         return analytics_disabled();
@@ -618,7 +791,26 @@ async fn server_paths(State(state): State<Arc<AppState>>, Query(q): Query<TopQue
     }
 }
 
-/// Server-wide breakdown: [`breakdown`] for one dimension across every app.
+// Server-wide breakdown: [`breakdown`] for one dimension across every app.
+#[utoipa::path(
+    get,
+    path = "/api/traffic/breakdown/{dimension}",
+    tag = "Traffic Analytics",
+    summary = "Get server-wide dimension breakdown",
+    description = "Top values of one dimension across every app on the box, summed over\nthe range. An unrecognized dimension returns an empty array, not an\nerror.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    params(
+        ("dimension" = String, Path, description = "One of: status, method, country, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. The\n`agent` dimension holds the bot/AI-agent name (e.g. GPTBot,\nClaudeBot) and is only present for bot traffic. `ip` holds the\nresolved real client IP (respecting Cloudflare CF-Connecting-IP\nand X-Forwarded-For); `useragent` holds the raw User-Agent header."),
+        TopQuery
+    ),
+    responses(
+        (status = 200, description = "Top values of the dimension across all apps", body = Vec<TrafficBreakdownEntry>),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 404, response = NotFoundError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn server_breakdown(
     Path(dimension): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -1038,8 +1230,26 @@ fn app_leaderboard(rows: Vec<StatsRow>, apps_limit: usize) -> Vec<TrafficAppEntr
     entries
 }
 
-/// Server-wide dashboard: every member merged across all apps, plus the app
-/// leaderboard.
+// Server-wide dashboard: every member merged across all apps, plus the app
+// leaderboard.
+#[utoipa::path(
+    get,
+    path = "/api/traffic/dashboard",
+    tag = "Traffic Analytics",
+    summary = "Get aggregate traffic dashboard (server-wide)",
+    description = "Bundle every traffic shape into one response so a dashboard can replace\n~15 separate requests with a single call. Each member is verbatim the\nshape of its standalone endpoint, with the same server-side sketch\nmerges (t-digest latency, HLL uniques) — nothing is re-summed.\n\n`overview`, `paths`, and every `breakdowns` dimension follow `from`/`to`;\n`series` follows `range`. The server-wide variant includes `apps` (every\napp with traffic, ranked by requests desc, capped at `apps_limit`). An\nempty range returns 200 with zeroed/empty members, never 404.\n\nAdditive: older Coolify keeps calling the individual endpoints; new\nCoolify calls this first and falls back to them on 404.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    params(
+        DashboardQuery
+    ),
+    responses(
+        (status = 200, description = "Aggregate dashboard, including the app leaderboard", body = TrafficDashboard),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 404, response = NotFoundError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn server_dashboard(
     State(state): State<Arc<AppState>>,
     Query(q): Query<DashboardQuery>,
@@ -1047,7 +1257,32 @@ async fn server_dashboard(
     run_dashboard(state, Target::Server, true, q).await
 }
 
-/// Per-app dashboard: same members filtered to one app, `apps` omitted.
+// Per-app dashboard: same members filtered to one app, `apps` omitted.
+#[utoipa::path(
+    get,
+    path = "/api/app/{uuid}/traffic/dashboard",
+    tag = "Traffic Analytics",
+    summary = "Get aggregate traffic dashboard (per app)",
+    description = "Per-app variant of `GET /api/traffic/dashboard`: every member filtered\nto one app, and `apps` omitted entirely. `apps_limit` is ignored.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    // DashboardQuery minus apps_limit: the leaderboard knob is ignored on the
+    // per-app variant, so the spec doesn't advertise it here.
+    params(
+        ("uuid" = String, Path, description = "App UUID"),
+        ("from" = Option<String>, Query, description = "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch (all recorded history) when omitted."),
+        ("to" = Option<String>, Query, description = "End date in ISO 8601 format (UTC). Defaults to now when omitted."),
+        ("range" = Option<String>, Query, description = "Time range for the series member: `24h` (default), `7d`, or `30d`."),
+        ("paths_limit" = Option<String>, Query, description = "Top-N cap for the paths member. Positive integer, max 1000, default 50."),
+        ("breakdown_limit" = Option<String>, Query, description = "Top-N cap for each breakdown member. Positive integer, max 1000, default 50."),
+    ),
+    responses(
+        (status = 200, description = "Aggregate dashboard for one app (no leaderboard)", body = TrafficDashboard),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 404, response = NotFoundError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn app_dashboard(
     Path(app): Path<String>,
     State(state): State<Arc<AppState>>,

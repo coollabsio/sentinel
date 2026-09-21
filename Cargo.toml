@@ -42,6 +42,13 @@ tdigests = "1"
 hyperloglogplus = "0.4"
 siphasher = "1"
 traffic = { path = "crates/traffic" }
+# OpenAPI: the spec is generated from route annotations (utoipa-axum) and
+# served with Scalar + Swagger UI frontends. Versions verified 2026-09 against
+# crates.io; axum 0.8 compatible.
+utoipa = "5.5"
+utoipa-axum = "0.2"
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 [package]
 name = "sentinel"

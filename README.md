@@ -81,6 +81,7 @@ Sentinel is configured using environment variables:
 | `STORAGE_VOLUMES_ENABLED` | `true` | Enable/disable the per-container volume `du`-walk |
 | `STORAGE_VOLUMES_REFRESH_RATE_SECONDS` | 900 | Interval for the expensive volume walk (kept separate so it can't hammer host I/O) |
 | `HOST_MOUNT_PREFIX` | *(empty)* | Path prefix under which host paths are mounted into Sentinel's container, used to resolve volume/bind sources |
+| `DOCKER_HOST` | `/var/run/docker.sock` | Docker Engine API socket; `unix://` URLs and bare paths only — e.g. `unix:///run/user/1000/podman/podman.sock` for rootless Podman |
 | `DEBUG` | `false` | Enable verbose logging, `human_friendly_time` fields, and the `/api/stats` route |
 | `PORT` | `8888` | HTTP server port |
 | `SENTINEL_COMMAND_RETENTION_DAYS` | 7 | Days to keep completed control-command results for replay |
@@ -150,17 +151,17 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ### Complete API Documentation
 
-For detailed API documentation including request/response examples, query parameters, and error responses, see [API.md](./API.md).
+For detailed API documentation including request/response examples, query parameters, and error responses, see [API.md](./API.md) — or the interactive docs served by a running instance at `/scalar` and `/swagger-ui`.
 
 ### OpenAPI Specification
 
-An OpenAPI 3.0 specification is available at [openapi.yaml](./openapi.yaml) for use with Swagger UI and other API tools.
+The OpenAPI specification is **generated from code annotations** and served live at `/api-docs/openapi.json` (explorable via `/scalar` or `/swagger-ui`). There is no hand-written spec file to get out of date.
 
 ## Traffic Analytics
 
 Sentinel can optionally compute Cloudflare-style web analytics (requests, bandwidth, status classes, latency percentiles, unique visitors, geo, browser/OS/device, bot classification, referers, top paths) on the server from the reverse-proxy's JSON access log (Traefik or Caddy).
 
-Only per-minute aggregate rollups are stored, never raw request rows, so storage doesn't grow with traffic. Rollups compact minute → hourly → daily with per-tier retention. Coolify pulls the aggregates the same way it does CPU/memory metrics; see [API.md](./API.md#traffic-analytics) for the query endpoints.
+Only per-minute aggregate rollups are stored, never raw request rows, so storage doesn't grow with traffic. Rollups compact minute → hourly → daily with per-tier retention. Coolify pulls the aggregates the same way it does CPU/memory metrics; see the interactive docs at `/scalar` (tag *Traffic Analytics*) for the query endpoints.
 
 The feature is opt-in at runtime (`TRAFFIC_ENABLED=true`) and gated at compile time by the `traffic` Cargo feature. The published Docker images already build with `--features traffic`; if you build Sentinel yourself, pass `cargo build --features traffic` or the traffic endpoints will 404.
 
@@ -206,8 +207,7 @@ sentinel/
 │   └── docker/       # Docker Engine client (bollard)
 ├── Cargo.toml         # Workspace manifest
 ├── Dockerfile          # Docker build configuration
-├── API.md              # API documentation
-└── openapi.yaml        # OpenAPI specification
+└── API.md              # API documentation (points to the generated live spec)
 ```
 
 ### Building
