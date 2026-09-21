@@ -8,3 +8,4 @@ sentinel
 *.sqlite-wal
 *.sqlite-shm
 .ai/
+/.direnv
