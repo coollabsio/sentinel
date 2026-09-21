@@ -2,20 +2,33 @@ use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
 use crate::time::format_millis;
-use crate::types::MemUsage;
+use crate::types::{BadRequestError, InternalServerError, MemUsage, UnauthorizedError};
 
-pub fn routes() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/api/memory/current", get(current))
-        .route("/api/memory/history", get(history))
+pub fn routes() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::new()
+        .routes(routes!(current))
+        .routes(routes!(history))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/memory/current",
+    tag = "System Metrics",
+    summary = "Get current memory usage",
+    description = "Retrieve the current memory usage statistics",
+    responses(
+        (status = 200, description = "Current memory usage", body = MemUsage),
+        (status = 401, response = UnauthorizedError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn current(State(state): State<Arc<AppState>>) -> Response {
     let time = collector::now_millis();
     let mut row = state.memory.get();
@@ -33,6 +46,21 @@ async fn current(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/memory/history",
+    tag = "System Metrics",
+    summary = "Get memory usage history",
+    description = "Retrieve historical memory usage data with optional date range filtering",
+    params(HistoryQuery),
+    responses(
+        (status = 200, description = "Historical memory usage data", body = Vec<MemUsage>),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuery>) -> Response {
     let (from, to) = match resolve_range(&q, "1970-01-01T00:00:00Z") {
         Ok(r) => r,

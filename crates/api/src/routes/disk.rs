@@ -2,21 +2,34 @@ use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
 use crate::time::format_millis;
-use crate::types::DiskUsage;
+use crate::types::{BadRequestError, DiskUsage, InternalServerError, UnauthorizedError};
 
-pub fn routes() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/api/disk/current", get(current))
-        .route("/api/disk/history", get(history))
+pub fn routes() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::new()
+        .routes(routes!(current))
+        .routes(routes!(history))
 }
 
-/// Latest stored snapshot: one row per mountpoint from the most recent cycle.
+#[utoipa::path(
+    get,
+    path = "/api/disk/current",
+    tag = "System Metrics",
+    summary = "Get current disk usage",
+    description = "Latest stored filesystem usage, one entry per real mountpoint",
+    responses(
+        (status = 200, description = "Current disk usage per mountpoint", body = Vec<DiskUsage>),
+        (status = 401, response = UnauthorizedError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
+// Latest stored snapshot: one row per mountpoint from the most recent cycle.
 async fn current(State(state): State<Arc<AppState>>) -> Response {
     let permit = match state.history_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
@@ -36,6 +49,21 @@ async fn current(State(state): State<Arc<AppState>>) -> Response {
     Json(out).into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/disk/history",
+    tag = "System Metrics",
+    summary = "Get disk usage history",
+    description = "Historical filesystem usage across mountpoints with optional date range filtering",
+    params(HistoryQuery),
+    responses(
+        (status = 200, description = "Historical disk usage data", body = Vec<DiskUsage>),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
 async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuery>) -> Response {
     let (from, to) = match resolve_range(&q, "1970-01-01T00:00:00Z") {
         Ok(r) => r,
