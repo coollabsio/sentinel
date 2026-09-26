@@ -116,6 +116,95 @@ fn suffix(tier: Tier) -> &'static str {
     }
 }
 
+/// Which app keys a per-app query reads.
+///
+/// A Coolify resource with uuid `U` writes traffic under the key `U` and under
+/// every key that starts with `U-` (Compose services `U-web`, previews
+/// `U-pr-12`, Compose previews `U-12-web`). [`AppFilter::Resource`] selects all
+/// of them, so the caller can merge their sketches into one exact result
+/// instead of adding per-key estimates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppFilter<'a> {
+    /// Only the key that is equal to this value.
+    Exact(&'a str),
+    /// The key that is equal to this uuid, and every key that starts with
+    /// `uuid-`. A key such as `{uuid}x…` (no dash) is not selected.
+    Resource(&'a str),
+}
+
+impl AppFilter<'_> {
+    /// The app predicate. It always uses the numbered parameters `?1..?3`
+    /// (key, lower bound, upper bound); the caller's own parameters start at
+    /// `?4`. `Exact` does not reference `?2`/`?3`, which SQLite permits: an
+    /// unreferenced numbered parameter is bound and ignored.
+    ///
+    /// `Resource` compares a byte range, not `LIKE 'uuid-%'`: `app >= 'uuid-'
+    /// AND app < 'uuid.'` selects exactly the keys that start with `uuid-`,
+    /// because `.` (0x2E) is the byte directly after `-` (0x2D) and the
+    /// columns use the default `BINARY` (memcmp) collation. There is no
+    /// pattern, so `%`, `_` and `\` in the uuid are literal and need no
+    /// escape.
+    fn predicate(self) -> &'static str {
+        match self {
+            AppFilter::Exact(_) => "app = ?1",
+            AppFilter::Resource(_) => "(app = ?1 OR (app >= ?2 AND app < ?3))",
+        }
+    }
+
+    /// `INDEXED BY` for the `(app, bucket…)` index of a table. Without it,
+    /// SQLite (no `ANALYZE` statistics) prefers the primary key's `bucket`
+    /// range for the `OR`, which reads every app's rows in the window — and all
+    /// history for the default unbounded range. With it, the plan is a
+    /// `MULTI-INDEX OR`: `app = ? AND bucket` range for the exact key plus an
+    /// `app` range for the `uuid-` keys. `Exact` keeps today's plan untouched.
+    /// The index always exists: [`apply`] creates it for every tier.
+    fn indexed_by(self, index: &str) -> String {
+        match self {
+            AppFilter::Exact(_) => String::new(),
+            AppFilter::Resource(_) => format!(" INDEXED BY {index}"),
+        }
+    }
+
+    /// Values for `?1..?3`, see [`Self::predicate`].
+    fn params(self) -> (String, String, String) {
+        match self {
+            AppFilter::Exact(key) => (key.to_string(), String::new(), String::new()),
+            AppFilter::Resource(uuid) => (uuid.to_string(), format!("{uuid}-"), format!("{uuid}.")),
+        }
+    }
+}
+
+fn stats_for_sql(tier: Tier, filter: AppFilter<'_>) -> String {
+    let sfx = suffix(tier);
+    format!(
+        "SELECT {STATS_COLS} FROM traffic_stats_{sfx}{} \
+         WHERE {} AND bucket >= ?4 AND bucket < ?5 ORDER BY bucket",
+        filter.indexed_by(&format!("idx_ts_{sfx}_app_bucket")),
+        filter.predicate(),
+    )
+}
+
+fn paths_for_sql(tier: Tier, filter: AppFilter<'_>) -> String {
+    let sfx = suffix(tier);
+    format!(
+        "SELECT {PATHS_COLS} FROM traffic_paths_{sfx}{} \
+         WHERE {} AND bucket >= ?4 AND bucket < ?5 ORDER BY bucket LIMIT ?6",
+        filter.indexed_by(&format!("idx_tp_{sfx}_app_bucket")),
+        filter.predicate(),
+    )
+}
+
+fn breakdown_for_sql(tier: Tier, filter: AppFilter<'_>) -> String {
+    let sfx = suffix(tier);
+    format!(
+        "SELECT {BREAKDOWN_COLS} FROM traffic_breakdown_{sfx}{} \
+         WHERE {} AND bucket >= ?4 AND bucket < ?5 AND dimension = ?6 \
+         ORDER BY requests DESC LIMIT ?7",
+        filter.indexed_by(&format!("idx_tb_{sfx}_app_bucket")),
+        filter.predicate(),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatsRow {
     pub bucket: i64,
@@ -446,6 +535,7 @@ impl AnalyticsStore {
         })
     }
 
+    /// Stats rows of exactly one app key. See [`Self::stats_for`].
     pub fn stats_range(
         &self,
         tier: Tier,
@@ -453,20 +543,10 @@ impl AnalyticsStore {
         from: i64,
         to: i64,
     ) -> Result<Vec<StatsRow>, StoreError> {
-        self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {STATS_COLS} FROM traffic_stats_{} \
-                 WHERE app = ?1 AND bucket >= ?2 AND bucket < ?3 ORDER BY bucket",
-                suffix(tier)
-            );
-            let mut stmt = c.prepare_cached(&sql)?;
-            let rows = stmt
-                .query_map((app, from, to), map_stats_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+        self.stats_for(tier, AppFilter::Exact(app), from, to)
     }
 
+    /// Path rows of exactly one app key. See [`Self::paths_for`].
     pub fn paths_range(
         &self,
         tier: Tier,
@@ -475,20 +555,10 @@ impl AnalyticsStore {
         to: i64,
         limit: usize,
     ) -> Result<Vec<PathRow>, StoreError> {
-        self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {PATHS_COLS} FROM traffic_paths_{} \
-                 WHERE app = ?1 AND bucket >= ?2 AND bucket < ?3 ORDER BY bucket LIMIT ?4",
-                suffix(tier)
-            );
-            let mut stmt = c.prepare_cached(&sql)?;
-            let rows = stmt
-                .query_map((app, from, to, limit as i64), map_path_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+        self.paths_for(tier, AppFilter::Exact(app), from, to, limit)
     }
 
+    /// Breakdown rows of exactly one app key. See [`Self::breakdown_for`].
     pub fn breakdown_range(
         &self,
         tier: Tier,
@@ -498,16 +568,68 @@ impl AnalyticsStore {
         to: i64,
         limit: usize,
     ) -> Result<Vec<BreakdownRow>, StoreError> {
+        self.breakdown_for(tier, AppFilter::Exact(app), dim, from, to, limit)
+    }
+
+    /// `tier` stats rows in `[from, to)` of every app key that `filter`
+    /// selects, ordered by bucket. Rows keep their real `app` key; merging
+    /// them is the caller's job.
+    pub fn stats_for(
+        &self,
+        tier: Tier,
+        filter: AppFilter<'_>,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<StatsRow>, StoreError> {
         self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {BREAKDOWN_COLS} FROM traffic_breakdown_{} \
-                 WHERE app = ?1 AND bucket >= ?2 AND bucket < ?3 AND dimension = ?4 \
-                 ORDER BY requests DESC LIMIT ?5",
-                suffix(tier)
-            );
-            let mut stmt = c.prepare_cached(&sql)?;
+            let mut stmt = c.prepare_cached(&stats_for_sql(tier, filter))?;
+            let (key, lo, hi) = filter.params();
             let rows = stmt
-                .query_map((app, from, to, dim, limit as i64), map_breakdown_row)?
+                .query_map((key, lo, hi, from, to), map_stats_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// `tier` path rows in `[from, to)` of every app key that `filter`
+    /// selects, ordered by bucket, capped at `limit` rows (a memory backstop).
+    pub fn paths_for(
+        &self,
+        tier: Tier,
+        filter: AppFilter<'_>,
+        from: i64,
+        to: i64,
+        limit: usize,
+    ) -> Result<Vec<PathRow>, StoreError> {
+        self.with_reader(|c| {
+            let mut stmt = c.prepare_cached(&paths_for_sql(tier, filter))?;
+            let (key, lo, hi) = filter.params();
+            let rows = stmt
+                .query_map((key, lo, hi, from, to, limit as i64), map_path_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// `tier` breakdown rows of one `dim` in `[from, to)` of every app key
+    /// that `filter` selects, busiest first, capped at `limit` rows.
+    pub fn breakdown_for(
+        &self,
+        tier: Tier,
+        filter: AppFilter<'_>,
+        dim: &str,
+        from: i64,
+        to: i64,
+        limit: usize,
+    ) -> Result<Vec<BreakdownRow>, StoreError> {
+        self.with_reader(|c| {
+            let mut stmt = c.prepare_cached(&breakdown_for_sql(tier, filter))?;
+            let (key, lo, hi) = filter.params();
+            let rows = stmt
+                .query_map(
+                    (key, lo, hi, from, to, dim, limit as i64),
+                    map_breakdown_row,
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })

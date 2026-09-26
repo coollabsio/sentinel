@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use store::traffic::{AnalyticsStore, BreakdownRow, PathRow, StatsRow, Tier};
+use store::traffic::{AnalyticsStore, AppFilter, BreakdownRow, PathRow, StatsRow, Tier};
 use traffic::sketches::{LatencyDigest, Uniques};
 
 use crate::AppState;
@@ -72,6 +72,23 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/api/app/{uuid}/traffic/series", get(app_series))
         .route("/api/app/{uuid}/traffic/dashboard", get(app_dashboard))
+        // Per-resource variants: the per-app shapes over the key `{uuid}` and
+        // every `{uuid}-…` key (Compose services, previews), merged with the
+        // same sketch unions — a visitor on two keys counts once.
+        .route(
+            "/api/resource/{uuid}/traffic/overview",
+            get(resource_overview),
+        )
+        .route("/api/resource/{uuid}/traffic/paths", get(resource_paths))
+        .route(
+            "/api/resource/{uuid}/traffic/breakdown/{dimension}",
+            get(resource_breakdown),
+        )
+        .route("/api/resource/{uuid}/traffic/series", get(resource_series))
+        .route(
+            "/api/resource/{uuid}/traffic/dashboard",
+            get(resource_dashboard),
+        )
         // Server-wide variants: same shapes, merged across every app/host.
         .route("/api/traffic/overview", get(server_overview))
         .route("/api/traffic/paths", get(server_paths))
@@ -429,11 +446,42 @@ where
     }
 }
 
+/// Per-resource variant of [`app_series`]: every key of the resource, with a
+/// per-bucket HLL union and t-digest merge across the keys.
+async fn resource_series(
+    Path(uuid): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SeriesQuery>,
+) -> Response {
+    let Some(analytics) = state.analytics.clone() else {
+        return analytics_disabled();
+    };
+    run_series(state, q.range, move |tier, lo, hi| {
+        analytics.stats_for(tier, AppFilter::Resource(&uuid), lo, hi)
+    })
+    .await
+}
+
 async fn overview(
     Path(app): Path<String>,
     State(state): State<Arc<AppState>>,
     Query(q): Query<HistoryQuery>,
 ) -> Response {
+    run_overview(state, Target::App(app), q).await
+}
+
+/// [`overview`] over every key of one resource: counters summed, HLL
+/// sketches unioned, t-digests merged.
+async fn resource_overview(
+    Path(uuid): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
+    run_overview(state, Target::Resource(uuid), q).await
+}
+
+/// Shared body for the per-app and per-resource overview.
+async fn run_overview(state: Arc<AppState>, target: Target, q: HistoryQuery) -> Response {
     let Some(analytics) = state.analytics.clone() else {
         return analytics_disabled();
     };
@@ -452,7 +500,7 @@ async fn overview(
     let result = tokio::task::spawn_blocking(move || {
         let mut rows = Vec::new();
         for (tier, lo, hi) in tier_reads(from, to) {
-            rows.extend(analytics.stats_range(tier, &app, lo, hi)?);
+            rows.extend(target.stats(&analytics, tier, lo, hi)?);
         }
         Ok::<_, store::StoreError>(summarize_stats(&rows))
     })
@@ -470,6 +518,21 @@ async fn paths(
     State(state): State<Arc<AppState>>,
     Query(q): Query<TopQuery>,
 ) -> Response {
+    run_paths(state, Target::App(app), q).await
+}
+
+/// [`paths`] over every key of one resource. Rows group by `(app, path)`, so
+/// each entry keeps its real key (Coolify maps domains per key).
+async fn resource_paths(
+    Path(uuid): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<TopQuery>,
+) -> Response {
+    run_paths(state, Target::Resource(uuid), q).await
+}
+
+/// Shared body for the per-app and per-resource top paths.
+async fn run_paths(state: Arc<AppState>, target: Target, q: TopQuery) -> Response {
     let Some(analytics) = state.analytics.clone() else {
         return analytics_disabled();
     };
@@ -488,10 +551,11 @@ async fn paths(
         Err(e) => return internal_error(e),
     };
     let result = tokio::task::spawn_blocking(move || {
+        let label = target.label();
         let mut rows = Vec::new();
         for (tier, lo, hi) in tier_reads(from, to) {
-            let r = analytics.paths_range(tier, &app, lo, hi, budget)?;
-            warn_if_truncated("paths", &app, r.len(), budget);
+            let r = target.paths(&analytics, tier, lo, hi, budget)?;
+            warn_if_truncated("paths", &label, r.len(), budget);
             rows.extend(r);
         }
         Ok::<_, store::StoreError>(top_paths(rows, limit))
@@ -510,6 +574,25 @@ async fn breakdown(
     State(state): State<Arc<AppState>>,
     Query(q): Query<TopQuery>,
 ) -> Response {
+    run_breakdown(state, Target::App(app), dimension, q).await
+}
+
+/// [`breakdown`] over every key of one resource, merged by value.
+async fn resource_breakdown(
+    Path((uuid, dimension)): Path<(String, String)>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<TopQuery>,
+) -> Response {
+    run_breakdown(state, Target::Resource(uuid), dimension, q).await
+}
+
+/// Shared body for the per-app and per-resource breakdown.
+async fn run_breakdown(
+    state: Arc<AppState>,
+    target: Target,
+    dimension: String,
+    q: TopQuery,
+) -> Response {
     let Some(analytics) = state.analytics.clone() else {
         return analytics_disabled();
     };
@@ -529,9 +612,10 @@ async fn breakdown(
     };
     let result = tokio::task::spawn_blocking(move || {
         let mut rows = Vec::new();
+        let label = target.label();
         for (tier, lo, hi) in tier_reads(from, to) {
-            let r = analytics.breakdown_range(tier, &app, &dimension, lo, hi, budget)?;
-            warn_if_truncated("breakdown", &app, r.len(), budget);
+            let r = target.breakdown(&analytics, tier, &dimension, lo, hi, budget)?;
+            warn_if_truncated("breakdown", &label, r.len(), budget);
             rows.extend(r);
         }
         Ok::<_, store::StoreError>(top_breakdown(rows, limit))
@@ -843,21 +927,39 @@ where
 
 // --- Aggregate dashboard ----------------------------------------------------
 
-/// Selects whether a dashboard query runs server-wide (every app/host) or is
-/// filtered to one app, unifying the two store method families behind one
-/// interface so [`build_dashboard`] keeps a single code path. Each method is
-/// exactly the call the corresponding standalone handler already makes.
+/// Selects whether a query runs server-wide (every app/host), on one exact app
+/// key, or on every key of one Coolify resource. It puts the store method
+/// families behind one interface so the handlers and [`build_dashboard`] keep
+/// a single code path. Each method is exactly the call the corresponding
+/// standalone handler makes.
 enum Target {
     Server,
+    /// One exact app key (`/api/app/{uuid}/…`).
     App(String),
+    /// The key `{uuid}` and every `{uuid}-…` key (`/api/resource/{uuid}/…`):
+    /// Compose services, previews and Compose previews of one resource. Their
+    /// rows go through the same merges as one app's rows, so a visitor seen on
+    /// two keys counts once.
+    Resource(String),
 }
 
 impl Target {
-    /// Label for the truncation warning: `*` server-wide, else the app.
-    fn label(&self) -> &str {
+    /// Label for the truncation warning: `*` server-wide, the key for one
+    /// app, `{uuid}-*` for a resource.
+    fn label(&self) -> String {
         match self {
-            Target::Server => "*",
-            Target::App(app) => app,
+            Target::Server => "*".to_string(),
+            Target::App(app) => app.clone(),
+            Target::Resource(uuid) => format!("{uuid}-*"),
+        }
+    }
+
+    /// The store key filter, `None` server-wide.
+    fn filter(&self) -> Option<AppFilter<'_>> {
+        match self {
+            Target::Server => None,
+            Target::App(app) => Some(AppFilter::Exact(app)),
+            Target::Resource(uuid) => Some(AppFilter::Resource(uuid)),
         }
     }
 
@@ -868,9 +970,9 @@ impl Target {
         lo: i64,
         hi: i64,
     ) -> Result<Vec<StatsRow>, store::StoreError> {
-        match self {
-            Target::Server => a.stats_rows_between(tier, lo, hi),
-            Target::App(app) => a.stats_range(tier, app, lo, hi),
+        match self.filter() {
+            None => a.stats_rows_between(tier, lo, hi),
+            Some(f) => a.stats_for(tier, f, lo, hi),
         }
     }
 
@@ -882,9 +984,9 @@ impl Target {
         hi: i64,
         budget: usize,
     ) -> Result<Vec<PathRow>, store::StoreError> {
-        match self {
-            Target::Server => a.paths_rows_between(tier, lo, hi),
-            Target::App(app) => a.paths_range(tier, app, lo, hi, budget),
+        match self.filter() {
+            None => a.paths_rows_between(tier, lo, hi),
+            Some(f) => a.paths_for(tier, f, lo, hi, budget),
         }
     }
 
@@ -897,9 +999,9 @@ impl Target {
         hi: i64,
         budget: usize,
     ) -> Result<Vec<BreakdownRow>, store::StoreError> {
-        match self {
-            Target::Server => a.breakdown_dim_rows_between(tier, dim, lo, hi, budget),
-            Target::App(app) => a.breakdown_range(tier, app, dim, lo, hi, budget),
+        match self.filter() {
+            None => a.breakdown_dim_rows_between(tier, dim, lo, hi, budget),
+            Some(f) => a.breakdown_for(tier, f, dim, lo, hi, budget),
         }
     }
 }
@@ -939,12 +1041,13 @@ fn build_dashboard(
     // Paths. Only the per-app read applies the `LIMIT budget`; the server-wide
     // `paths_rows_between` is unbounded, so a truncation warning there would be
     // a false signal (nothing was cut).
-    let path_budget_applies = matches!(target, Target::App(_));
+    let path_budget_applies = target.filter().is_some();
+    let label = target.label();
     let mut path_rows = Vec::new();
     for (tier, lo, hi) in tier_reads(p.from, p.to) {
         let r = target.paths(analytics, tier, lo, hi, MAX_SCAN_ROWS)?;
         if path_budget_applies {
-            warn_if_truncated("dashboard_paths", target.label(), r.len(), MAX_SCAN_ROWS);
+            warn_if_truncated("dashboard_paths", &label, r.len(), MAX_SCAN_ROWS);
         }
         path_rows.extend(r);
     }
@@ -956,12 +1059,7 @@ fn build_dashboard(
         let mut rows = Vec::new();
         for (tier, lo, hi) in tier_reads(p.from, p.to) {
             let r = target.breakdown(analytics, tier, name, lo, hi, MAX_SCAN_ROWS)?;
-            warn_if_truncated(
-                "dashboard_breakdown",
-                target.label(),
-                r.len(),
-                MAX_SCAN_ROWS,
-            );
+            warn_if_truncated("dashboard_breakdown", &label, r.len(), MAX_SCAN_ROWS);
             rows.extend(r);
         }
         Ok(top_breakdown(rows, p.breakdown_limit))
@@ -1054,6 +1152,16 @@ async fn app_dashboard(
     Query(q): Query<DashboardQuery>,
 ) -> Response {
     run_dashboard(state, Target::App(app), false, q).await
+}
+
+/// Per-resource dashboard: the per-app shape (`apps` omitted, `apps_limit`
+/// ignored) over every key of the resource.
+async fn resource_dashboard(
+    Path(uuid): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DashboardQuery>,
+) -> Response {
+    run_dashboard(state, Target::Resource(uuid), false, q).await
 }
 
 /// Shared body for both dashboard handlers: resolve every knob (any invalid

@@ -1173,3 +1173,286 @@ async fn app_dashboard_ignores_invalid_apps_limit() {
     assert_eq!(s, StatusCode::OK);
     assert!(j.get("apps").is_none());
 }
+
+// --- Per-resource routes ----------------------------------------------------
+
+/// The resource `res` owns the keys `res` and `res-web`. Both saw the same
+/// single client IP. `resx` (no dash) is a different resource and must never
+/// be merged in.
+fn seeded_resource() -> AnalyticsStore {
+    let a = AnalyticsStore::open_in_memory().unwrap();
+    a.flush_window(
+        &[
+            stats(
+                BUCKET,
+                "res",
+                "h1",
+                10,
+                digest_bytes(&ramp(1, 100)),
+                uniques_bytes(5..6),
+            ),
+            stats(
+                NEXT_BUCKET,
+                "res-web",
+                "h1",
+                30,
+                digest_bytes(&ramp(101, 200)),
+                uniques_bytes(5..6),
+            ),
+            stats(
+                BUCKET,
+                "resx",
+                "h1",
+                1_000,
+                digest_bytes(&ramp(5_000, 6_000)),
+                uniques_bytes(100..200),
+            ),
+        ],
+        &[
+            path_row(BUCKET, "res", "/", 5, digest_bytes(&ramp(1, 10))),
+            path_row(NEXT_BUCKET, "res", "/", 1, digest_bytes(&ramp(1, 10))),
+            path_row(BUCKET, "res-web", "/", 7, digest_bytes(&ramp(1, 10))),
+            path_row(BUCKET, "resx", "/", 900, digest_bytes(&ramp(1, 10))),
+        ],
+        &[
+            bd(BUCKET, "res", "US", 5),
+            bd(NEXT_BUCKET, "res-web", "US", 4),
+            bd(BUCKET, "res-web", "DE", 3),
+            bd(BUCKET, "resx", "US", 100),
+        ],
+    )
+    .unwrap();
+    a
+}
+
+async fn get_res(uri: &str) -> (StatusCode, serde_json::Value) {
+    get_with(state(Some(seeded_resource())), uri).await
+}
+
+/// The same visitor on two keys of one resource counts once. Adding the
+/// per-key app overviews (what Coolify did before) counts it twice.
+#[tokio::test]
+async fn resource_overview_unions_visitors_and_merges_latency_across_keys() {
+    let (s, j) = get_res(&format!("/api/resource/res/traffic/overview?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j["requests"], 40, "res 10 + res-web 30; resx excluded");
+    assert_eq!(j["bytes_in"], 400);
+    assert_eq!(j["status"]["s2xx"], 36);
+    assert_eq!(j["unique_visitors"], 1, "one IP on two keys is one visitor");
+
+    let mut summed = 0;
+    for key in ["res", "res-web"] {
+        let (_, a) = get_res(&format!("/api/app/{key}/traffic/overview?{RANGE}")).await;
+        summed += a["unique_visitors"].as_u64().unwrap();
+    }
+    assert_eq!(summed, 2, "the per-key sum double-counts the visitor");
+
+    // Digests merged: `res` alone is 1..=100 ms, `res-web` alone 101..=200 ms.
+    let p50 = j["latency"]["p50"].as_f64().unwrap();
+    let p99 = j["latency"]["p99"].as_f64().unwrap();
+    assert!((90.0..=110.0).contains(&p50), "p50 {p50}");
+    assert!((190.0..=200.0).contains(&p99), "p99 {p99}");
+}
+
+/// Paths group by `(app, path)`: every entry keeps its real key.
+#[tokio::test]
+async fn resource_paths_keep_the_real_app_key() {
+    let (s, j) = get_res(&format!("/api/resource/res/traffic/paths?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+    let rows = j.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{j}");
+    assert_eq!(rows[0]["app"], "res-web");
+    assert_eq!(rows[0]["path"], "/");
+    assert_eq!(rows[0]["requests"], 7);
+    assert_eq!(rows[1]["app"], "res");
+    assert_eq!(rows[1]["requests"], 6, "res `/` summed across buckets");
+}
+
+/// Breakdowns merge by value across the keys; `resx` stays out.
+#[tokio::test]
+async fn resource_breakdown_merges_values_across_keys() {
+    let (s, j) = get_res(&format!(
+        "/api/resource/res/traffic/breakdown/country?{RANGE}"
+    ))
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        j,
+        serde_json::json!([
+            { "value": "US", "requests": 9, "bytes_out": 900 },
+            { "value": "DE", "requests": 3, "bytes_out": 300 },
+        ])
+    );
+}
+
+/// Series: one output bucket holds rows of two keys with the same visitor,
+/// so that bucket reports one visitor and the summed requests.
+#[tokio::test]
+async fn resource_series_unions_visitors_per_bucket() {
+    let a = AnalyticsStore::open_in_memory().unwrap();
+    let bucket = floor_to(now_ms(), MIN_MS);
+    a.flush_window(
+        &[
+            stats(
+                bucket,
+                "res",
+                "h1",
+                10,
+                digest_bytes(&ramp(1, 10)),
+                uniques_bytes(5..6),
+            ),
+            stats(
+                bucket,
+                "res-web",
+                "h2",
+                20,
+                digest_bytes(&ramp(1, 10)),
+                uniques_bytes(5..6),
+            ),
+            stats(
+                bucket,
+                "resx",
+                "h1",
+                500,
+                digest_bytes(&ramp(1, 10)),
+                uniques_bytes(100..200),
+            ),
+        ],
+        &[],
+        &[],
+    )
+    .unwrap();
+    let (s, j) = get_with(state(Some(a)), "/api/resource/res/traffic/series").await;
+    assert_eq!(s, StatusCode::OK);
+    let buckets = j.as_array().unwrap();
+    assert_eq!(buckets.len(), 24);
+    let hit: Vec<_> = buckets.iter().filter(|b| b["requests"] != 0).collect();
+    assert_eq!(hit.len(), 1, "{j}");
+    assert_eq!(hit[0]["requests"], 30);
+    assert_eq!(hit[0]["unique_visitors"], 1);
+}
+
+/// Every JSON object key path, so two payloads can be compared by shape.
+fn shape(v: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+    if let Some(map) = v.as_object() {
+        for (k, child) in map {
+            let path = format!("{prefix}.{k}");
+            out.push(path.clone());
+            shape(child, &path, out);
+        }
+    } else if let Some(first) = v.as_array().and_then(|a| a.first()) {
+        shape(first, &format!("{prefix}[]"), out);
+    }
+}
+
+/// The resource dashboard has exactly the per-app dashboard's shape (no
+/// `apps`), and its members use the resource merges.
+#[tokio::test]
+async fn resource_dashboard_has_the_app_dashboard_shape() {
+    let (s, r) = get_res(&format!(
+        "/api/resource/res/traffic/dashboard?{RANGE}&apps_limit=0"
+    ))
+    .await;
+    assert_eq!(s, StatusCode::OK, "apps_limit is ignored, like per-app");
+    let (s, a) = get_res(&format!("/api/app/res/traffic/dashboard?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (mut rs, mut as_) = (Vec::new(), Vec::new());
+    shape(&r, "", &mut rs);
+    shape(&a, "", &mut as_);
+    rs.sort();
+    as_.sort();
+    assert_eq!(rs, as_);
+    assert!(r.get("apps").is_none());
+
+    assert_eq!(r["overview"]["requests"], 40);
+    assert_eq!(r["overview"]["unique_visitors"], 1);
+    assert_eq!(r["paths"].as_array().unwrap().len(), 2);
+    assert_eq!(r["breakdowns"]["country"][0]["requests"], 9);
+    assert_eq!(r["series"].as_array().unwrap().len(), 24);
+}
+
+/// A valid uuid without data answers 200 with zeroed/empty bodies, never
+/// 404 — Coolify reads 404 as "old Sentinel, fall back".
+#[tokio::test]
+async fn resource_routes_answer_200_for_a_uuid_without_data() {
+    for uri in [
+        "/api/resource/nodata/traffic/overview",
+        "/api/resource/nodata/traffic/paths",
+        "/api/resource/nodata/traffic/breakdown/country",
+        "/api/resource/nodata/traffic/series",
+        "/api/resource/nodata/traffic/dashboard",
+    ] {
+        let (s, _) = get_res(uri).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+    }
+    let (_, j) = get_res("/api/resource/nodata/traffic/overview").await;
+    assert_eq!(j["requests"], 0);
+}
+
+/// `%`, `_` and `\` in the uuid are literal: `re%` and `re_` select no keys
+/// although `res` and `res-web` exist.
+#[tokio::test]
+async fn resource_uuid_wildcards_are_literal() {
+    for uuid in ["re%25", "re_", "re%5C", "r%25-web"] {
+        let (s, j) = get_res(&format!("/api/resource/{uuid}/traffic/overview?{RANGE}")).await;
+        assert_eq!(s, StatusCode::OK, "{uuid}");
+        assert_eq!(j["requests"], 0, "{uuid}");
+    }
+}
+
+/// The resource routes accept and reject the same inputs as the app routes:
+/// same query validation, same path handling, same auth, same disabled 404.
+#[tokio::test]
+async fn resource_routes_validate_like_the_app_routes() {
+    for suffix in [
+        "overview?from=bogus",
+        "paths?to=bogus",
+        "paths?limit=abc",
+        "breakdown/country?limit=0",
+        "series?range=bogus",
+        "dashboard?paths_limit=0",
+        "dashboard?range=bogus",
+        "overview?from=&to=",
+        "paths?limit=",
+        "dashboard?apps_limit=abc",
+    ] {
+        for uuid in ["res", "%FF", "a%2Fb"] {
+            let (app, _) = get_res(&format!("/api/app/{uuid}/traffic/{suffix}")).await;
+            let (res, _) = get_res(&format!("/api/resource/{uuid}/traffic/{suffix}")).await;
+            assert_eq!(res, app, "{uuid} {suffix}");
+        }
+    }
+    // Empty segment: no route matches, exactly like the app routes.
+    let (app, _) = get_res("/api/app//traffic/overview").await;
+    let (res, _) = get_res("/api/resource//traffic/overview").await;
+    assert_eq!(res, app);
+
+    // Invalid UTF-8 in the uuid is a 400 from the path extractor.
+    let (s, _) = get_res("/api/resource/%FF/traffic/overview").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // No token: 401, like every other route.
+    let res = crate::router(state(Some(seeded_resource())))
+        .oneshot(
+            Request::builder()
+                .uri("/api/resource/res/traffic/overview")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    for uri in [
+        "/api/resource/res/traffic/overview",
+        "/api/resource/res/traffic/paths",
+        "/api/resource/res/traffic/breakdown/country",
+        "/api/resource/res/traffic/series",
+        "/api/resource/res/traffic/dashboard",
+    ] {
+        let (s, j) = get_with(state(None), uri).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(j["error"], "traffic analytics not enabled", "{uri}");
+    }
+}

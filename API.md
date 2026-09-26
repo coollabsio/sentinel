@@ -836,6 +836,42 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ---
 
+### Get Resource Traffic
+
+A Coolify resource writes traffic under its own key `{uuid}` and under every key that starts with `{uuid}-`: Compose services (`{uuid}-{service}`), previews (`{uuid}-pr-12`), and Compose previews (`{uuid}-12-{service}`). These endpoints read all of those keys and merge them with the same server-side merges as the server-wide endpoints. Counters are summed, unique-visitor HyperLogLog++ sketches are unioned (a visitor who hits two keys counts once), and latency t-digests are merged for `p50`/`p95`/`p99`. A key such as `{uuid}x…` (no dash) is not included.
+
+**Endpoints** (each one has the same query parameters, validation, limits, and response shape as its per-app counterpart):
+
+| Endpoint | Per-app counterpart |
+|----------|---------------------|
+| `GET /api/resource/:uuid/traffic/overview` | [Get App Traffic Overview](#get-app-traffic-overview) |
+| `GET /api/resource/:uuid/traffic/paths` | [Get App Top Paths](#get-app-top-paths) |
+| `GET /api/resource/:uuid/traffic/breakdown/:dimension` | [Get App Dimension Breakdown](#get-app-dimension-breakdown) |
+| `GET /api/resource/:uuid/traffic/series` | [Get App Status-Class Time Series](#get-app-status-class-time-series) |
+| `GET /api/resource/:uuid/traffic/dashboard` | [Get Aggregate Dashboard](#get-aggregate-dashboard), per-app variant (`apps` omitted, `apps_limit` ignored) |
+
+**Path Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `uuid` | string | Yes | Coolify resource UUID. Matched literally (`%` and `_` are not wildcards) |
+
+Merge rules per endpoint:
+- `overview`: one merged object over every row of every key.
+- `paths`: grouped by `(app, path)`. Each entry keeps its real key in `app` (for example `{uuid}-web`), so the same path on two keys stays two entries.
+- `breakdown`: merged by `value` across all keys.
+- `series`: merged per bucket; `unique_visitors` and `p95` are a per-bucket sketch merge across all keys.
+- `dashboard`: each member follows the rule of its standalone endpoint above.
+
+A resource with no data in range returns `200` with zeroed/empty bodies. Sentinel versions without these routes return `404`, so a client can fall back to the per-app endpoints.
+
+**Example:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "http://localhost:8888/api/resource/jc4wsgs/traffic/overview?from=2024-01-15T00:00:00Z"
+```
+
+---
+
 ## Debug Endpoints
 
 Debug endpoints are only available when the `DEBUG` environment variable is set to `true`.

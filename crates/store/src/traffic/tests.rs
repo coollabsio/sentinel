@@ -809,3 +809,221 @@ fn paths_and_breakdown_flush_and_range() {
     assert_eq!(got_breakdown.len(), 1);
     assert_eq!(got_breakdown[0].value, "US");
 }
+
+/// Keys a resource filter must select (`u`, `u-…`) and keys it must not
+/// (`ux…` without the dash, other resources, keys that sort next to the
+/// range bounds).
+const RESOURCE_KEYS: [(&str, bool); 10] = [
+    ("u", true),
+    ("u-web", true),
+    ("u-pr-12", true),
+    ("u-12-web", true),
+    ("u-", true),
+    ("ux", false),
+    ("ux-web", false),
+    ("u.", false),
+    ("u,", false),
+    ("v-web", false),
+];
+
+fn seed_keys(s: &AnalyticsStore, tier: Tier, keys: &[&str]) {
+    let stats: Vec<_> = keys
+        .iter()
+        .map(|k| stats_row(60_000, k, "h", 1, vec![], vec![]))
+        .collect();
+    let paths: Vec<_> = keys.iter().map(|k| path_row(60_000, k, "/", 1)).collect();
+    let breakdown: Vec<_> = keys
+        .iter()
+        .map(|k| breakdown_row(60_000, k, "country", "US", 1))
+        .collect();
+    s.write_rows(tier, &stats, &paths, &breakdown).unwrap();
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// `AppFilter::Resource("u")` selects `u` and every `u-…` key in all three
+/// tables and all three tiers, and nothing else. Every row keeps its real
+/// `app` key.
+#[test]
+fn resource_filter_selects_the_uuid_and_its_dash_keys_only() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    let keys: Vec<&str> = RESOURCE_KEYS.iter().map(|(k, _)| *k).collect();
+    let want = sorted(
+        RESOURCE_KEYS
+            .iter()
+            .filter(|(_, m)| *m)
+            .map(|(k, _)| k.to_string())
+            .collect(),
+    );
+    for tier in [Tier::M1, Tier::H1, Tier::D1] {
+        seed_keys(&s, tier, &keys);
+        let f = AppFilter::Resource("u");
+
+        let stats = s.stats_for(tier, f, 0, i64::MAX).unwrap();
+        assert_eq!(
+            sorted(stats.into_iter().map(|r| r.app).collect()),
+            want,
+            "{tier:?}"
+        );
+        let paths = s.paths_for(tier, f, 0, i64::MAX, 100).unwrap();
+        assert_eq!(
+            sorted(paths.into_iter().map(|r| r.app).collect()),
+            want,
+            "{tier:?}"
+        );
+        let bd = s
+            .breakdown_for(tier, f, "country", 0, i64::MAX, 100)
+            .unwrap();
+        assert_eq!(
+            sorted(bd.into_iter().map(|r| r.app).collect()),
+            want,
+            "{tier:?}"
+        );
+    }
+}
+
+/// The exact filter is unchanged: it selects one key, never `u-…`.
+#[test]
+fn exact_filter_selects_one_key() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    let keys: Vec<&str> = RESOURCE_KEYS.iter().map(|(k, _)| *k).collect();
+    seed_keys(&s, Tier::M1, &keys);
+    let got = s.stats_range(Tier::M1, "u", 0, i64::MAX).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].app, "u");
+    assert_eq!(
+        s.paths_range(Tier::M1, "u", 0, i64::MAX, 100)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        s.breakdown_range(Tier::M1, "u", "country", 0, i64::MAX, 100)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// The resource filter is a byte range, not a `LIKE` pattern: `%`, `_` and
+/// `\` in the uuid are literal characters.
+#[test]
+fn resource_filter_treats_like_wildcards_as_literals() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    seed_keys(
+        &s,
+        Tier::M1,
+        &[
+            "a%", "a%-web", "ab", "ab-web", "a_-web", "a\\-web", "abc-web",
+        ],
+    );
+    let apps = |uuid: &str| {
+        sorted(
+            s.stats_for(Tier::M1, AppFilter::Resource(uuid), 0, i64::MAX)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.app)
+                .collect(),
+        )
+    };
+    assert_eq!(apps("a%"), vec!["a%", "a%-web"]);
+    assert_eq!(apps("a_"), vec!["a_-web"]);
+    assert_eq!(apps("a\\"), vec!["a\\-web"]);
+    assert_eq!(apps("a"), Vec::<String>::new());
+    assert_eq!(apps("ab"), vec!["ab", "ab-web"]);
+}
+
+/// The bucket window still applies to every selected key.
+#[test]
+fn resource_filter_respects_the_bucket_window() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    s.flush_window(
+        &[
+            stats_row(0, "u", "h", 1, vec![], vec![]),
+            stats_row(60_000, "u-web", "h", 2, vec![], vec![]),
+            stats_row(120_000, "u-web", "h", 4, vec![], vec![]),
+        ],
+        &[],
+        &[],
+    )
+    .unwrap();
+    let got = s
+        .stats_for(Tier::M1, AppFilter::Resource("u"), 60_000, 120_000)
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].requests, 2);
+}
+
+/// The resource query must read the `(app, bucket…)` index of each table in
+/// each tier, never a full scan and never the primary key's bucket range
+/// (which reads every app's rows). Runs on the bundled SQLite, so a planner
+/// change in an upgrade shows up here.
+#[test]
+fn resource_queries_use_the_app_index() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    for tier in [Tier::M1, Tier::H1, Tier::D1] {
+        let sfx = suffix(tier);
+        let f = AppFilter::Resource("u");
+        for (sql, index, n) in [
+            (
+                stats_for_sql(tier, f),
+                format!("idx_ts_{sfx}_app_bucket"),
+                5,
+            ),
+            (
+                paths_for_sql(tier, f),
+                format!("idx_tp_{sfx}_app_bucket"),
+                6,
+            ),
+            (
+                breakdown_for_sql(tier, f),
+                format!("idx_tb_{sfx}_app_bucket"),
+                7,
+            ),
+        ] {
+            let plan = s
+                .with_reader(|c| {
+                    let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let params: Vec<i64> = vec![0; n];
+                    let rows = stmt
+                        .query_map(rusqlite::params_from_iter(params), |r| {
+                            r.get::<_, String>(3)
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows.join(" | "))
+                })
+                .unwrap();
+            assert!(
+                plan.contains("MULTI-INDEX OR")
+                    && plan.contains(&format!("USING INDEX {index} (app=?"))
+                    && plan.contains(&format!("USING INDEX {index} (app>? AND app<?)")),
+                "{tier:?} {index}: {plan}"
+            );
+            assert!(!plan.contains("SCAN traffic_"), "{plan}");
+            assert!(!plan.contains("sqlite_autoindex"), "{plan}");
+        }
+
+        // The exact-key query keeps its full `(app, bucket)` index seek.
+        let sql = stats_for_sql(tier, AppFilter::Exact("u"));
+        let plan = s
+            .with_reader(|c| {
+                let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(vec![0i64; 5]), |r| {
+                        r.get::<_, String>(3)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows.join(" | "))
+            })
+            .unwrap();
+        assert!(
+            plan.contains(&format!(
+                "USING INDEX idx_ts_{sfx}_app_bucket (app=? AND bucket>? AND bucket<?)"
+            )),
+            "{plan}"
+        );
+    }
+}

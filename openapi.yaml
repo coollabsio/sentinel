@@ -731,6 +731,171 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /api/resource/{uuid}/traffic/overview:
+    get:
+      summary: Get resource traffic overview
+      description: |
+        Same shape as the per-app overview, over the key `{uuid}` and every
+        `{uuid}-…` key of one Coolify resource. Counters are summed, HLL
+        sketches are unioned (a visitor on two keys counts once), and
+        t-digests are merged for the percentiles. A resource with no data in
+        range returns 200 with every counter zeroed. Sentinel versions
+        without this route return 404.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/ResourceUuid'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+      responses:
+        '200':
+          description: Resource traffic overview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrafficOverview'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/resource/{uuid}/traffic/paths:
+    get:
+      summary: Get resource top paths
+      description: |
+        Same shape as the per-app top paths, over every key of one resource.
+        Entries group by `(app, path)` and keep the real key in `app`, so the
+        same path on two keys stays two entries.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/ResourceUuid'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Top paths for the resource
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TrafficPath'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/resource/{uuid}/traffic/breakdown/{dimension}:
+    get:
+      summary: Get resource dimension breakdown
+      description: |
+        Same shape as the per-app breakdown, over every key of one resource,
+        merged by value. An unrecognized dimension returns an empty array.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/ResourceUuid'
+        - name: dimension
+          in: path
+          required: true
+          description: Same values as the per-app breakdown.
+          schema:
+            type: string
+          example: country
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Top values of the dimension for the resource
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TrafficBreakdownEntry'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/resource/{uuid}/traffic/series:
+    get:
+      summary: Get resource status-class time series
+      description: |
+        Same shape as the per-app series, over every key of one resource.
+        Each bucket is merged across the keys: counters summed,
+        `unique_visitors` a per-bucket HLL union, `p95` a per-bucket t-digest
+        merge.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/ResourceUuid'
+        - $ref: '#/components/parameters/Range'
+      responses:
+        '200':
+          description: Status-class time series for the resource
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TrafficSeriesBucket'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/resource/{uuid}/traffic/dashboard:
+    get:
+      summary: Get aggregate traffic dashboard (per resource)
+      description: |
+        Same shape as the per-app dashboard (`apps` omitted, `apps_limit`
+        ignored), over every key of one resource. Each member uses the merge
+        of its standalone resource endpoint.
+      tags:
+        - Traffic Analytics
+      parameters:
+        - $ref: '#/components/parameters/ResourceUuid'
+        - $ref: '#/components/parameters/FromDate'
+        - $ref: '#/components/parameters/ToDate'
+        - $ref: '#/components/parameters/Range'
+        - $ref: '#/components/parameters/PathsLimit'
+        - $ref: '#/components/parameters/BreakdownLimit'
+      responses:
+        '200':
+          description: Aggregate dashboard for one resource (no leaderboard)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrafficDashboard'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/TrafficNotEnabledError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /api/stats:
     get:
       summary: Get database statistics
@@ -792,6 +957,19 @@ components:
       in: path
       required: true
       description: Coolify app UUID (or host, for Caddy — see README.md)
+      schema:
+        type: string
+      example: jc4wsgs
+
+    ResourceUuid:
+      name: uuid
+      in: path
+      required: true
+      description: |
+        Coolify resource UUID. Selects the key `{uuid}` and every key that
+        starts with `{uuid}-` (Compose services, previews, Compose previews).
+        Matched literally: `%` and `_` are not wildcards, and `{uuid}x…`
+        (no dash) is not selected.
       schema:
         type: string
       example: jc4wsgs
