@@ -3,15 +3,18 @@
 //! Main traffic loop: tail, parse, enrich, aggregate, and flush. Polling and
 //! flush run on separate timers; shutdown drains and awaits one final flush.
 //! Input and storage failures are logged and skipped so traffic analytics
-//! cannot take down the agent.
+//! cannot take down the agent. If the access log cannot be opened at startup,
+//! the service retries the open with a bounded backoff until it succeeds or
+//! shutdown arrives.
 
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use store::traffic::AnalyticsStore;
 
-use crate::TrafficError;
 use crate::aggregator::{Aggregator, WindowRollup};
 use crate::enrich::{CountryLookup, Enricher};
 use crate::parser::{ProxyType, detect, parse_line};
@@ -25,6 +28,14 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// How often the window boundary is re-checked. Finer than the window itself
 /// so a closed window is flushed within a second of closing.
 const DEFAULT_FLUSH_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// First delay before the access log open is tried again, when the open at
+/// startup failed. The same order as [`DEFAULT_FLUSH_CHECK_INTERVAL`]: a log
+/// that shows up a moment late loses about a second of traffic.
+const OPEN_RETRY_INITIAL: Duration = Duration::from_secs(1);
+/// Cap for the doubling open-retry delay. A log that is missing for a long
+/// time costs one `open(2)` every 30s, and its first lines are still read
+/// (see [`TrafficService::wait_for_access_log`]).
+const OPEN_RETRY_MAX: Duration = Duration::from_secs(30);
 /// User-Agent parse cache capacity. Not config-exposed: a few thousand
 /// distinct UAs per minute is already atypical, and the entries are tiny.
 const UA_CACHE_CAP: usize = 1024;
@@ -46,6 +57,11 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Doubles `current`, capped at `max`: 1s, 2s, 4s, 8s, 16s, 30s, 30s, ...
+fn next_open_retry_delay(current: Duration, max: Duration) -> Duration {
+    current.saturating_mul(2).min(max)
 }
 
 /// Resolves the configured `TRAFFIC_PROXY_TYPE` string. An unrecognized value
@@ -70,7 +86,14 @@ fn parse_proxy_type(s: &str) -> ProxyType {
 /// The traffic-analytics ingestion service.
 pub struct TrafficService {
     store: AnalyticsStore,
-    tailer: Tailer,
+    access_log_path: PathBuf,
+    /// `None` until the access log opens. Only `None` if the open in
+    /// [`Self::build`] failed; [`Self::run`] then retries it before it tails.
+    tailer: Option<Tailer>,
+    /// Error kind of the last failed open, `None` once the log is open.
+    last_open_error: Option<ErrorKind>,
+    open_retry_initial: Duration,
+    open_retry_max: Duration,
     enricher: Enricher,
     aggregator: Aggregator,
     /// Starts at whatever config resolved to (possibly [`ProxyType::Auto`]);
@@ -98,13 +121,14 @@ impl TrafficService {
     /// Builds the service with the production cadence (1-minute windows, a
     /// 250ms poll, a 1s flush check).
     ///
-    /// Fails only if the access log at `cfg.traffic.access_log_path` cannot be
-    /// opened; every other kind of failure is handled at runtime instead.
+    /// Never fails. If the access log at `cfg.traffic.access_log_path` cannot
+    /// be opened now, a warning is logged and [`Self::run`] retries the open
+    /// with a backoff. Every other kind of failure is handled at runtime too.
     pub async fn build(
         cfg: &config::Config,
         store: AnalyticsStore,
         geo: Arc<dyn CountryLookup>,
-    ) -> Result<Self, TrafficError> {
+    ) -> Self {
         Self::build_with_intervals(
             cfg,
             store,
@@ -126,16 +150,23 @@ impl TrafficService {
         window_ms: i64,
         poll_interval: Duration,
         flush_check_interval: Duration,
-    ) -> Result<Self, TrafficError> {
+    ) -> Self {
         let path = &cfg.traffic.access_log_path;
-        let tailer = Tailer::open(path).map_err(|e| {
-            tracing::error!(
-                error = %e,
-                path = %path.display(),
-                "failed to open proxy access log"
-            );
-            TrafficError::Io(e)
-        })?;
+        let (tailer, last_open_error) = match Tailer::open(path) {
+            Ok(tailer) => (Some(tailer), None),
+            Err(e) => {
+                // Logged once here. The retry loop logs again at warn level
+                // only if the error kind changes.
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    retry_secs = OPEN_RETRY_INITIAL.as_secs(),
+                    "proxy access log cannot be opened; traffic ingest waits and retries \
+                     (check that the proxy log directory is mounted and JSON access logging is on)"
+                );
+                (None, Some(e.kind()))
+            }
+        };
 
         let proxy = parse_proxy_type(&cfg.traffic.proxy_type);
         tracing::info!(
@@ -143,12 +174,17 @@ impl TrafficService {
             ?proxy,
             topn = cfg.traffic.topn,
             sample_threshold = cfg.traffic.sample_threshold,
+            waiting_for_access_log = tailer.is_none(),
             "traffic service ready"
         );
 
-        Ok(Self {
+        Self {
             store,
+            access_log_path: path.clone(),
             tailer,
+            last_open_error,
+            open_retry_initial: OPEN_RETRY_INITIAL,
+            open_retry_max: OPEN_RETRY_MAX,
             enricher: Enricher::new(geo, UA_CACHE_CAP),
             aggregator: Aggregator::new(cfg.traffic.topn as usize),
             proxy,
@@ -161,7 +197,15 @@ impl TrafficService {
             sample_count: 0,
             dropped: Arc::new(AtomicU64::new(0)),
             processed: Arc::new(AtomicU64::new(0)),
-        })
+        }
+    }
+
+    /// Replaces the open-retry backoff, so tests do not wait whole seconds.
+    #[cfg(test)]
+    fn with_open_retry(mut self, initial: Duration, max: Duration) -> Self {
+        self.open_retry_initial = initial;
+        self.open_retry_max = max;
+        self
     }
 
     /// Shared handle on the processed-event counter, taken before `run`
@@ -176,6 +220,12 @@ impl TrafficService {
     /// the partial window and returns. Never panics, never propagates an
     /// error: every failure mode is logged and stepped over.
     pub async fn run(mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        if self.tailer.is_none() && !self.wait_for_access_log(&mut shutdown).await {
+            // Nothing was tailed, so there is no window to flush.
+            tracing::info!("traffic service stopped before the access log opened");
+            return;
+        }
+
         self.current_bucket = bucket_of(now_ms(), self.window_ms);
 
         let mut poll = tokio::time::interval(self.poll_interval);
@@ -230,13 +280,85 @@ impl TrafficService {
         }
     }
 
+    /// Tries to open the access log again with a doubling backoff
+    /// (`open_retry_initial` up to `open_retry_max`) until it opens, and
+    /// stores the tailer. Returns `false` if `shutdown` changes (or its
+    /// sender is dropped) first; the wait between attempts ends at once then.
+    ///
+    /// Every error kind is retried, not only `NotFound`: a permission or
+    /// mount problem can be fixed on the host while Sentinel runs, and a
+    /// stopped ingest task cannot recover without a restart. The real error
+    /// is logged at warn level each time its kind changes, and at debug
+    /// level on the other attempts, so a long wait does not spam the log.
+    ///
+    /// If the last failed attempt was `NotFound`, the file did not exist at
+    /// most `open_retry_max` ago. All its content is then new, so it is read
+    /// from offset 0 and the first lines the proxy wrote are not lost. After
+    /// any other error the file may hold old history, so the open seeks to
+    /// EOF, the same as an open at startup.
+    async fn wait_for_access_log(
+        &mut self,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
+        let started = tokio::time::Instant::now();
+        let mut delay = self.open_retry_initial;
+        // The first attempt was in `build`.
+        let mut attempts = 1u32;
+
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return false,
+                _ = tokio::time::sleep(delay) => {}
+            }
+
+            attempts = attempts.saturating_add(1);
+            let from_start = self.last_open_error == Some(ErrorKind::NotFound);
+            match open_access_log(&self.access_log_path, from_start) {
+                Ok(tailer) => {
+                    tracing::info!(
+                        path = %self.access_log_path.display(),
+                        attempts,
+                        waited_secs = started.elapsed().as_secs(),
+                        from_start,
+                        "proxy access log opened; traffic ingest started"
+                    );
+                    self.tailer = Some(tailer);
+                    self.last_open_error = None;
+                    return true;
+                }
+                Err(e) => {
+                    delay = next_open_retry_delay(delay, self.open_retry_max);
+                    if self.last_open_error != Some(e.kind()) {
+                        tracing::warn!(
+                            error = %e,
+                            path = %self.access_log_path.display(),
+                            attempts,
+                            next_retry_secs = delay.as_secs(),
+                            "proxy access log still cannot be opened; retrying"
+                        );
+                    } else {
+                        tracing::debug!(
+                            error = %e,
+                            attempts,
+                            next_retry_secs = delay.as_secs(),
+                            "proxy access log still cannot be opened"
+                        );
+                    }
+                    self.last_open_error = Some(e.kind());
+                }
+            }
+        }
+    }
+
     /// Reads whatever the tailer has and folds each line in. An I/O error is
     /// logged and swallowed -- the file may be mid-rotation, and the next
     /// poll will pick up where this one left off. Any lines the tailer did
     /// manage to hand back before erroring are still processed.
     fn drain_once(&mut self, lines: &mut Vec<Vec<u8>>) {
         lines.clear();
-        if let Err(e) = self.tailer.poll_lines(lines) {
+        if let Some(tailer) = self.tailer.as_mut()
+            && let Err(e) = tailer.poll_lines(lines)
+        {
             tracing::warn!(error = %e, "access log poll failed");
         }
         for line in lines.iter() {
@@ -343,6 +465,15 @@ impl TrafficService {
             Ok(Err(e)) => tracing::warn!(error = %e, bucket, "traffic window flush failed"),
             Err(e) => tracing::warn!(error = %e, bucket, "traffic flush task failed"),
         }
+    }
+}
+
+/// Opens the access log at offset 0 (`from_start`) or at EOF.
+fn open_access_log(path: &Path, from_start: bool) -> std::io::Result<Tailer> {
+    if from_start {
+        Tailer::open_from_start(path)
+    } else {
+        Tailer::open(path)
     }
 }
 

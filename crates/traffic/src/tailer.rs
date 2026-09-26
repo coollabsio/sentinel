@@ -27,10 +27,22 @@ impl Tailer {
     /// Opens `path` and seeks to the end, so only lines appended after
     /// this call will be yielded by `poll_lines`.
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        Self::open_at(path, SeekFrom::End(0))
+    }
+
+    /// Opens `path` at offset 0, so lines already in the file are yielded
+    /// too. For a file that did not exist a moment ago: everything in it is
+    /// new, the same reasoning as the rename/recreate branch of
+    /// [`Self::poll_lines`].
+    pub fn open_from_start(path: &Path) -> std::io::Result<Self> {
+        Self::open_at(path, SeekFrom::Start(0))
+    }
+
+    fn open_at(path: &Path, start: SeekFrom) -> std::io::Result<Self> {
         let mut file = File::open(path)?;
         let meta = file.metadata()?;
         let inode = meta.ino();
-        let pos = file.seek(SeekFrom::End(0))?;
+        let pos = file.seek(start)?;
         Ok(Self {
             path: path.to_path_buf(),
             file,

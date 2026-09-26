@@ -129,8 +129,7 @@ async fn full_pipeline_flushes_tailed_lines_to_the_store() {
         Duration::from_millis(10),
         Duration::from_millis(10),
     )
-    .await
-    .expect("build service");
+    .await;
 
     let (tx, rx) = tokio::sync::watch::channel(false);
     let handle = tokio::spawn(svc.run(rx));
@@ -179,8 +178,7 @@ async fn shutdown_flushes_the_partial_window_before_returning() {
         Duration::from_millis(5),
         Duration::from_millis(5),
     )
-    .await
-    .expect("build service");
+    .await;
     let processed = svc.processed_counter();
 
     let (tx, rx) = tokio::sync::watch::channel(false);
@@ -221,9 +219,7 @@ async fn auto_detect_locks_in_only_on_a_successful_detection() {
 
     let store = AnalyticsStore::open_in_memory().expect("open store");
     let cfg = test_config(log, 0);
-    let mut svc = TrafficService::build(&cfg, store, Arc::new(NoGeo))
-        .await
-        .expect("build service");
+    let mut svc = TrafficService::build(&cfg, store, Arc::new(NoGeo)).await;
 
     assert_eq!(svc.proxy, ProxyType::Auto, "config said auto");
 
@@ -253,9 +249,7 @@ async fn sampling_hard_caps_events_per_second() {
 
     let store = AnalyticsStore::open_in_memory().expect("open store");
     let cfg = test_config(log, 2);
-    let mut svc = TrafficService::build(&cfg, store, Arc::new(NoGeo))
-        .await
-        .expect("build service");
+    let mut svc = TrafficService::build(&cfg, store, Arc::new(NoGeo)).await;
 
     let line = traefik_line("/", 200, 0);
     for _ in 0..5 {
@@ -282,9 +276,7 @@ async fn a_backward_clock_step_still_closes_the_window() {
     let log = dir.path().join("access.log");
     std::fs::File::create(&log).expect("create access log");
     let store = AnalyticsStore::open_in_memory().expect("open store");
-    let mut svc = TrafficService::build(&test_config(log, 0), store, Arc::new(NoGeo))
-        .await
-        .expect("build service");
+    let mut svc = TrafficService::build(&test_config(log, 0), store, Arc::new(NoGeo)).await;
 
     svc.current_bucket = 600_000;
 
@@ -334,4 +326,165 @@ fn default_window_bucketing_matches_the_aggregator() {
             crate::aggregator::Aggregator::bucket_of(ts)
         );
     }
+}
+
+/// The access log does not exist when the service starts. The ingest task
+/// must stay alive, open the file when it appears, and read the lines the
+/// proxy wrote before the open (the file is new, so it is read from the
+/// start, not from EOF).
+#[tokio::test]
+async fn a_missing_access_log_is_retried_until_it_appears() {
+    const N: u64 = 3;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("access.log");
+
+    let store = AnalyticsStore::open_in_memory().expect("open store");
+    let cfg = test_config(log.clone(), 0);
+
+    let svc = TrafficService::build_with_intervals(
+        &cfg,
+        store.clone(),
+        Arc::new(NoGeo),
+        600_000,
+        Duration::from_millis(5),
+        Duration::from_millis(5),
+    )
+    .await
+    .with_open_retry(Duration::from_millis(5), Duration::from_millis(20));
+    assert!(svc.tailer.is_none(), "the access log does not exist yet");
+    assert_eq!(svc.last_open_error, Some(std::io::ErrorKind::NotFound));
+    let processed = svc.processed_counter();
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(svc.run(rx));
+
+    // Let a few retries fail first, then create the file with its lines in
+    // one write.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!handle.is_finished(), "the ingest task must stay alive");
+    let content: String = (0..N)
+        .map(|i| format!("{}\n", traefik_line("/", 200, i as u32)))
+        .collect();
+    std::fs::write(&log, content).expect("create access log");
+
+    let seen = wait_for_counter(&processed, N, Duration::from_secs(5)).await;
+    assert_eq!(
+        seen, N,
+        "lines written before the late open must be ingested"
+    );
+
+    // Lines appended after the open are tailed as usual.
+    append(&log, &format!("{}\n", traefik_line("/", 200, 9)));
+    let seen = wait_for_counter(&processed, N + 1, Duration::from_secs(5)).await;
+    assert_eq!(
+        seen,
+        N + 1,
+        "lines appended after the open must be ingested"
+    );
+
+    tx.send(true).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("run() must return promptly after shutdown")
+        .expect("run() task must not panic");
+    assert_eq!(total_requests(&store), (N + 1) as i64);
+}
+
+/// Shutdown must end the open-retry wait at once, also in the middle of a
+/// long backoff delay.
+#[tokio::test]
+async fn shutdown_ends_the_open_retry_wait() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("missing").join("access.log");
+
+    let store = AnalyticsStore::open_in_memory().expect("open store");
+    let svc = TrafficService::build(&test_config(log, 0), store.clone(), Arc::new(NoGeo))
+        .await
+        .with_open_retry(Duration::from_secs(3600), Duration::from_secs(3600));
+    assert!(svc.tailer.is_none());
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(svc.run(rx));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!handle.is_finished(), "run() must wait, not give up");
+
+    tx.send(true).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("run() must return promptly after shutdown")
+        .expect("run() task must not panic");
+    assert_eq!(total_requests(&store), 0);
+}
+
+/// A dropped shutdown sender is shutdown too, the same as in the main loop.
+#[tokio::test]
+async fn a_dropped_shutdown_sender_ends_the_open_retry_wait() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("access.log");
+
+    let store = AnalyticsStore::open_in_memory().expect("open store");
+    let svc = TrafficService::build(&test_config(log, 0), store, Arc::new(NoGeo))
+        .await
+        .with_open_retry(Duration::from_secs(3600), Duration::from_secs(3600));
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(svc.run(rx));
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("run() must return promptly after the sender is dropped")
+        .expect("run() task must not panic");
+}
+
+/// When the access log exists at startup, behavior is unchanged: it is
+/// opened at once and at EOF, so old lines are not ingested again.
+#[tokio::test]
+async fn an_existing_access_log_is_opened_at_eof() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("access.log");
+    std::fs::write(&log, format!("{}\n", traefik_line("/old", 200, 0))).expect("write log");
+
+    let store = AnalyticsStore::open_in_memory().expect("open store");
+    let svc = TrafficService::build_with_intervals(
+        &test_config(log.clone(), 0),
+        store.clone(),
+        Arc::new(NoGeo),
+        600_000,
+        Duration::from_millis(5),
+        Duration::from_millis(5),
+    )
+    .await;
+    assert!(svc.tailer.is_some(), "an existing log opens at once");
+    assert_eq!(svc.last_open_error, None);
+    let processed = svc.processed_counter();
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(svc.run(rx));
+
+    append(&log, &format!("{}\n", traefik_line("/new", 200, 1)));
+    let seen = wait_for_counter(&processed, 1, Duration::from_secs(5)).await;
+    assert_eq!(seen, 1);
+
+    tx.send(true).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("run() must return promptly after shutdown")
+        .expect("run() task must not panic");
+    assert_eq!(
+        total_requests(&store),
+        1,
+        "only the line appended after startup is ingested"
+    );
+}
+
+#[test]
+fn open_retry_delay_doubles_up_to_the_cap() {
+    let mut delay = OPEN_RETRY_INITIAL;
+    let mut seen = vec![delay.as_secs()];
+    for _ in 0..7 {
+        delay = next_open_retry_delay(delay, OPEN_RETRY_MAX);
+        seen.push(delay.as_secs());
+    }
+    assert_eq!(seen, vec![1, 2, 4, 8, 16, 30, 30, 30]);
 }

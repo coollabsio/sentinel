@@ -435,25 +435,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             *geoip_attribution.write().unwrap_or_else(|e| e.into_inner()) = Some(attribution);
         }
 
-        // Ingest. A build failure here is nearly always "the access log isn't
-        // there": the proxy's log directory isn't mounted into this container,
-        // or the proxy hasn't been switched to JSON access logging yet. That is
-        // a real misconfiguration worth surfacing loudly, but not a crash — and
-        // not a reason to stop maintaining a database that may already hold
-        // history, so the tasks below are spawned either way.
-        match traffic::service::TrafficService::build(&config, analytics.clone(), lookup).await {
-            Ok(service) => {
-                let rx = shutdown_rx.clone();
-                services.spawn(async move {
-                    service.run(rx).await;
-                    Ok::<(), String>(())
-                });
-            }
-            Err(e) => tracing::error!(
-                error = %e,
-                path = %config.traffic.access_log_path.display(),
-                "traffic ingest unavailable; compaction and retention still run"
-            ),
+        // Ingest. `build` does not fail: if the access log cannot be opened
+        // yet (deleted before this container started, log directory not
+        // mounted, proxy not on JSON access logging yet), it logs a warning
+        // and `run` retries the open with a backoff until it succeeds or
+        // shutdown arrives. The tasks below run either way.
+        {
+            let service =
+                traffic::service::TrafficService::build(&config, analytics.clone(), lookup).await;
+            let rx = shutdown_rx.clone();
+            services.spawn(async move {
+                service.run(rx).await;
+                Ok::<(), String>(())
+            });
         }
 
         // 1m -> 1h compaction, hourly, with one pass at startup. Compaction

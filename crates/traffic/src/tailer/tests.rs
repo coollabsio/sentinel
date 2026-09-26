@@ -31,6 +31,37 @@ fn yields_complete_lines_appended_after_open() {
 }
 
 #[test]
+fn open_starts_at_eof_and_skips_existing_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("access.log");
+    std::fs::write(&path, b"history line\n").unwrap();
+
+    let mut tailer = Tailer::open(&path).unwrap();
+    append(&path, b"new line\n");
+
+    let mut out = Vec::new();
+    tailer.poll_lines(&mut out).unwrap();
+    assert_eq!(out, vec![b"new line".to_vec()]);
+}
+
+#[test]
+fn open_from_start_yields_existing_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("access.log");
+    std::fs::write(&path, b"first\nsecond\n").unwrap();
+
+    let mut tailer = Tailer::open_from_start(&path).unwrap();
+    append(&path, b"third\n");
+
+    let mut out = Vec::new();
+    tailer.poll_lines(&mut out).unwrap();
+    assert_eq!(
+        out,
+        vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+    );
+}
+
+#[test]
 fn buffers_partial_line_until_newline_arrives() {
     let (_dir, path, mut tailer) = open_tailer();
 
