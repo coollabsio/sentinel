@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding agents when working with code in this repository.
 
 ## Project Overview
 Sentinel is an API for gathering Linux server and Docker Engine metrics, built for integration with Coolify.io. It's a Rust-based service that collects system metrics (CPU, memory) and Docker container stats, storing them in SQLite and pushing them to a configured endpoint.
@@ -81,8 +81,8 @@ The application connects to Docker daemon via Unix socket to collect container s
 ### Version Locations (all must be updated together)
 1. `Cargo.toml` — `[workspace.package] version = "X.Y.Z"`
 2. `openapi.yaml:12` — `version: X.Y.Z` (info block)
-3. `openapi.yaml:69` — `example: X.Y.Z` (version endpoint response)
-4. `API.md:74` — `X.Y.Z` (version endpoint example response)
+3. `openapi.yaml:77` — `example: X.Y.Z` (version endpoint response)
+4. `API.md:75` — `X.Y.Z` (version endpoint example response)
 
 ### Steps
 1. **Bump version** in all 4 locations above, then verify:
