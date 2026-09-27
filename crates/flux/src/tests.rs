@@ -271,6 +271,134 @@ async fn endpoint_reconcile_route_requires_internal_authentication() {
     server.abort();
 }
 
+#[test]
+fn validates_and_canonicalizes_workload_pull_policy() {
+    use crate::internal_api::workload_pull_policy;
+
+    assert_eq!(workload_pull_policy("").unwrap(), "");
+    assert_eq!(workload_pull_policy("missing").unwrap(), "");
+    assert_eq!(workload_pull_policy("newer").unwrap(), "newer");
+    assert_eq!(workload_pull_policy("always").unwrap(), "always");
+    for invalid in ["never", "Newer", "newer --privileged", " always"] {
+        assert_eq!(
+            workload_pull_policy(invalid).unwrap_err().0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+}
+
+#[tokio::test]
+async fn workload_deploy_route_rejects_an_invalid_pull_policy() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        ConnectionRegistry::default(),
+        "internal-secret".into(),
+    ));
+    let deploy = |pull_policy: Option<&str>| {
+        let mut body = serde_json::json!({
+            "server_id": "server-1",
+            "command_id": "deploy-1",
+            "name": "coolify-test-web",
+            "image": "docker.io/library/nginx:latest",
+            "restart_policy": "unless-stopped",
+        });
+        if let Some(pull_policy) = pull_policy {
+            body["pull_policy"] = pull_policy.into();
+        }
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/workload.deploy"))
+            .bearer_auth("internal-secret")
+            .json(&body)
+            .send()
+    };
+
+    assert_eq!(
+        deploy(Some("never")).await.unwrap().status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    for accepted in [
+        None,
+        Some(""),
+        Some("missing"),
+        Some("newer"),
+        Some("always"),
+    ] {
+        assert_eq!(
+            deploy(accepted).await.unwrap().status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{accepted:?} should pass validation and reach dispatch"
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn workload_deploy_route_returns_the_sentinel_failure_message() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let request = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/workload.deploy"))
+            .bearer_auth("internal-secret")
+            .json(&serde_json::json!({
+                "server_id": "server-1",
+                "command_id": "deploy-1",
+                "name": "coolify-test-web",
+                "image": "docker.io/library/nginx:latest",
+                "restart_policy": "unless-stopped",
+            }))
+            .send(),
+    );
+
+    receiver.recv().await.unwrap();
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: "deploy-1:result".into(),
+                command_id: "deploy-1".into(),
+                status: sentinel_protocol::control::v1::CommandStatus::Failed.into(),
+                observed_at_unix_ms: now_millis(),
+                payload: Some(
+                    sentinel_protocol::control::v1::command_result::Payload::Error(
+                        sentinel_protocol::control::v1::CommandError {
+                            code: "workload_deploy_failed".into(),
+                            message: "listen tcp4 10.240.0.2:8080: bind: address already in use"
+                                .into(),
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response.text().await.unwrap(),
+        "listen tcp4 10.240.0.2:8080: bind: address already in use"
+    );
+    server.abort();
+}
+
 struct TestTlsMaterial {
     certificate: String,
     private_key: String,

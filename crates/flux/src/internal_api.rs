@@ -4,16 +4,18 @@ use axum::Json;
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    ClusterLeaveRequest, Command, CommandStatus, ContainerListRequest, ContainerPort,
-    CorrosionEndpointReconcileRequest, CorrosionInspectRequest, CorrosionReconcileRequest,
-    FirewallIngressRule, FirewallInspectRequest, FirewallReconcileRequest, FirewallRule,
-    SystemInfoRequest, SystemPingRequest, WireguardInspectRequest, WireguardKeyEnsureRequest,
-    WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest, WorkloadEndpoint,
-    WorkloadEnvironmentVariable, WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
+    ClusterLeaveRequest, Command, CommandResult, CommandStatus, ContainerListRequest,
+    ContainerPort, CorrosionEndpointReconcileRequest, CorrosionInspectRequest,
+    CorrosionReconcileRequest, FirewallIngressRule, FirewallInspectRequest,
+    FirewallReconcileRequest, FirewallRule, SystemInfoRequest, SystemPingRequest,
+    WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest,
+    WorkloadDeployRequest, WorkloadEndpoint, WorkloadEnvironmentVariable, WorkloadLabel,
+    WorkloadLifecycleAction, WorkloadLifecycleRequest,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
@@ -89,6 +91,19 @@ struct WorkloadDeployApiRequest {
     cpu_reservation: Option<f64>,
     memory_limit_bytes: Option<u64>,
     memory_reservation_bytes: Option<u64>,
+    #[serde(default)]
+    pull_policy: String,
+}
+
+/// Validates a workload image pull policy. The default (`missing`) is
+/// canonicalized to an empty string so default deploy commands encode exactly
+/// as they did before the field existed, keeping command journal replay stable.
+pub(crate) fn workload_pull_policy(value: &str) -> Result<String, (StatusCode, &'static str)> {
+    match value {
+        "" | "missing" => Ok(String::new()),
+        "newer" | "always" => Ok(value.into()),
+        _ => Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid pull policy")),
+    }
 }
 
 #[derive(Deserialize)]
@@ -378,7 +393,7 @@ async fn cluster_leave(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<ClusterLeaveApiRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let result = dispatch_network(
         &state,
         &headers,
@@ -393,7 +408,7 @@ async fn cluster_leave(
     )
     .await?;
     let Some(command_result::Payload::ClusterLeave(value)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     Ok(Json(serde_json::json!({
         "command_id": request.command_id,
@@ -412,12 +427,12 @@ async fn dispatch_network(
     command_id: &str,
     command_type: &str,
     payload: Payload,
-) -> Result<sentinel_protocol::control::v1::CommandResult, (StatusCode, &'static str)> {
+) -> Result<sentinel_protocol::control::v1::CommandResult, ApiError> {
     let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok());
     if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
     }
     if server_id.is_empty()
         || server_id.len() > 255
@@ -427,7 +442,7 @@ async fn dispatch_network(
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
     {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request"));
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request").into());
     }
     let now = now_millis();
     let result = state
@@ -447,7 +462,7 @@ async fn dispatch_network(
         .await
         .map_err(dispatch_error)?;
     if result.status != CommandStatus::Succeeded as i32 {
-        return Err((StatusCode::BAD_GATEWAY, "Sentinel command failed"));
+        return Err(command_failed(result));
     }
     Ok(result)
 }
@@ -456,7 +471,7 @@ async fn wireguard_key_ensure(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<WireguardKeyApiRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let result = dispatch_network(
         &state,
         &headers,
@@ -469,7 +484,7 @@ async fn wireguard_key_ensure(
     )
     .await?;
     let Some(command_result::Payload::WireguardKeyEnsure(value)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     Ok(Json(
         serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "public_key": value.public_key}),
@@ -480,7 +495,7 @@ async fn wireguard_inspect(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<WireguardInspectApiRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let result = dispatch_network(
         &state,
         &headers,
@@ -495,7 +510,7 @@ async fn wireguard_inspect(
     )
     .await?;
     let Some(command_result::Payload::WireguardInspect(value)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     let peers = value.peers.into_iter().map(|peer| serde_json::json!({"public_key": peer.public_key, "endpoint": peer.endpoint, "allowed_ips": peer.allowed_ips, "latest_handshake_unix_seconds": peer.latest_handshake_unix_seconds})).collect::<Vec<_>>();
     Ok(Json(
@@ -507,7 +522,7 @@ async fn wireguard_reconcile(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<WireguardReconcileApiRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let peers = request
         .peers
         .into_iter()
@@ -535,7 +550,7 @@ async fn wireguard_reconcile(
     )
     .await?;
     let Some(command_result::Payload::WireguardReconcile(value)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     let network = value
         .state
@@ -550,7 +565,7 @@ async fn firewall_inspect(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<FirewallInspectApiRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let result = dispatch_network(
         &state,
         &headers,
@@ -564,7 +579,7 @@ async fn firewall_inspect(
     )
     .await?;
     let Some(command_result::Payload::FirewallInspect(value)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     Ok(Json(
         serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "applied_revision": value.applied_revision, "configuration_hash": value.configuration_hash, "drifted": value.drifted, "table": value.table, "ingress_enforced": value.ingress_enforced}),
@@ -575,7 +590,7 @@ async fn firewall_reconcile(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<FirewallReconcileApiRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let rules = request
         .rules
         .into_iter()
@@ -615,7 +630,7 @@ async fn firewall_reconcile(
     )
     .await?;
     let Some(command_result::Payload::FirewallReconcile(value)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     let network = value
         .state
@@ -629,7 +644,7 @@ async fn corrosion_inspect(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<CorrosionInspectApiRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let result = dispatch_network(
         &state,
         &headers,
@@ -640,7 +655,7 @@ async fn corrosion_inspect(
     )
     .await?;
     let Some(command_result::Payload::CorrosionInspect(value)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     Ok(Json(
         serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "version": value.version, "member_state": value.member_state, "endpoint_count": value.endpoint_count, "last_convergence_unix_seconds": value.last_convergence_unix_seconds}),
@@ -651,7 +666,7 @@ async fn corrosion_reconcile(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<CorrosionReconcileApiRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let result = dispatch_network(
         &state,
         &headers,
@@ -667,7 +682,7 @@ async fn corrosion_reconcile(
     )
     .await?;
     let Some(command_result::Payload::CorrosionReconcile(value)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     let discovery = value
         .state
@@ -681,7 +696,7 @@ async fn corrosion_endpoint_reconcile(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<CorrosionEndpointReconcileApiRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let endpoints = request
         .endpoints
         .into_iter()
@@ -709,7 +724,7 @@ async fn corrosion_endpoint_reconcile(
     )
     .await?;
     let Some(command_result::Payload::CorrosionEndpointReconcile(value)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     Ok(Json(serde_json::json!({
         "command_id": request.command_id,
@@ -723,12 +738,12 @@ async fn workload_lifecycle(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<WorkloadLifecycleApiRequest>,
-) -> Result<Json<WorkloadLifecycleResponse>, (StatusCode, &'static str)> {
+) -> Result<Json<WorkloadLifecycleResponse>, ApiError> {
     let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok());
     if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
     }
     if request.server_id.is_empty()
         || request.server_id.len() > 255
@@ -739,7 +754,7 @@ async fn workload_lifecycle(
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
     {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request"));
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request").into());
     }
     let now = now_millis();
     let action = request.action;
@@ -763,14 +778,14 @@ async fn workload_lifecycle(
         .await
         .map_err(dispatch_error)?;
     if result.status != CommandStatus::Succeeded as i32 {
-        return Err((StatusCode::BAD_GATEWAY, "Sentinel command failed"));
+        return Err(command_failed(result));
     }
     let observed_at_unix_ms = result.observed_at_unix_ms;
     let Some(command_result::Payload::WorkloadLifecycle(changed)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     if changed.action != action.protocol() as i32 {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     }
     Ok(Json(WorkloadLifecycleResponse {
         command_id: request.command_id,
@@ -784,12 +799,12 @@ async fn workload_deploy(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<WorkloadDeployApiRequest>,
-) -> Result<Json<WorkloadDeployResponse>, (StatusCode, &'static str)> {
+) -> Result<Json<WorkloadDeployResponse>, ApiError> {
     let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok());
     if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
     }
     if request.server_id.is_empty()
         || request.server_id.len() > 255
@@ -800,8 +815,9 @@ async fn workload_deploy(
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
     {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request"));
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request").into());
     }
+    let pull_policy = workload_pull_policy(&request.pull_policy)?;
     let now = now_millis();
     let result = state
         .registry
@@ -843,6 +859,7 @@ async fn workload_deploy(
                     cpu_reservation: request.cpu_reservation,
                     memory_limit_bytes: request.memory_limit_bytes,
                     memory_reservation_bytes: request.memory_reservation_bytes,
+                    pull_policy,
                 })),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },
@@ -851,11 +868,11 @@ async fn workload_deploy(
         .await
         .map_err(dispatch_error)?;
     if result.status != CommandStatus::Succeeded as i32 {
-        return Err((StatusCode::BAD_GATEWAY, "Sentinel command failed"));
+        return Err(command_failed(result));
     }
     let observed_at_unix_ms = result.observed_at_unix_ms;
     let Some(command_result::Payload::WorkloadDeploy(deployed)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     Ok(Json(WorkloadDeployResponse {
         command_id: request.command_id,
@@ -876,15 +893,15 @@ async fn container_list(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<ContainerListApiRequest>,
-) -> Result<Json<ContainerListResponse>, (StatusCode, &'static str)> {
+) -> Result<Json<ContainerListResponse>, ApiError> {
     let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok());
     if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
     }
     if request.server_id.is_empty() || request.server_id.len() > 255 {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID"));
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID").into());
     }
     let command_id = Uuid::new_v4().to_string();
     let now = now_millis();
@@ -905,11 +922,11 @@ async fn container_list(
         .await
         .map_err(dispatch_error)?;
     if result.status != CommandStatus::Succeeded as i32 {
-        return Err((StatusCode::BAD_GATEWAY, "Sentinel command failed"));
+        return Err(command_failed(result));
     }
     let observed_at_unix_ms = result.observed_at_unix_ms;
     let Some(command_result::Payload::ContainerList(list)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     let containers = list
         .containers
@@ -948,15 +965,15 @@ async fn system_info(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<SystemInfoApiRequest>,
-) -> Result<Json<SystemInfoResponse>, (StatusCode, &'static str)> {
+) -> Result<Json<SystemInfoResponse>, ApiError> {
     let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok());
     if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
     }
     if request.server_id.is_empty() || request.server_id.len() > 255 {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID"));
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID").into());
     }
     let command_id = Uuid::new_v4().to_string();
     let now = now_millis();
@@ -977,11 +994,11 @@ async fn system_info(
         .await
         .map_err(dispatch_error)?;
     if result.status != CommandStatus::Succeeded as i32 {
-        return Err((StatusCode::BAD_GATEWAY, "Sentinel command failed"));
+        return Err(command_failed(result));
     }
     let observed_at_unix_ms = result.observed_at_unix_ms;
     let Some(command_result::Payload::SystemInfo(info)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
 
     Ok(Json(SystemInfoResponse {
@@ -1014,15 +1031,15 @@ async fn ping(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<PingRequest>,
-) -> Result<Json<PingResponse>, (StatusCode, &'static str)> {
+) -> Result<Json<PingResponse>, ApiError> {
     let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok());
     if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
     }
     if request.server_id.is_empty() || request.server_id.len() > 255 {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID"));
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID").into());
     }
     let command_id = Uuid::new_v4().to_string();
     let nonce = Uuid::new_v4().to_string();
@@ -1046,13 +1063,13 @@ async fn ping(
         .await
         .map_err(dispatch_error)?;
     if result.status != CommandStatus::Succeeded as i32 {
-        return Err((StatusCode::BAD_GATEWAY, "Sentinel command failed"));
+        return Err(command_failed(result));
     }
     let Some(command_result::Payload::SystemPing(ping)) = result.payload else {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     if ping.nonce != nonce {
-        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel nonce"));
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel nonce").into());
     }
 
     Ok(Json(PingResponse {
@@ -1062,6 +1079,30 @@ async fn ping(
         sentinel_version: ping.sentinel_version,
         boot_id: ping.boot_id,
     }))
+}
+
+/// An internal API error. A failed Sentinel command keeps the message that Sentinel reported.
+pub(crate) struct ApiError(StatusCode, String);
+
+impl From<(StatusCode, &'static str)> for ApiError {
+    fn from((status, message): (StatusCode, &'static str)) -> Self {
+        Self(status, message.into())
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.0, self.1).into_response()
+    }
+}
+
+fn command_failed(result: CommandResult) -> ApiError {
+    match result.payload {
+        Some(command_result::Payload::Error(error)) if !error.message.trim().is_empty() => {
+            ApiError(StatusCode::BAD_GATEWAY, error.message)
+        }
+        _ => (StatusCode::BAD_GATEWAY, "Sentinel command failed").into(),
+    }
 }
 
 fn dispatch_error(error: CommandDispatchError) -> (StatusCode, &'static str) {

@@ -201,6 +201,8 @@ message WorkloadDeployRequest {
   optional double cpu_reservation = 13;
   optional uint64 memory_limit_bytes = 14;
   optional uint64 memory_reservation_bytes = 15;
+  // One of "missing", "newer", or "always". Empty means "missing".
+  string pull_policy = 16;
 }
 
 message WorkloadEnvironmentVariable {

@@ -1225,6 +1225,7 @@ fn builds_shell_free_podman_deploy_arguments() {
         cpu_reservation: Some(1.25),
         memory_limit_bytes: Some(1_073_741_824),
         memory_reservation_bytes: Some(536_870_912),
+        pull_policy: "newer".into(),
     };
 
     let arguments = crate::commands::podman_deploy_args(&request).unwrap();
@@ -1240,6 +1241,7 @@ fn builds_shell_free_podman_deploy_arguments() {
             .windows(2)
             .any(|v| v == ["--network", "coolify-node-1"])
     );
+    assert!(arguments.windows(2).any(|v| v == ["--pull", "newer"]));
     assert!(arguments.windows(2).any(|v| v == ["--ip", "100.64.0.2"]));
     assert!(arguments.windows(2).any(|v| v == ["--dns", "10.240.0.2"]));
     assert!(arguments.windows(2).any(|v| v == ["--cpus", "2.5"]));
@@ -1306,6 +1308,31 @@ fn rejects_unsafe_or_oversized_deploy_requests() {
     assert!(crate::commands::podman_deploy_args(&request("bad name", "alpine")).is_err());
     assert!(crate::commands::podman_deploy_args(&request("safe-name", "")).is_err());
     assert!(crate::commands::podman_deploy_args(&request("safe-name", "alpine;rm")).is_err());
+}
+
+#[test]
+fn uses_the_requested_image_pull_policy() {
+    let request = |pull_policy: &str| sentinel_protocol::control::v1::WorkloadDeployRequest {
+        name: "safe-name".into(),
+        image: "docker.io/library/nginx:latest".into(),
+        restart_policy: "unless-stopped".into(),
+        pull_policy: pull_policy.into(),
+        ..Default::default()
+    };
+    let pull = |pull_policy: &str| {
+        let arguments = crate::commands::podman_deploy_args(&request(pull_policy)).unwrap();
+        let index = arguments.iter().position(|v| v == "--pull").unwrap();
+        assert_eq!(arguments.iter().filter(|v| *v == "--pull").count(), 1);
+        arguments[index + 1].clone()
+    };
+
+    assert_eq!(pull(""), "missing");
+    assert_eq!(pull("missing"), "missing");
+    assert_eq!(pull("newer"), "newer");
+    assert_eq!(pull("always"), "always");
+    for invalid in ["never", "Newer", "newer --privileged", " always"] {
+        assert!(crate::commands::podman_deploy_args(&request(invalid)).is_err());
+    }
 }
 
 #[test]

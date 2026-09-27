@@ -613,6 +613,12 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
     ) {
         return Err("The restart policy is invalid.".into());
     }
+    let pull_policy = match request.pull_policy.as_str() {
+        "" | "missing" => "missing",
+        "newer" => "newer",
+        "always" => "always",
+        _ => return Err("The image pull policy is invalid.".into()),
+    };
     if request.command.len() > 64
         || request.environment.len() > 256
         || request.labels.len() > 128
@@ -652,7 +658,7 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
         "--detach".into(),
         "--replace".into(),
         "--pull".into(),
-        "missing".into(),
+        pull_policy.into(),
         "--name".into(),
         request.name.clone(),
         "--restart".into(),
