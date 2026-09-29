@@ -108,6 +108,7 @@ impl Pusher {
             .client
             .post(&self.config.push_url)
             .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
             .bearer_auth(&self.config.token)
             .json(&payload)
             .send()
