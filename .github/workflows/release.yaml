@@ -12,6 +12,9 @@ env:
   GITHUB_REGISTRY: ghcr.io
   DOCKER_REGISTRY: docker.io
   IMAGE_NAME: "coollabsio/sentinel"
+  # Host binary and Flux broker images are GHCR-only, like the `main` builds.
+  HOST_IMAGE_NAME: "coollabsio/sentinel-host"
+  FLUX_IMAGE_NAME: "coollabsio/flux"
 
 jobs:
   build-push:
@@ -66,6 +69,34 @@ jobs:
           labels: |
             coolify.managed=true
 
+      - name: Build and Push Host Artifact (${{ matrix.arch }})
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.host
+          platforms: ${{ matrix.platform }}
+          push: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.VERSION }}
+          tags: |
+            ${{ env.GITHUB_REGISTRY }}/${{ env.HOST_IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
+          labels: |
+            coolify.managed=true
+            org.opencontainers.image.description=Portable Sentinel host binary
+
+      - name: Build and Push Flux Image (${{ matrix.arch }})
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.flux
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ${{ env.GITHUB_REGISTRY }}/${{ env.FLUX_IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
+          labels: |
+            coolify.managed=true
+            org.opencontainers.image.description=Coolify Flux connection broker
+
   merge-manifest:
     runs-on: ubuntu-24.04
     needs: build-push
@@ -107,6 +138,31 @@ jobs:
           docker buildx imagetools create \
           ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }} \
           --tag ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Create & publish host artifact and Flux manifests
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          {
+            echo "### Host images for $VERSION"
+            echo
+            echo "| Image | Digest |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for image in "$HOST_IMAGE_NAME" "$FLUX_IMAGE_NAME"; do
+            reference="$GITHUB_REGISTRY/$image:$VERSION"
+            docker buildx imagetools create \
+              "$reference-amd64" \
+              "$reference-aarch64" \
+              --tag "$reference"
+            digest="$(docker buildx imagetools inspect "$reference" --format '{{json .Manifest}}' | jq -r .digest)"
+            case "$digest" in
+              sha256:*) ;;
+              *) echo "Could not read the manifest digest of $reference" >&2; exit 1 ;;
+            esac
+            echo "$reference@$digest"
+            echo "| \`$reference\` | \`$digest\` |" >> "$GITHUB_STEP_SUMMARY"
+          done
 
       - name: Create & publish manifest on ${{ env.DOCKER_REGISTRY }}
         run: |
