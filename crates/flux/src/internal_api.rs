@@ -12,17 +12,17 @@ use sentinel_protocol::control::v1::{
     ClusterLeaveRequest, Command, CommandResult, CommandStatus, ContainerListRequest,
     ContainerPort, CorrosionEndpointReconcileRequest, CorrosionInspectRequest,
     CorrosionReconcileRequest, FirewallIngressRule, FirewallInspectRequest,
-    FirewallReconcileRequest, FirewallRule, SystemInfoRequest, SystemPingRequest,
-    WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest,
-    WorkloadDeployRequest, WorkloadEndpoint, WorkloadEnvironmentVariable, WorkloadLabel,
-    WorkloadLifecycleAction, WorkloadLifecycleRequest,
+    FirewallReconcileRequest, FirewallRule, LogSource, LogsReadRequest, SystemInfoRequest,
+    SystemPingRequest, WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer,
+    WireguardReconcileRequest, WorkloadDeployRequest, WorkloadEndpoint,
+    WorkloadEnvironmentVariable, WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
     CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT,
-    CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO,
+    CAPABILITY_SYSTEM_PING, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
+    CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -47,6 +47,31 @@ struct PingRequest {
 #[derive(Deserialize)]
 struct SystemInfoApiRequest {
     server_id: String,
+}
+
+#[derive(Deserialize)]
+struct LogsReadApiRequest {
+    server_id: String,
+    source: LogsReadApiSource,
+    limit: u32,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LogsReadApiSource {
+    Sentinel,
+    Corrosion,
+    DiscoveryDns,
+}
+
+impl LogsReadApiSource {
+    fn protocol(self) -> LogSource {
+        match self {
+            Self::Sentinel => LogSource::Sentinel,
+            Self::Corrosion => LogSource::Corrosion,
+            Self::DiscoveryDns => LogSource::DiscoveryDns,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -294,6 +319,24 @@ pub struct SystemInfoResponse {
 }
 
 #[derive(Serialize)]
+pub struct LogsReadResponse {
+    command_id: String,
+    observed_at_unix_ms: i64,
+    source: LogsReadApiSource,
+    truncated: bool,
+    events: Vec<LogEventResponse>,
+}
+
+#[derive(Serialize)]
+struct LogEventResponse {
+    timestamp_unix_ms: i64,
+    level: String,
+    component: String,
+    message: String,
+    fields: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
 pub struct ContainerListResponse {
     command_id: String,
     observed_at_unix_ms: i64,
@@ -348,6 +391,7 @@ pub async fn serve(
         .route("/v1/commands/system.ping", post(ping))
         .route("/v1/commands/system.info", post(system_info))
         .route("/v1/commands/container.list", post(container_list))
+        .route("/v1/commands/logs.read", post(logs_read))
         .route("/v1/commands/network.cluster.leave", post(cluster_leave))
         .route("/v1/commands/workload.deploy", post(workload_deploy))
         .route("/v1/commands/workload.lifecycle", post(workload_lifecycle))
@@ -1024,6 +1068,74 @@ async fn system_info(
         load_average_one: info.load_average_one,
         load_average_five: info.load_average_five,
         load_average_fifteen: info.load_average_fifteen,
+    }))
+}
+
+async fn logs_read(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<LogsReadApiRequest>,
+) -> Result<Json<LogsReadResponse>, ApiError> {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    if authorization != Some(&format!("Bearer {}", state.token)) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
+    }
+    if request.server_id.is_empty() || request.server_id.len() > 255 {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID").into());
+    }
+    if !(1..=500).contains(&request.limit) {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid limit").into());
+    }
+    let command_id = Uuid::new_v4().to_string();
+    let now = now_millis();
+    let result = state
+        .registry
+        .dispatch(
+            &request.server_id,
+            Command {
+                command_id: command_id.clone(),
+                command_type: CAPABILITY_LOGS_READ.into(),
+                payload_version: 1,
+                created_at_unix_ms: now,
+                payload: Some(Payload::LogsRead(LogsReadRequest {
+                    source: request.source.protocol().into(),
+                    limit: request.limit,
+                })),
+                expires_at_unix_ms: now + COMMAND_TIMEOUT.as_millis() as i64,
+            },
+            COMMAND_TIMEOUT,
+        )
+        .await
+        .map_err(dispatch_error)?;
+    if result.status != CommandStatus::Succeeded as i32 {
+        return Err(command_failed(result));
+    }
+    let observed_at_unix_ms = result.observed_at_unix_ms;
+    let Some(command_result::Payload::LogsRead(logs)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
+    };
+    if logs.source != i32::from(request.source.protocol()) {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
+    }
+
+    Ok(Json(LogsReadResponse {
+        command_id,
+        observed_at_unix_ms,
+        source: request.source,
+        truncated: logs.truncated,
+        events: logs
+            .events
+            .into_iter()
+            .map(|event| LogEventResponse {
+                timestamp_unix_ms: event.timestamp_unix_ms,
+                level: event.level,
+                component: event.component,
+                message: event.message,
+                fields: event.fields.into_iter().collect(),
+            })
+            .collect(),
     }))
 }
 

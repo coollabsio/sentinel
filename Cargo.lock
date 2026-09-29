@@ -517,6 +517,7 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tracing",
+ "tracing-subscriber",
  "url",
  "x509-parser",
 ]

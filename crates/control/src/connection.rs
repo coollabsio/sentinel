@@ -9,9 +9,9 @@ use sentinel_protocol::control::v1::{
     AgentMessage, CommandAccepted, Heartbeat, Hello, RuntimeChanged,
 };
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RESOURCES,
-    NETWORK_CAPABILITIES,
+    CAPABILITY_CONTAINER_LIST, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO,
+    CAPABILITY_SYSTEM_PING, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_WORKLOAD_RESOURCES, NETWORK_CAPABILITIES,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
@@ -107,6 +107,7 @@ pub async fn connect(
                     CAPABILITY_WORKLOAD_DEPLOY.into(),
                     CAPABILITY_WORKLOAD_RESOURCES.into(),
                     CAPABILITY_WORKLOAD_LIFECYCLE.into(),
+                    CAPABILITY_LOGS_READ.into(),
                 ]
                 .into_iter()
                 .chain(NETWORK_CAPABILITIES.map(str::to_string))

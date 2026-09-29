@@ -7,7 +7,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use rcgen::{CertificateParams, KeyPair};
 use sentinel_protocol::{
-    CAPABILITY_CORROSION_ENDPOINT_RECONCILE, CAPABILITY_SYSTEM_PING, PROTOCOL_MAX, PROTOCOL_MIN,
+    CAPABILITY_CORROSION_ENDPOINT_RECONCILE, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_PING,
+    PROTOCOL_MAX, PROTOCOL_MIN,
 };
 use tonic::transport::Server;
 
@@ -129,6 +130,258 @@ fn selects_protocol_and_capabilities_for_valid_hello() {
             CAPABILITY_CORROSION_ENDPOINT_RECONCILE
         ]
     );
+}
+
+#[tokio::test]
+async fn accepts_a_hello_with_unknown_or_ungranted_capabilities_without_granting_them() {
+    let claims = CredentialClaims {
+        subject: "server-1".into(),
+        capabilities: vec![CAPABILITY_SYSTEM_PING.into()],
+        protocol_min: 1,
+        protocol_max: 1,
+        expires_at: i64::MAX,
+    };
+    let hello = sentinel_protocol::control::v1::Hello {
+        server_id: "server-1".into(),
+        sentinel_version: "9.9.9".into(),
+        protocol_min: 1,
+        protocol_max: 1,
+        capabilities: vec![
+            CAPABILITY_SYSTEM_PING.into(),
+            CAPABILITY_LOGS_READ.into(),
+            "future.capability.v7".into(),
+        ],
+        boot_id: "boot-1".into(),
+        trust_bundle_version: 1,
+    };
+
+    let negotiated = negotiate(&claims, &hello).unwrap();
+    assert_eq!(negotiated.capabilities, vec![CAPABILITY_SYSTEM_PING]);
+
+    let registry = ConnectionRegistry::default();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            negotiated.protocol_version,
+            negotiated.capabilities,
+        )
+        .await;
+    let result = registry
+        .dispatch(
+            "server-1",
+            sentinel_protocol::control::v1::Command {
+                command_id: "logs-1".into(),
+                command_type: CAPABILITY_LOGS_READ.into(),
+                ..Default::default()
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+    assert_eq!(result.unwrap_err(), CommandDispatchError::Unsupported);
+}
+
+#[test]
+fn still_refuses_a_hello_with_an_invalid_identity_or_protocol() {
+    let claims = CredentialClaims {
+        subject: "server-1".into(),
+        capabilities: vec![CAPABILITY_SYSTEM_PING.into()],
+        protocol_min: 1,
+        protocol_max: 1,
+        expires_at: i64::MAX,
+    };
+    let hello = sentinel_protocol::control::v1::Hello {
+        server_id: "server-1".into(),
+        sentinel_version: "main".into(),
+        protocol_min: 1,
+        protocol_max: 1,
+        capabilities: vec![CAPABILITY_SYSTEM_PING.into()],
+        boot_id: "boot-1".into(),
+        trust_bundle_version: 1,
+    };
+
+    for invalid in [
+        sentinel_protocol::control::v1::Hello {
+            sentinel_version: String::new(),
+            ..hello.clone()
+        },
+        sentinel_protocol::control::v1::Hello {
+            server_id: "server-2".into(),
+            ..hello.clone()
+        },
+        sentinel_protocol::control::v1::Hello {
+            protocol_min: 2,
+            protocol_max: 2,
+            ..hello.clone()
+        },
+    ] {
+        assert!(negotiate(&claims, &invalid).is_err());
+    }
+}
+
+#[tokio::test]
+async fn logs_read_route_returns_sentinel_log_events() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![CAPABILITY_LOGS_READ.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let request = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/logs.read"))
+            .bearer_auth("internal-secret")
+            .json(&serde_json::json!({
+                "server_id": "server-1",
+                "source": "discovery_dns",
+                "limit": 50,
+            }))
+            .send(),
+    );
+
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    assert_eq!(command.command_type, CAPABILITY_LOGS_READ);
+    assert!(matches!(
+        command.payload,
+        Some(sentinel_protocol::control::v1::command::Payload::LogsRead(
+            sentinel_protocol::control::v1::LogsReadRequest { source, limit: 50 }
+        )) if source == sentinel_protocol::control::v1::LogSource::DiscoveryDns as i32
+    ));
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: format!("{}:result", command.command_id),
+                command_id: command.command_id.clone(),
+                status: sentinel_protocol::control::v1::CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: 1_700_000_000_500,
+                payload: Some(
+                    sentinel_protocol::control::v1::command_result::Payload::LogsRead(
+                        sentinel_protocol::control::v1::LogsReadResult {
+                            source: sentinel_protocol::control::v1::LogSource::DiscoveryDns.into(),
+                            events: vec![sentinel_protocol::control::v1::LogEvent {
+                                timestamp_unix_ms: 1_700_000_000_000,
+                                level: "warn".into(),
+                                component: "coolify-discovery-dns".into(),
+                                message: "query failed".into(),
+                                fields: [("_PID".to_string(), "42".to_string())].into(),
+                            }],
+                            truncated: true,
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({
+            "command_id": command.command_id,
+            "observed_at_unix_ms": 1_700_000_000_500_i64,
+            "source": "discovery_dns",
+            "truncated": true,
+            "events": [{
+                "timestamp_unix_ms": 1_700_000_000_000_i64,
+                "level": "warn",
+                "component": "coolify-discovery-dns",
+                "message": "query failed",
+                "fields": {"_PID": "42"}
+            }]
+        })
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn logs_read_route_validates_the_request_and_capability() {
+    let registry = ConnectionRegistry::default();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![CAPABILITY_SYSTEM_PING.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry,
+        "internal-secret".into(),
+    ));
+    let send = |token: &str, body: serde_json::Value| {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/logs.read"))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+    };
+    let valid = |server_id: &str| serde_json::json!({"server_id": server_id, "source": "sentinel", "limit": 10});
+
+    for (token, body, status) in [
+        (
+            "wrong",
+            valid("server-1"),
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "internal-secret",
+            serde_json::json!({"server_id": "server-1", "source": "sentinel", "limit": 0}),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            serde_json::json!({"server_id": "server-1", "source": "sentinel", "limit": 501}),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            serde_json::json!({"server_id": "server-1", "source": "syslog", "limit": 10}),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            valid("offline"),
+            reqwest::StatusCode::NOT_FOUND,
+        ),
+        (
+            "internal-secret",
+            valid("server-1"),
+            reqwest::StatusCode::CONFLICT,
+        ),
+    ] {
+        assert_eq!(
+            send(token, body.clone()).await.unwrap().status(),
+            status,
+            "{body}"
+        );
+    }
+    server.abort();
 }
 
 #[tokio::test]

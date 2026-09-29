@@ -87,6 +87,52 @@ fn publishes_version_one_and_initial_capabilities() {
     assert_eq!(CAPABILITY_WORKLOAD_DEPLOY, "workload.deploy.v1");
     assert_eq!(CAPABILITY_WORKLOAD_RESOURCES, "workload.resources.v1");
     assert_eq!(CAPABILITY_WORKLOAD_LIFECYCLE, "workload.lifecycle.v1");
+    assert_eq!(CAPABILITY_LOGS_READ, "logs.read.v1");
+}
+
+#[test]
+fn logs_read_command_and_result_round_trip() {
+    let command = control::v1::Command {
+        command_id: "logs-1".into(),
+        command_type: CAPABILITY_LOGS_READ.into(),
+        payload_version: 1,
+        created_at_unix_ms: 1,
+        payload: Some(control::v1::command::Payload::LogsRead(
+            control::v1::LogsReadRequest {
+                source: control::v1::LogSource::Corrosion.into(),
+                limit: 200,
+            },
+        )),
+        expires_at_unix_ms: 2,
+    };
+    assert_eq!(
+        control::v1::Command::decode(command.encode_to_vec().as_slice()).unwrap(),
+        command
+    );
+
+    let result = control::v1::CommandResult {
+        event_id: "logs-1:result".into(),
+        command_id: "logs-1".into(),
+        status: control::v1::CommandStatus::Succeeded.into(),
+        observed_at_unix_ms: 3,
+        payload: Some(control::v1::command_result::Payload::LogsRead(
+            control::v1::LogsReadResult {
+                source: control::v1::LogSource::Sentinel.into(),
+                events: vec![control::v1::LogEvent {
+                    timestamp_unix_ms: 1_700_000_000_000,
+                    level: "info".into(),
+                    component: "control::connection".into(),
+                    message: "Sentinel connected to Flux".into(),
+                    fields: [("transport".to_string(), "Tls".to_string())].into(),
+                }],
+                truncated: true,
+            },
+        )),
+    };
+    assert_eq!(
+        control::v1::CommandResult::decode(result.encode_to_vec().as_slice()).unwrap(),
+        result
+    );
 }
 
 #[test]

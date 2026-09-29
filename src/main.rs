@@ -135,17 +135,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let config = Arc::new(config::Config::load(development)?);
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                if config.debug {
-                    "debug".into()
-                } else {
-                    "info".into()
-                }
-            }),
-        )
-        .init();
+    // One global filter feeds both stdout and the redacted in-memory buffer
+    // behind `logs.read.v1`, so the buffer holds exactly what is printed.
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    if config.debug {
+                        "debug".into()
+                    } else {
+                        "info".into()
+                    }
+                }),
+            )
+            .with(tracing_subscriber::fmt::layer().log_internal_errors(true))
+            .with(control::log_layer())
+            .init();
+    }
 
     tracing::info!(version = %config.version, "Sentinel is starting");
 

@@ -5,16 +5,17 @@ use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
     ClusterLeaveResult, Command, CommandError, CommandResult, CommandStatus, ContainerListResult,
-    ContainerObservation, ContainerPort, SystemInfoResult, SystemPingResult,
-    WireguardInspectResult, WireguardKeyEnsureResult, WorkloadDeployRequest, WorkloadDeployResult,
-    WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadLifecycleResult,
+    ContainerObservation, ContainerPort, LogSource, LogsReadResult, SystemInfoResult,
+    SystemPingResult, WireguardInspectResult, WireguardKeyEnsureResult, WorkloadDeployRequest,
+    WorkloadDeployResult, WorkloadLifecycleAction, WorkloadLifecycleRequest,
+    WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
     CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT,
-    CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO,
+    CAPABILITY_SYSTEM_PING, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
+    CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
@@ -63,7 +64,15 @@ impl CommandExecutor {
         capability_accepted: bool,
     ) -> CommandExecution {
         let request = journal_request(&command);
-        match self.journal.lookup(&command.command_id, &request) {
+        // logs.read is a read-only, frequently polled command. Its results are
+        // never replayed, so it is not journaled; a repeated ID reads again.
+        let journaled = command.command_type != CAPABILITY_LOGS_READ;
+        let lookup = if journaled {
+            self.journal.lookup(&command.command_id, &request)
+        } else {
+            Ok(CommandLookup::Missing)
+        };
+        match lookup {
             Ok(CommandLookup::Completed(result)) => {
                 return match CommandResult::decode(result.as_slice()) {
                     Ok(result) => CommandExecution {
@@ -116,6 +125,13 @@ impl CommandExecutor {
             (CAPABILITY_SYSTEM_PING, Some(Payload::SystemPing(ping))) => !ping.nonce.is_empty(),
             (CAPABILITY_SYSTEM_INFO, Some(Payload::SystemInfo(_))) => true,
             (CAPABILITY_CONTAINER_LIST, Some(Payload::ContainerList(_))) => true,
+            (CAPABILITY_LOGS_READ, Some(Payload::LogsRead(request))) => {
+                (1..=crate::logs::LOGS_READ_MAX_LIMIT).contains(&request.limit)
+                    && matches!(
+                        LogSource::try_from(request.source),
+                        Ok(LogSource::Sentinel | LogSource::Corrosion | LogSource::DiscoveryDns)
+                    )
+            }
             (CAPABILITY_CLUSTER_LEAVE, Some(Payload::ClusterLeave(request))) => {
                 crate::network::validate_cluster_leave(request).is_ok()
             }
@@ -155,6 +171,7 @@ impl CommandExecutor {
                     | CAPABILITY_CLUSTER_LEAVE
                     | CAPABILITY_SYSTEM_INFO
                     | CAPABILITY_CONTAINER_LIST
+                    | CAPABILITY_LOGS_READ
                     | CAPABILITY_WORKLOAD_DEPLOY
                     | CAPABILITY_WORKLOAD_LIFECYCLE
                     | CAPABILITY_WIREGUARD_KEY_ENSURE
@@ -181,10 +198,13 @@ impl CommandExecutor {
             };
         }
 
-        match self
-            .journal
-            .start(&command.command_id, &request, now_millis())
-        {
+        let start = if journaled {
+            self.journal
+                .start(&command.command_id, &request, now_millis())
+        } else {
+            Ok(CommandStart::Started)
+        };
+        match start {
             Ok(CommandStart::Completed(result)) => {
                 return match CommandResult::decode(result.as_slice()) {
                     Ok(result) => CommandExecution {
@@ -270,6 +290,18 @@ impl CommandExecutor {
                     )),
                 },
                 Err(message) => failed(&command.command_id, "container_list_failed", message),
+            }
+        } else if let Some(Payload::LogsRead(request)) = command.payload {
+            match crate::logs::read_logs(request.source(), request.limit) {
+                Ok((events, truncated)) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::LogsRead(LogsReadResult {
+                        source: request.source,
+                        events,
+                        truncated,
+                    }),
+                ),
+                Err(message) => failed(&command.command_id, "logs_read_failed", &message),
             }
         } else if let Some(Payload::ClusterLeave(request)) = command.payload {
             match crate::network::leave_cluster(&self.network_root, &request) {
@@ -387,9 +419,10 @@ impl CommandExecutor {
                 "Command payload is missing.",
             )
         };
-        if let Err(error) =
-            self.journal
-                .finish(&command.command_id, &result.encode_to_vec(), now_millis())
+        if journaled
+            && let Err(error) =
+                self.journal
+                    .finish(&command.command_id, &result.encode_to_vec(), now_millis())
         {
             tracing::warn!(%error, command_id = %command.command_id, "could not persist command result");
         }

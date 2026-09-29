@@ -74,6 +74,7 @@ message Command {
     CorrosionReconcileRequest corrosion_reconcile = 22;
     CorrosionEndpointReconcileRequest corrosion_endpoint_reconcile = 23;
     ClusterLeaveRequest cluster_leave = 24;
+    LogsReadRequest logs_read = 25;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -110,6 +111,7 @@ message CommandResult {
     CorrosionReconcileResult corrosion_reconcile = 22;
     CorrosionEndpointReconcileResult corrosion_endpoint_reconcile = 23;
     ClusterLeaveResult cluster_leave = 24;
+    LogsReadResult logs_read = 25;
     CommandError error = 20;
   }
 }
@@ -280,6 +282,35 @@ message WorkloadEndpoint {
 }
 message CorrosionEndpointReconcileRequest { string owner_node_ip = 1; repeated WorkloadEndpoint endpoints = 2; }
 message CorrosionEndpointReconcileResult { string owner_node_ip = 1; uint64 endpoint_count = 2; }
+
+enum LogSource {
+  LOG_SOURCE_UNSPECIFIED = 0;
+  LOG_SOURCE_SENTINEL = 1;
+  LOG_SOURCE_CORROSION = 2;
+  LOG_SOURCE_DISCOVERY_DNS = 3;
+}
+
+message LogsReadRequest {
+  LogSource source = 1;
+  // Newest events to return, 1 to 500.
+  uint32 limit = 2;
+}
+
+message LogEvent {
+  int64 timestamp_unix_ms = 1;
+  // One of "error", "warn", "info", "debug", or "trace".
+  string level = 2;
+  string component = 3;
+  string message = 4;
+  map<string, string> fields = 5;
+}
+
+message LogsReadResult {
+  LogSource source = 1;
+  // Oldest first.
+  repeated LogEvent events = 2;
+  bool truncated = 3;
+}
 
 message CommandError {
   string code = 1;

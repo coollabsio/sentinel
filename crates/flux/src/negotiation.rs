@@ -1,8 +1,9 @@
 use sentinel_protocol::control::v1::Hello;
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RESOURCES,
-    NETWORK_CAPABILITIES, PROTOCOL_MAX, PROTOCOL_MIN, intersect_capabilities, select_protocol,
+    CAPABILITY_CONTAINER_LIST, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO,
+    CAPABILITY_SYSTEM_PING, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_WORKLOAD_RESOURCES, NETWORK_CAPABILITIES, PROTOCOL_MAX, PROTOCOL_MIN,
+    intersect_capabilities, select_protocol,
 };
 
 use crate::CredentialClaims;
@@ -19,13 +20,6 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
         || hello.boot_id.is_empty()
     {
         return Err("invalid identity");
-    }
-    if hello
-        .capabilities
-        .iter()
-        .any(|capability| !claims.capabilities.contains(capability))
-    {
-        return Err("capability was not granted");
     }
     let credential_protocol = select_protocol(
         claims.protocol_min,
@@ -48,12 +42,29 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
         CAPABILITY_WORKLOAD_DEPLOY,
         CAPABILITY_WORKLOAD_RESOURCES,
         CAPABILITY_WORKLOAD_LIFECYCLE,
+        CAPABILITY_LOGS_READ,
     ]
     .into_iter()
     .chain(NETWORK_CAPABILITIES)
     .collect::<Vec<_>>();
     let capabilities =
         intersect_capabilities(&claims.capabilities, &hello.capabilities, &supported);
+    // A newer Sentinel may advertise capabilities that this credential does not
+    // grant or that this Flux does not know yet. They are left out of the
+    // accepted set instead of refusing the connection.
+    let ignored: Vec<&str> = hello
+        .capabilities
+        .iter()
+        .map(String::as_str)
+        .filter(|capability| !capabilities.iter().any(|accepted| accepted == capability))
+        .collect();
+    if !ignored.is_empty() {
+        tracing::info!(
+            server_id = %hello.server_id,
+            ignored = ?ignored,
+            "Flux ignored capabilities that are not granted or not supported"
+        );
+    }
     Ok(Negotiated {
         protocol_version,
         capabilities,

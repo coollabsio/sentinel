@@ -495,6 +495,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "workload.deploy.v1",
             "workload.resources.v1",
             "workload.lifecycle.v1",
+            "logs.read.v1",
             "network.cluster.leave.v1",
             "network.wireguard.key.ensure.v1",
             "network.wireguard.inspect.v1",
@@ -1412,4 +1413,306 @@ fn rejects_unsafe_workload_lifecycle_requests() {
         })
         .is_err()
     );
+}
+
+fn logs_read_command(
+    command_id: &str,
+    source: sentinel_protocol::control::v1::LogSource,
+    limit: u32,
+) -> sentinel_protocol::control::v1::Command {
+    sentinel_protocol::control::v1::Command {
+        command_id: command_id.into(),
+        command_type: sentinel_protocol::CAPABILITY_LOGS_READ.into(),
+        payload_version: 1,
+        payload: Some(sentinel_protocol::control::v1::command::Payload::LogsRead(
+            sentinel_protocol::control::v1::LogsReadRequest {
+                source: source.into(),
+                limit,
+            },
+        )),
+        expires_at_unix_ms: i64::MAX,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn executes_sentinel_logs_read_commands() {
+    use sentinel_protocol::control::v1::LogSource;
+    use sentinel_protocol::control::v1::command_result;
+
+    let execution = crate::commands::CommandExecutor::new("dev")
+        .execute(logs_read_command("logs-1", LogSource::Sentinel, 5), true);
+
+    assert!(execution.accepted);
+    assert!(matches!(
+        execution.result.payload,
+        Some(command_result::Payload::LogsRead(result))
+            if result.source == LogSource::Sentinel as i32 && result.events.len() <= 5
+    ));
+}
+
+#[test]
+fn rejects_invalid_logs_read_requests() {
+    use sentinel_protocol::control::v1::LogSource;
+
+    for (index, (source, limit)) in [
+        (LogSource::Sentinel, 0),
+        (LogSource::Sentinel, 501),
+        (LogSource::Unspecified, 10),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let execution = crate::commands::CommandExecutor::new("dev").execute(
+            logs_read_command(&format!("logs-invalid-{index}"), source, limit),
+            true,
+        );
+        assert!(!execution.accepted, "{source:?} {limit}");
+    }
+    let mut command = logs_read_command("logs-unknown-source", LogSource::Sentinel, 10);
+    if let Some(sentinel_protocol::control::v1::command::Payload::LogsRead(request)) =
+        command.payload.as_mut()
+    {
+        request.source = 99;
+    }
+    assert!(
+        !crate::commands::CommandExecutor::new("dev")
+            .execute(command, true)
+            .accepted
+    );
+    assert!(
+        !crate::commands::CommandExecutor::new("dev")
+            .execute(
+                logs_read_command("logs-not-granted", LogSource::Sentinel, 10),
+                false
+            )
+            .accepted
+    );
+}
+
+#[test]
+fn log_buffer_keeps_the_newest_events_within_its_limits() {
+    use sentinel_protocol::control::v1::LogEvent;
+
+    let buffer = crate::logs::LogBuffer::new();
+    for index in 0..2_100 {
+        buffer.push(LogEvent {
+            timestamp_unix_ms: index,
+            level: "info".into(),
+            message: format!("event {index}"),
+            ..Default::default()
+        });
+    }
+    let (events, truncated) = buffer.newest(3);
+    assert!(truncated);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.timestamp_unix_ms)
+            .collect::<Vec<_>>(),
+        [2_097, 2_098, 2_099]
+    );
+    let (events, _) = buffer.newest(usize::MAX);
+    assert_eq!(events.len(), 2_000);
+    assert_eq!(events[0].timestamp_unix_ms, 100);
+
+    let buffer = crate::logs::LogBuffer::new();
+    for index in 0..400 {
+        buffer.push(LogEvent {
+            timestamp_unix_ms: index,
+            message: "x".repeat(4 * 1024),
+            ..Default::default()
+        });
+    }
+    let (events, _) = buffer.newest(usize::MAX);
+    assert!(events.len() < 400 && events.len() > 200);
+    assert_eq!(events.last().unwrap().timestamp_unix_ms, 399);
+    assert!(
+        events
+            .iter()
+            .map(|event| event.message.len())
+            .sum::<usize>()
+            <= 1024 * 1024
+    );
+
+    let (events, truncated) = crate::logs::LogBuffer::new().newest(10);
+    assert!(events.is_empty() && !truncated);
+}
+
+#[test]
+fn redacts_secrets_from_log_text() {
+    use crate::logs::redact_text;
+
+    let jwt = "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJzZXJ2ZXItMSJ9.c2lnbmF0dXJlLXZhbHVl";
+    for (input, expected) in [
+        (
+            "Authorization: Bearer abc.def-123",
+            "Authorization: Bearer [redacted]",
+        ),
+        ("sent bearer s3cr3t now", "sent bearer [redacted] now"),
+        (&format!("credential {jwt}."), "credential [redacted]."),
+        (
+            "token=abc123 password=\"hunter 2\" user=root",
+            "token=[redacted] password=[redacted] user=root",
+        ),
+        (
+            "https://host/cb?api_key=abc&x=1",
+            "https://host/cb?api_key=[redacted]&x=1",
+        ),
+        (
+            "authorization=Bearer abc123 next",
+            "authorization=[redacted] next",
+        ),
+        (
+            "DB_PASSWORD=pw, COOKIE=c; ENVIRONMENT=prod",
+            "DB_PASSWORD=[redacted], COOKIE=[redacted]; ENVIRONMENT=[redacted]",
+        ),
+        (
+            "Sentinel 1.0.2 connected to flux.coolify.io with id=42",
+            "Sentinel 1.0.2 connected to flux.coolify.io with id=42",
+        ),
+        ("bearer", "bearer"),
+        ("überbearer token", "überbearer token"),
+    ] {
+        assert_eq!(redact_text(input), expected, "{input}");
+    }
+    assert!(crate::logs::is_secret_name("private_key"));
+    assert!(crate::logs::is_secret_name("X-Auth-Token"));
+    assert!(!crate::logs::is_secret_name("connection_id"));
+}
+
+#[test]
+fn log_layer_records_redacted_bounded_events_that_pass_the_filter() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let buffer: &'static crate::logs::LogBuffer =
+        Box::leak(Box::new(crate::logs::LogBuffer::new()));
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new("info"))
+        .with(crate::logs::log_layer_for(buffer));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::debug!("filtered out");
+        tracing::info!(
+            target: "control::connection",
+            token = "abc",
+            transport = "Tls",
+            long = %"y".repeat(5_000),
+            "connected with password={}",
+            "hunter2"
+        );
+        tracing::warn!(message = %"z".repeat(10_000));
+        tracing::error!(
+            f0 = 0,
+            f1 = 1,
+            f2 = 2,
+            f3 = 3,
+            f4 = 4,
+            f5 = 5,
+            f6 = 6,
+            f7 = 7,
+            f8 = 8,
+            f9 = 9,
+            f10 = 10,
+            f11 = 11,
+            f12 = 12,
+            f13 = 13,
+            f14 = 14,
+            f15 = 15,
+            f16 = 16,
+            f17 = 17,
+            "many fields"
+        );
+    });
+
+    let (events, truncated) = buffer.newest(10);
+    assert!(!truncated);
+    assert_eq!(events.len(), 3);
+    let event = &events[0];
+    assert_eq!(event.level, "info");
+    assert_eq!(event.component, "control::connection");
+    assert_eq!(event.message, "connected with password=[redacted]");
+    assert_eq!(event.fields["token"], "[redacted]");
+    assert_eq!(event.fields["transport"], "Tls");
+    assert_eq!(event.fields["long"].len(), 1024);
+    assert!(event.timestamp_unix_ms > 0);
+    assert_eq!(events[1].level, "warn");
+    assert_eq!(events[1].message.len(), 4 * 1024);
+    assert_eq!(events[2].level, "error");
+    assert_eq!(events[2].fields.len(), 16);
+}
+
+#[test]
+fn builds_fixed_shell_free_journalctl_arguments() {
+    assert_eq!(
+        crate::logs::journal_args("corrosion.service", 11),
+        [
+            "--unit",
+            "corrosion.service",
+            "--no-pager",
+            "--quiet",
+            "--output",
+            "json",
+            "--lines",
+            "11"
+        ]
+    );
+}
+
+#[test]
+fn parses_journald_json_output() {
+    let output = concat!(
+        "-- No entries --\n",
+        r#"{"__REALTIME_TIMESTAMP":"1700000000000001","PRIORITY":"6","MESSAGE":"first","_PID":"10"}"#,
+        "\n",
+        r#"{"__REALTIME_TIMESTAMP":"1700000001000000","PRIORITY":"3","MESSAGE":"failed token=abc","_PID":"10"}"#,
+        "\n",
+        r#"{"__REALTIME_TIMESTAMP":"1700000002000000","PRIORITY":"4","MESSAGE":[104,105,255]}"#,
+        "\n",
+        r#"{"__REALTIME_TIMESTAMP":"1700000003000000","PRIORITY":"7","MESSAGE":"debug"}"#,
+        "\n",
+        r#"{"__REALTIME_TIMESTAMP":"1700000004000000","MESSAGE":"no priority"}"#,
+        "\n",
+    );
+
+    let (events, truncated) =
+        crate::logs::parse_journal(output.as_bytes(), "coolify-discovery-dns.service", 4);
+
+    assert!(truncated);
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].timestamp_unix_ms, 1_700_000_001_000);
+    assert_eq!(events[0].level, "error");
+    assert_eq!(events[0].message, "failed token=[redacted]");
+    assert_eq!(events[0].component, "coolify-discovery-dns");
+    assert_eq!(events[0].fields["_PID"], "10");
+    assert_eq!(events[1].level, "warn");
+    assert_eq!(events[1].message, "hi\u{fffd}");
+    assert!(events[1].fields.is_empty());
+    assert_eq!(events[2].level, "debug");
+    assert_eq!(events[3].level, "info");
+
+    let (events, truncated) = crate::logs::parse_journal(b"", "corrosion.service", 10);
+    assert!(events.is_empty() && !truncated);
+}
+
+#[test]
+fn logs_read_commands_are_not_journaled_but_other_commands_are() {
+    use sentinel_protocol::control::v1::LogSource;
+
+    let journal = store::CommandJournal::open_in_memory(7, 100_000).unwrap();
+    let mut executor = crate::commands::CommandExecutor::with_journal("dev", journal.clone());
+    let logs = logs_read_command("logs-unjournaled", LogSource::Sentinel, 10);
+    let ping = durable_ping_command("ping-journaled", "nonce");
+
+    assert!(executor.execute(logs.clone(), true).accepted);
+    assert!(executor.execute(logs.clone(), true).accepted);
+    assert!(executor.execute(ping.clone(), true).accepted);
+
+    assert!(matches!(
+        journal.lookup(&logs.command_id, &crate::commands::journal_request(&logs)),
+        Ok(store::CommandLookup::Missing)
+    ));
+    assert!(matches!(
+        journal.lookup(&ping.command_id, &crate::commands::journal_request(&ping)),
+        Ok(store::CommandLookup::Completed(_))
+    ));
 }

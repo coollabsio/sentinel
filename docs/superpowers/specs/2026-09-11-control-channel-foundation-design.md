@@ -320,10 +320,9 @@ Flux rejects the stream when:
 - `Hello` is not the first message.
 - The JWT subject differs from `Hello.server_id`.
 - The protocol ranges do not overlap.
-- Sentinel advertises a capability not granted by its credential.
 - Another required field is invalid.
 
-Flux accepts only the intersection of credential capabilities, Sentinel capabilities, and Flux-supported capabilities.
+Flux accepts only the intersection of credential capabilities, Sentinel capabilities, and Flux-supported capabilities. Advertised capabilities outside that intersection (for example from a newer Sentinel) are logged and ignored; they do not refuse the stream, and commands for them cannot be dispatched.
 
 Binary versions are diagnostic data. They do not control compatibility.
 
@@ -429,6 +428,19 @@ boot_id
 ```
 
 The handler uses existing Sentinel host collection functions where suitable. It must not invoke a shell command. Field failures return absent optional fields or a stable command error according to the final protobuf field requirements.
+
+### `logs.read.v1`
+
+Request: `source` (`sentinel`, `corrosion`, or `discovery_dns`) and `limit` (1 to 500).
+
+Result: `source`, `events` (oldest first; each has `timestamp_unix_ms`, `level`, `component`, `message`, `fields`), and `truncated` (older events exist).
+
+- `sentinel` reads a redacted in-memory ring of Sentinel's own log events (2,000 events or 1 MiB, oldest dropped). It only holds events that pass the stdout log filter.
+- `corrosion` and `discovery_dns` run `journalctl --unit corrosion.service` or `coolify-discovery-dns.service` without a shell, with an 8-second timeout. A missing `journalctl` or an empty journal returns no events.
+- Secret-looking field names, `name=value` pairs, bearer tokens, and JWT-like strings are replaced with `[redacted]` before storage or return.
+- Results are not written to the command journal. A repeated command ID reads the logs again.
+
+Flux exposes it as `POST /v1/commands/logs.read` with `{"server_id", "source", "limit"}`.
 
 ## 12. Sentinel runtime design
 
