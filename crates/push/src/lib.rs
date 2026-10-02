@@ -53,6 +53,22 @@ pub fn snapshot_metadata(inspection_failures: usize) -> serde_json::Value {
     })
 }
 
+/// Coolify reads `X-Sentinel-Version` on every push to detect an outdated
+/// Sentinel without an SSH round trip.
+pub fn push_request(
+    client: &reqwest::Client,
+    config: &Config,
+    payload: &serde_json::Value,
+) -> reqwest::RequestBuilder {
+    client
+        .post(&config.push_url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("X-Sentinel-Version", &config.version)
+        .bearer_auth(&config.token)
+        .json(payload)
+}
+
 pub struct Pusher {
     config: Arc<Config>,
     docker: DockerClient,
@@ -104,13 +120,7 @@ impl Pusher {
         tracing::info!(url = %self.config.push_url, "pushing");
         let payload = self.build_payload().await?;
 
-        let response = self
-            .client
-            .post(&self.config.push_url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .bearer_auth(&self.config.token)
-            .json(&payload)
+        let response = push_request(&self.client, &self.config, &payload)
             .send()
             .await?;
 
