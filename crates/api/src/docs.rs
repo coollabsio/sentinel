@@ -1,14 +1,13 @@
 //! Root of the generated OpenAPI document: info, tags, and the
 //! bearer security scheme. Paths and schemas are contributed by the
 //! `#[utoipa::path]` annotations on the route handlers and composed in
-//! `crate::router()` via utoipa-axum's `OpenApiRouter`.
+//! `crate::openapi_document()` via utoipa-axum's `OpenApiRouter`.
 //!
-//! This module replaces the old hand-written `openapi.yaml`. The version is
-//! the build version (`config::VERSION`, honoring `SENTINEL_BUILD_VERSION`),
-//! so the spec always matches `/api/version` with no manual bumping.
+//! The version is the crate version (`CARGO_PKG_VERSION`), not
+//! `config::VERSION`: a dev build tag from `SENTINEL_BUILD_VERSION` must not
+//! change the committed `openapi.json`.
 //!
-//! No `servers` list: OpenAPI then defaults to `/`, so "Try it" in the docs
-//! UIs calls the same host that served the page.
+//! No `servers` list: OpenAPI then defaults to `/`, the host that serves the API.
 
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme};
 use utoipa::openapi::tag::TagBuilder;
@@ -29,7 +28,7 @@ pub fn base_openapi() -> OpenApi {
                      This service is designed for integration with \
                      [Coolify.io](https://coolify.io).",
                 ))
-                .version(config::VERSION)
+                .version(env!("CARGO_PKG_VERSION"))
                 .contact(Some(
                     ContactBuilder::new()
                         .name(Some("Coolify"))

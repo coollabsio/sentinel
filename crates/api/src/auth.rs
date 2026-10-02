@@ -7,24 +7,8 @@ use std::sync::Arc;
 
 use crate::{AppState, types::ErrorBody};
 
-/// Endpoints exempt from authentication, matching the Go implementation,
-/// plus the generated OpenAPI document (it exposes the schema, not data).
-const PUBLIC_PATHS: [&str; 3] = ["/api/health", "/api/version", "/api-docs/openapi.json"];
-
-/// Interactive documentation UIs (and their static assets) are public like
-/// the spec they render. Prefix matching covers `/scalar`, `/scalar/...`,
-/// `/swagger-ui`, `/swagger-ui/...`.
-const PUBLIC_PREFIXES: [&str; 2] = ["/scalar", "/swagger-ui"];
-
-fn is_public(path: &str) -> bool {
-    PUBLIC_PATHS.contains(&path)
-        || PUBLIC_PREFIXES.iter().any(|prefix| {
-            path == *prefix
-                || path
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })
-}
+/// Endpoints exempt from authentication, matching the Go implementation.
+const PUBLIC_PATHS: [&str; 2] = ["/api/health", "/api/version"];
 
 pub async fn require_token(
     State(state): State<Arc<AppState>>,
@@ -32,7 +16,7 @@ pub async fn require_token(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if is_public(path) {
+    if PUBLIC_PATHS.contains(&path) {
         return next.run(request).await;
     }
 

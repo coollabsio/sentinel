@@ -24,9 +24,10 @@ The application follows a service-oriented architecture with these main componen
 1. **API Server** (`crates/api/`) - Axum-based HTTP server exposing metrics endpoints
    - Routes handle CPU, memory, and container metrics
    - Debug routes available when DEBUG=true
-   - OpenAPI spec is generated from `#[utoipa::path]` route annotations (utoipa-axum
-     `OpenApiRouter`); served at `/api-docs/openapi.json` with public interactive
-     docs at `/scalar` and `/swagger-ui`. Never hand-edit a spec file — annotate the route.
+   - `openapi.json` is generated from `#[utoipa::path]` route annotations (utoipa-axum
+     `OpenApiRouter`) and is not served at runtime. Never hand-edit it — annotate the
+     route, then run `UPDATE_OPENAPI=1 cargo test -p api --features traffic openapi_json`.
+     The test `openapi_json_is_up_to_date` fails in CI when the file drifts.
 
 2. **Collector Service** (`crates/collector/`) - Background service that periodically collects system and Docker metrics
    - Runs on configurable interval (COLLECTOR_REFRESH_RATE_SECONDS)
@@ -82,13 +83,12 @@ The application connects to Docker daemon via Unix socket to collect container s
 ## Release Process
 
 ### Version Locations
-`Cargo.toml` — `[workspace.package] version = "X.Y.Z"` is the ONLY bump
-location. The served OpenAPI document derives its version from
-`config::VERSION` (which honors `SENTINEL_BUILD_VERSION`), so it always
-matches `/api/version` with no manual sync.
+`Cargo.toml` — `[workspace.package] version = "X.Y.Z"` is the ONLY manual bump
+location. `openapi.json` takes its version from `CARGO_PKG_VERSION`, so
+regenerate it after the bump (CI fails until you do).
 
 ### Steps
-1. **Bump version** in `Cargo.toml`, then verify `cargo build --release --locked` passes
+1. **Bump version** in `Cargo.toml`, run `UPDATE_OPENAPI=1 cargo test -p api --features traffic openapi_json`, then verify `cargo build --release --locked` passes
 2. **Commit & push to `next`** — triggers `release-next.yaml` workflow
    - Builds multi-arch Docker images (amd64 + aarch64)
    - Pushes to Docker Hub & GHCR with `next` tag

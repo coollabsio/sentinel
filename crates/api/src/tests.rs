@@ -97,3 +97,25 @@ fn openapi_documents_every_route() {
         );
     }
 }
+
+/// `openapi.json` at the repo root is the committed API spec. It must equal
+/// the spec generated from the route annotations, so it can never drift from
+/// the code. The committed file is the full build (with traffic routes), so
+/// this check only runs with the `traffic` feature, as CI does.
+#[cfg(feature = "traffic")]
+#[test]
+fn openapi_json_is_up_to_date() {
+    const UPDATE: &str = "UPDATE_OPENAPI=1 cargo test -p api --features traffic openapi_json";
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../openapi.json");
+    let generated = super::openapi_document().to_pretty_json().unwrap() + "\n";
+    if std::env::var_os("UPDATE_OPENAPI").is_some() {
+        std::fs::write(path, &generated).unwrap();
+        return;
+    }
+    let committed = std::fs::read_to_string(path).unwrap_or_default();
+    // Not assert_eq!: a full-spec diff would bury the fix instruction.
+    assert!(
+        committed == generated,
+        "openapi.json is out of date. Regenerate it with: {UPDATE}"
+    );
+}

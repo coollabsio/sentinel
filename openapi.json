@@ -1,0 +1,2527 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Sentinel API",
+    "description": "REST API for gathering Linux server and Docker Engine metrics.\n\nSentinel collects system metrics (CPU, memory) and Docker container statistics, storing them in SQLite and providing both current and historical data through REST endpoints.\n\nThis service is designed for integration with [Coolify.io](https://coolify.io).",
+    "contact": {
+      "name": "Coolify",
+      "url": "https://coolify.io"
+    },
+    "license": {
+      "name": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0"
+    },
+    "version": "1.0.2"
+  },
+  "paths": {
+    "/api/app/{uuid}/traffic/breakdown/{dimension}": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get app dimension breakdown",
+        "description": "Top values of one dimension for one app, summed across every bucket\nin range. A synthetic `__other__` entry absorbs the long tail past\nthe server's top-N cap (TRAFFIC_TOPN). An unrecognized dimension\nreturns an empty array, not an error.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "breakdown",
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "path",
+            "description": "App UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dimension",
+            "in": "path",
+            "description": "One of: status, method, country, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. The\n`agent` dimension holds the bot/AI-agent name (e.g. GPTBot,\nClaudeBot) and is only present for bot traffic. `ip` holds the\nresolved real client IP (respecting Cloudflare CF-Connecting-IP\nand X-Forwarded-For); `useragent` holds the raw User-Agent header.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "A `String`, not a `usize`, so `?limit=` (empty) can be treated as\nabsent rather than rejected by the extractor — the same courtesy\n`resolve_range` extends to `?from=`.\n\nPositive integer, max 1000. Defaults to 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Top values of the dimension for the app",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TrafficBreakdownEntry"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/app/{uuid}/traffic/dashboard": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get aggregate traffic dashboard (per app)",
+        "description": "Per-app variant of `GET /api/traffic/dashboard`: every member filtered\nto one app, and `apps` omitted entirely. `apps_limit` is ignored.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "app_dashboard",
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "path",
+            "description": "App UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch (all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "range",
+            "in": "query",
+            "description": "Time range for the series member: `24h` (default), `7d`, or `30d`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "paths_limit",
+            "in": "query",
+            "description": "Top-N cap for the paths member. Positive integer, max 1000, default 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "breakdown_limit",
+            "in": "query",
+            "description": "Top-N cap for each breakdown member. Positive integer, max 1000, default 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aggregate dashboard for one app (no leaderboard)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficDashboard"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/app/{uuid}/traffic/overview": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get app traffic overview",
+        "description": "Request/bandwidth totals, status-class counts, latency percentiles,\nand estimated unique visitors for one app, merged across every host\nit was served on. An app with no data in range returns 200 with\nevery counter zeroed, not 404.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "overview",
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "path",
+            "description": "App UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "App traffic overview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficOverview"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/app/{uuid}/traffic/paths": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get app top paths",
+        "description": "Busiest request paths for one app, summed across every bucket in\nrange, with per-path latency. A synthetic `__other__` entry absorbs\nthe long tail past the server's top-N cap (TRAFFIC_TOPN).\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "paths",
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "path",
+            "description": "App UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "A `String`, not a `usize`, so `?limit=` (empty) can be treated as\nabsent rather than rejected by the extractor — the same courtesy\n`resolve_range` extends to `?from=`.\n\nPositive integer, max 1000. Defaults to 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Top paths for the app",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TrafficPath"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/app/{uuid}/traffic/series": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get app status-class time series",
+        "description": "Per-bucket 2xx/3xx/4xx/5xx request counts for one app, zero-filled to\na fixed length: 24 hourly buckets for `range=24h`, 7 or 30 daily\nbuckets for `range=7d`/`range=30d`.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "app_series",
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "path",
+            "description": "App UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "range",
+            "in": "query",
+            "description": "Time range: `24h` (hourly buckets, default), `7d` or `30d` (daily buckets).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Status-class time series for the app",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TrafficSeriesBucket"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/container/{containerId}/cpu/history": {
+      "get": {
+        "tags": [
+          "Container Metrics"
+        ],
+        "summary": "Get container CPU usage history",
+        "description": "Retrieve CPU usage history for a specific Docker container",
+        "operationId": "cpu_history",
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "description": "Exact container display name recorded by Sentinel",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Container CPU usage history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CpuUsage"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/container/{containerId}/disk/current": {
+      "get": {
+        "tags": [
+          "Container Metrics"
+        ],
+        "summary": "Get current container storage",
+        "description": "Latest stored writable-layer and volume size for a specific container. Returns `null` when no storage row has been recorded for the container.",
+        "operationId": "disk_current",
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "description": "Exact container display name recorded by Sentinel",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current container storage (or null)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ContainerDiskUsage"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/container/{containerId}/disk/history": {
+      "get": {
+        "tags": [
+          "Container Metrics"
+        ],
+        "summary": "Get container storage history",
+        "description": "Historical writable-layer and volume sizes for a specific container",
+        "operationId": "disk_history",
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "description": "Exact container display name recorded by Sentinel",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Container storage history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ContainerDiskUsage"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/container/{containerId}/memory/history": {
+      "get": {
+        "tags": [
+          "Container Metrics"
+        ],
+        "summary": "Get container memory usage history",
+        "description": "Retrieve memory usage history for a specific Docker container",
+        "operationId": "memory_history",
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "description": "Exact container display name recorded by Sentinel",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Container memory usage history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/MemUsage"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/cpu/current": {
+      "get": {
+        "tags": [
+          "System Metrics"
+        ],
+        "summary": "Get current CPU usage",
+        "description": "Retrieve the current CPU usage percentage",
+        "operationId": "current",
+        "responses": {
+          "200": {
+            "description": "Current CPU usage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CpuCurrent"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/cpu/history": {
+      "get": {
+        "tags": [
+          "System Metrics"
+        ],
+        "summary": "Get CPU usage history",
+        "description": "Retrieve historical CPU usage data with optional date range filtering",
+        "operationId": "history",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Historical CPU usage data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CpuUsage"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/disk/current": {
+      "get": {
+        "tags": [
+          "System Metrics"
+        ],
+        "summary": "Get current disk usage",
+        "description": "Latest stored filesystem usage, one entry per real mountpoint",
+        "operationId": "current",
+        "responses": {
+          "200": {
+            "description": "Current disk usage per mountpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DiskUsage"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/disk/history": {
+      "get": {
+        "tags": [
+          "System Metrics"
+        ],
+        "summary": "Get disk usage history",
+        "description": "Historical filesystem usage across mountpoints with optional date range filtering",
+        "operationId": "history",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Historical disk usage data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DiskUsage"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/health": {
+      "get": {
+        "tags": [
+          "Core"
+        ],
+        "summary": "Health check",
+        "description": "Check if the service is running",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "ok"
+              }
+            }
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    },
+    "/api/memory/current": {
+      "get": {
+        "tags": [
+          "System Metrics"
+        ],
+        "summary": "Get current memory usage",
+        "description": "Retrieve the current memory usage statistics",
+        "operationId": "current",
+        "responses": {
+          "200": {
+            "description": "Current memory usage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemUsage"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/memory/history": {
+      "get": {
+        "tags": [
+          "System Metrics"
+        ],
+        "summary": "Get memory usage history",
+        "description": "Retrieve historical memory usage data with optional date range filtering",
+        "operationId": "history",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Historical memory usage data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/MemUsage"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/resource/{uuid}/traffic/breakdown/{dimension}": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get resource dimension breakdown",
+        "description": "Per-resource variant of the app dimension breakdown, merged by `value`\nacross every key of the resource.\n\nReads the key `{uuid}` and every key that starts with `{uuid}-`\n(Compose services, previews, Compose previews). A key such as\n`{uuid}x…` (no dash) is not included.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "resource_breakdown",
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "path",
+            "description": "Coolify resource UUID. Matched literally (`%` and `_` are not wildcards).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dimension",
+            "in": "path",
+            "description": "One of: status, method, country, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. An\nunrecognized dimension returns an empty array, not an error.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "A `String`, not a `usize`, so `?limit=` (empty) can be treated as\nabsent rather than rejected by the extractor — the same courtesy\n`resolve_range` extends to `?from=`.\n\nPositive integer, max 1000. Defaults to 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Top values of the dimension for the resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TrafficBreakdownEntry"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/resource/{uuid}/traffic/dashboard": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get aggregate traffic dashboard (per resource)",
+        "description": "Per-resource variant of `GET /api/traffic/dashboard`: every member\nfollows the merge rule of its standalone resource endpoint, and `apps`\nis omitted entirely. `apps_limit` is ignored.\n\nReads the key `{uuid}` and every key that starts with `{uuid}-`\n(Compose services, previews, Compose previews). A key such as\n`{uuid}x…` (no dash) is not included.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "resource_dashboard",
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "path",
+            "description": "Coolify resource UUID. Matched literally (`%` and `_` are not wildcards).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch (all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "range",
+            "in": "query",
+            "description": "Time range for the series member: `24h` (default), `7d`, or `30d`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "paths_limit",
+            "in": "query",
+            "description": "Top-N cap for the paths member. Positive integer, max 1000, default 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "breakdown_limit",
+            "in": "query",
+            "description": "Top-N cap for each breakdown member. Positive integer, max 1000, default 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aggregate dashboard for one resource (no leaderboard)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficDashboard"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/resource/{uuid}/traffic/overview": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get resource traffic overview",
+        "description": "Per-resource variant of the app overview. Counters are summed, unique\nvisitor HyperLogLog++ sketches are unioned (a visitor on two keys\ncounts once), and latency t-digests are merged. A resource with no\ndata in range returns 200 with every counter zeroed.\n\nReads the key `{uuid}` and every key that starts with `{uuid}-`\n(Compose services, previews, Compose previews). A key such as\n`{uuid}x…` (no dash) is not included.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "resource_overview",
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "path",
+            "description": "Coolify resource UUID. Matched literally (`%` and `_` are not wildcards).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Resource traffic overview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficOverview"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/resource/{uuid}/traffic/paths": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get resource top paths",
+        "description": "Per-resource variant of the app top paths. Rows group by `(app, path)`:\neach entry keeps its real key in `app` (for example `{uuid}-web`), so\nthe same path on two keys stays two entries.\n\nReads the key `{uuid}` and every key that starts with `{uuid}-`\n(Compose services, previews, Compose previews). A key such as\n`{uuid}x…` (no dash) is not included.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "resource_paths",
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "path",
+            "description": "Coolify resource UUID. Matched literally (`%` and `_` are not wildcards).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "A `String`, not a `usize`, so `?limit=` (empty) can be treated as\nabsent rather than rejected by the extractor — the same courtesy\n`resolve_range` extends to `?from=`.\n\nPositive integer, max 1000. Defaults to 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Top paths for the resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TrafficPath"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/resource/{uuid}/traffic/series": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get resource status-class time series",
+        "description": "Per-resource variant of the app status-class time series. Counters are\nsummed per bucket; `unique_visitors` and `p95` are a per-bucket sketch\nmerge across all keys of the resource.\n\nReads the key `{uuid}` and every key that starts with `{uuid}-`\n(Compose services, previews, Compose previews). A key such as\n`{uuid}x…` (no dash) is not included.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "resource_series",
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "path",
+            "description": "Coolify resource UUID. Matched literally (`%` and `_` are not wildcards).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "range",
+            "in": "query",
+            "description": "Time range: `24h` (hourly buckets, default), `7d` or `30d` (daily buckets).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Status-class time series for the resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TrafficSeriesBucket"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/stats": {
+      "get": {
+        "tags": [
+          "Debug"
+        ],
+        "summary": "Get database statistics",
+        "description": "Retrieve database storage statistics and estimated logical table sizes.\n\nOnly served when `DEBUG=true`; returns 404 otherwise.",
+        "operationId": "stats",
+        "responses": {
+          "200": {
+            "description": "Database statistics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/traffic/apps": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get recorded apps",
+        "description": "List every app UUID (or host, for Caddy) that traffic analytics has\nrecorded data for.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "apps",
+        "responses": {
+          "200": {
+            "description": "Recorded app identifiers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/traffic/attribution": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get GeoIP attribution",
+        "description": "License attribution string for whichever GeoIP data source is\ncurrently active (resolved at runtime — see README.md's GeoIP\nlicensing section).\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "attribution",
+        "responses": {
+          "200": {
+            "description": "Active GeoIP source's attribution string, or null",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficAttribution"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/traffic/breakdown/{dimension}": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get server-wide dimension breakdown",
+        "description": "Top values of one dimension across every app on the box, summed over\nthe range. An unrecognized dimension returns an empty array, not an\nerror.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "server_breakdown",
+        "parameters": [
+          {
+            "name": "dimension",
+            "in": "path",
+            "description": "One of: status, method, country, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. The\n`agent` dimension holds the bot/AI-agent name (e.g. GPTBot,\nClaudeBot) and is only present for bot traffic. `ip` holds the\nresolved real client IP (respecting Cloudflare CF-Connecting-IP\nand X-Forwarded-For); `useragent` holds the raw User-Agent header.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "A `String`, not a `usize`, so `?limit=` (empty) can be treated as\nabsent rather than rejected by the extractor — the same courtesy\n`resolve_range` extends to `?from=`.\n\nPositive integer, max 1000. Defaults to 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Top values of the dimension across all apps",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TrafficBreakdownEntry"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/traffic/dashboard": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get aggregate traffic dashboard (server-wide)",
+        "description": "Bundle every traffic shape into one response so a dashboard can replace\n~15 separate requests with a single call. Each member is verbatim the\nshape of its standalone endpoint, with the same server-side sketch\nmerges (t-digest latency, HLL uniques) — nothing is re-summed.\n\n`overview`, `paths`, and every `breakdowns` dimension follow `from`/`to`;\n`series` follows `range`. The server-wide variant includes `apps` (every\napp with traffic, ranked by requests desc, capped at `apps_limit`). An\nempty range returns 200 with zeroed/empty members, never 404.\n\nAdditive: older Coolify keeps calling the individual endpoints; new\nCoolify calls this first and falls back to them on 404.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "server_dashboard",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "range",
+            "in": "query",
+            "description": "Time range for the series member: `24h` (default), `7d`, or `30d`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "paths_limit",
+            "in": "query",
+            "description": "Top-N cap for the paths member. Positive integer, max 1000, default 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "breakdown_limit",
+            "in": "query",
+            "description": "Top-N cap for each breakdown member. Positive integer, max 1000, default 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "apps_limit",
+            "in": "query",
+            "description": "Top-N cap for the apps leaderboard (server-wide dashboard only; ignored\non the per-app variant). Positive integer, max 1000, default 200.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aggregate dashboard, including the app leaderboard",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficDashboard"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/traffic/overview": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get server-wide traffic overview",
+        "description": "Request/bandwidth totals, status-class counts, latency percentiles,\nand estimated unique visitors merged across every app and host on the\nbox. Sketches (t-digest, HyperLogLog) are merged server-side, so the\npercentiles and visitor estimate are a true cross-app merge, not a sum\nof per-app estimates. Same shape as the per-app overview.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "server_overview",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server-wide traffic overview",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficOverview"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/traffic/paths": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get server-wide top paths",
+        "description": "Busiest request paths across every app on the box, summed over the\nrange with per-path latency. Rows are keyed by `(app, path)`: the same path served by\nmultiple apps stays a separate entry per app, each labelled with its\nowning `app`, giving a correct top-N across all apps that preserves\nper-app attribution.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "server_paths",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "A `String`, not a `usize`, so `?limit=` (empty) can be treated as\nabsent rather than rejected by the extractor — the same courtesy\n`resolve_range` extends to `?from=`.\n\nPositive integer, max 1000. Defaults to 50.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server-wide top paths",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TrafficPath"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/traffic/series": {
+      "get": {
+        "tags": [
+          "Traffic Analytics"
+        ],
+        "summary": "Get server-wide status-class time series",
+        "description": "Per-bucket 2xx/3xx/4xx/5xx request counts across every app/host,\nzero-filled to a fixed length (see the per-app variant for granularity).\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+        "operationId": "series",
+        "parameters": [
+          {
+            "name": "range",
+            "in": "query",
+            "description": "Time range: `24h` (hourly buckets, default), `7d` or `30d` (daily buckets).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Status-class time series",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TrafficSeriesBucket"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/version": {
+      "get": {
+        "tags": [
+          "Core"
+        ],
+        "summary": "Get version",
+        "description": "Get the current version of Sentinel",
+        "operationId": "version",
+        "responses": {
+          "200": {
+            "description": "Current version",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ContainerDiskUsage": {
+        "type": "object",
+        "description": "Per-container storage: Docker writable-layer size plus summed volume sizes.",
+        "required": [
+          "time",
+          "writableLayer",
+          "volumesTotal"
+        ],
+        "properties": {
+          "human_friendly_time": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "time": {
+            "type": "string"
+          },
+          "volumesTotal": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "writableLayer": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "CpuCurrent": {
+        "type": "object",
+        "description": "Current CPU usage. WIRE FORMAT IS FROZEN: `percent` is a NUMBER here,\nunlike /api/cpu/history where it is a string. Do not \"fix\" this.",
+        "required": [
+          "time",
+          "percent"
+        ],
+        "properties": {
+          "percent": {
+            "type": "number",
+            "format": "double"
+          },
+          "time": {
+            "type": "string"
+          }
+        }
+      },
+      "CpuUsage": {
+        "type": "object",
+        "description": "WIRE FORMAT IS FROZEN. `percent` is a string here (history endpoints) but a\nnumber in /api/cpu/current. Do not \"fix\" this — Coolify parses it as-is.",
+        "required": [
+          "time",
+          "percent"
+        ],
+        "properties": {
+          "human_friendly_time": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "percent": {
+            "type": "string"
+          },
+          "time": {
+            "type": "string"
+          }
+        }
+      },
+      "DiskUsage": {
+        "type": "object",
+        "description": "Server filesystem usage for one mountpoint. These endpoints are new (not\npart of the frozen Go wire format), so `time` is a stringified millis for\nconsistency with the other series while byte fields stay numeric.",
+        "required": [
+          "time",
+          "mount",
+          "total",
+          "used",
+          "available",
+          "usedPercent"
+        ],
+        "properties": {
+          "available": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "human_friendly_time": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mount": {
+            "type": "string"
+          },
+          "time": {
+            "type": "string"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "used": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "usedPercent": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "MemUsage": {
+        "type": "object",
+        "description": "WIRE FORMAT IS FROZEN. `usedPercent` is the only camelCase key in the API.",
+        "required": [
+          "time",
+          "total",
+          "available",
+          "used",
+          "usedPercent",
+          "free"
+        ],
+        "properties": {
+          "available": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "free": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "human_friendly_time": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "time": {
+            "type": "string"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "used": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "usedPercent": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "StatsMemoryUsage": {
+        "type": "object",
+        "required": [
+          "total",
+          "available",
+          "used",
+          "usedPercent",
+          "free"
+        ],
+        "properties": {
+          "available": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "free": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "used": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "usedPercent": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "StatsResponse": {
+        "type": "object",
+        "description": "Database storage statistics and estimated logical table sizes.",
+        "required": [
+          "row_count",
+          "storage_usage_kb",
+          "storage_usage_mb",
+          "memory_usage",
+          "table_sizes"
+        ],
+        "properties": {
+          "memory_usage": {
+            "$ref": "#/components/schemas/StatsMemoryUsage"
+          },
+          "row_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "storage_usage_kb": {
+            "type": "string",
+            "description": "Human-readable strings (\"{:.2}\"), part of the wire format."
+          },
+          "storage_usage_mb": {
+            "type": "string"
+          },
+          "table_sizes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StatsTableSize"
+            }
+          }
+        }
+      },
+      "StatsTableSize": {
+        "type": "object",
+        "required": [
+          "table_name",
+          "row_count",
+          "size_mb",
+          "size_kb"
+        ],
+        "properties": {
+          "row_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "size_kb": {
+            "type": "string"
+          },
+          "size_mb": {
+            "type": "string",
+            "description": "Human-readable strings (\"{:.2}\"), part of the wire format."
+          },
+          "table_name": {
+            "type": "string"
+          }
+        }
+      },
+      "TrafficAppEntry": {
+        "type": "object",
+        "description": "One row of the server-wide app leaderboard: an app UUID plus its overview,\nranked by request count descending.",
+        "required": [
+          "uuid",
+          "overview"
+        ],
+        "properties": {
+          "overview": {
+            "$ref": "#/components/schemas/TrafficOverview"
+          },
+          "uuid": {
+            "type": "string"
+          }
+        }
+      },
+      "TrafficAttribution": {
+        "type": "object",
+        "description": "The attribution string required by the license of whichever GeoIP source\nis currently active (design spec §6), or `null` when none applies (GeoIP\ndisabled, not yet resolved, or an unrecognized `GEOIP_DB_URL` override).",
+        "properties": {
+          "attribution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "TrafficBreakdownEntry": {
+        "type": "object",
+        "description": "One value of a breakdown dimension (country, device, status class, ...),\nsummed over every bucket in the range.",
+        "required": [
+          "value",
+          "requests",
+          "bytes_out"
+        ],
+        "properties": {
+          "bytes_out": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "requests": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
+      "TrafficBreakdowns": {
+        "type": "object",
+        "description": "The eleven breakdown dimensions Coolify renders, each a top-N list in the\nsame shape as `GET /traffic/breakdown/{dim}`. A fixed struct rather than a\nmap so the dimension set is the single source of truth and always complete.",
+        "required": [
+          "country",
+          "referer",
+          "browser",
+          "os",
+          "device",
+          "protocol",
+          "cache",
+          "status",
+          "agent",
+          "ip",
+          "useragent"
+        ],
+        "properties": {
+          "agent": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficBreakdownEntry"
+            }
+          },
+          "browser": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficBreakdownEntry"
+            }
+          },
+          "cache": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficBreakdownEntry"
+            }
+          },
+          "country": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficBreakdownEntry"
+            }
+          },
+          "device": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficBreakdownEntry"
+            }
+          },
+          "ip": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficBreakdownEntry"
+            }
+          },
+          "os": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficBreakdownEntry"
+            }
+          },
+          "protocol": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficBreakdownEntry"
+            }
+          },
+          "referer": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficBreakdownEntry"
+            }
+          },
+          "status": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficBreakdownEntry"
+            }
+          },
+          "useragent": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficBreakdownEntry"
+            }
+          }
+        }
+      },
+      "TrafficDashboard": {
+        "type": "object",
+        "description": "Everything Coolify's traffic dashboard needs in one payload, so it can\nreplace ~15 separate round-trips with a single request. Every member is the\nverbatim shape of its standalone endpoint — the same serializers and\nserver-side sketch merges — bundled, never re-summed.",
+        "required": [
+          "overview",
+          "paths",
+          "breakdowns",
+          "series"
+        ],
+        "properties": {
+          "apps": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/TrafficAppEntry"
+            },
+            "description": "Per-app leaderboard, present only on the server-wide dashboard and\nomitted entirely on the per-app variant."
+          },
+          "attribution": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The active GeoIP attribution string, or `null`. Flattened out of\n[`TrafficAttribution`] so the dashboard carries the bare value."
+          },
+          "breakdowns": {
+            "$ref": "#/components/schemas/TrafficBreakdowns"
+          },
+          "overview": {
+            "$ref": "#/components/schemas/TrafficOverview"
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficPath"
+            }
+          },
+          "series": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficSeriesBucket"
+            }
+          }
+        }
+      },
+      "TrafficLatency": {
+        "type": "object",
+        "description": "Approximate latency quantiles in milliseconds (t-digest estimate). `0.0`\non every field when the range holds no decodable latency sketch.",
+        "required": [
+          "p50",
+          "p95",
+          "p99"
+        ],
+        "properties": {
+          "p50": {
+            "type": "number",
+            "format": "double"
+          },
+          "p95": {
+            "type": "number",
+            "format": "double"
+          },
+          "p99": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "TrafficOverview": {
+        "type": "object",
+        "description": "App-level traffic totals for a query range, merged across *every* host\nthat served the app (per-host detail is deliberately not exposed here).",
+        "required": [
+          "requests",
+          "bytes_in",
+          "bytes_out",
+          "status",
+          "latency",
+          "unique_visitors"
+        ],
+        "properties": {
+          "bytes_in": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "bytes_out": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "latency": {
+            "$ref": "#/components/schemas/TrafficLatency"
+          },
+          "requests": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TrafficStatusBreakdown"
+          },
+          "unique_visitors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Approximate distinct client IPs (HyperLogLog++ estimate, ~1-2% error).",
+            "minimum": 0
+          }
+        }
+      },
+      "TrafficPath": {
+        "type": "object",
+        "description": "One row of the top-paths table, summed over every bucket in the range.\nCarries only p50/p95 — p99 is omitted deliberately to keep a 50-row\npayload small, and the app-level p99 is available from the overview.",
+        "required": [
+          "path",
+          "app",
+          "requests",
+          "bytes_out",
+          "s4xx",
+          "s5xx",
+          "p50",
+          "p95"
+        ],
+        "properties": {
+          "app": {
+            "type": "string",
+            "description": "The app (Coolify app UUID, or host for Caddy) that served this path,\nso a server-wide response can attribute each path back to its owning\napp/domain. On a per-app endpoint every row carries the queried app."
+          },
+          "bytes_out": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "p50": {
+            "type": "number",
+            "format": "double"
+          },
+          "p95": {
+            "type": "number",
+            "format": "double"
+          },
+          "path": {
+            "type": "string"
+          },
+          "requests": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "s4xx": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "s5xx": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "TrafficSeriesBucket": {
+        "type": "object",
+        "description": "One time bucket of traffic totals, for the series endpoints. `bucket` is\nthe unix-millis start of the bucket (hour- or day-aligned by the request's\n`range`). Counters are zero for buckets with no traffic.\n\n`unique_visitors` is a per-bucket HyperLogLog++ estimate (the bucket's own\nsketches merged, ~1-2% error) — it is *not* additive across buckets, so a\nsum of these will overcount a range's true distinct visitors. `p95` is the\nbucket's 95th-percentile latency in ms (t-digest estimate), `0.0` when the\nbucket holds no decodable latency sketch.",
+        "required": [
+          "bucket",
+          "requests",
+          "bytes_in",
+          "bytes_out",
+          "s2xx",
+          "s3xx",
+          "s4xx",
+          "s5xx",
+          "unique_visitors",
+          "p95"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "bytes_in": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "bytes_out": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "p95": {
+            "type": "number",
+            "format": "double"
+          },
+          "requests": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "s2xx": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "s3xx": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "s4xx": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "s5xx": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unique_visitors": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "TrafficStatusBreakdown": {
+        "type": "object",
+        "description": "Request counts by HTTP status class.",
+        "required": [
+          "s2xx",
+          "s3xx",
+          "s4xx",
+          "s5xx"
+        ],
+        "properties": {
+          "s2xx": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "s3xx": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "s4xx": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "s5xx": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Bearer token authentication. Set the TOKEN environment variable when running Sentinel and include it in the Authorization header."
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Core",
+      "description": "Health check and version endpoints"
+    },
+    {
+      "name": "System Metrics",
+      "description": "CPU and memory metrics for the host system"
+    },
+    {
+      "name": "Container Metrics",
+      "description": "Metrics for Docker containers"
+    },
+    {
+      "name": "Traffic Analytics",
+      "description": "On-box, aggregate-only web/traffic analytics computed from the reverse-proxy access log. Only present when Sentinel is built with the `traffic` Cargo feature and `TRAFFIC_ENABLED=true` at runtime; see README.md for the full feature description and Coolify handoff requirements."
+    },
+    {
+      "name": "Debug",
+      "description": "Debug-only endpoints (available when DEBUG=true)"
+    }
+  ]
+}

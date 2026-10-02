@@ -15,8 +15,6 @@ use config::Config;
 use store::{MemRow, Store};
 use tokio::sync::{Mutex, Semaphore};
 use utoipa_axum::{router::OpenApiRouter, routes};
-use utoipa_scalar::{Scalar, Servable};
-use utoipa_swagger_ui::SwaggerUi;
 
 pub const MAX_CONCURRENT_HISTORY_QUERIES: usize = 8;
 pub const MAX_CONCURRENT_ANALYTICS_QUERIES: usize = 8;
@@ -104,7 +102,7 @@ pub struct AppState {
 }
 
 /// Everything except the debug-gated `/api/stats` *route*. Its documentation
-/// is merged into the spec separately (see [`openapi_document`]) so the spec
+/// is merged into the spec separately (see `openapi_document`) so the spec
 /// always documents all endpoints regardless of the DEBUG flag.
 fn core_openapi_router() -> OpenApiRouter<Arc<AppState>> {
     let open = OpenApiRouter::with_openapi(docs::base_openapi())
@@ -124,10 +122,12 @@ fn core_openapi_router() -> OpenApiRouter<Arc<AppState>> {
     open
 }
 
-/// The complete OpenAPI document for this build. `/api/stats` is included
+/// The complete OpenAPI document for this build, committed as `openapi.json`
+/// (see `tests::openapi_json_is_up_to_date`); it is not served at runtime. `/api/stats` is included
 /// unconditionally — the route is DEBUG-gated at runtime, and the operation
 /// description says so. Traffic paths are present when compiled with the
 /// `traffic` feature (release builds always are).
+#[cfg(test)]
 fn openapi_document() -> utoipa::openapi::OpenApi {
     let (_, mut api) = core_openapi_router().split_for_parts();
     let (_, stats_api) = routes::stats::routes().split_for_parts();
@@ -139,17 +139,10 @@ pub fn router(state: Arc<AppState>) -> Router {
     let debug = state.config.debug;
 
     let (mut app, _) = core_openapi_router().split_for_parts();
-    let api = openapi_document();
 
     if debug {
         app = app.merge(routes::stats::routes());
     }
-
-    // Interactive docs and the spec JSON are public, like /api/health and
-    // /api/version (see auth::PUBLIC_PATHS / PUBLIC_PREFIXES).
-    let app = app
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api.clone()))
-        .merge(Router::from(Scalar::with_url("/scalar", api)));
 
     app.layer(axum::middleware::from_fn_with_state(
         state.clone(),

@@ -2,33 +2,32 @@
 
 Sentinel provides a REST API for retrieving system and Docker container metrics. All metrics can be queried both for current values and historical data.
 
-## Interactive documentation (source of truth)
+## OpenAPI specification (source of truth)
 
-The API is documented by an OpenAPI specification **generated from the route
-annotations in code** — it can never drift from the implementation. A running
-Sentinel instance serves it in three forms, all without authentication:
+The full API is described in [`openapi.json`](./openapi.json). The file is
+**generated from the route annotations in code**: a test fails in CI when the
+file and the code do not match, so it can never drift from the implementation.
+Sentinel does not serve the spec or a docs UI at runtime.
 
-| URL | What |
-|-----|------|
-| `/scalar` | [Scalar](https://scalar.com) interactive API reference |
-| `/swagger-ui` | Swagger UI interactive explorer |
-| `/api-docs/openapi.json` | The raw OpenAPI document (JSON) |
+To browse it, open `openapi.json` in any OpenAPI tool, for example
+<https://editor.swagger.io>, Scalar, Postman, or Insomnia.
 
-For example, with the default port: <http://localhost:8888/scalar>
+To regenerate it after you change a route:
+
+```bash
+UPDATE_OPENAPI=1 cargo test -p api --features traffic openapi_json
+```
 
 ## Authentication
 
-Metrics and debug endpoints require a Bearer token. The health/version
-endpoints and the documentation routes are public. Set the `TOKEN`
-environment variable when running Sentinel, and include it in protected
-requests:
+Metrics and debug endpoints require a Bearer token. The health and version
+endpoints are public so container and orchestration probes can use them. Set
+the `TOKEN` environment variable when running Sentinel, and include it in
+protected requests:
 
 ```bash
 Authorization: Bearer YOUR_TOKEN_HERE
 ```
-
-Both frontends have an "Authorize" control where you can paste the token once
-to call protected endpoints interactively.
 
 ## Conditional routes
 

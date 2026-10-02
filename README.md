@@ -151,17 +151,17 @@ curl -H "Authorization: Bearer YOUR_TOKEN" \
 
 ### Complete API Documentation
 
-For detailed API documentation including request/response examples, query parameters, and error responses, see [API.md](./API.md) — or the interactive docs served by a running instance at `/scalar` and `/swagger-ui`.
+For detailed API documentation including request/response examples, query parameters, and error responses, see [API.md](./API.md) and the OpenAPI spec [openapi.json](./openapi.json).
 
 ### OpenAPI Specification
 
-The OpenAPI specification is **generated from code annotations** and served live at `/api-docs/openapi.json` (explorable via `/scalar` or `/swagger-ui`). There is no hand-written spec file to get out of date.
+[openapi.json](./openapi.json) is **generated from the route annotations in code**, and a test fails in CI when it drifts. Open it in any OpenAPI tool (for example <https://editor.swagger.io>). See [API.md](./API.md) for how to regenerate it.
 
 ## Traffic Analytics
 
 Sentinel can optionally compute Cloudflare-style web analytics (requests, bandwidth, status classes, latency percentiles, unique visitors, geo, browser/OS/device, bot classification, referers, top paths) on the server from the reverse-proxy's JSON access log (Traefik or Caddy).
 
-Only per-minute aggregate rollups are stored, never raw request rows, so storage doesn't grow with traffic. Rollups compact minute → hourly → daily with per-tier retention. Coolify pulls the aggregates the same way it does CPU/memory metrics; see the interactive docs at `/scalar` (tag *Traffic Analytics*) for the query endpoints.
+Only per-minute aggregate rollups are stored, never raw request rows, so storage doesn't grow with traffic. Rollups compact minute → hourly → daily with per-tier retention. Coolify pulls the aggregates the same way it does CPU/memory metrics; see the *Traffic Analytics* tag in [openapi.json](./openapi.json) for the query endpoints.
 
 The feature is opt-in at runtime (`TRAFFIC_ENABLED=true`) and gated at compile time by the `traffic` Cargo feature. The published Docker images already build with `--features traffic`; if you build Sentinel yourself, pass `cargo build --features traffic` or the traffic endpoints will 404.
 
@@ -207,7 +207,8 @@ sentinel/
 │   └── docker/       # Docker Engine client (bollard)
 ├── Cargo.toml         # Workspace manifest
 ├── Dockerfile          # Docker build configuration
-└── API.md              # API documentation (points to the generated live spec)
+├── API.md              # API documentation
+└── openapi.json        # OpenAPI spec, generated from route annotations
 ```
 
 ### Building
