@@ -145,3 +145,32 @@ fn opens_a_bare_filename_with_no_directory_component() {
         result.err()
     );
 }
+
+/// A container that is no longer listed by Docker loses its status row, so it
+/// does not keep reporting its last state; listed containers keep theirs.
+#[test]
+fn prune_container_status_drops_unlisted_containers() {
+    use store::ContainerStatusSample;
+    let s = Store::open_in_memory().unwrap();
+    let status = |id: &str| ContainerStatusSample {
+        container_id: id.into(),
+        state: "running".into(),
+        health_status: "healthy".into(),
+        restart_count: 0,
+    };
+    s.upsert_container_status_batch(1000, &[status("keep"), status("gone")])
+        .unwrap();
+
+    assert_eq!(s.prune_container_status(&["keep".to_string()]).unwrap(), 1);
+    let ids: Vec<_> = s
+        .latest_container_metrics()
+        .unwrap()
+        .into_iter()
+        .map(|m| (m.container_id, m.status.is_some()))
+        .collect();
+    assert_eq!(ids, vec![("keep".to_string(), true)]);
+
+    // An empty listing (no containers left) prunes everything.
+    assert_eq!(s.prune_container_status(&[]).unwrap(), 1);
+    assert!(s.latest_container_metrics().unwrap().is_empty());
+}

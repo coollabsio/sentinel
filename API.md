@@ -720,7 +720,7 @@ Retrieve the latest CPU, memory, storage and network sample, plus container stat
 - `memory` (object | null): Latest memory sample, same shape as [`/api/container/:containerId/memory/history`](#get-container-memory-history) items; `null` when none recorded
 - `disk` (object | null): Latest storage sample, same shape as [`/api/container/:containerId/disk/current`](#get-container-storage-current); `null` when none recorded
 - `network` (object | null): Latest network rate, same shape as [`/api/container/:containerId/network/history`](#get-container-network-history) items; `null` when none recorded
-- `status` (object | null): Current container status — `state` (Docker state, e.g. `running`), `health` (Docker health status `healthy`/`unhealthy`/`starting`/`none`, or `unknown` when the container has no healthcheck), `restartCount`; `null` when not inspected yet
+- `status` (object | null): Current container status — `state` (Docker state, e.g. `running`), `health` (Docker health status `healthy`/`unhealthy`/`starting`/`none`, or `unknown` when the container has no healthcheck), `restartCount`; `null` when not inspected yet or the container no longer exists
 - `time` (string): Newest Unix millisecond timestamp across the container's present metric samples (`status` is current-only and does not affect it); `"0"` when only a status row exists
 
 **Example:**

@@ -1,13 +1,19 @@
 #![forbid(unsafe_code)]
 
 pub mod calc;
+mod inspect_cache;
 pub mod model;
 
 pub use model::{ContainerDisk, ContainerStats, ContainerSummary};
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
+
 use bollard::Docker;
 use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions, StatsOptions};
 use futures_util::StreamExt;
+use inspect_cache::InspectCache;
 
 const SOCKET: &str = "/var/run/docker.sock";
 // Matches the Go client's `http.Client{Timeout: 10s}` (pkg/dockerClient). A
@@ -28,12 +34,17 @@ pub enum DockerError {
 #[derive(Clone)]
 pub struct DockerClient {
     inner: Docker,
+    /// Shared by every clone, so the collector and push reuse one inspect.
+    inspect_cache: Arc<Mutex<InspectCache>>,
 }
 
 impl DockerClient {
     pub fn new() -> Result<Self, DockerError> {
         let inner = Docker::connect_with_unix(SOCKET, TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            inspect_cache: Arc::default(),
+        })
     }
 
     pub async fn list_containers(&self) -> Result<Vec<ContainerSummary>, DockerError> {
@@ -42,6 +53,8 @@ impl DockerClient {
             ..Default::default()
         };
         let raw = self.inner.list_containers(Some(opts)).await?;
+        let live: HashSet<&str> = raw.iter().filter_map(|c| c.id.as_deref()).collect();
+        self.cache().retain_ids(&live);
         Ok(raw
             .into_iter()
             .map(|c| ContainerSummary {
@@ -149,6 +162,30 @@ impl DockerClient {
 
     pub async fn inspect_health(&self, id: &str) -> Result<String, DockerError> {
         Ok(self.inspect_health_and_restart_count(id).await?.0)
+    }
+
+    /// Health and restart count, from the shared cache when the entry is fresh
+    /// (see [`InspectCache::get`]), otherwise from a new inspect. `state` is the
+    /// container's state from the latest listing. A failed inspect is not cached.
+    pub async fn health_and_restart_count(
+        &self,
+        id: &str,
+        state: &str,
+    ) -> Result<(String, u64), DockerError> {
+        if let Some(v) = self.cache().get(id, state, Instant::now()) {
+            return Ok(v);
+        }
+        let v = self.inspect_health_and_restart_count(id).await?;
+        self.cache().insert(id, state, &v, Instant::now());
+        Ok(v)
+    }
+
+    fn cache(&self) -> MutexGuard<'_, InspectCache> {
+        // The cache holds no invariant a panic could break, so a poisoned lock
+        // is still safe to use.
+        self.inspect_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub async fn inspect_health_and_restart_count(

@@ -1415,7 +1415,7 @@ components:
           nullable: true
           allOf:
             - $ref: '#/components/schemas/ContainerStatus'
-          description: Current container status, or null when not inspected yet
+          description: Current container status, or null when not inspected yet or the container no longer exists
         time:
           type: string
           description: Newest Unix millisecond timestamp across the container's present metric samples ("0" when only a status row exists)

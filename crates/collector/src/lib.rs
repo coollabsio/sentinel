@@ -149,9 +149,10 @@ impl Collector {
                 return;
             }
         };
-        if containers.is_empty() {
-            return;
-        }
+        // Every listed container (running or not) still exists; a status row for
+        // any other name belongs to a removed container. An empty listing is
+        // still processed, so the last removed container is pruned too.
+        let listed: Vec<String> = containers.iter().map(|c| c.display_name()).collect();
 
         let mut fetched = Vec::with_capacity(containers.len());
         let mut tasks = JoinSet::new();
@@ -186,13 +187,18 @@ impl Collector {
         let mut status_samples = Vec::with_capacity(fetched.len());
         for f in fetched {
             let name = f.sample.container_id.clone();
-            let (rx_rate, tx_rate) = net_rate(net_prev.get(&f.docker_id), f.net_rx, f.net_tx, time);
+            // No network row without a usable baseline: a 0 there would be a
+            // made-up value, not a measured one.
+            if let Some((rx_rate, tx_rate)) =
+                net_rate(net_prev.get(&f.docker_id), f.net_rx, f.net_tx, time)
+            {
+                net_samples.push(ContainerNetworkSample {
+                    container_id: name.clone(),
+                    rx_bytes_per_sec: round2(rx_rate),
+                    tx_bytes_per_sec: round2(tx_rate),
+                });
+            }
             net_prev.insert(f.docker_id, (f.net_rx, f.net_tx, time));
-            net_samples.push(ContainerNetworkSample {
-                container_id: name.clone(),
-                rx_bytes_per_sec: round2(rx_rate),
-                tx_bytes_per_sec: round2(tx_rate),
-            });
             // No status row on an inspect failure: the previous row stays rather
             // than being overwritten with made-up values.
             if let Some((health_status, restart_count)) = f.inspect {
@@ -222,6 +228,9 @@ impl Collector {
             if let Err(e) = store.upsert_container_status_batch(time, &status_samples) {
                 tracing::warn!(error = %e, "failed to record container status");
             }
+            if let Err(e) = store.prune_container_status(&listed) {
+                tracing::warn!(error = %e, "failed to prune removed container status");
+            }
         })
         .await
         {
@@ -242,16 +251,22 @@ struct FetchedContainer {
     inspect: Option<(String, u64)>,
 }
 
-/// Bytes/sec from the counter delta since the previous cycle. Returns 0 on the
-/// first sample and on a counter reset (a container restart makes `cur < prev`),
-/// so a restart never emits a huge spurious spike.
-fn net_rate(prev: Option<&(u64, u64, i64)>, cur_rx: u64, cur_tx: u64, now: i64) -> (f64, f64) {
+/// Bytes/sec from the counter delta since the previous cycle. `None` on the
+/// first sample, on a counter reset (a container restart makes `cur < prev`)
+/// and on a clock that did not advance: the rate is unknown there, so the
+/// caller skips the row instead of storing a fake 0 or a huge spike.
+fn net_rate(
+    prev: Option<&(u64, u64, i64)>,
+    cur_rx: u64,
+    cur_tx: u64,
+    now: i64,
+) -> Option<(f64, f64)> {
     match prev {
         Some(&(prx, ptx, pt)) if now > pt && cur_rx >= prx && cur_tx >= ptx => {
             let dt = (now - pt) as f64 / 1000.0;
-            ((cur_rx - prx) as f64 / dt, (cur_tx - ptx) as f64 / dt)
+            Some(((cur_rx - prx) as f64 / dt, (cur_tx - ptx) as f64 / dt))
         }
-        _ => (0.0, 0.0),
+        _ => None,
     }
 }
 
@@ -268,10 +283,14 @@ async fn fetch(
         }
     };
 
-    // One inspect per container per cycle for health + restart count. A failure
-    // here must not drop the whole container (its cpu/mem/net are still valid);
-    // only its status write is skipped.
-    let inspect = match docker.inspect_health_and_restart_count(&container.id).await {
+    // Health + restart count, shared with push through the client's inspect
+    // cache, so most cycles make no inspect call. A failure here must not drop
+    // the whole container (its cpu/mem/net are still valid); only its status
+    // write is skipped.
+    let inspect = match docker
+        .health_and_restart_count(&container.id, &container.state)
+        .await
+    {
         Ok(v) => Some(v),
         Err(e) => {
             tracing::warn!(container = %name, error = %e, "failed to inspect container");
@@ -317,8 +336,8 @@ mod tests {
     use super::net_rate;
 
     #[test]
-    fn first_sample_is_zero() {
-        assert_eq!(net_rate(None, 1_000, 2_000, 5_000), (0.0, 0.0));
+    fn first_sample_has_no_rate() {
+        assert_eq!(net_rate(None, 1_000, 2_000, 5_000), None);
     }
 
     #[test]
@@ -327,20 +346,20 @@ mod tests {
         let prev = (1_000u64, 2_000u64, 0i64);
         assert_eq!(
             net_rate(Some(&prev), 6_000, 12_000, 5_000),
-            (1_000.0, 2_000.0)
+            Some((1_000.0, 2_000.0))
         );
     }
 
     #[test]
-    fn counter_reset_clamps_to_zero() {
-        // A container restart resets the counter, so cur < prev → 0, not a spike.
+    fn counter_reset_has_no_rate() {
+        // A container restart resets the counter, so cur < prev → no row, not a spike.
         let prev = (10_000u64, 20_000u64, 0i64);
-        assert_eq!(net_rate(Some(&prev), 5, 5, 5_000), (0.0, 0.0));
+        assert_eq!(net_rate(Some(&prev), 5, 5, 5_000), None);
     }
 
     #[test]
-    fn non_advancing_clock_is_zero() {
+    fn non_advancing_clock_has_no_rate() {
         let prev = (0u64, 0u64, 5_000i64);
-        assert_eq!(net_rate(Some(&prev), 100, 100, 5_000), (0.0, 0.0));
+        assert_eq!(net_rate(Some(&prev), 100, 100, 5_000), None);
     }
 }

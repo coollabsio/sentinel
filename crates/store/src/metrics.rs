@@ -500,6 +500,31 @@ impl Store {
         })
     }
 
+    /// Deletes the status rows of containers that are not in `live` (display
+    /// names from the current Docker listing), so a removed container does not
+    /// keep reporting its last state. Returns the number of rows deleted.
+    pub fn prune_container_status(&self, live: &[String]) -> Result<u64, StoreError> {
+        let live: std::collections::HashSet<&str> = live.iter().map(String::as_str).collect();
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            let stale: Vec<String> = {
+                let mut stmt = tx.prepare_cached("SELECT container_id FROM container_status")?;
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .filter(|id| id.as_ref().map_or(true, |id| !live.contains(id.as_str())))
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            {
+                let mut stmt =
+                    tx.prepare_cached("DELETE FROM container_status WHERE container_id = ?1")?;
+                for id in &stale {
+                    stmt.execute((id,))?;
+                }
+            }
+            tx.commit()?;
+            Ok(stale.len() as u64)
+        })
+    }
+
     /// All mounts from the most recent disk cycle (every mount in a cycle shares
     /// one timestamp, so `MAX(time)` selects the whole latest snapshot).
     pub fn disk_latest(&self) -> Result<Vec<DiskRow>, StoreError> {
