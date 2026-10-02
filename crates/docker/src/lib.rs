@@ -19,8 +19,7 @@ const SOCKET: &str = "/var/run/docker.sock";
 fn socket_path() -> String {
     match std::env::var("DOCKER_HOST") {
         Ok(host)
-            if host.starts_with("unix://")
-                || (!host.contains("://") && host.starts_with('/')) =>
+            if host.starts_with("unix://") || (!host.contains("://") && host.starts_with('/')) =>
         {
             host
         }
@@ -49,7 +48,8 @@ pub struct DockerClient {
 
 impl DockerClient {
     pub fn new() -> Result<Self, DockerError> {
-        let inner = Docker::connect_with_unix(&socket_path(), TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)?;
+        let inner =
+            Docker::connect_with_unix(&socket_path(), TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)?;
         Ok(Self { inner })
     }
 

@@ -1,4 +1,4 @@
-//! Root of the generated OpenAPI document: info, servers, tags, and the
+//! Root of the generated OpenAPI document: info, tags, and the
 //! bearer security scheme. Paths and schemas are contributed by the
 //! `#[utoipa::path]` annotations on the route handlers and composed in
 //! `crate::router()` via utoipa-axum's `OpenApiRouter`.
@@ -6,12 +6,14 @@
 //! This module replaces the old hand-written `openapi.yaml`. The version is
 //! the build version (`config::VERSION`, honoring `SENTINEL_BUILD_VERSION`),
 //! so the spec always matches `/api/version` with no manual bumping.
+//!
+//! No `servers` list: OpenAPI then defaults to `/`, so "Try it" in the docs
+//! UIs calls the same host that served the page.
 
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme};
 use utoipa::openapi::tag::TagBuilder;
 use utoipa::openapi::{
     ComponentsBuilder, ContactBuilder, InfoBuilder, LicenseBuilder, OpenApi, OpenApiBuilder,
-    ServerBuilder,
 };
 
 pub fn base_openapi() -> OpenApi {
@@ -42,16 +44,6 @@ pub fn base_openapi() -> OpenApi {
                 ))
                 .build(),
         )
-        .servers(Some(vec![
-            ServerBuilder::new()
-                .url("http://localhost:8888")
-                .description(Some("Local development server"))
-                .build(),
-            ServerBuilder::new()
-                .url("https://sentinel.example.com")
-                .description(Some("Production server"))
-                .build(),
-        ]))
         .tags(Some(vec![
             TagBuilder::new()
                 .name("Core")

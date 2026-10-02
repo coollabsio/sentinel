@@ -4,10 +4,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 use store::traffic::{AnalyticsStore, AppFilter, BreakdownRow, PathRow, StatsRow, Tier};
 use traffic::sketches::{LatencyDigest, Uniques};
@@ -897,7 +897,7 @@ async fn server_overview(
     path = "/api/traffic/paths",
     tag = "Traffic Analytics",
     summary = "Get server-wide top paths",
-    description = "Busiest request paths across every app on the box, summed over the\nrange with per-path latency. The same path served by multiple apps is\nmerged into one entry, giving a correct top-N across all apps rather\nthan a merge of per-app top-N lists.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
+    description = "Busiest request paths across every app on the box, summed over the\nrange with per-path latency. Rows are keyed by `(app, path)`: the same path served by\nmultiple apps stays a separate entry per app, each labelled with its\nowning `app`, giving a correct top-N across all apps that preserves\nper-app attribution.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
     params(
         TopQuery
     ),

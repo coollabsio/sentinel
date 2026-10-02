@@ -72,7 +72,11 @@ fn openapi_documents_every_route() {
     for p in &expected {
         assert!(paths.contains(p), "spec is missing {p}");
     }
-    assert_eq!(paths.len(), expected.len(), "unexpected extra paths: {paths:?}");
+    assert_eq!(
+        paths.len(),
+        expected.len(),
+        "unexpected extra paths: {paths:?}"
+    );
 
     // Bearer auth is the global default, with the docs-visible exceptions
     // explicitly opted out.

@@ -18,9 +18,12 @@ const PUBLIC_PREFIXES: [&str; 2] = ["/scalar", "/swagger-ui"];
 
 fn is_public(path: &str) -> bool {
     PUBLIC_PATHS.contains(&path)
-        || PUBLIC_PREFIXES
-            .iter()
-            .any(|prefix| path == *prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/')))
+        || PUBLIC_PREFIXES.iter().any(|prefix| {
+            path == *prefix
+                || path
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
 }
 
 pub async fn require_token(

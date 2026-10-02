@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;

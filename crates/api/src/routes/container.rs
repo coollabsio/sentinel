@@ -1,16 +1,15 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
 use crate::time::format_millis;
 use crate::types::{
-    BadRequestError, ContainerDiskUsage, CpuUsage, InternalServerError, MemUsage,
-    UnauthorizedError,
+    BadRequestError, ContainerDiskUsage, CpuUsage, InternalServerError, MemUsage, UnauthorizedError,
 };
 
 /// Container history defaults `from` one second later than the host endpoints.
@@ -146,7 +145,7 @@ async fn memory_history(
     path = "/api/container/{containerId}/disk/current",
     tag = "Container Metrics",
     summary = "Get current container storage",
-    description = "Latest stored writable-layer and volume size for a specific container (null if none recorded) Returns `null` when no storage row has been recorded for the container.",
+    description = "Latest stored writable-layer and volume size for a specific container. Returns `null` when no storage row has been recorded for the container.",
     params(
         ("containerId" = String, Path, description = "Exact container display name recorded by Sentinel")
     ),

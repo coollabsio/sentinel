@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
@@ -20,7 +20,7 @@ pub fn routes() -> OpenApiRouter<Arc<AppState>> {
     path = "/api/stats",
     tag = "Debug",
     summary = "Get database statistics",
-    description = "Retrieve database storage statistics and estimated logical table sizes.\nOnly available when DEBUG environment variable is set to true. Only available when DEBUG=true.",
+    description = "Retrieve database storage statistics and estimated logical table sizes.\n\nOnly served when `DEBUG=true`; returns 404 otherwise.",
     responses(
         (status = 200, description = "Database statistics", body = StatsResponse),
         (status = 401, response = UnauthorizedError),
