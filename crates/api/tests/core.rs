@@ -152,3 +152,36 @@ async fn require_token_middleware_runs_before_routing() {
         "incorrect token must be rejected"
     );
 }
+
+#[tokio::test]
+async fn docs_routes_need_no_token() {
+    use axum::http::StatusCode;
+    let state = test_state();
+    for uri in ["/api-docs/openapi.json", "/scalar", "/swagger-ui/"] {
+        assert_eq!(
+            status_for(api::router(state.clone()), uri, None).await,
+            StatusCode::OK,
+            "{uri} must be public"
+        );
+    }
+}
+
+#[tokio::test]
+async fn docs_prefixes_do_not_open_other_paths() {
+    // The public docs prefixes match whole path segments only, so a lookalike
+    // path or a metrics route stays behind the token.
+    use axum::http::StatusCode;
+    let state = test_state();
+    for uri in [
+        "/scalarx",
+        "/swagger-uix",
+        "/api-docs/openapi.jsonx",
+        "/api/cpu/current",
+    ] {
+        assert_eq!(
+            status_for(api::router(state.clone()), uri, None).await,
+            StatusCode::UNAUTHORIZED,
+            "{uri} must require a token"
+        );
+    }
+}
