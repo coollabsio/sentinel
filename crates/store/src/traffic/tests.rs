@@ -24,10 +24,9 @@ fn stats_row(
     }
 }
 
-/// Design spec §9: `wal_autocheckpoint=0` ([`AnalyticsStore::checkpoint`]'s
-/// timed `wal_checkpoint(TRUNCATE)` owns checkpointing instead) and
-/// `auto_vacuum=INCREMENTAL` (reported back as `2`) must both actually
-/// take effect on the writer connection, not just be sent and ignored.
+/// SQLite's automatic checkpoint must stay on (default 1000 pages), and
+/// `auto_vacuum=INCREMENTAL` (reported back as `2`) must actually take effect
+/// on the writer connection, not just be sent and ignored.
 #[test]
 fn writer_pragmas_take_effect() {
     let s = AnalyticsStore::open_in_memory().unwrap();
@@ -40,9 +39,9 @@ fn writer_pragmas_take_effect() {
         })
         .unwrap();
     assert_eq!(
-        autocheckpoint, 0,
-        "automatic checkpointing must be disabled; a later task's timed \
-         wal_checkpoint(TRUNCATE) owns it instead"
+        autocheckpoint, 1000,
+        "automatic checkpointing must stay on; with it off the WAL and its \
+         page cache grow for a whole hour between timed checkpoints"
     );
     assert_eq!(
         auto_vacuum, 2,
@@ -53,12 +52,9 @@ fn writer_pragmas_take_effect() {
     // reader connection's setting above.
 }
 
-/// With `wal_autocheckpoint` disabled, writes accumulate in the `-wal` file
-/// and nothing reclaims it on the write path — [`AnalyticsStore::checkpoint`]
-/// is the only thing that does. After a batch of flushes the WAL is non-empty;
-/// a checkpoint truncates it back to zero. This is the regression guard for the
-/// unbounded-WAL-growth bug: without the timed checkpoint the file only ever
-/// grows.
+/// The automatic checkpoint reuses the `-wal` file but never shrinks it;
+/// [`AnalyticsStore::checkpoint`] does. After a batch of flushes the WAL is
+/// non-empty; a checkpoint truncates it back to zero.
 #[test]
 fn checkpoint_truncates_the_wal() {
     let dir = std::env::temp_dir().join(format!("sentinel-traffic-wal-{}", std::process::id()));
@@ -76,10 +72,7 @@ fn checkpoint_truncates_the_wal() {
             s.flush_window(&stats, &[], &[]).unwrap();
         }
         let grew = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-        assert!(
-            grew > 0,
-            "writes with auto-checkpoint off must leave a non-empty WAL"
-        );
+        assert!(grew > 0, "writes must leave a non-empty WAL");
 
         // No reader is active here, so TRUNCATE runs to completion.
         s.checkpoint().unwrap();

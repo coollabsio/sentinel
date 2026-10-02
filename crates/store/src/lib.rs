@@ -19,6 +19,11 @@ pub use metrics::{
 pub use stats::{DbStats, TableStat};
 pub use traffic::{AnalyticsStore, BreakdownRow, PathRow, StatsRow, Tier};
 
+/// SQLite page cache for each connection, in KiB (negative `cache_size`). It is
+/// heap memory that never shrinks, and each store has two connections. A miss
+/// reads from the kernel page cache, so a small value costs little speed.
+pub(crate) const CACHE_SIZE_KIB: i64 = -2000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("sqlite: {0}")]
@@ -114,7 +119,7 @@ impl Store {
                 )?;
                 // A brief checkpoint can hold the DB; wait rather than error.
                 ro.busy_timeout(std::time::Duration::from_secs(5))?;
-                ro.pragma_update(None, "cache_size", -8000)?;
+                ro.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
                 Arc::new(Mutex::new(ro))
             }
             // In-memory: a second `:memory:` connection is a distinct empty DB,
@@ -128,9 +133,7 @@ impl Store {
     fn init_conn(conn: &rusqlite::Connection) -> Result<(), StoreError> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        // 8 MB, down from the Go implementation's 64 MB: the working set is
-        // small and a large page cache works against the footprint goal.
-        conn.pragma_update(None, "cache_size", -8000)?;
+        conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(())
     }

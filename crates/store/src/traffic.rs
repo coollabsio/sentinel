@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::StoreError;
+use crate::{CACHE_SIZE_KIB, StoreError};
 
 /// Per-family typed, STRICT table+index templates. All three roll-up tiers
 /// (`_1m`/`_1h`/`_1d`) are byte-identical bar the suffix, so [`apply`] builds
@@ -349,7 +349,7 @@ impl AnalyticsStore {
                 )?;
                 // A brief checkpoint can hold the DB; wait rather than error.
                 ro.busy_timeout(std::time::Duration::from_secs(5))?;
-                ro.pragma_update(None, "cache_size", -16000)?;
+                ro.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
                 Arc::new(Mutex::new(ro))
             }
             // In-memory: a second `:memory:` connection is a distinct empty
@@ -364,20 +364,16 @@ impl AnalyticsStore {
     fn init_conn(conn: &Connection) -> Result<(), StoreError> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        // ~16 MB, double Store's -8000 (~8 MB): deliberate deviation per this
-        // feature's spec — minute-cadence flush transactions touch more rows
-        // per commit than the metrics collector's per-5s scalar inserts.
-        conn.pragma_update(None, "cache_size", -16000)?;
+        conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // A brief checkpoint (or, later, the timed wal_checkpoint(TRUNCATE))
         // can hold the writer lock; wait rather than error immediately,
         // matching the reader connection below.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        // Disable SQLite's automatic checkpoint: the timed
-        // [`AnalyticsStore::checkpoint`] (`wal_checkpoint(TRUNCATE)`, driven
-        // hourly from `main.rs`) owns checkpointing instead, so it isn't racing
-        // an implicit one on the minute-flush write path (design spec §9).
-        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+        // SQLite's automatic checkpoint (every ~1000 WAL pages) stays on. With
+        // it off, each minute flush appends fresh copies of the same pages to
+        // the WAL for a whole hour, and queries read them: the WAL and its
+        // page cache (charged to the container) grow to tens of MB.
         // Must be set before any table exists (below, via `apply`) to take
         // effect without a full VACUUM later (design spec §9).
         conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
@@ -396,10 +392,9 @@ impl AnalyticsStore {
     /// Forces a `wal_checkpoint(TRUNCATE)`: flushes the WAL's committed pages
     /// into the main database file and truncates the `-wal` file back to zero.
     ///
-    /// [`Self::init_conn`] disables `wal_autocheckpoint`, so nothing checkpoints
-    /// on the write path — this timed call is the *only* thing that reclaims the
-    /// WAL, and without it `analytics.sqlite-wal` grows without bound across the
-    /// minute-cadence flushes and compaction rewrites (design spec §9). Runs on
+    /// SQLite's automatic checkpoint keeps the WAL small but never shrinks the
+    /// file; this timed call gives the disk space back after a large write such
+    /// as a compaction rewrite. Runs on
     /// the writer connection; a concurrent reader can make `TRUNCATE` fall back
     /// to a partial checkpoint, which is fine — the next tick truncates.
     pub fn checkpoint(&self) -> Result<(), StoreError> {

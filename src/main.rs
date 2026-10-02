@@ -476,10 +476,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             let result = tokio::task::spawn_blocking(move || {
                                 let written = traffic::compaction::compact_1m_to_1h(&s, collector::now_millis(), topn);
                                 // Checkpoint regardless of the compaction result:
-                                // `wal_autocheckpoint` is disabled, so this hourly
-                                // `wal_checkpoint(TRUNCATE)` is the only thing that
-                                // keeps analytics.sqlite-wal from growing without
-                                // bound across the minute-cadence flushes.
+                                // `wal_checkpoint(TRUNCATE)` shrinks the -wal file,
+                                // which the automatic checkpoint never does.
                                 let checkpointed = s.checkpoint();
                                 (written, checkpointed)
                             })
