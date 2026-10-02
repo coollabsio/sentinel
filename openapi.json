@@ -663,6 +663,110 @@
         ]
       }
     },
+    "/api/container/{containerId}/network/history": {
+      "get": {
+        "tags": [
+          "Container Metrics"
+        ],
+        "summary": "Get container network usage history",
+        "description": "Retrieve network throughput history (bytes/sec, summed across the container's interfaces) for a specific Docker container",
+        "operationId": "network_history",
+        "parameters": [
+          {
+            "name": "containerId",
+            "in": "path",
+            "description": "Exact container display name recorded by Sentinel",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Container network usage history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/NetworkUsage"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/containers/current": {
+      "get": {
+        "tags": [
+          "Container Metrics"
+        ],
+        "summary": "Get all containers (current)",
+        "description": "Latest CPU, memory, storage and network sample, plus container status, for every container in one response. Empty array when nothing recorded.",
+        "operationId": "containers_current",
+        "responses": {
+          "200": {
+            "description": "Current snapshot of every container",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ContainerCurrent"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/cpu/current": {
       "get": {
         "tags": [
@@ -876,6 +980,105 @@
         ]
       }
     },
+    "/api/load/current": {
+      "get": {
+        "tags": [
+          "System Metrics"
+        ],
+        "summary": "Get current load average",
+        "description": "Latest host load average (1 / 5 / 15 minute), or null when nothing has been recorded yet",
+        "operationId": "current",
+        "responses": {
+          "200": {
+            "description": "Current load average",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LoadAverage"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/load/history": {
+      "get": {
+        "tags": [
+          "System Metrics"
+        ],
+        "summary": "Get load average history",
+        "description": "Historical host load average with optional date range filtering",
+        "operationId": "history",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Load average history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/LoadAverage"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/memory/current": {
       "get": {
         "tags": [
@@ -946,6 +1149,105 @@
                   "type": "array",
                   "items": {
                     "$ref": "#/components/schemas/MemUsage"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/network/current": {
+      "get": {
+        "tags": [
+          "System Metrics"
+        ],
+        "summary": "Get current network usage",
+        "description": "Latest host network throughput (bytes/sec, summed across physical interfaces), or null when nothing has been recorded yet",
+        "operationId": "current",
+        "responses": {
+          "200": {
+            "description": "Current network usage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/NetworkUsage"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/network/history": {
+      "get": {
+        "tags": [
+          "System Metrics"
+        ],
+        "summary": "Get network usage history",
+        "description": "Historical host network throughput (bytes/sec) with optional date range filtering",
+        "operationId": "history",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Start date in ISO 8601 format (UTC). Defaults to the Unix epoch\n(all recorded history) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "End date in ISO 8601 format (UTC). Defaults to now when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Network usage history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/NetworkUsage"
                   }
                 }
               }
@@ -1377,6 +1679,39 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/StatsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/summary": {
+      "get": {
+        "tags": [
+          "System Metrics"
+        ],
+        "summary": "Get host summary",
+        "description": "Latest stored host CPU, memory, disk, network and load average usage, plus host status (uptime and swap), in one response. Any series with no rows is null.",
+        "operationId": "summary",
+        "responses": {
+          "200": {
+            "description": "Host summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostSummary"
                 }
               }
             }
@@ -1856,6 +2191,72 @@
   },
   "components": {
     "schemas": {
+      "ContainerCurrent": {
+        "type": "object",
+        "description": "One container's latest snapshot for `GET /api/containers/current`. Each\nmetric reuses the same shape its per-container history endpoint returns and\nis `null` when that series has no rows for the container. `time` is the\nnewest millisecond timestamp (as a string, like every other `time`) across\nwhichever metric samples are present (`status` is a current-only row and\ndoes not affect it).",
+        "required": [
+          "id",
+          "time"
+        ],
+        "properties": {
+          "cpu": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CpuUsage"
+              }
+            ]
+          },
+          "disk": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContainerDiskUsage"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "memory": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MemUsage"
+              }
+            ]
+          },
+          "network": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NetworkUsage"
+              }
+            ]
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContainerStatus"
+              }
+            ]
+          },
+          "time": {
+            "type": "string"
+          }
+        }
+      },
       "ContainerDiskUsage": {
         "type": "object",
         "description": "Per-container storage: Docker writable-layer size plus summed volume sizes.",
@@ -1883,6 +2284,28 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "ContainerStatus": {
+        "type": "object",
+        "description": "Current-only container status from Docker `state` + inspect.",
+        "required": [
+          "state",
+          "health",
+          "restartCount"
+        ],
+        "properties": {
+          "health": {
+            "type": "string"
+          },
+          "restartCount": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string"
           }
         }
       },
@@ -1970,6 +2393,151 @@
           }
         }
       },
+      "HostInfo": {
+        "type": "object",
+        "description": "Current-only host status: uptime plus swap (no history series).",
+        "required": [
+          "time",
+          "uptimeSeconds",
+          "swapTotal",
+          "swapUsed",
+          "swapFree",
+          "swapUsedPercent"
+        ],
+        "properties": {
+          "human_friendly_time": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "swapFree": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "swapTotal": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "swapUsed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "swapUsedPercent": {
+            "type": "number",
+            "format": "double"
+          },
+          "time": {
+            "type": "string"
+          },
+          "uptimeSeconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "HostSummary": {
+        "type": "object",
+        "description": "Host current snapshot bundle for `GET /api/summary`: the latest stored CPU,\nmemory, disk, network and load rows plus current host status, in one\nresponse. Any series with no rows is `null`.",
+        "properties": {
+          "cpu": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CpuCurrent"
+              }
+            ]
+          },
+          "disk": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/DiskUsage"
+            }
+          },
+          "host": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HostInfo"
+              }
+            ]
+          },
+          "load": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LoadAverage"
+              }
+            ]
+          },
+          "memory": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MemUsage"
+              }
+            ]
+          },
+          "network": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NetworkUsage"
+              }
+            ]
+          }
+        }
+      },
+      "LoadAverage": {
+        "type": "object",
+        "description": "Host load average (1 / 5 / 15 minute).",
+        "required": [
+          "time",
+          "load1",
+          "load5",
+          "load15"
+        ],
+        "properties": {
+          "human_friendly_time": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "load1": {
+            "type": "number",
+            "format": "double"
+          },
+          "load15": {
+            "type": "number",
+            "format": "double"
+          },
+          "load5": {
+            "type": "number",
+            "format": "double"
+          },
+          "time": {
+            "type": "string"
+          }
+        }
+      },
       "MemUsage": {
         "type": "object",
         "description": "WIRE FORMAT IS FROZEN. `usedPercent` is the only camelCase key in the API.",
@@ -2012,6 +2580,34 @@
             "minimum": 0
           },
           "usedPercent": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "NetworkUsage": {
+        "type": "object",
+        "description": "Network throughput as a rate (bytes/sec), for host and per-container network\nendpoints. Rates rather than raw counters, so they downsample by mean.",
+        "required": [
+          "time",
+          "rxBytesPerSec",
+          "txBytesPerSec"
+        ],
+        "properties": {
+          "human_friendly_time": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rxBytesPerSec": {
+            "type": "number",
+            "format": "double"
+          },
+          "time": {
+            "type": "string"
+          },
+          "txBytesPerSec": {
             "type": "number",
             "format": "double"
           }
@@ -2509,7 +3105,7 @@
     },
     {
       "name": "System Metrics",
-      "description": "CPU and memory metrics for the host system"
+      "description": "CPU, memory, disk, network and load metrics for the host system"
     },
     {
       "name": "Container Metrics",

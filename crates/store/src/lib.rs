@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 
 pub use command_journal::{CommandJournal, CommandLookup, CommandStart};
 pub use metrics::{
-    ContainerDiskRow, ContainerDiskSample, ContainerSample, CpuRow, DiskRow, DiskSample, MemRow,
+    ContainerDiskRow, ContainerDiskSample, ContainerMetrics, ContainerNetworkRow,
+    ContainerNetworkSample, ContainerSample, ContainerStatusRow, ContainerStatusSample, CpuRow,
+    DiskRow, DiskSample, HostStatusRow, HostSummaryRows, LoadRow, MemRow, NetworkRow,
 };
 pub use stats::{DbStats, TableStat};
 pub use traffic::{AnalyticsStore, BreakdownRow, PathRow, StatsRow, Tier};

@@ -7,9 +7,11 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
+use crate::routes::network::to_network_usage;
 use crate::time::format_millis;
 use crate::types::{
-    BadRequestError, ContainerDiskUsage, CpuUsage, InternalServerError, MemUsage, UnauthorizedError,
+    BadRequestError, ContainerDiskUsage, CpuUsage, InternalServerError, MemUsage, NetworkUsage,
+    UnauthorizedError,
 };
 
 /// Container history defaults `from` one second later than the host endpoints.
@@ -23,6 +25,58 @@ pub fn routes() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(memory_history))
         .routes(routes!(disk_current))
         .routes(routes!(disk_history))
+        .routes(routes!(network_history))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/container/{containerId}/network/history",
+    tag = "Container Metrics",
+    summary = "Get container network usage history",
+    description = "Retrieve network throughput history (bytes/sec, summed across the container's interfaces) for a specific Docker container",
+    params(
+        ("containerId" = String, Path, description = "Exact container display name recorded by Sentinel"),
+        HistoryQuery
+    ),
+    responses(
+        (status = 200, description = "Container network usage history", body = Vec<NetworkUsage>),
+        (status = 400, response = BadRequestError),
+        (status = 401, response = UnauthorizedError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
+async fn network_history(
+    Path(container_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
+    let id = container_id;
+    let (from, to) = match resolve_range(&q, DEFAULT_FROM) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let permit = match state.history_queries.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(e) => return internal_error(e),
+    };
+    let store = state.store.clone();
+    let result =
+        tokio::task::spawn_blocking(move || store.container_network_history(&id, from, to)).await;
+    drop(permit);
+    let rows = match result {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => return internal_error(e),
+        Err(e) => return internal_error(e),
+    };
+
+    let debug = state.config.debug;
+    let out: Vec<NetworkUsage> = rows
+        .into_iter()
+        .map(|r| to_network_usage(r.into(), debug))
+        .collect();
+    Json(out).into_response()
 }
 
 #[utoipa::path(
@@ -229,7 +283,7 @@ async fn disk_history(
     Json(out).into_response()
 }
 
-fn to_container_disk(r: store::ContainerDiskRow, debug: bool) -> ContainerDiskUsage {
+pub(crate) fn to_container_disk(r: store::ContainerDiskRow, debug: bool) -> ContainerDiskUsage {
     ContainerDiskUsage {
         time: r.time.to_string(),
         writable_layer: r.writable_layer,

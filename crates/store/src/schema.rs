@@ -55,6 +55,48 @@ CREATE TABLE IF NOT EXISTS container_disk_usage (
     PRIMARY KEY (time, container_id)
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS network_usage (
+    time             INTEGER PRIMARY KEY,
+    rx_bytes_per_sec REAL NOT NULL,
+    tx_bytes_per_sec REAL NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS load_average (
+    time   INTEGER PRIMARY KEY,
+    load1  REAL NOT NULL,
+    load5  REAL NOT NULL,
+    load15 REAL NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS container_network_usage (
+    time             INTEGER NOT NULL,
+    container_id     TEXT    NOT NULL,
+    rx_bytes_per_sec REAL    NOT NULL,
+    tx_bytes_per_sec REAL    NOT NULL,
+    PRIMARY KEY (time, container_id)
+) STRICT;
+
+-- Current status only (latest snapshot per container), keyed on the display
+-- name like every other container series; not a time-series, so no history.
+CREATE TABLE IF NOT EXISTS container_status (
+    container_id  TEXT PRIMARY KEY,
+    state         TEXT    NOT NULL,
+    health_status TEXT    NOT NULL,
+    restart_count INTEGER NOT NULL,
+    time          INTEGER NOT NULL
+) STRICT;
+
+-- Singleton host status (id fixed at 0): current-only uptime + swap.
+CREATE TABLE IF NOT EXISTS host_status (
+    id                INTEGER PRIMARY KEY CHECK (id = 0),
+    uptime_seconds    INTEGER NOT NULL,
+    swap_total        INTEGER NOT NULL,
+    swap_used         INTEGER NOT NULL,
+    swap_free         INTEGER NOT NULL,
+    swap_used_percent REAL    NOT NULL,
+    time              INTEGER NOT NULL
+) STRICT;
+
 CREATE INDEX IF NOT EXISTS idx_ccu_container_time
     ON container_cpu_usage (container_id, time);
 CREATE INDEX IF NOT EXISTS idx_cmu_container_time
@@ -63,6 +105,8 @@ CREATE INDEX IF NOT EXISTS idx_du_mount_time
     ON disk_usage (mount, time);
 CREATE INDEX IF NOT EXISTS idx_cdu_container_time
     ON container_disk_usage (container_id, time);
+CREATE INDEX IF NOT EXISTS idx_cnu_container_time
+    ON container_network_usage (container_id, time);
 
 CREATE TABLE IF NOT EXISTS sentinel_meta (
     key   TEXT PRIMARY KEY,

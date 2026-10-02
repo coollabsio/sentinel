@@ -262,14 +262,16 @@ async fn inspect(
     summary: docker::ContainerSummary,
     now: String,
 ) -> Option<Container> {
-    let (health_status, restart_count) =
-        match docker.inspect_health_and_restart_count(&summary.id).await {
-            Ok(details) => details,
-            Err(e) => {
-                tracing::warn!(id = %summary.id, error = %e, "failed to inspect container");
-                return None;
-            }
-        };
+    let (health_status, restart_count) = match docker
+        .health_and_restart_count(&summary.id, &summary.state)
+        .await
+    {
+        Ok(details) => details,
+        Err(e) => {
+            tracing::warn!(id = %summary.id, error = %e, "failed to inspect container");
+            return None;
+        }
+    };
 
     // The push payload uses the raw Docker name, NOT the coolify.name label
     // that the collector uses. Preserved from the Go implementation.

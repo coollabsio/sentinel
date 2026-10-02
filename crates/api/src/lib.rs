@@ -111,7 +111,10 @@ fn core_openapi_router() -> OpenApiRouter<Arc<AppState>> {
         .merge(routes::cpu::routes())
         .merge(routes::memory::routes())
         .merge(routes::disk::routes())
-        .merge(routes::container::routes());
+        .merge(routes::container::routes())
+        .merge(routes::network::routes())
+        .merge(routes::load::routes())
+        .merge(routes::summary::routes());
 
     // Compile-time gate only. Whether the routes have anything to serve is a
     // runtime question (`AppState::analytics`), which each handler answers

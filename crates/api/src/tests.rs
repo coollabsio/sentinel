@@ -41,10 +41,17 @@ fn openapi_documents_every_route() {
         "/api/memory/history",
         "/api/disk/current",
         "/api/disk/history",
+        "/api/network/current",
+        "/api/network/history",
+        "/api/load/current",
+        "/api/load/history",
+        "/api/summary",
+        "/api/containers/current",
         "/api/container/{containerId}/cpu/history",
         "/api/container/{containerId}/memory/history",
         "/api/container/{containerId}/disk/current",
         "/api/container/{containerId}/disk/history",
+        "/api/container/{containerId}/network/history",
         // DEBUG-gated at runtime, always documented.
         "/api/stats",
     ];

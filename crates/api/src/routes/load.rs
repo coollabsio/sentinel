@@ -8,7 +8,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use crate::AppState;
 use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
 use crate::time::format_millis;
-use crate::types::{BadRequestError, DiskUsage, InternalServerError, UnauthorizedError};
+use crate::types::{BadRequestError, InternalServerError, LoadAverage, UnauthorizedError};
 
 pub fn routes() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
@@ -18,46 +18,44 @@ pub fn routes() -> OpenApiRouter<Arc<AppState>> {
 
 #[utoipa::path(
     get,
-    path = "/api/disk/current",
+    path = "/api/load/current",
     tag = "System Metrics",
-    summary = "Get current disk usage",
-    description = "Latest stored filesystem usage, one entry per real mountpoint",
+    summary = "Get current load average",
+    description = "Latest host load average (1 / 5 / 15 minute), or null when nothing has been recorded yet",
     responses(
-        (status = 200, description = "Current disk usage per mountpoint", body = Vec<DiskUsage>),
+        (status = 200, description = "Current load average", body = Option<LoadAverage>),
         (status = 401, response = UnauthorizedError),
         (status = 500, response = InternalServerError),
     ),
     security(("bearerAuth" = []))
 )]
-// Latest stored snapshot: one row per mountpoint from the most recent cycle.
 async fn current(State(state): State<Arc<AppState>>) -> Response {
     let permit = match state.history_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => return internal_error(e),
     };
     let store = state.store.clone();
-    let result = tokio::task::spawn_blocking(move || store.disk_latest()).await;
+    let result = tokio::task::spawn_blocking(move || store.load_latest()).await;
     drop(permit);
-    let rows = match result {
-        Ok(Ok(rows)) => rows,
+    let row = match result {
+        Ok(Ok(row)) => row,
         Ok(Err(e)) => return internal_error(e),
         Err(e) => return internal_error(e),
     };
 
     let debug = state.config.debug;
-    let out: Vec<DiskUsage> = rows.into_iter().map(|r| to_disk_usage(r, debug)).collect();
-    Json(out).into_response()
+    Json(row.map(|r| to_load(r, debug))).into_response()
 }
 
 #[utoipa::path(
     get,
-    path = "/api/disk/history",
+    path = "/api/load/history",
     tag = "System Metrics",
-    summary = "Get disk usage history",
-    description = "Historical filesystem usage across mountpoints with optional date range filtering",
+    summary = "Get load average history",
+    description = "Historical host load average with optional date range filtering",
     params(HistoryQuery),
     responses(
-        (status = 200, description = "Historical disk usage data", body = Vec<DiskUsage>),
+        (status = 200, description = "Load average history", body = Vec<LoadAverage>),
         (status = 400, response = BadRequestError),
         (status = 401, response = UnauthorizedError),
         (status = 500, response = InternalServerError),
@@ -75,7 +73,7 @@ async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuer
         Err(e) => return internal_error(e),
     };
     let store = state.store.clone();
-    let result = tokio::task::spawn_blocking(move || store.disk_history(from, to)).await;
+    let result = tokio::task::spawn_blocking(move || store.load_history(from, to)).await;
     drop(permit);
     let rows = match result {
         Ok(Ok(rows)) => rows,
@@ -84,18 +82,16 @@ async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuer
     };
 
     let debug = state.config.debug;
-    let out: Vec<DiskUsage> = rows.into_iter().map(|r| to_disk_usage(r, debug)).collect();
+    let out: Vec<LoadAverage> = rows.into_iter().map(|r| to_load(r, debug)).collect();
     Json(out).into_response()
 }
 
-pub(crate) fn to_disk_usage(r: store::DiskRow, debug: bool) -> DiskUsage {
-    DiskUsage {
+pub(crate) fn to_load(r: store::LoadRow, debug: bool) -> LoadAverage {
+    LoadAverage {
         time: r.time.to_string(),
-        mount: r.mount,
-        total: r.total,
-        used: r.used,
-        available: r.available,
-        used_percent: r.used_percent,
+        load1: r.load1,
+        load5: r.load5,
+        load15: r.load15,
         human_friendly_time: debug.then(|| format_millis(r.time)),
     }
 }

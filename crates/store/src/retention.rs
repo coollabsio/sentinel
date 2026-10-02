@@ -6,13 +6,16 @@ pub const DOWNSAMPLE_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Downsampling bucket width.
 pub const BUCKET_MS: i64 = 60_000;
 
-const TABLES: [&str; 6] = [
+const TABLES: [&str; 9] = [
     "cpu_usage",
     "memory_usage",
     "container_cpu_usage",
     "container_memory_usage",
     "disk_usage",
     "container_disk_usage",
+    "network_usage",
+    "load_average",
+    "container_network_usage",
 ];
 
 impl Store {
@@ -29,6 +32,11 @@ impl Store {
                 );
                 deleted += c.execute(&sql, (cutoff,))? as u64;
             }
+            // container_status is a current-only snapshot keyed on the display
+            // name; its `time` is a last-seen stamp. A container not seen since
+            // the cutoff is gone, so drop its stale status row (no per-row "keep
+            // last 10" — each container already has at most one row).
+            deleted += c.execute("DELETE FROM container_status WHERE time < ?1", (cutoff,))? as u64;
             Ok(deleted)
         })
     }
@@ -97,6 +105,30 @@ impl Store {
                 "container_disk_usage",
                 "container_id",
                 &["writable_layer", "volumes_total"],
+                lower_bound,
+                cutoff,
+            )?;
+            // Network is stored as a rate (bytes/sec), so a per-minute mean is
+            // the correct aged value — the same reason it is not a raw counter.
+            collapsed += bucket_host(
+                &tx,
+                "network_usage",
+                &["rx_bytes_per_sec", "tx_bytes_per_sec"],
+                lower_bound,
+                cutoff,
+            )?;
+            collapsed += bucket_host(
+                &tx,
+                "load_average",
+                &["load1", "load5", "load15"],
+                lower_bound,
+                cutoff,
+            )?;
+            collapsed += bucket_entity(
+                &tx,
+                "container_network_usage",
+                "container_id",
+                &["rx_bytes_per_sec", "tx_bytes_per_sec"],
                 lower_bound,
                 cutoff,
             )?;
@@ -204,9 +236,21 @@ fn bucket_entity(
 }
 
 fn avg_list(cols: &[&str]) -> String {
+    // REAL columns keep two decimals; every other column is a byte/count value
+    // rounded back to an integer to satisfy STRICT typing. Integer-casting a
+    // REAL column (e.g. a `load1` of 0.75) would silently truncate it.
+    const REAL_COLS: [&str; 7] = [
+        "percent",
+        "used_percent",
+        "rx_bytes_per_sec",
+        "tx_bytes_per_sec",
+        "load1",
+        "load5",
+        "load15",
+    ];
     cols.iter()
         .map(|c| {
-            if *c == "percent" || *c == "used_percent" {
+            if REAL_COLS.contains(c) {
                 format!("ROUND(AVG({c}), 2) AS {c}")
             } else {
                 format!("CAST(ROUND(AVG({c})) AS INTEGER) AS {c}")
