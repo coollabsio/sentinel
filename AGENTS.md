@@ -26,7 +26,7 @@ The application follows a service-oriented architecture with these main componen
    - Debug routes available when DEBUG=true
    - `openapi.json` is generated from `#[utoipa::path]` route annotations (utoipa-axum
      `OpenApiRouter`) and is not served at runtime. Never hand-edit it — annotate the
-     route, then run `UPDATE_OPENAPI=1 cargo test -p api --features traffic openapi_json`.
+     route, then run `just openapi` (or `cargo run -p api --features traffic --example openapi`).
      The test `openapi_json_is_up_to_date` fails in CI when the file drifts.
 
 2. **Collector Service** (`crates/collector/`) - Background service that periodically collects system and Docker metrics
@@ -88,7 +88,7 @@ location. `openapi.json` takes its version from `CARGO_PKG_VERSION`, so
 regenerate it after the bump (CI fails until you do).
 
 ### Steps
-1. **Bump version** in `Cargo.toml`, run `UPDATE_OPENAPI=1 cargo test -p api --features traffic openapi_json`, then verify `cargo build --release --locked` passes
+1. **Bump version** in `Cargo.toml`, run `just openapi`, then verify `cargo build --release --locked` passes
 2. **Commit & push to `next`** — triggers `release-next.yaml` workflow
    - Builds multi-arch Docker images (amd64 + aarch64)
    - Pushes to Docker Hub & GHCR with `next` tag

@@ -105,17 +105,12 @@ fn openapi_documents_every_route() {
 #[cfg(feature = "traffic")]
 #[test]
 fn openapi_json_is_up_to_date() {
-    const UPDATE: &str = "UPDATE_OPENAPI=1 cargo test -p api --features traffic openapi_json";
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../openapi.json");
-    let generated = super::openapi_document().to_pretty_json().unwrap() + "\n";
-    if std::env::var_os("UPDATE_OPENAPI").is_some() {
-        std::fs::write(path, &generated).unwrap();
-        return;
-    }
     let committed = std::fs::read_to_string(path).unwrap_or_default();
     // Not assert_eq!: a full-spec diff would bury the fix instruction.
     assert!(
-        committed == generated,
-        "openapi.json is out of date. Regenerate it with: {UPDATE}"
+        committed == super::openapi_json(),
+        "openapi.json is out of date. Regenerate it with: \
+         cargo run -p api --features traffic --example openapi (or: just openapi)"
     );
 }

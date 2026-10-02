@@ -15,7 +15,7 @@ To browse it, open `openapi.json` in any OpenAPI tool, for example
 To regenerate it after you change a route:
 
 ```bash
-UPDATE_OPENAPI=1 cargo test -p api --features traffic openapi_json
+cargo run -p api --features traffic --example openapi   # or: just openapi
 ```
 
 ## Authentication

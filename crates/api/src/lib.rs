@@ -122,17 +122,25 @@ fn core_openapi_router() -> OpenApiRouter<Arc<AppState>> {
     open
 }
 
-/// The complete OpenAPI document for this build, committed as `openapi.json`
-/// (see `tests::openapi_json_is_up_to_date`); it is not served at runtime. `/api/stats` is included
+/// The complete OpenAPI document for this build. `/api/stats` is included
 /// unconditionally — the route is DEBUG-gated at runtime, and the operation
 /// description says so. Traffic paths are present when compiled with the
 /// `traffic` feature (release builds always are).
-#[cfg(test)]
 fn openapi_document() -> utoipa::openapi::OpenApi {
     let (_, mut api) = core_openapi_router().split_for_parts();
     let (_, stats_api) = routes::stats::routes().split_for_parts();
     api.merge(stats_api);
     api
+}
+
+/// The exact content of the committed `openapi.json`. It is not served at
+/// runtime: `examples/openapi.rs` writes it, and
+/// `tests::openapi_json_is_up_to_date` checks it.
+pub fn openapi_json() -> String {
+    openapi_document()
+        .to_pretty_json()
+        .expect("OpenAPI document serializes")
+        + "\n"
 }
 
 pub fn router(state: Arc<AppState>) -> Router {

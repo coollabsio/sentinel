@@ -11,3 +11,7 @@ dev:
     # Watch only source trees: sentinel writes ./db/*.sqlite-shm on startup,
     # and watching the project root self-triggers a restart loop.
     TOKEN=your-secret-token PUSH_ENABLED=false DOCKER_HOST=${DOCKER_HOST:-unix://$XDG_RUNTIME_DIR/podman/podman.sock} cargo watch -c -w src -w crates -w Cargo.toml -w Cargo.lock -x run
+
+# Regenerate openapi.json from the route annotations.
+openapi:
+    cargo run -p api --features traffic --example openapi

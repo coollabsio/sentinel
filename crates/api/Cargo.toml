@@ -30,3 +30,9 @@ traffic = ["dep:traffic"]
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+# Writes openapi.json at the repo root. Needs `traffic`, or the spec would
+# miss the traffic routes.
+[[example]]
+name = "openapi"
+required-features = ["traffic"]
