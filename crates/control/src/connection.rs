@@ -10,8 +10,8 @@ use sentinel_protocol::control::v1::{
 };
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO,
-    CAPABILITY_SYSTEM_PING, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
-    CAPABILITY_WORKLOAD_RESOURCES, NETWORK_CAPABILITIES,
+    CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE, CAPABILITY_WORKLOAD_DEPLOY,
+    CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RESOURCES, NETWORK_CAPABILITIES,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
@@ -81,7 +81,9 @@ pub async fn connect(
     mut shutdown: watch::Receiver<bool>,
     command_executor: Arc<tokio::sync::Mutex<CommandExecutor>>,
 ) -> Result<(), FluxConnectionError> {
-    if assignment.trust_bundle_version() != control_tls.trust_bundle_version {
+    // The installed version can change at runtime through trust.bundle.update.v1.
+    let trust_bundle_version = crate::trust::installed_version(&control_tls);
+    if assignment.trust_bundle_version() != trust_bundle_version {
         return Err(FluxConnectionError::TrustBundleVersionMismatch);
     }
     let transport = FluxTransport::from_url(assignment.flux_url(), control_tls.allow_plaintext)?;
@@ -108,12 +110,13 @@ pub async fn connect(
                     CAPABILITY_WORKLOAD_RESOURCES.into(),
                     CAPABILITY_WORKLOAD_LIFECYCLE.into(),
                     CAPABILITY_LOGS_READ.into(),
+                    CAPABILITY_TRUST_BUNDLE_UPDATE.into(),
                 ]
                 .into_iter()
                 .chain(NETWORK_CAPABILITIES.map(str::to_string))
                 .collect(),
                 boot_id: boot_id(),
-                trust_bundle_version: control_tls.trust_bundle_version,
+                trust_bundle_version,
             })),
         })
         .await
@@ -309,6 +312,8 @@ pub(crate) async fn connect_endpoint(
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(CONNECT_TIMEOUT);
     if transport == FluxTransport::Tls {
+        // Read on every connection so an installed trust bundle update applies
+        // to the next connection without restarting Sentinel.
         let ca = std::fs::read(&control_tls.ca_path).map_err(|_| FluxConnectionError::MissingCa)?;
         if ca.is_empty() {
             return Err(FluxConnectionError::MissingCa);

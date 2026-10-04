@@ -6,9 +6,9 @@ use config::ControlTlsConfig;
 use reqwest::StatusCode;
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO,
-    CAPABILITY_SYSTEM_PING, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
-    CAPABILITY_WORKLOAD_RESOURCES, NETWORK_CAPABILITIES, PROTOCOL_MAX, PROTOCOL_MIN,
-    select_protocol,
+    CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE, CAPABILITY_WORKLOAD_DEPLOY,
+    CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RESOURCES, NETWORK_CAPABILITIES,
+    PROTOCOL_MAX, PROTOCOL_MIN, select_protocol,
 };
 use serde::{Deserialize, Serialize};
 use store::CommandJournal;
@@ -237,10 +237,12 @@ impl AssignmentClient {
                 CAPABILITY_WORKLOAD_RESOURCES,
                 CAPABILITY_WORKLOAD_LIFECYCLE,
                 CAPABILITY_LOGS_READ,
+                CAPABILITY_TRUST_BUNDLE_UPDATE,
             ]
             .into_iter()
             .chain(NETWORK_CAPABILITIES)
             .collect(),
+            trust_bundle_version: crate::trust::installed_version(&self.control_tls),
         };
         let mut response = self
             .client
@@ -305,7 +307,8 @@ impl AssignmentClient {
                 &self.sentinel_version,
                 self.command_journal.clone(),
             )
-            .with_discovery_trigger(discovery_trigger.clone()),
+            .with_discovery_trigger(discovery_trigger.clone())
+            .with_control_tls(self.control_tls.clone()),
         ));
         // Restores the approved cluster network and stopped workloads once per
         // boot. It needs neither Coolify nor Flux; commands that arrive while it
@@ -427,6 +430,8 @@ struct AssignmentRequest<'a> {
     protocol_min: u32,
     protocol_max: u32,
     capabilities: Vec<&'static str>,
+    /// Lets Coolify return an assignment for the bundle this Node has installed.
+    trust_bundle_version: u64,
 }
 
 #[derive(Deserialize)]

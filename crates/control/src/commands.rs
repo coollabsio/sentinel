@@ -7,16 +7,16 @@ use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
     ClusterLeaveResult, Command, CommandError, CommandResult, CommandStatus, ContainerListResult,
     ContainerObservation, ContainerPort, LogSource, LogsReadResult, SystemInfoResult,
-    SystemPingResult, WireguardInspectResult, WireguardKeyEnsureResult, WorkloadDeployRequest,
-    WorkloadDeployResult, WorkloadLifecycleAction, WorkloadLifecycleRequest,
+    SystemPingResult, TrustBundleUpdateResult, WireguardInspectResult, WireguardKeyEnsureResult,
+    WorkloadDeployRequest, WorkloadDeployResult, WorkloadLifecycleAction, WorkloadLifecycleRequest,
     WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_INSPECT,
     CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT, CAPABILITY_FIREWALL_RECONCILE,
     CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_TRUST_BUNDLE_UPDATE, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
+    CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
@@ -36,6 +36,7 @@ pub(crate) struct CommandExecutor {
     podman: PathBuf,
     system: System,
     discovery_trigger: Option<Arc<Notify>>,
+    control_tls: Option<config::ControlTlsConfig>,
 }
 
 impl CommandExecutor {
@@ -55,7 +56,14 @@ impl CommandExecutor {
             podman: PathBuf::from("podman"),
             system: host_system(),
             discovery_trigger: None,
+            control_tls: None,
         }
+    }
+
+    /// Lets `trust.bundle.update.v1` replace the Flux trust bundle files.
+    pub(crate) fn with_control_tls(mut self, control_tls: config::ControlTlsConfig) -> Self {
+        self.control_tls = Some(control_tls);
+        self
     }
 
     /// Wakes the discovery publisher after a command changes local workloads.
@@ -172,6 +180,11 @@ impl CommandExecutor {
             (CAPABILITY_FIREWALL_RECONCILE, Some(Payload::FirewallReconcile(request))) => {
                 crate::network::render_firewall(request).is_ok()
             }
+            (CAPABILITY_TRUST_BUNDLE_UPDATE, Some(Payload::TrustBundleUpdate(request))) => {
+                request.version > 0
+                    && !request.bundle_pem.is_empty()
+                    && request.bundle_pem.len() <= crate::trust::MAX_BUNDLE_BYTES
+            }
             (CAPABILITY_CORROSION_INSPECT, Some(Payload::CorrosionInspect(_))) => true,
             (CAPABILITY_CORROSION_RECONCILE, Some(Payload::CorrosionReconcile(request))) => {
                 crate::network::render_corrosion(request).is_ok()
@@ -186,6 +199,7 @@ impl CommandExecutor {
                     | CAPABILITY_SYSTEM_INFO
                     | CAPABILITY_CONTAINER_LIST
                     | CAPABILITY_LOGS_READ
+                    | CAPABILITY_TRUST_BUNDLE_UPDATE
                     | CAPABILITY_WORKLOAD_DEPLOY
                     | CAPABILITY_WORKLOAD_LIFECYCLE
                     | CAPABILITY_WIREGUARD_KEY_ENSURE
@@ -315,6 +329,28 @@ impl CommandExecutor {
                     }),
                 ),
                 Err(message) => failed(&command.command_id, "logs_read_failed", &message),
+            }
+        } else if let Some(Payload::TrustBundleUpdate(request)) = command.payload {
+            match self.control_tls.as_ref() {
+                Some(control_tls) => {
+                    match crate::trust::install(control_tls, request.version, &request.bundle_pem) {
+                        Ok(update) => succeeded(
+                            &command.command_id,
+                            command_result::Payload::TrustBundleUpdate(TrustBundleUpdateResult {
+                                installed_version: update.installed_version,
+                                changed: update.changed,
+                            }),
+                        ),
+                        Err(message) => {
+                            failed(&command.command_id, "trust_bundle_update_failed", &message)
+                        }
+                    }
+                }
+                None => failed(
+                    &command.command_id,
+                    "trust_bundle_unavailable",
+                    "This Sentinel has no Flux trust bundle to update.",
+                ),
             }
         } else if let Some(Payload::ClusterLeave(request)) = command.payload {
             match crate::network::leave_cluster(&self.network_root, &request) {

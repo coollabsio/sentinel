@@ -1230,6 +1230,7 @@ pub(crate) fn inspect_corrosion(root: &Path) -> CorrosionInspectResult {
             member_state: "absent".into(),
             endpoint_count: 0,
             last_convergence_unix_seconds: None,
+            alive_member_count: None,
         };
     }
     if root != Path::new("/") {
@@ -1238,6 +1239,7 @@ pub(crate) fn inspect_corrosion(root: &Path) -> CorrosionInspectResult {
             member_state: "configured".into(),
             endpoint_count: 0,
             last_convergence_unix_seconds: None,
+            alive_member_count: None,
         };
     }
 
@@ -1281,11 +1283,13 @@ pub(crate) fn inspect_corrosion(root: &Path) -> CorrosionInspectResult {
         .transpose()
         .ok()
         .flatten();
+    let alive_member_count = membership
+        .as_ref()
+        .filter(|output| output.status.success())
+        .map(|output| corrosion_alive_member_count(&output.stdout, cluster_id));
     let converged = active
-        && membership.as_ref().is_some_and(|output| {
-            output.status.success()
-                && corrosion_membership_converged(&output.stdout, cluster_id, peer_count)
-        });
+        && alive_member_count
+            .is_some_and(|alive| corrosion_membership_converged(alive, cluster_id, peer_count));
     let convergence_path = Path::new("/var/lib/coolify/network/corrosion.converged");
     if converged {
         let now = unix_seconds();
@@ -1305,6 +1309,7 @@ pub(crate) fn inspect_corrosion(root: &Path) -> CorrosionInspectResult {
         endpoint_count,
         last_convergence_unix_seconds: read_trimmed_u64(convergence_path)
             .and_then(|value| i64::try_from(value).ok()),
+        alive_member_count,
     }
 }
 
@@ -1320,17 +1325,39 @@ pub(crate) fn unix_seconds() -> i64 {
         .min(i64::MAX as u64) as i64
 }
 
-fn corrosion_membership_converged(output: &[u8], cluster_id: u16, peer_count: u64) -> bool {
+fn corrosion_membership_converged(
+    alive_member_count: u64,
+    cluster_id: u16,
+    peer_count: u64,
+) -> bool {
+    cluster_id != 0 && alive_member_count >= peer_count
+}
+
+/// Counts the Corrosion members of this cluster that are `Alive`. Coolify compares this
+/// with the number of reachable peers, so an offline peer does not block convergence.
+fn corrosion_alive_member_count(output: &[u8], cluster_id: u16) -> u64 {
     if cluster_id == 0 {
-        return false;
+        return 0;
     }
-    if peer_count == 0 {
-        return true;
+    let members: Result<Vec<serde_json::Value>, _> = serde_json::Deserializer::from_slice(output)
+        .into_iter::<serde_json::Value>()
+        .collect();
+    if let Ok(members) = members {
+        return members
+            .iter()
+            .filter(|member| {
+                member.get("state").and_then(serde_json::Value::as_str) == Some("Alive")
+                    && member
+                        .pointer("/id/cluster_id")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(u64::from(cluster_id))
+            })
+            .count() as u64;
     }
     let text = String::from_utf8_lossy(output);
     let expected_cluster = format!("\"cluster_id\": {cluster_id}");
-    text.matches("\"state\": \"Alive\"").count() as u64 >= peer_count
-        && text.matches(&expected_cluster).count() as u64 >= peer_count
+    (text.matches("\"state\": \"Alive\"").count() as u64)
+        .min(text.matches(&expected_cluster).count() as u64)
 }
 
 fn corrosion_endpoint_count() -> Option<u64> {
@@ -2434,9 +2461,52 @@ mod tests {
           "state": "Alive"
         }"#;
 
-        assert!(corrosion_membership_converged(output, 42, 1));
-        assert!(!corrosion_membership_converged(output, 43, 1));
-        assert!(!corrosion_membership_converged(output, 42, 2));
+        assert!(corrosion_membership_converged(
+            corrosion_alive_member_count(output, 42),
+            42,
+            1
+        ));
+        assert!(!corrosion_membership_converged(
+            corrosion_alive_member_count(output, 43),
+            43,
+            1
+        ));
+        assert!(!corrosion_membership_converged(
+            corrosion_alive_member_count(output, 42),
+            42,
+            2
+        ));
+        assert!(!corrosion_membership_converged(5, 0, 1));
+        assert!(corrosion_membership_converged(0, 42, 0));
+    }
+
+    #[test]
+    fn corrosion_alive_member_count_counts_only_alive_members_of_the_cluster() {
+        let output = br#"{
+          "id": {"addr": "10.240.0.3:8787", "cluster_id": 42},
+          "state": "Alive"
+        }
+        {
+          "id": {"addr": "10.240.0.4:8787", "cluster_id": 42},
+          "state": "Down"
+        }
+        {
+          "id": {"addr": "10.240.0.5:8787", "cluster_id": 7},
+          "state": "Alive"
+        }"#;
+
+        assert_eq!(corrosion_alive_member_count(output, 42), 1);
+        assert_eq!(corrosion_alive_member_count(output, 7), 1);
+        assert_eq!(corrosion_alive_member_count(output, 0), 0);
+        assert_eq!(corrosion_alive_member_count(b"", 42), 0);
+    }
+
+    #[test]
+    fn corrosion_alive_member_count_falls_back_for_unstructured_output() {
+        let output = b"member \"cluster_id\": 42 \"state\": \"Alive\" trailing text";
+
+        assert_eq!(corrosion_alive_member_count(output, 42), 1);
+        assert_eq!(corrosion_alive_member_count(output, 43), 0);
     }
 
     #[test]

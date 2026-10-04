@@ -586,9 +586,10 @@ async fn corrosion_reconcile_route_forwards_the_node_dns_name() {
                         sentinel_protocol::control::v1::CorrosionReconcileResult {
                             state: Some(sentinel_protocol::control::v1::CorrosionInspectResult {
                                 version: "v1.0.0".into(),
-                                member_state: "configured".into(),
+                                member_state: "joining".into(),
                                 endpoint_count: 0,
                                 last_convergence_unix_seconds: None,
+                                alive_member_count: Some(1),
                             }),
                             changed: true,
                         },
@@ -600,6 +601,9 @@ async fn corrosion_reconcile_route_forwards_the_node_dns_name() {
 
     let response = request.await.unwrap().unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["member_state"], "joining");
+    assert_eq!(body["alive_member_count"], 1);
     server.abort();
 }
 
@@ -930,4 +934,191 @@ fn permits_plaintext_only_with_the_explicit_development_opt_in() {
         "Flux TLS is required unless FLUX_DEVELOPMENT_ALLOW_PLAINTEXT=true"
     );
     assert!(load_server_tls(None, None, true).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn trust_bundle_update_route_forwards_the_bundle_and_returns_the_installed_version() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_TRUST_BUNDLE_UPDATE.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let bundle = "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n";
+    let request = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/trust.bundle.update"))
+            .bearer_auth("internal-secret")
+            .json(&serde_json::json!({
+                "server_id": "server-1",
+                "command_id": "trust-bundle-3",
+                "version": 3,
+                "bundle_pem": bundle,
+            }))
+            .send(),
+    );
+
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    assert_eq!(command.command_id, "trust-bundle-3");
+    assert_eq!(
+        command.command_type,
+        sentinel_protocol::CAPABILITY_TRUST_BUNDLE_UPDATE
+    );
+    assert!(matches!(
+        &command.payload,
+        Some(sentinel_protocol::control::v1::command::Payload::TrustBundleUpdate(
+            sentinel_protocol::control::v1::TrustBundleUpdateRequest { version: 3, bundle_pem }
+        )) if bundle_pem == bundle
+    ));
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: "trust-bundle-3:result".into(),
+                command_id: "trust-bundle-3".into(),
+                status: sentinel_protocol::control::v1::CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: 1_700_000_000_500,
+                payload: Some(
+                    sentinel_protocol::control::v1::command_result::Payload::TrustBundleUpdate(
+                        sentinel_protocol::control::v1::TrustBundleUpdateResult {
+                            installed_version: 3,
+                            changed: true,
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({
+            "command_id": "trust-bundle-3",
+            "observed_at_unix_ms": 1_700_000_000_500_i64,
+            "installed_version": 3,
+            "changed": true,
+        })
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn trust_bundle_update_route_validates_the_request_and_capability() {
+    let registry = ConnectionRegistry::default();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![CAPABILITY_SYSTEM_PING.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry,
+        "internal-secret".into(),
+    ));
+    let send = |token: &str, body: serde_json::Value| {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/trust.bundle.update"))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+    };
+    let body = |server_id: &str, command_id: &str, version: u64, bundle: &str| serde_json::json!({"server_id": server_id, "command_id": command_id, "version": version, "bundle_pem": bundle});
+    let pem = "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n";
+
+    for (token, request, status) in [
+        (
+            "wrong",
+            body("server-1", "trust-1", 2, pem),
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "wrong",
+            body("server-1", "trust-1", 0, pem),
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "internal-secret",
+            body("server-1", "trust-1", 0, pem),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            body("server-1", "trust-1", 2, " "),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            body("server-1", "trust-1", 2, &"A".repeat(64 * 1024 + 1)),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            body("server-1", "bad id!", 2, pem),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            body("offline", "trust-1", 2, pem),
+            reqwest::StatusCode::NOT_FOUND,
+        ),
+        (
+            "internal-secret",
+            body("server-1", "trust-1", 2, pem),
+            reqwest::StatusCode::CONFLICT,
+        ),
+    ] {
+        assert_eq!(send(token, request.clone()).await.unwrap().status(), status);
+    }
+    server.abort();
+}
+
+#[test]
+fn negotiates_the_trust_bundle_update_capability_when_granted() {
+    let claims = CredentialClaims {
+        subject: "server-1".into(),
+        capabilities: vec![sentinel_protocol::CAPABILITY_TRUST_BUNDLE_UPDATE.into()],
+        protocol_min: 1,
+        protocol_max: 1,
+        expires_at: i64::MAX,
+    };
+    let hello = sentinel_protocol::control::v1::Hello {
+        server_id: "server-1".into(),
+        sentinel_version: "main".into(),
+        protocol_min: 1,
+        protocol_max: 1,
+        capabilities: vec![sentinel_protocol::CAPABILITY_TRUST_BUNDLE_UPDATE.into()],
+        boot_id: "boot-1".into(),
+        trust_bundle_version: 2,
+    };
+
+    assert_eq!(
+        negotiate(&claims, &hello).unwrap().capabilities,
+        vec![sentinel_protocol::CAPABILITY_TRUST_BUNDLE_UPDATE]
+    );
 }

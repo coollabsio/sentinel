@@ -7,6 +7,7 @@ mod discovery;
 mod logs;
 mod network;
 mod restore;
+mod trust;
 
 pub use assignment::{
     Assignment, AssignmentClient, AssignmentError, AssignmentErrorKind, AssignmentOutcome,

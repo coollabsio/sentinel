@@ -204,3 +204,41 @@ fn generates_grpc_client_and_server_types() {
     );
     assert!(type_name::<control::v1::agent_server::AgentServer<()>>().contains("AgentServer"));
 }
+
+#[test]
+fn trust_bundle_update_command_and_result_round_trip() {
+    assert_eq!(CAPABILITY_TRUST_BUNDLE_UPDATE, "trust.bundle.update.v1");
+    let command = control::v1::Command {
+        command_id: "trust-1".into(),
+        command_type: CAPABILITY_TRUST_BUNDLE_UPDATE.into(),
+        payload_version: 1,
+        created_at_unix_ms: 1,
+        payload: Some(control::v1::command::Payload::TrustBundleUpdate(
+            control::v1::TrustBundleUpdateRequest {
+                version: 2,
+                bundle_pem: "-----BEGIN CERTIFICATE-----\n".into(),
+            },
+        )),
+        expires_at_unix_ms: 2,
+    };
+    assert_eq!(
+        control::v1::Command::decode(command.encode_to_vec().as_slice()).unwrap(),
+        command
+    );
+    let result = control::v1::CommandResult {
+        event_id: "trust-1:result".into(),
+        command_id: "trust-1".into(),
+        status: control::v1::CommandStatus::Succeeded.into(),
+        observed_at_unix_ms: 3,
+        payload: Some(control::v1::command_result::Payload::TrustBundleUpdate(
+            control::v1::TrustBundleUpdateResult {
+                installed_version: 2,
+                changed: true,
+            },
+        )),
+    };
+    assert_eq!(
+        control::v1::CommandResult::decode(result.encode_to_vec().as_slice()).unwrap(),
+        result
+    );
+}

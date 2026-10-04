@@ -77,6 +77,7 @@ message Command {
     CorrosionReconcileRequest corrosion_reconcile = 22;
     ClusterLeaveRequest cluster_leave = 24;
     LogsReadRequest logs_read = 25;
+    TrustBundleUpdateRequest trust_bundle_update = 26;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -116,6 +117,7 @@ message CommandResult {
     CorrosionReconcileResult corrosion_reconcile = 22;
     ClusterLeaveResult cluster_leave = 24;
     LogsReadResult logs_read = 25;
+    TrustBundleUpdateResult trust_bundle_update = 26;
     CommandError error = 20;
   }
 }
@@ -271,7 +273,7 @@ message FirewallIngressRule { string destination_ip = 1; string protocol = 2; ui
 message FirewallReconcileRequest { uint64 revision = 1; uint32 wireguard_port = 2; string cluster_cidr = 3; repeated FirewallRule rules = 4; string wireguard_interface = 5; string flux_probe_host = 6; repeated string workload_cidrs = 7; repeated FirewallIngressRule ingress_rules = 8; string local_node_ip = 9; }
 message FirewallReconcileResult { FirewallInspectResult state = 1; bool changed = 2; bool rollback_cancelled = 3; }
 message CorrosionInspectRequest {}
-message CorrosionInspectResult { string version = 1; string member_state = 2; uint64 endpoint_count = 3; optional int64 last_convergence_unix_seconds = 4; }
+message CorrosionInspectResult { string version = 1; string member_state = 2; uint64 endpoint_count = 3; optional int64 last_convergence_unix_seconds = 4; optional uint64 alive_member_count = 5; }
 message CorrosionReconcileRequest { string version = 1; string cluster_id = 2; string bind_address = 3; repeated string peers = 4; string node_dns_name = 5; }
 message CorrosionReconcileResult { CorrosionInspectResult state = 1; bool changed = 2; }
 
@@ -302,6 +304,19 @@ message LogsReadResult {
   // Oldest first.
   repeated LogEvent events = 2;
   bool truncated = 3;
+}
+
+// Installs a Flux CA trust bundle for future Flux connections. Sentinel accepts
+// only a strictly newer version, or the identical bundle at the installed version.
+message TrustBundleUpdateRequest {
+  uint64 version = 1;
+  // PEM-encoded CA certificates only. Never contains private keys.
+  string bundle_pem = 2;
+}
+
+message TrustBundleUpdateResult {
+  uint64 installed_version = 1;
+  bool changed = 2;
 }
 
 message CommandError {

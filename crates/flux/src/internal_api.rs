@@ -12,16 +12,16 @@ use sentinel_protocol::control::v1::{
     ClusterLeaveRequest, Command, CommandResult, CommandStatus, ContainerListRequest,
     ContainerPort, CorrosionInspectRequest, CorrosionReconcileRequest, FirewallIngressRule,
     FirewallInspectRequest, FirewallReconcileRequest, FirewallRule, LogSource, LogsReadRequest,
-    SystemInfoRequest, SystemPingRequest, WireguardInspectRequest, WireguardKeyEnsureRequest,
-    WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest, WorkloadEnvironmentVariable,
-    WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
+    SystemInfoRequest, SystemPingRequest, TrustBundleUpdateRequest, WireguardInspectRequest,
+    WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest,
+    WorkloadEnvironmentVariable, WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_INSPECT,
     CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT, CAPABILITY_FIREWALL_RECONCILE,
     CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_TRUST_BUNDLE_UPDATE, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
+    CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -31,6 +31,8 @@ use crate::{CommandDispatchError, ConnectionRegistry, now_millis};
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+/// Matches Sentinel's limit. A CA certificate is about 1 KiB.
+const MAX_TRUST_BUNDLE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct ApiState {
@@ -46,6 +48,14 @@ struct PingRequest {
 #[derive(Deserialize)]
 struct SystemInfoApiRequest {
     server_id: String,
+}
+
+#[derive(Deserialize)]
+struct TrustBundleUpdateApiRequest {
+    server_id: String,
+    command_id: String,
+    version: u64,
+    bundle_pem: String,
 }
 
 #[derive(Deserialize)]
@@ -371,6 +381,10 @@ pub async fn serve(
         .route("/v1/commands/system.info", post(system_info))
         .route("/v1/commands/container.list", post(container_list))
         .route("/v1/commands/logs.read", post(logs_read))
+        .route(
+            "/v1/commands/trust.bundle.update",
+            post(trust_bundle_update),
+        )
         .route("/v1/commands/network.cluster.leave", post(cluster_leave))
         .route("/v1/commands/workload.deploy", post(workload_deploy))
         .route("/v1/commands/workload.lifecycle", post(workload_lifecycle))
@@ -436,6 +450,51 @@ async fn cluster_leave(
         "firewall_removed": value.firewall_removed,
         "discovery_removed": value.discovery_removed,
         "resolver_reverted": value.resolver_reverted,
+    })))
+}
+
+/// Forwards a Flux CA trust bundle to Sentinel. The bundle holds public CA
+/// certificates only; Sentinel validates it before installing.
+async fn trust_bundle_update(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<TrustBundleUpdateApiRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if request.version == 0
+        || request.bundle_pem.trim().is_empty()
+        || request.bundle_pem.len() > MAX_TRUST_BUNDLE_BYTES
+    {
+        let authorization = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        if authorization != Some(&format!("Bearer {}", state.token)) {
+            return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
+        }
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid trust bundle").into());
+    }
+    let result = dispatch_network(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_TRUST_BUNDLE_UPDATE,
+        Payload::TrustBundleUpdate(TrustBundleUpdateRequest {
+            version: request.version,
+            bundle_pem: request.bundle_pem,
+        }),
+    )
+    .await?;
+    let Some(command_result::Payload::TrustBundleUpdate(value)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
+    };
+    if value.installed_version != request.version {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
+    }
+    Ok(Json(serde_json::json!({
+        "command_id": request.command_id,
+        "observed_at_unix_ms": result.observed_at_unix_ms,
+        "installed_version": value.installed_version,
+        "changed": value.changed,
     })))
 }
 
@@ -677,7 +736,7 @@ async fn corrosion_inspect(
         return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
     };
     Ok(Json(
-        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "version": value.version, "member_state": value.member_state, "endpoint_count": value.endpoint_count, "last_convergence_unix_seconds": value.last_convergence_unix_seconds}),
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "version": value.version, "member_state": value.member_state, "endpoint_count": value.endpoint_count, "last_convergence_unix_seconds": value.last_convergence_unix_seconds, "alive_member_count": value.alive_member_count}),
     ))
 }
 
@@ -708,7 +767,7 @@ async fn corrosion_reconcile(
         .state
         .ok_or((StatusCode::BAD_GATEWAY, "invalid Sentinel response"))?;
     Ok(Json(
-        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "changed": value.changed, "version": discovery.version, "member_state": discovery.member_state, "endpoint_count": discovery.endpoint_count, "last_convergence_unix_seconds": discovery.last_convergence_unix_seconds}),
+        serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "changed": value.changed, "version": discovery.version, "member_state": discovery.member_state, "endpoint_count": discovery.endpoint_count, "last_convergence_unix_seconds": discovery.last_convergence_unix_seconds, "alive_member_count": discovery.alive_member_count}),
     ))
 }
 

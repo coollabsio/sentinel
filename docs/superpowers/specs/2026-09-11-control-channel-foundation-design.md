@@ -442,6 +442,20 @@ Result: `source`, `events` (oldest first; each has `timestamp_unix_ms`, `level`,
 
 Flux exposes it as `POST /v1/commands/logs.read` with `{"server_id", "source", "limit"}`.
 
+### `trust.bundle.update.v1`
+
+Request: `version` and `bundle_pem`. Result: `installed_version` and `changed`.
+
+Coolify uses it to stage a Flux CA rotation over the already trusted channel.
+
+- The bundle may contain only PEM `CERTIFICATE` blocks: 1 to 8 certificates, 64 KiB at most, each a CA (`basicConstraints CA:TRUE`) that has not expired.
+- `version` must be greater than the installed version. The installed version may be repeated only with the identical bundle, which returns `changed: false`. Older versions are rejected.
+- Sentinel writes the bundle to `FLUX_CA_PATH` and then the version to the `.version` file next to it, each through a synced temporary file and a rename. The replaced pair stays as `.previous`. If the version cannot be written, the previous bundle is restored.
+- The installed version is the `.version` file when it is valid, otherwise `FLUX_TRUST_BUNDLE_VERSION`. Sentinel reports it in the assignment request and the hello, and compares it with the assignment.
+- The TLS client reads the bundle on every connection, so the update applies to the next connection without a restart.
+
+Flux exposes it as `POST /v1/commands/trust.bundle.update` with `{"server_id", "command_id", "version", "bundle_pem"}`.
+
 ## 12. Sentinel runtime design
 
 The `control` crate receives:

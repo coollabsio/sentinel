@@ -486,6 +486,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
     assert_eq!(request.body["sentinel_version"], "1.0.1");
     assert_eq!(request.body["protocol_min"], 1);
     assert_eq!(request.body["protocol_max"], 1);
+    assert_eq!(request.body["trust_bundle_version"], 1);
     assert_eq!(
         request.body["capabilities"],
         json!([
@@ -496,6 +497,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "workload.resources.v1",
             "workload.lifecycle.v1",
             "logs.read.v1",
+            "trust.bundle.update.v1",
             "network.cluster.leave.v1",
             "network.wireguard.key.ensure.v1",
             "network.wireguard.inspect.v1",
@@ -1931,4 +1933,277 @@ fn workload_commands_reject_names_that_cannot_be_a_stop_marker() {
     }
     assert!(podman_log(root.path()).is_empty());
     assert!(!root.path().join("var/lib/coolify/workloads").exists());
+}
+
+fn test_ca_pem(expired: bool) -> String {
+    let now = time::OffsetDateTime::now_utc();
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    params.not_before = now - time::Duration::days(2);
+    params.not_after = if expired {
+        now - time::Duration::days(1)
+    } else {
+        now + time::Duration::days(1)
+    };
+    CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap())
+        .unwrap()
+        .pem()
+}
+
+fn trust_directory_config(
+    root: &tempfile::TempDir,
+    bundle: &str,
+    version: u64,
+) -> config::ControlTlsConfig {
+    let ca_path = root.path().join("sentinel-flux-ca.pem");
+    std::fs::write(&ca_path, bundle).unwrap();
+    std::fs::write(
+        root.path().join("sentinel-flux-ca.version"),
+        format!("{version}\n"),
+    )
+    .unwrap();
+    control_tls_config(ca_path, 1)
+}
+
+fn trust_bundle_update_command(
+    command_id: &str,
+    version: u64,
+    bundle_pem: &str,
+) -> sentinel_protocol::control::v1::Command {
+    sentinel_protocol::control::v1::Command {
+        command_id: command_id.into(),
+        command_type: sentinel_protocol::CAPABILITY_TRUST_BUNDLE_UPDATE.into(),
+        payload_version: 1,
+        created_at_unix_ms: 1,
+        payload: Some(
+            sentinel_protocol::control::v1::command::Payload::TrustBundleUpdate(
+                sentinel_protocol::control::v1::TrustBundleUpdateRequest {
+                    version,
+                    bundle_pem: bundle_pem.into(),
+                },
+            ),
+        ),
+        expires_at_unix_ms: i64::MAX,
+    }
+}
+
+#[test]
+fn validates_trust_bundles_as_bounded_lists_of_ca_certificates() {
+    let first = test_ca_pem(false);
+    let second = test_ca_pem(false);
+    let leaf = test_tls_material(&["127.0.0.1"]).server_pem;
+
+    assert_eq!(
+        crate::trust::validate_bundle(&format!("{first}{second}")),
+        Ok(2)
+    );
+    for (name, bundle) in [
+        ("empty", String::new()),
+        ("garbage", "not a certificate".to_string()),
+        (
+            "invalid DER",
+            "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n".to_string(),
+        ),
+        ("leaf certificate", format!("{first}{leaf}")),
+        ("expired CA", test_ca_pem(true)),
+        (
+            "private key",
+            format!("{first}{}", KeyPair::generate().unwrap().serialize_pem()),
+        ),
+        ("stray text", format!("{first}trailing text\n")),
+        (
+            "unterminated",
+            first
+                .trim_end()
+                .trim_end_matches("-----END CERTIFICATE-----")
+                .to_string(),
+        ),
+        (
+            "too many",
+            first.repeat(crate::trust::MAX_BUNDLE_CERTIFICATES + 1),
+        ),
+        (
+            "too large",
+            format!("{first}{}", "\n".repeat(crate::trust::MAX_BUNDLE_BYTES)),
+        ),
+    ] {
+        assert!(
+            crate::trust::validate_bundle(&bundle).is_err(),
+            "{name} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn installs_a_newer_trust_bundle_atomically_and_keeps_the_previous_one() {
+    let root = tempfile::tempdir().unwrap();
+    let old = test_ca_pem(false);
+    let new = test_ca_pem(false);
+    let config = trust_directory_config(&root, &old, 3);
+    let dual = format!("{old}{new}");
+
+    assert_eq!(crate::trust::installed_version(&config), 3);
+    assert_eq!(
+        crate::trust::install(&config, 4, &dual),
+        Ok(crate::trust::TrustBundleUpdate {
+            installed_version: 4,
+            changed: true,
+        })
+    );
+
+    assert_eq!(std::fs::read_to_string(&config.ca_path).unwrap(), dual);
+    assert_eq!(crate::trust::installed_version(&config), 4);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("sentinel-flux-ca.pem.previous")).unwrap(),
+        old
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("sentinel-flux-ca.version.previous")).unwrap(),
+        "3\n"
+    );
+    assert!(!root.path().join("sentinel-flux-ca.pem.update").exists());
+    assert!(!root.path().join("sentinel-flux-ca.version.update").exists());
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&config.ca_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    // Re-delivery of the installed bundle is an idempotent no-op.
+    assert_eq!(
+        crate::trust::install(&config, 4, &dual),
+        Ok(crate::trust::TrustBundleUpdate {
+            installed_version: 4,
+            changed: false,
+        })
+    );
+}
+
+#[test]
+fn rejects_trust_bundle_downgrades_and_conflicting_versions() {
+    let root = tempfile::tempdir().unwrap();
+    let old = test_ca_pem(false);
+    let config = trust_directory_config(&root, &old, 5);
+    let other = test_ca_pem(false);
+
+    assert!(crate::trust::install(&config, 4, &other).is_err());
+    assert!(crate::trust::install(&config, 5, &other).is_err());
+    assert!(crate::trust::install(&config, 6, "garbage").is_err());
+    assert_eq!(std::fs::read_to_string(&config.ca_path).unwrap(), old);
+    assert_eq!(crate::trust::installed_version(&config), 5);
+}
+
+#[test]
+fn falls_back_to_the_configured_trust_bundle_version_without_a_version_file() {
+    let root = tempfile::tempdir().unwrap();
+    let ca_path = root.path().join("sentinel-flux-ca.pem");
+    std::fs::write(&ca_path, test_ca_pem(false)).unwrap();
+
+    assert_eq!(
+        crate::trust::installed_version(&control_tls_config(ca_path.clone(), 7)),
+        7
+    );
+    std::fs::write(root.path().join("sentinel-flux-ca.version"), "garbage").unwrap();
+    assert_eq!(
+        crate::trust::installed_version(&control_tls_config(ca_path, 7)),
+        7
+    );
+}
+
+#[test]
+fn restores_the_previous_trust_bundle_when_the_version_cannot_be_written() {
+    let root = tempfile::tempdir().unwrap();
+    let old = test_ca_pem(false);
+    let ca_path = root.path().join("sentinel-flux-ca.pem");
+    std::fs::write(&ca_path, &old).unwrap();
+    // A non-empty directory in place of the version file makes the final rename fail.
+    let version_path = root.path().join("sentinel-flux-ca.version");
+    std::fs::create_dir(&version_path).unwrap();
+    std::fs::write(version_path.join("blocker"), "x").unwrap();
+    let config = control_tls_config(ca_path.clone(), 1);
+
+    let result = crate::trust::install(&config, 2, &format!("{old}{}", test_ca_pem(false)));
+
+    assert!(result.unwrap_err().contains("previous bundle was restored"));
+    assert_eq!(std::fs::read_to_string(&ca_path).unwrap(), old);
+    assert_eq!(crate::trust::installed_version(&config), 1);
+    assert!(!root.path().join("sentinel-flux-ca.pem.update").exists());
+    assert!(!root.path().join("sentinel-flux-ca.version.update").exists());
+}
+
+#[test]
+fn executes_capability_gated_trust_bundle_updates() {
+    use sentinel_protocol::control::v1::command_result;
+
+    let root = tempfile::tempdir().unwrap();
+    let old = test_ca_pem(false);
+    let config = trust_directory_config(&root, &old, 1);
+    let dual = format!("{old}{}", test_ca_pem(false));
+    let mut executor =
+        crate::commands::CommandExecutor::new("dev").with_control_tls(config.clone());
+
+    let refused = executor.execute(trust_bundle_update_command("trust-0", 2, &dual), false);
+    assert!(!refused.accepted);
+    assert_eq!(crate::trust::installed_version(&config), 1);
+
+    let installed = executor.execute(trust_bundle_update_command("trust-1", 2, &dual), true);
+    assert!(installed.accepted);
+    assert!(matches!(
+        installed.result.payload,
+        Some(command_result::Payload::TrustBundleUpdate(result))
+            if result.installed_version == 2 && result.changed
+    ));
+
+    let downgrade = executor.execute(trust_bundle_update_command("trust-2", 1, &old), true);
+    assert_eq!(
+        downgrade.result.status,
+        sentinel_protocol::control::v1::CommandStatus::Failed as i32
+    );
+    assert!(matches!(
+        downgrade.result.payload,
+        Some(command_result::Payload::Error(error)) if error.code == "trust_bundle_update_failed"
+    ));
+
+    let mut without_trust = crate::commands::CommandExecutor::new("dev");
+    let unavailable = without_trust.execute(trust_bundle_update_command("trust-3", 2, &dual), true);
+    assert!(matches!(
+        unavailable.result.payload,
+        Some(command_result::Payload::Error(error)) if error.code == "trust_bundle_unavailable"
+    ));
+}
+
+#[tokio::test]
+async fn reconnects_with_an_updated_trust_bundle_without_a_restart() {
+    let material = test_tls_material(&["127.0.0.1"]);
+    let root = tempfile::tempdir().unwrap();
+    let old = test_ca_pem(false);
+    let config = trust_directory_config(&root, &old, 1);
+    let endpoint = start_tls_server("127.0.0.1:0", &material).await;
+
+    assert!(matches!(
+        crate::connection::connect_endpoint(&endpoint, &config).await,
+        Err(FluxConnectionError::Connection)
+    ));
+
+    let mut executor =
+        crate::commands::CommandExecutor::new("dev").with_control_tls(config.clone());
+    let update = executor.execute(
+        trust_bundle_update_command("trust-1", 2, &format!("{old}{}", material.ca_pem)),
+        true,
+    );
+    assert_eq!(
+        update.result.status,
+        sentinel_protocol::control::v1::CommandStatus::Succeeded as i32
+    );
+
+    let reconnected = crate::connection::connect_endpoint(&endpoint, &config).await;
+    assert!(reconnected.is_ok(), "{reconnected:?}");
+    assert_eq!(crate::trust::installed_version(&config), 2);
 }
