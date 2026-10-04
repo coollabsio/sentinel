@@ -7,8 +7,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use rcgen::{CertificateParams, KeyPair};
 use sentinel_protocol::{
-    CAPABILITY_CORROSION_ENDPOINT_RECONCILE, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_PING,
-    PROTOCOL_MAX, PROTOCOL_MIN,
+    CAPABILITY_CORROSION_RECONCILE, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_PING, PROTOCOL_MAX,
+    PROTOCOL_MIN,
 };
 use tonic::transport::Server;
 
@@ -101,7 +101,7 @@ fn selects_protocol_and_capabilities_for_valid_hello() {
         subject: "server-1".into(),
         capabilities: vec![
             CAPABILITY_SYSTEM_PING.into(),
-            CAPABILITY_CORROSION_ENDPOINT_RECONCILE.into(),
+            CAPABILITY_CORROSION_RECONCILE.into(),
         ],
         protocol_min: 1,
         protocol_max: 1,
@@ -114,7 +114,7 @@ fn selects_protocol_and_capabilities_for_valid_hello() {
         protocol_max: 1,
         capabilities: vec![
             CAPABILITY_SYSTEM_PING.into(),
-            CAPABILITY_CORROSION_ENDPOINT_RECONCILE.into(),
+            CAPABILITY_CORROSION_RECONCILE.into(),
         ],
         boot_id: "boot-1".into(),
         trust_bundle_version: 1,
@@ -125,10 +125,7 @@ fn selects_protocol_and_capabilities_for_valid_hello() {
     assert_eq!(negotiated.protocol_version, 1);
     assert_eq!(
         negotiated.capabilities,
-        vec![
-            CAPABILITY_SYSTEM_PING,
-            CAPABILITY_CORROSION_ENDPOINT_RECONCILE
-        ]
+        vec![CAPABILITY_SYSTEM_PING, CAPABILITY_CORROSION_RECONCILE]
     );
 }
 
@@ -497,7 +494,7 @@ async fn registry_times_out_when_sentinel_does_not_return_a_result() {
 }
 
 #[tokio::test]
-async fn endpoint_reconcile_route_requires_internal_authentication() {
+async fn coolify_driven_endpoint_reconcile_route_is_removed() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(serve_internal_api(
@@ -510,6 +507,7 @@ async fn endpoint_reconcile_route_requires_internal_authentication() {
         .post(format!(
             "http://{address}/v1/commands/discovery.corrosion.endpoints.reconcile"
         ))
+        .bearer_auth("internal-secret")
         .json(&serde_json::json!({
             "server_id": "server-1",
             "command_id": "endpoint-1",
@@ -520,7 +518,118 @@ async fn endpoint_reconcile_route_requires_internal_authentication() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    server.abort();
+}
+
+#[tokio::test]
+async fn corrosion_reconcile_route_forwards_the_node_dns_name() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![CAPABILITY_CORROSION_RECONCILE.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let request = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!(
+                "http://{address}/v1/commands/discovery.corrosion.reconcile"
+            ))
+            .bearer_auth("internal-secret")
+            .json(&serde_json::json!({
+                "server_id": "server-1",
+                "command_id": "corrosion-1",
+                "version": "v1.0.0",
+                "cluster_id": "cluster-one",
+                "bind_address": "10.240.0.2",
+                "peers": ["10.240.0.3:8787"],
+                "node_dns_name": "worker-1",
+            }))
+            .send(),
+    );
+
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    let Some(sentinel_protocol::control::v1::command::Payload::CorrosionReconcile(payload)) =
+        command.payload
+    else {
+        panic!("expected a Corrosion reconcile payload");
+    };
+    assert_eq!(payload.node_dns_name, "worker-1");
+    assert_eq!(payload.bind_address, "10.240.0.2");
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: "corrosion-1:result".into(),
+                command_id: "corrosion-1".into(),
+                status: sentinel_protocol::control::v1::CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: now_millis(),
+                payload: Some(
+                    sentinel_protocol::control::v1::command_result::Payload::CorrosionReconcile(
+                        sentinel_protocol::control::v1::CorrosionReconcileResult {
+                            state: Some(sentinel_protocol::control::v1::CorrosionInspectResult {
+                                version: "v1.0.0".into(),
+                                member_state: "configured".into(),
+                                endpoint_count: 0,
+                                last_convergence_unix_seconds: None,
+                            }),
+                            changed: true,
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    server.abort();
+}
+
+#[tokio::test]
+async fn corrosion_reconcile_route_requires_the_node_dns_name() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        ConnectionRegistry::default(),
+        "internal-secret".into(),
+    ));
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{address}/v1/commands/discovery.corrosion.reconcile"
+        ))
+        .bearer_auth("internal-secret")
+        .json(&serde_json::json!({
+            "server_id": "server-1",
+            "command_id": "corrosion-1",
+            "version": "v1.0.0",
+            "cluster_id": "cluster-one",
+            "bind_address": "10.240.0.2",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     server.abort();
 }
 

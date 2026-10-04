@@ -5,18 +5,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use sentinel_protocol::control::v1::{
-    ClusterLeaveRequest, ClusterLeaveResult, CorrosionEndpointReconcileRequest,
-    CorrosionEndpointReconcileResult, CorrosionInspectResult, CorrosionReconcileRequest,
+    ClusterLeaveRequest, ClusterLeaveResult, CorrosionInspectResult, CorrosionReconcileRequest,
     CorrosionReconcileResult, FirewallInspectResult, FirewallReconcileRequest,
     FirewallReconcileResult, WireguardInspectResult, WireguardPeer, WireguardPeerState,
-    WireguardReconcileRequest, WireguardReconcileResult, WorkloadEndpoint,
+    WireguardReconcileRequest, WireguardReconcileResult,
 };
-use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const COOLIFY_NFT_TABLE: &str = "coolify_cluster";
 const COOLIFY_NFT_BRIDGE_TABLE: &str = "coolify_cluster_bridge";
 pub(crate) const CORROSION_VERSION: &str = "v1.0.0";
+/// The Node WireGuard IP that owns this Node's discovery rows and serves its Corrosion API.
+pub(crate) const CORROSION_OWNER_FILE: &str = "etc/corrosion/coolify-owner";
+/// The Node DNS label published as `<name>.nodes.coolify.internal`.
+pub(crate) const CORROSION_NODE_NAME_FILE: &str = "etc/corrosion/coolify-node-name";
 
 pub(crate) fn validate_interface(value: &str) -> Result<(), String> {
     if value.is_empty()
@@ -52,8 +54,19 @@ pub(crate) fn leave_cluster(
     request: &ClusterLeaveRequest,
 ) -> Result<ClusterLeaveResult, String> {
     validate_cluster_leave(request)?;
+    // Hold the publisher lock so no endpoint publish can run between withdrawing
+    // this Node's rows and removing the identity files that enable publishing.
+    let _publisher = crate::discovery::publisher_lock();
 
     if root == Path::new("/") {
+        match crate::discovery::withdraw_endpoints(&request.owner_node_ip) {
+            // Give Corrosion a moment to broadcast the deletion before it stops;
+            // rows that do not propagate still expire within the endpoint TTL.
+            Ok(()) => std::thread::sleep(std::time::Duration::from_secs(2)),
+            Err(message) => {
+                tracing::warn!(error = %message, "could not withdraw this Node's discovery endpoints before leaving the cluster");
+            }
+        }
         let _ = Command::new("resolvectl")
             .args(["revert", &request.interface])
             .status();
@@ -91,7 +104,8 @@ pub(crate) fn leave_cluster(
         state_path(root, "firewall.transaction.nft"),
         root.join("etc/corrosion/config.toml"),
         root.join("etc/corrosion/schemas/coolify.sql"),
-        root.join("etc/corrosion/coolify-owner"),
+        root.join(CORROSION_OWNER_FILE),
+        root.join(CORROSION_NODE_NAME_FILE),
         root.join("etc/corrosion/coolify-cluster-id"),
         root.join("etc/corrosion/coolify-peer-count"),
         root.join("etc/systemd/system/corrosion.service"),
@@ -411,6 +425,9 @@ pub(crate) fn render_corrosion(request: &CorrosionReconcileRequest) -> Result<St
     {
         return Err("The Corrosion configuration is invalid.".into());
     }
+    if !valid_discovery_label(&request.node_dns_name) {
+        return Err("The Corrosion Node DNS name is invalid.".into());
+    }
     let peers = request
         .peers
         .iter()
@@ -432,7 +449,7 @@ fn corrosion_cluster_id(value: &str) -> Result<u16, String> {
     Ok(id.max(1))
 }
 
-fn valid_discovery_label(value: &str) -> bool {
+pub(crate) fn valid_discovery_label(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
         && value
@@ -440,123 +457,6 @@ fn valid_discovery_label(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
         && !value.starts_with('-')
         && !value.ends_with('-')
-}
-
-fn validate_workload_endpoint(
-    endpoint: &WorkloadEndpoint,
-    expected_owner: &str,
-) -> Result<(), String> {
-    if endpoint.owner_node_ip != expected_owner
-        || !valid_discovery_label(&endpoint.workload_id)
-        || !valid_discovery_label(&endpoint.namespace)
-        || endpoint
-            .owner_node_ip
-            .parse::<std::net::Ipv4Addr>()
-            .is_err()
-        || endpoint.container_ip.parse::<std::net::Ipv4Addr>().is_err()
-        || !matches!(
-            endpoint.state.as_str(),
-            "configured"
-                | "created"
-                | "running"
-                | "paused"
-                | "restarting"
-                | "stopped"
-                | "exited"
-                | "dead"
-                | "removing"
-        )
-        || !matches!(
-            endpoint.health.as_str(),
-            "healthy" | "unhealthy" | "starting" | "unknown"
-        )
-        || endpoint.updated_at_unix_seconds <= 0
-        || endpoint.expires_at_unix_seconds <= endpoint.updated_at_unix_seconds
-        || endpoint.expires_at_unix_seconds - endpoint.updated_at_unix_seconds > 3600
-    {
-        return Err("A Corrosion endpoint is invalid or is not owned by this Node.".into());
-    }
-    Ok(())
-}
-
-fn corrosion_endpoint_transaction(
-    request: &CorrosionEndpointReconcileRequest,
-    local_owner: &str,
-) -> Result<Vec<Value>, String> {
-    if request.owner_node_ip != local_owner
-        || request.owner_node_ip.parse::<std::net::Ipv4Addr>().is_err()
-        || request.endpoints.len() > 10_000
-    {
-        return Err(
-            "The Corrosion endpoint snapshot is invalid or is not owned by this Node.".into(),
-        );
-    }
-    let mut transaction = vec![json!([
-        "DELETE FROM workload_endpoints WHERE owner_node_ip = ?",
-        [local_owner]
-    ])];
-    for endpoint in &request.endpoints {
-        validate_workload_endpoint(endpoint, local_owner)?;
-        transaction.push(json!([
-            "INSERT INTO workload_endpoints (workload_id, namespace, owner_node_ip, container_ip, state, health, updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                endpoint.workload_id,
-                endpoint.namespace,
-                endpoint.owner_node_ip,
-                endpoint.container_ip,
-                endpoint.state,
-                endpoint.health,
-                endpoint.updated_at_unix_seconds,
-                endpoint.expires_at_unix_seconds
-            ]
-        ]));
-    }
-    Ok(transaction)
-}
-
-pub(crate) fn validate_corrosion_endpoints(
-    request: &CorrosionEndpointReconcileRequest,
-) -> Result<(), String> {
-    corrosion_endpoint_transaction(request, &request.owner_node_ip).map(|_| ())
-}
-
-pub(crate) fn reconcile_corrosion_endpoints(
-    root: &Path,
-    request: &CorrosionEndpointReconcileRequest,
-) -> Result<CorrosionEndpointReconcileResult, String> {
-    let owner_path = root.join("etc/corrosion/coolify-owner");
-    let local_owner = fs::read_to_string(owner_path)
-        .map_err(|_| "Corrosion is not configured for this Node.".to_string())?;
-    let local_owner = local_owner.trim();
-    let transaction = corrosion_endpoint_transaction(request, local_owner)?;
-
-    if root == Path::new("/") {
-        let body = serde_json::to_string(&transaction)
-            .map_err(|_| "The Corrosion endpoint transaction could not be encoded.".to_string())?;
-        run(
-            Command::new("curl")
-                .args([
-                    "--fail-with-body",
-                    "--silent",
-                    "--show-error",
-                    "--connect-timeout",
-                    "5",
-                    "--max-time",
-                    "20",
-                    "--header",
-                    "Content-Type: application/json",
-                    "--data-binary",
-                ])
-                .arg(body)
-                .arg(format!("http://{local_owner}:8080/v1/transactions")),
-            "Corrosion could not reconcile the endpoint snapshot.",
-        )?;
-    }
-
-    Ok(CorrosionEndpointReconcileResult {
-        owner_node_ip: local_owner.into(),
-        endpoint_count: request.endpoints.len() as u64,
-    })
 }
 
 pub(crate) fn ensure_key(root: &Path, interface: &str) -> Result<String, String> {
@@ -1245,8 +1145,13 @@ pub(crate) fn reconcile_corrosion(
     )?;
     let cluster_id = corrosion_cluster_id(&request.cluster_id)?;
     atomic_write(
-        &root.join("etc/corrosion/coolify-owner"),
+        &root.join(CORROSION_OWNER_FILE),
         format!("{}\n", request.bind_address).as_bytes(),
+        0o644,
+    )?;
+    atomic_write(
+        &root.join(CORROSION_NODE_NAME_FILE),
+        format!("{}\n", request.node_dns_name).as_bytes(),
         0o644,
     )?;
     atomic_write(
@@ -1397,7 +1302,7 @@ fn read_trimmed_u64(path: impl AsRef<Path>) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-fn unix_seconds() -> i64 {
+pub(crate) fn unix_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1974,6 +1879,7 @@ mod tests {
             cluster_id: "cluster-one".into(),
             bind_address: "10.240.0.2".into(),
             peers: vec!["10.240.0.3:8787".into()],
+            node_dns_name: "worker-1".into(),
         };
         let result = reconcile_corrosion(temp.path(), &request).unwrap();
         assert!(result.changed);
@@ -1990,6 +1896,50 @@ mod tests {
         assert!(schema.contains("health TEXT NOT NULL DEFAULT ''"));
         assert!(schema.contains("updated_at INTEGER NOT NULL DEFAULT 0"));
         assert!(schema.contains("expires_at INTEGER NOT NULL DEFAULT 0"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join(CORROSION_OWNER_FILE)).unwrap(),
+            "10.240.0.2\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join(CORROSION_NODE_NAME_FILE)).unwrap(),
+            "worker-1\n"
+        );
+        let node_name_mode = fs::metadata(temp.path().join(CORROSION_NODE_NAME_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(node_name_mode, 0o644);
+    }
+
+    #[test]
+    fn corrosion_reconcile_rejects_an_invalid_node_dns_name_before_writing() {
+        for invalid in ["", "-worker", "worker-", "worker.one", "worker_one", "a\nb"] {
+            let temp = tempfile::tempdir().unwrap();
+            let request = CorrosionReconcileRequest {
+                version: CORROSION_VERSION.into(),
+                cluster_id: "cluster-one".into(),
+                bind_address: "10.240.0.2".into(),
+                peers: vec![],
+                node_dns_name: invalid.into(),
+            };
+
+            assert_eq!(
+                reconcile_corrosion(temp.path(), &request).unwrap_err(),
+                "The Corrosion Node DNS name is invalid."
+            );
+            assert!(render_corrosion(&request).is_err());
+            assert!(!temp.path().join(CORROSION_NODE_NAME_FILE).exists());
+            assert!(!temp.path().join("etc/corrosion/config.toml").exists());
+        }
+        let too_long = CorrosionReconcileRequest {
+            version: CORROSION_VERSION.into(),
+            cluster_id: "cluster-one".into(),
+            bind_address: "10.240.0.2".into(),
+            peers: vec![],
+            node_dns_name: "a".repeat(64),
+        };
+        assert!(render_corrosion(&too_long).is_err());
     }
 
     #[test]
@@ -1999,6 +1949,7 @@ mod tests {
             cluster_id: "cluster-one".into(),
             bind_address: "0.0.0.0".into(),
             peers: vec!["10.240.0.3:8787".into()],
+            node_dns_name: "worker-1".into(),
         };
         assert!(render_corrosion(&request).is_err());
 
@@ -2024,58 +1975,6 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, 0);
         assert!(corrosion_cluster_id("").is_err());
-    }
-
-    #[test]
-    fn corrosion_endpoint_snapshot_is_owned_and_atomic() {
-        let request = CorrosionEndpointReconcileRequest {
-            owner_node_ip: "10.240.0.2".into(),
-            endpoints: vec![WorkloadEndpoint {
-                workload_id: "web".into(),
-                namespace: "default".into(),
-                owner_node_ip: "10.240.0.2".into(),
-                container_ip: "10.240.0.2".into(),
-                state: "running".into(),
-                health: "healthy".into(),
-                updated_at_unix_seconds: 1_700_000_000,
-                expires_at_unix_seconds: 1_700_000_300,
-            }],
-        };
-
-        let transaction = corrosion_endpoint_transaction(&request, "10.240.0.2").unwrap();
-
-        assert_eq!(
-            transaction[0][0],
-            "DELETE FROM workload_endpoints WHERE owner_node_ip = ?"
-        );
-        assert_eq!(transaction[0][1][0], "10.240.0.2");
-        assert_eq!(transaction.len(), 2);
-        assert!(
-            transaction[1][0]
-                .as_str()
-                .unwrap()
-                .starts_with("INSERT INTO workload_endpoints")
-        );
-    }
-
-    #[test]
-    fn corrosion_endpoint_snapshot_rejects_another_nodes_rows() {
-        let request = CorrosionEndpointReconcileRequest {
-            owner_node_ip: "10.240.0.2".into(),
-            endpoints: vec![WorkloadEndpoint {
-                workload_id: "web".into(),
-                namespace: "default".into(),
-                owner_node_ip: "10.240.0.3".into(),
-                container_ip: "10.240.0.3".into(),
-                state: "running".into(),
-                health: "healthy".into(),
-                updated_at_unix_seconds: 1_700_000_000,
-                expires_at_unix_seconds: 1_700_000_300,
-            }],
-        };
-
-        assert!(corrosion_endpoint_transaction(&request, "10.240.0.2").is_err());
-        assert!(corrosion_endpoint_transaction(&request, "10.240.0.3").is_err());
     }
 
     #[test]
@@ -2120,6 +2019,10 @@ mod tests {
             "var/lib/coolify/network/firewall.state",
             "etc/corrosion/config.toml",
             "etc/corrosion/schemas/coolify.sql",
+            "etc/corrosion/coolify-owner",
+            "etc/corrosion/coolify-node-name",
+            "etc/corrosion/coolify-cluster-id",
+            "etc/corrosion/coolify-peer-count",
             "etc/systemd/system/corrosion.service",
             "etc/systemd/system/coolify-discovery-dns.service",
             "var/lib/corrosion/db.sqlite",

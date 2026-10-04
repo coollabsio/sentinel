@@ -3,6 +3,7 @@
 mod assignment;
 mod commands;
 mod connection;
+mod discovery;
 mod logs;
 mod network;
 

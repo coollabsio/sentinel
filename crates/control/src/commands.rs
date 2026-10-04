@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use prost::Message;
 use sentinel_protocol::control::v1::command::Payload;
@@ -11,14 +12,15 @@ use sentinel_protocol::control::v1::{
     WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
-    CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
-    CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT,
-    CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO,
-    CAPABILITY_SYSTEM_PING, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
-    CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_INSPECT,
+    CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT, CAPABILITY_FIREWALL_RECONCILE,
+    CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
+    CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
+use tokio::sync::Notify;
 
 pub(crate) const CONTAINER_RUNTIMES: [&str; 2] = ["podman", "docker"];
 
@@ -32,6 +34,7 @@ pub(crate) struct CommandExecutor {
     journal: CommandJournal,
     network_root: PathBuf,
     system: System,
+    discovery_trigger: Option<Arc<Notify>>,
 }
 
 impl CommandExecutor {
@@ -49,7 +52,14 @@ impl CommandExecutor {
             journal,
             network_root: PathBuf::from("/"),
             system: host_system(),
+            discovery_trigger: None,
         }
+    }
+
+    /// Wakes the discovery publisher after a command changes local workloads.
+    pub(crate) fn with_discovery_trigger(mut self, trigger: Arc<Notify>) -> Self {
+        self.discovery_trigger = Some(trigger);
+        self
     }
 
     #[cfg(test)]
@@ -158,10 +168,6 @@ impl CommandExecutor {
             (CAPABILITY_CORROSION_RECONCILE, Some(Payload::CorrosionReconcile(request))) => {
                 crate::network::render_corrosion(request).is_ok()
             }
-            (
-                CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
-                Some(Payload::CorrosionEndpointReconcile(request)),
-            ) => crate::network::validate_corrosion_endpoints(request).is_ok(),
             _ => false,
         };
         let accepted = !(command.command_id.is_empty()
@@ -181,7 +187,6 @@ impl CommandExecutor {
                     | CAPABILITY_FIREWALL_RECONCILE
                     | CAPABILITY_CORROSION_INSPECT
                     | CAPABILITY_CORROSION_RECONCILE
-                    | CAPABILITY_CORROSION_ENDPOINT_RECONCILE
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
@@ -400,18 +405,6 @@ impl CommandExecutor {
                 ),
                 Err(message) => failed(&command.command_id, "corrosion_reconcile_failed", &message),
             }
-        } else if let Some(Payload::CorrosionEndpointReconcile(request)) = command.payload {
-            match crate::network::reconcile_corrosion_endpoints(&self.network_root, &request) {
-                Ok(result) => succeeded(
-                    &command.command_id,
-                    command_result::Payload::CorrosionEndpointReconcile(result),
-                ),
-                Err(message) => failed(
-                    &command.command_id,
-                    "corrosion_endpoint_reconcile_failed",
-                    &message,
-                ),
-            }
         } else {
             failed(
                 &command.command_id,
@@ -419,6 +412,16 @@ impl CommandExecutor {
                 "Command payload is missing.",
             )
         };
+        if matches!(
+            result.payload,
+            Some(
+                command_result::Payload::WorkloadDeploy(_)
+                    | command_result::Payload::WorkloadLifecycle(_)
+            )
+        ) && let Some(trigger) = &self.discovery_trigger
+        {
+            trigger.notify_one();
+        }
         if journaled
             && let Err(error) =
                 self.journal

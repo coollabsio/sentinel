@@ -7,7 +7,8 @@ use super::*;
 #[test]
 fn network_capabilities_are_typed_and_versioned() {
     let capabilities = NETWORK_CAPABILITIES;
-    assert_eq!(capabilities.len(), 9);
+    assert_eq!(capabilities.len(), 8);
+    assert!(!capabilities.contains(&"discovery.corrosion.endpoints.reconcile.v1"));
     assert!(
         capabilities
             .iter()
@@ -54,27 +55,17 @@ fn network_capabilities_are_typed_and_versioned() {
     };
     assert_eq!(firewall.flux_probe_host, "10.240.0.1");
 
-    let endpoints = control::v1::CorrosionEndpointReconcileRequest {
-        owner_node_ip: "10.240.0.2".into(),
-        endpoints: vec![control::v1::WorkloadEndpoint {
-            workload_id: "web".into(),
-            namespace: "default".into(),
-            owner_node_ip: "10.240.0.2".into(),
-            container_ip: "10.240.0.2".into(),
-            state: "running".into(),
-            health: "healthy".into(),
-            updated_at_unix_seconds: 1_700_000_000,
-            expires_at_unix_seconds: 1_700_000_300,
-        }],
+    let corrosion = control::v1::CorrosionReconcileRequest {
+        version: "v1.0.0".into(),
+        cluster_id: "cluster-one".into(),
+        bind_address: "10.240.0.2".into(),
+        peers: vec![],
+        node_dns_name: "worker-1".into(),
     };
-    assert_eq!(
-        endpoints.endpoints[0].owner_node_ip,
-        endpoints.owner_node_ip
-    );
-    assert_eq!(
-        CAPABILITY_CORROSION_ENDPOINT_RECONCILE,
-        "discovery.corrosion.endpoints.reconcile.v1"
-    );
+    let decoded =
+        control::v1::CorrosionReconcileRequest::decode(corrosion.encode_to_vec().as_slice())
+            .unwrap();
+    assert_eq!(decoded.node_dns_name, "worker-1");
 }
 
 #[test]

@@ -299,11 +299,20 @@ impl AssignmentClient {
         let mut last_status = None;
         let mut temporary_attempt = 0;
         let mut connection_attempt = 0;
+        let discovery_trigger = Arc::new(tokio::sync::Notify::new());
         let command_executor = Arc::new(tokio::sync::Mutex::new(
             crate::commands::CommandExecutor::with_journal(
                 &self.sentinel_version,
                 self.command_journal.clone(),
-            ),
+            )
+            .with_discovery_trigger(discovery_trigger.clone()),
+        ));
+        // Publishes this Node's own discovery endpoints independently of the
+        // Coolify and Flux connections, so DNS survives a control-plane outage.
+        let discovery_publisher = tokio::spawn(crate::discovery::run(
+            std::path::PathBuf::from("/"),
+            discovery_trigger,
+            shutdown.clone(),
         ));
 
         loop {
@@ -386,6 +395,7 @@ impl AssignmentClient {
             }
         }
 
+        discovery_publisher.abort();
         tracing::info!("Sentinel control assignment polling stopped");
     }
 }
