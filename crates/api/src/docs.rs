@@ -50,7 +50,9 @@ pub fn base_openapi() -> OpenApi {
                 .build(),
             TagBuilder::new()
                 .name("System Metrics")
-                .description(Some("CPU, memory, disk, network and load metrics for the host system"))
+                .description(Some(
+                    "CPU, memory, disk, network and load metrics for the host system",
+                ))
                 .build(),
             TagBuilder::new()
                 .name("Container Metrics")
