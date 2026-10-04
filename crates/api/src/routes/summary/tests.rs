@@ -71,6 +71,7 @@ fn state(store: Store) -> Arc<AppState> {
         )),
         analytics: None,
         geoip_attribution: Arc::new(std::sync::RwLock::new(None)),
+        push_status: Default::default(),
     })
 }
 

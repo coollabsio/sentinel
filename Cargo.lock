@@ -87,6 +87,7 @@ dependencies = [
  "collector",
  "config",
  "http-body-util",
+ "push",
  "serde",
  "serde_json",
  "store",

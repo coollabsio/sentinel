@@ -4,6 +4,7 @@ pub mod disk;
 pub mod load;
 pub mod memory;
 pub mod network;
+pub mod push;
 pub mod stats;
 pub mod summary;
 #[cfg(feature = "traffic")]

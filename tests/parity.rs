@@ -55,6 +55,7 @@ async fn fetch(uri: &str) -> serde_json::Value {
         )),
         analytics: None,
         geoip_attribution: Arc::new(std::sync::RwLock::new(None)),
+        push_status: Default::default(),
     });
 
     let res = api::router(state)

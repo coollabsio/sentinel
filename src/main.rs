@@ -219,6 +219,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let geoip_attribution: Arc<std::sync::RwLock<Option<String>>> =
         Arc::new(std::sync::RwLock::new(None));
 
+    // Written by the pusher after each attempt, served by `/api/push-status`.
+    // Stays at its default (all null / 0) when push is disabled.
+    let push_status = push::SharedPushStatus::default();
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut services = tokio::task::JoinSet::new();
     let mut control_services = tokio::task::JoinSet::new();
@@ -244,6 +248,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(not(feature = "traffic"))]
             analytics: None,
             geoip_attribution: geoip_attribution.clone(),
+            push_status: push_status.clone(),
         });
         let app = api::router(state);
         let mut rx = shutdown_rx.clone();
@@ -306,7 +311,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Pusher
     if config.push_enabled {
-        let pusher = push::Pusher::new(config.clone(), docker.clone(), store.clone())?;
+        let pusher = push::Pusher::new(
+            config.clone(),
+            docker.clone(),
+            store.clone(),
+            push_status.clone(),
+        )?;
         let rx = shutdown_rx.clone();
         services.spawn(async move {
             pusher.run(rx).await;

@@ -102,6 +102,7 @@ fn test_state() -> std::sync::Arc<api::AppState> {
         )),
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        push_status: Default::default(),
     })
 }
 

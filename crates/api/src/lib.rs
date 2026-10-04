@@ -99,6 +99,9 @@ pub struct AppState {
     /// all of which the `/api/traffic/attribution` endpoint reports the same
     /// way: `{"attribution": null}`.
     pub geoip_attribution: Arc<std::sync::RwLock<Option<String>>>,
+    /// Written by the push loop after every attempt, read by
+    /// `/api/push-status`. Left at its default when push is disabled.
+    pub push_status: push::SharedPushStatus,
 }
 
 /// Everything except the debug-gated `/api/stats` *route*. Its documentation
@@ -114,7 +117,8 @@ fn core_openapi_router() -> OpenApiRouter<Arc<AppState>> {
         .merge(routes::container::routes())
         .merge(routes::network::routes())
         .merge(routes::load::routes())
-        .merge(routes::summary::routes());
+        .merge(routes::summary::routes())
+        .merge(routes::push::routes());
 
     // Compile-time gate only. Whether the routes have anything to serve is a
     // runtime question (`AppState::analytics`), which each handler answers

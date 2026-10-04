@@ -46,6 +46,7 @@ fn openapi_documents_every_route() {
         "/api/load/current",
         "/api/load/history",
         "/api/summary",
+        "/api/push-status",
         "/api/containers/current",
         "/api/container/{containerId}/cpu/history",
         "/api/container/{containerId}/memory/history",

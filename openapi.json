@@ -1270,6 +1270,36 @@
         ]
       }
     },
+    "/api/push-status": {
+      "get": {
+        "tags": [
+          "Core"
+        ],
+        "summary": "Get push status",
+        "description": "Outcome of the most recent pushes to Coolify: when the last attempt and the last success happened, the last error (DNS, TLS, connection, non-2xx response, ...) and how many attempts failed in a row. All fields are null / 0 when push is disabled or no push was attempted yet.",
+        "operationId": "push_status",
+        "responses": {
+          "200": {
+            "description": "Push status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PushStatusBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/resource/{uuid}/traffic/breakdown/{dimension}": {
       "get": {
         "tags": [
@@ -2610,6 +2640,56 @@
           "txBytesPerSec": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "PushStatusBody": {
+        "type": "object",
+        "description": "Outcome of the most recent push attempts to Coolify.",
+        "required": [
+          "consecutive_failures"
+        ],
+        "properties": {
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Failed attempts since the last success.",
+            "example": 1,
+            "minimum": 0
+          },
+          "last_attempt_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Time of the last push attempt (RFC 3339, UTC), null if none yet.",
+            "example": "2026-10-04T12:00:00Z"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Error of the last failed attempt (at most 500 chars); null after a success.",
+            "example": "push to https://coolify.example/api/v1/sentinel/push returned 401: Unauthenticated."
+          },
+          "last_status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "HTTP status of the last failed attempt when it was a non-2xx response; null otherwise and after a success.",
+            "example": 401,
+            "minimum": 0
+          },
+          "last_success_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Time of the last successful push (RFC 3339, UTC), null if none yet.",
+            "example": "2026-10-04T11:59:00Z"
           }
         }
       },

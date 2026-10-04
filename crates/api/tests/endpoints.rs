@@ -41,6 +41,7 @@ fn state(debug: bool) -> Arc<AppState> {
         )),
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        push_status: Default::default(),
     })
 }
 
@@ -183,6 +184,7 @@ async fn cpu_history_returns_empty_array_not_null() {
         )),
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        push_status: Default::default(),
     });
     let (s, j) = get(router(st), "/api/cpu/history", Some("secret")).await;
     assert_eq!(s, StatusCode::OK);
@@ -226,4 +228,59 @@ async fn debug_mode_adds_human_friendly_time() {
     assert_eq!(s, StatusCode::OK);
     let row = &j.as_array().unwrap()[0];
     assert_eq!(row["human_friendly_time"], "2023-11-14T22:13:20Z");
+}
+
+#[tokio::test]
+async fn push_status_requires_the_bearer_token() {
+    let (s, _) = get(router(state(false)), "/api/push-status", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    let (s, _) = get(router(state(false)), "/api/push-status", Some("wrong")).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn push_status_is_empty_before_any_attempt() {
+    let (s, j) = get(router(state(false)), "/api/push-status", Some("secret")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        j,
+        serde_json::json!({
+            "last_attempt_at": null,
+            "last_success_at": null,
+            "last_error": null,
+            "last_status": null,
+            "consecutive_failures": 0,
+        })
+    );
+}
+
+#[tokio::test]
+async fn push_status_reports_the_last_attempt() {
+    let st = state(false);
+    let ok_at = time::macros::datetime!(2026-10-04 12:00:00.123456789 UTC);
+    let failed_at = time::macros::datetime!(2026-10-04 12:01:00 UTC);
+    push::record_attempt(&st.push_status, ok_at, &Ok(()));
+    push::record_attempt(
+        &st.push_status,
+        failed_at,
+        &Err(push::PushError::Status {
+            url: "https://coolify.example/api/v1/sentinel/push".into(),
+            status: 401,
+            body: "Unauthenticated.".into(),
+        }),
+    );
+
+    let (s, j) = get(router(st), "/api/push-status", Some("secret")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        j,
+        serde_json::json!({
+            "last_attempt_at": "2026-10-04T12:01:00Z",
+            "last_success_at": "2026-10-04T12:00:00Z",
+            "last_error": "push to https://coolify.example/api/v1/sentinel/push returned 401: Unauthenticated.",
+            "last_status": 401,
+            "consecutive_failures": 1,
+        })
+    );
 }

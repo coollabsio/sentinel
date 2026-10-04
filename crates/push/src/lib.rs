@@ -3,17 +3,22 @@
 pub mod fs_usage;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use config::Config;
 use docker::DockerClient;
 use serde::Serialize;
 use store::Store;
+use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 const MAX_CONCURRENT_INSPECTS: usize = 10;
+
+/// Upper bound (in chars) on `PushStatus::last_error`, so a large response
+/// body echoed in `PushError::Status` can't bloat `/api/push-status`.
+pub const MAX_ERROR_CHARS: usize = 500;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
@@ -69,15 +74,80 @@ pub fn push_request(
         .json(payload)
 }
 
+/// Outcome of the most recent push attempts, served by `/api/push-status` so
+/// Coolify can see why pushes fail (DNS, TLS, refused, non-2xx) instead of
+/// only noticing that they stopped arriving. Stays at its default (all
+/// `None` / 0) when push is disabled.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushStatus {
+    pub last_attempt_at: Option<OffsetDateTime>,
+    pub last_success_at: Option<OffsetDateTime>,
+    /// Error chain of the last failed attempt, at most `MAX_ERROR_CHARS`
+    /// chars. Cleared by a successful push.
+    pub last_error: Option<String>,
+    /// HTTP status of the last failed attempt when it was a non-2xx response.
+    /// Cleared by a successful push.
+    pub last_status: Option<u16>,
+    pub consecutive_failures: u64,
+}
+
+impl PushStatus {
+    pub fn record_success(&mut self, at: OffsetDateTime) {
+        self.last_attempt_at = Some(at);
+        self.last_success_at = Some(at);
+        self.last_error = None;
+        self.last_status = None;
+        self.consecutive_failures = 0;
+    }
+
+    pub fn record_failure(&mut self, at: OffsetDateTime, error: &PushError) {
+        self.last_attempt_at = Some(at);
+        self.last_error = Some(error_message(error).chars().take(MAX_ERROR_CHARS).collect());
+        self.last_status = match error {
+            PushError::Status { status, .. } => Some(*status),
+            _ => None,
+        };
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+    }
+}
+
+/// Shared between the push loop (writer) and the API (reader). A std mutex:
+/// it is never held across an await.
+pub type SharedPushStatus = Arc<Mutex<PushStatus>>;
+
+/// The error's display string followed by its source chain. reqwest's own
+/// display omits the cause ("error sending request for url (...)"), which is
+/// exactly the part that tells DNS, TLS and connection-refused apart. Sources
+/// whose text is already included (thiserror's `{0}` + `#[from]`) are skipped.
+pub fn error_message(error: &PushError) -> String {
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !message.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        source = cause.source();
+    }
+    message
+}
+
 pub struct Pusher {
     config: Arc<Config>,
     docker: DockerClient,
     store: Store,
     client: reqwest::Client,
+    status: SharedPushStatus,
 }
 
 impl Pusher {
-    pub fn new(config: Arc<Config>, docker: DockerClient, store: Store) -> Result<Self, PushError> {
+    pub fn new(
+        config: Arc<Config>,
+        docker: DockerClient,
+        store: Store,
+        status: SharedPushStatus,
+    ) -> Result<Self, PushError> {
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(100)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
@@ -88,6 +158,7 @@ impl Pusher {
             docker,
             store,
             client,
+            status,
         })
     }
 
@@ -108,9 +179,11 @@ impl Pusher {
                     return;
                 }
                 _ = ticker.tick() => {
-                    if let Err(e) = self.push_once().await {
+                    let result = self.push_once().await;
+                    if let Err(e) = &result {
                         tracing::warn!(error = %e, "push operation failed");
                     }
+                    record_attempt(&self.status, OffsetDateTime::now_utc(), &result);
                 }
             }
         }
@@ -254,6 +327,19 @@ impl Pusher {
             );
         }
         Ok((out, skipped))
+    }
+}
+
+/// Applies one push attempt's outcome to the shared status.
+pub fn record_attempt(
+    status: &SharedPushStatus,
+    at: OffsetDateTime,
+    result: &Result<(), PushError>,
+) {
+    let mut status = status.lock().unwrap_or_else(|e| e.into_inner());
+    match result {
+        Ok(()) => status.record_success(at),
+        Err(e) => status.record_failure(at, e),
     }
 }
 

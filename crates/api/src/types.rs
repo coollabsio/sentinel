@@ -61,6 +61,28 @@ pub struct ContainerDiskUsage {
     pub human_friendly_time: Option<String>,
 }
 
+/// Outcome of the most recent push attempts to Coolify.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PushStatusBody {
+    /// Time of the last push attempt (RFC 3339, UTC), null if none yet.
+    #[schema(example = "2026-10-04T12:00:00Z")]
+    pub last_attempt_at: Option<String>,
+    /// Time of the last successful push (RFC 3339, UTC), null if none yet.
+    #[schema(example = "2026-10-04T11:59:00Z")]
+    pub last_success_at: Option<String>,
+    /// Error of the last failed attempt (at most 500 chars); null after a success.
+    #[schema(
+        example = "push to https://coolify.example/api/v1/sentinel/push returned 401: Unauthenticated."
+    )]
+    pub last_error: Option<String>,
+    /// HTTP status of the last failed attempt when it was a non-2xx response; null otherwise and after a success.
+    #[schema(example = 401)]
+    pub last_status: Option<u16>,
+    /// Failed attempts since the last success.
+    #[schema(example = 1)]
+    pub consecutive_failures: u64,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ErrorBody {
     pub error: String,
