@@ -1702,3 +1702,233 @@ fn logs_read_commands_are_not_journaled_but_other_commands_are() {
         Ok(store::CommandLookup::Completed(_))
     ));
 }
+
+/// A fake Podman that logs `<subcommand> <marker present|absent>` for the
+/// container named by its last argument, at the moment it runs.
+fn fake_podman(root: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = root.join("fake-podman");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nfor last in \"$@\"; do :; done\nif [ -e '{root}/var/lib/coolify/workloads/stopped/'\"$last\"'.stopped' ]; then marker=present; else marker=absent; fi\necho \"$1 $marker\" >> '{root}/podman.log'\nif [ -e '{root}/podman-fails' ]; then echo 'podman failed' >&2; exit 125; fi\nif [ \"$1\" = run ]; then echo 0123abcd; fi\n",
+            root = root.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    script
+}
+
+fn workload_lifecycle_command(
+    command_id: &str,
+    name: &str,
+    action: sentinel_protocol::control::v1::WorkloadLifecycleAction,
+) -> sentinel_protocol::control::v1::Command {
+    sentinel_protocol::control::v1::Command {
+        command_id: command_id.into(),
+        command_type: sentinel_protocol::CAPABILITY_WORKLOAD_LIFECYCLE.into(),
+        payload_version: 1,
+        created_at_unix_ms: 1,
+        payload: Some(
+            sentinel_protocol::control::v1::command::Payload::WorkloadLifecycle(
+                sentinel_protocol::control::v1::WorkloadLifecycleRequest {
+                    name: name.into(),
+                    action: action.into(),
+                },
+            ),
+        ),
+        expires_at_unix_ms: i64::MAX,
+    }
+}
+
+fn workload_deploy_command(
+    command_id: &str,
+    name: &str,
+) -> sentinel_protocol::control::v1::Command {
+    sentinel_protocol::control::v1::Command {
+        command_id: command_id.into(),
+        command_type: sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into(),
+        payload_version: 1,
+        created_at_unix_ms: 1,
+        payload: Some(
+            sentinel_protocol::control::v1::command::Payload::WorkloadDeploy(
+                sentinel_protocol::control::v1::WorkloadDeployRequest {
+                    name: name.into(),
+                    image: "docker.io/library/alpine:latest".into(),
+                    restart_policy: "unless-stopped".into(),
+                    ..Default::default()
+                },
+            ),
+        ),
+        expires_at_unix_ms: i64::MAX,
+    }
+}
+
+fn podman_log(root: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(root.join("podman.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn stop_marker(root: &std::path::Path, name: &str) -> PathBuf {
+    root.join("var/lib/coolify/workloads/stopped")
+        .join(format!("{name}.stopped"))
+}
+
+#[test]
+fn workload_commands_keep_a_durable_stop_marker() {
+    use sentinel_protocol::control::v1::CommandStatus;
+    use sentinel_protocol::control::v1::WorkloadLifecycleAction::{Remove, Restart, Start, Stop};
+
+    let root = tempfile::tempdir().unwrap();
+    let podman = fake_podman(root.path());
+    let mut executor = crate::commands::CommandExecutor::new("dev")
+        .with_network_root(root.path())
+        .with_podman(&podman);
+    let marker = stop_marker(root.path(), "coolify-web");
+    let mut run = |command| {
+        let execution = executor.execute(command, true);
+        assert_eq!(
+            execution.result.status,
+            CommandStatus::Succeeded as i32,
+            "{:?}",
+            execution.result
+        );
+    };
+
+    run(workload_lifecycle_command("stop-1", "coolify-web", Stop));
+    assert!(marker.exists());
+    run(workload_lifecycle_command("start-1", "coolify-web", Start));
+    assert!(!marker.exists());
+
+    run(workload_lifecycle_command("stop-2", "coolify-web", Stop));
+    run(workload_lifecycle_command(
+        "restart-1",
+        "coolify-web",
+        Restart,
+    ));
+    assert!(!marker.exists());
+
+    run(workload_lifecycle_command("stop-3", "coolify-web", Stop));
+    run(workload_lifecycle_command(
+        "remove-1",
+        "coolify-web",
+        Remove,
+    ));
+    assert!(!marker.exists());
+
+    run(workload_lifecycle_command("stop-4", "coolify-web", Stop));
+    run(workload_deploy_command("deploy-1", "coolify-web"));
+    assert!(!marker.exists());
+
+    // The marker exists while Podman stops the workload, and is removed only
+    // after Podman started, restarted or removed it.
+    assert_eq!(
+        podman_log(root.path()),
+        [
+            "stop present",
+            "start present",
+            "stop present",
+            "restart present",
+            "stop present",
+            "rm present",
+            "stop present",
+            "run absent",
+        ]
+    );
+
+    // Other workloads keep their own markers.
+    run(workload_lifecycle_command("stop-5", "coolify-api", Stop));
+    run(workload_lifecycle_command("start-2", "coolify-web", Start));
+    assert!(stop_marker(root.path(), "coolify-api").exists());
+}
+
+#[test]
+fn failed_workload_commands_leave_the_prior_stop_intent() {
+    use sentinel_protocol::control::v1::CommandStatus;
+    use sentinel_protocol::control::v1::WorkloadLifecycleAction::{Start, Stop};
+
+    let root = tempfile::tempdir().unwrap();
+    let podman = fake_podman(root.path());
+    let mut executor = crate::commands::CommandExecutor::new("dev")
+        .with_network_root(root.path())
+        .with_podman(&podman);
+    let marker = stop_marker(root.path(), "coolify-web");
+    let fails = root.path().join("podman-fails");
+
+    // A failed stop of a running workload removes the marker it created.
+    std::fs::write(&fails, "").unwrap();
+    let failed = executor.execute(
+        workload_lifecycle_command("stop-1", "coolify-web", Stop),
+        true,
+    );
+    assert_eq!(failed.result.status, CommandStatus::Failed as i32);
+    assert!(!marker.exists());
+    assert_eq!(podman_log(root.path()), ["stop present"]);
+
+    // A failed stop of a workload already stopped on purpose keeps the marker.
+    std::fs::remove_file(&fails).unwrap();
+    executor.execute(
+        workload_lifecycle_command("stop-2", "coolify-web", Stop),
+        true,
+    );
+    std::fs::write(&fails, "").unwrap();
+    let failed = executor.execute(
+        workload_lifecycle_command("stop-3", "coolify-web", Stop),
+        true,
+    );
+    assert_eq!(failed.result.status, CommandStatus::Failed as i32);
+    assert!(marker.exists());
+
+    // Failed starts and deploys keep it too.
+    let failed = executor.execute(
+        workload_lifecycle_command("start-1", "coolify-web", Start),
+        true,
+    );
+    assert_eq!(failed.result.status, CommandStatus::Failed as i32);
+    let failed = executor.execute(workload_deploy_command("deploy-1", "coolify-web"), true);
+    assert_eq!(failed.result.status, CommandStatus::Failed as i32);
+    assert!(marker.exists());
+}
+
+#[test]
+fn workload_commands_reject_names_that_cannot_be_a_stop_marker() {
+    use sentinel_protocol::control::v1::CommandStatus;
+    use sentinel_protocol::control::v1::WorkloadLifecycleAction::Stop;
+
+    let root = tempfile::tempdir().unwrap();
+    let podman = fake_podman(root.path());
+    let mut executor = crate::commands::CommandExecutor::new("dev")
+        .with_network_root(root.path())
+        .with_podman(&podman);
+
+    for (index, name) in ["..", ".", ".hidden", "-web", "a/b", "", "bad name"]
+        .into_iter()
+        .enumerate()
+    {
+        let stop = executor.execute(
+            workload_lifecycle_command(&format!("stop-{index}"), name, Stop),
+            true,
+        );
+        let deploy = executor.execute(
+            workload_deploy_command(&format!("deploy-{index}"), name),
+            true,
+        );
+        assert_ne!(
+            stop.result.status,
+            CommandStatus::Succeeded as i32,
+            "{name}"
+        );
+        assert_ne!(
+            deploy.result.status,
+            CommandStatus::Succeeded as i32,
+            "{name}"
+        );
+    }
+    assert!(podman_log(root.path()).is_empty());
+    assert!(!root.path().join("var/lib/coolify/workloads").exists());
+}

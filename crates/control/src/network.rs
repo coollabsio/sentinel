@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 const COOLIFY_NFT_TABLE: &str = "coolify_cluster";
 const COOLIFY_NFT_BRIDGE_TABLE: &str = "coolify_cluster_bridge";
+const BRIDGE_SYSCTL_FILE: &str = "etc/sysctl.d/90-coolify-workload-firewall.conf";
 pub(crate) const CORROSION_VERSION: &str = "v1.0.0";
 /// The Node WireGuard IP that owns this Node's discovery rows and serves its Corrosion API.
 pub(crate) const CORROSION_OWNER_FILE: &str = "etc/corrosion/coolify-owner";
@@ -934,20 +935,7 @@ fn activate_firewall(
     snapshot: &str,
     request: &FirewallReconcileRequest,
 ) -> Result<(), String> {
-    let sysctl_path = root.join("etc/sysctl.d/90-coolify-workload-firewall.conf");
-    atomic_write(
-        &sysctl_path,
-        b"net.ipv4.ip_forward=1\nnet.bridge.bridge-nf-call-iptables=1\n",
-        0o644,
-    )?;
-    run(
-        Command::new("modprobe").arg("br_netfilter"),
-        "The bridge firewall module could not be loaded.",
-    )?;
-    run(
-        Command::new("sysctl").arg("--load").arg(&sysctl_path),
-        "The bridge firewall settings could not be activated.",
-    )?;
+    load_bridge_sysctls(root)?;
     let current_inet = Command::new("nft")
         .args(["list", "table", "inet", COOLIFY_NFT_TABLE])
         .output()
@@ -1042,6 +1030,28 @@ fn activate_firewall(
         "The firewall rollback could not be cancelled.",
     )?;
     atomic_write(&last_good, snapshot.as_bytes(), 0o600)
+}
+
+/// Writes the persistent forwarding settings and loads them. `br_netfilter` is
+/// not loaded at boot, so the bridge setting must be re-applied after a reboot.
+fn load_bridge_sysctls(root: &Path) -> Result<(), String> {
+    let sysctl_path = root.join(BRIDGE_SYSCTL_FILE);
+    atomic_write(
+        &sysctl_path,
+        b"net.ipv4.ip_forward=1\nnet.bridge.bridge-nf-call-iptables=1\n",
+        0o644,
+    )?;
+    if root != Path::new("/") {
+        return Ok(());
+    }
+    run(
+        Command::new("modprobe").arg("br_netfilter"),
+        "The bridge firewall module could not be loaded.",
+    )?;
+    run(
+        Command::new("sysctl").arg("--load").arg(&sysctl_path),
+        "The bridge firewall settings could not be activated.",
+    )
 }
 
 fn configure_mesh_nat(interface: &str, workload_cidrs: &[String]) -> Result<(), String> {
@@ -1438,7 +1448,7 @@ fn corrosion_schema() -> &'static str {
 }
 
 fn corrosion_unit() -> &'static str {
-    "[Unit]\nDescription=Coolify Corrosion discovery\nAfter=network-online.target\nWants=network-online.target\n[Service]\nExecStart=/usr/local/bin/corrosion agent --config /etc/corrosion/config.toml\nUser=corrosion\nGroup=corrosion\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\nStateDirectory=corrosion\nRuntimeDirectory=corrosion\nReadWritePaths=/var/lib/corrosion /run/corrosion\nRestart=on-failure\nRestartSec=2s\n[Install]\nWantedBy=multi-user.target\n"
+    "[Unit]\nDescription=Coolify Corrosion discovery\nAfter=network-online.target\nWants=network-online.target\nStartLimitIntervalSec=0\n[Service]\nExecStart=/usr/local/bin/corrosion agent --config /etc/corrosion/config.toml\nUser=corrosion\nGroup=corrosion\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\nStateDirectory=corrosion\nRuntimeDirectory=corrosion\nReadWritePaths=/var/lib/corrosion /run/corrosion\nRestart=always\nRestartSec=5s\n[Install]\nWantedBy=multi-user.target\n"
 }
 
 fn corrosion_dns_unit(bind_address: &str) -> Result<String, String> {
@@ -1446,7 +1456,7 @@ fn corrosion_dns_unit(bind_address: &str) -> Result<String, String> {
         return Err("The Corrosion DNS bind address is invalid.".into());
     }
     Ok(format!(
-        "[Unit]\nDescription=Coolify internal discovery DNS\nAfter=corrosion.service\nRequires=corrosion.service\n[Service]\nExecStart=/usr/local/bin/sentinel discovery-dns --bind {bind_address}:53 --zone coolify.internal --corrosion-config /etc/corrosion/config.toml\nUser=coolify-dns\nGroup=coolify-dns\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\nRestart=on-failure\nRestartSec=2s\n[Install]\nWantedBy=multi-user.target\n"
+        "[Unit]\nDescription=Coolify internal discovery DNS\nAfter=corrosion.service\nWants=corrosion.service\nStartLimitIntervalSec=0\n[Service]\nExecStart=/usr/local/bin/sentinel discovery-dns --bind {bind_address}:53 --zone coolify.internal --corrosion-config /etc/corrosion/config.toml\nUser=coolify-dns\nGroup=coolify-dns\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\nRestart=always\nRestartSec=5s\n[Install]\nWantedBy=multi-user.target\n"
     ))
 }
 
@@ -1564,6 +1574,446 @@ fn run(command: &mut Command, fallback: &str) -> Result<(), String> {
     } else {
         message
     })
+}
+
+/// Cluster network state that Coolify already applied to this Node, read from
+/// the files Sentinel keeps. A boot restore re-activates only this state.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct AppliedNetwork {
+    pub(crate) wireguard: Vec<AppliedWireguard>,
+    pub(crate) firewall: Option<AppliedFirewall>,
+    pub(crate) corrosion: Option<AppliedCorrosion>,
+    /// Applied state that exists but could not be read; the restore is incomplete.
+    pub(crate) problems: Vec<String>,
+}
+
+impl AppliedNetwork {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.wireguard.is_empty()
+            && self.firewall.is_none()
+            && self.corrosion.is_none()
+            && self.problems.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppliedWireguard {
+    pub(crate) interface: String,
+    pub(crate) address: String,
+    pub(crate) peer_addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppliedFirewall {
+    pub(crate) wireguard_interface: String,
+    pub(crate) workload_cidrs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppliedCorrosion {
+    pub(crate) units_current: bool,
+    pub(crate) dns_unit_installed: bool,
+}
+
+/// What is live on the host right now.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct LiveNetwork {
+    pub(crate) links_up: Vec<String>,
+    pub(crate) inet_table_exists: bool,
+    pub(crate) bridge_table_exists: bool,
+    pub(crate) corrosion_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RestoreStep {
+    BridgeSysctls,
+    LoadFirewall {
+        inet_table_exists: bool,
+        bridge_table_exists: bool,
+    },
+    WireguardUp {
+        interface: String,
+        address: String,
+    },
+    DiscoveryResolver {
+        interface: String,
+        address: String,
+        peer_addresses: Vec<String>,
+    },
+    RefreshCorrosionUnits,
+    RestartCorrosion,
+    StartDiscoveryDns,
+    MeshNat {
+        interface: String,
+        workload_cidrs: Vec<String>,
+    },
+}
+
+/// Network restore steps, split around the workload restart: the mesh NAT
+/// exemption goes last so it is inserted ahead of the rules Netavark adds when
+/// the workloads start.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RestorePlan {
+    pub(crate) before_workloads: Vec<RestoreStep>,
+    pub(crate) after_workloads: Vec<RestoreStep>,
+}
+
+pub(crate) fn read_applied_network(root: &Path) -> AppliedNetwork {
+    let mut applied = AppliedNetwork::default();
+    let state_dir = state_path(root, "");
+    let mut interfaces = fs::read_dir(&state_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                .filter_map(|name| name.strip_suffix(".state").map(str::to_string))
+                .filter(|name| name != "firewall" && validate_interface(name).is_ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    interfaces.sort();
+    for interface in interfaces {
+        let config_path = root.join("etc/wireguard").join(format!("{interface}.conf"));
+        if !config_path.exists() {
+            continue;
+        }
+        match fs::read_to_string(&config_path)
+            .map_err(|_| "The WireGuard configuration could not be read.".to_string())
+            .and_then(|config| parse_wireguard_config(&config))
+        {
+            Ok((address, peer_addresses)) => applied.wireguard.push(AppliedWireguard {
+                interface,
+                address,
+                peer_addresses,
+            }),
+            Err(message) => applied.problems.push(format!("{interface}: {message}")),
+        }
+    }
+
+    if state_path(root, "firewall.state").exists() {
+        match fs::read_to_string(state_path(root, "firewall.last-good.nft")) {
+            Ok(snapshot) => match parse_firewall_snapshot(&snapshot) {
+                Some(firewall) => applied.firewall = Some(firewall),
+                None => applied
+                    .problems
+                    .push("The firewall snapshot does not describe the workload networks.".into()),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => applied
+                .problems
+                .push("The firewall snapshot could not be read.".into()),
+        }
+    }
+
+    let unit_path = root.join("etc/systemd/system/corrosion.service");
+    if root.join("etc/corrosion/config.toml").exists() && unit_path.exists() {
+        let dns_unit_path = root.join("etc/systemd/system/coolify-discovery-dns.service");
+        let dns_unit_installed = dns_unit_path.exists();
+        let dns_unit_current = !dns_unit_installed
+            || expected_dns_unit(root).is_none_or(|expected| {
+                fs::read(&dns_unit_path).ok().as_deref() == Some(expected.as_bytes())
+            });
+        applied.corrosion = Some(AppliedCorrosion {
+            units_current: dns_unit_current
+                && fs::read(&unit_path).ok().as_deref() == Some(corrosion_unit().as_bytes()),
+            dns_unit_installed,
+        });
+    }
+
+    applied
+}
+
+fn expected_dns_unit(root: &Path) -> Option<String> {
+    let owner = fs::read_to_string(root.join(CORROSION_OWNER_FILE)).ok()?;
+    corrosion_dns_unit(owner.trim()).ok()
+}
+
+/// Reads the address and peer addresses from a rendered WireGuard config,
+/// never the keys.
+fn parse_wireguard_config(config: &str) -> Result<(String, Vec<String>), String> {
+    let mut address = None;
+    let mut peer_addresses = Vec::new();
+    for line in config.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "Address" => address = Some(value.trim().to_string()),
+            "AllowedIPs" => peer_addresses.extend(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|cidr| valid_ipv4_cidr(cidr))
+                    .map(str::to_string),
+            ),
+            _ => {}
+        }
+    }
+    let address = address
+        .filter(|address| address.ends_with("/32") && valid_ipv4_cidr(address))
+        .ok_or("The WireGuard configuration has no valid address.")?;
+    Ok((address, peer_addresses))
+}
+
+/// Recovers the WireGuard interface and workload CIDRs from a firewall
+/// snapshot, both as rendered here and as printed by `nft list table`.
+fn parse_firewall_snapshot(snapshot: &str) -> Option<AppliedFirewall> {
+    let interface = snapshot
+        .split_once("iifname \"")?
+        .1
+        .split_once('"')?
+        .0
+        .to_string();
+    validate_interface(&interface).ok()?;
+    let elements = snapshot
+        .split_once("set workload_networks")?
+        .1
+        .split_once("elements = {")?
+        .1
+        .split_once('}')?
+        .0;
+    let mut workload_cidrs = elements
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            if token.contains('/') {
+                token.to_string()
+            } else {
+                format!("{token}/32")
+            }
+        })
+        .filter(|cidr| valid_ipv4_cidr(cidr))
+        .collect::<Vec<_>>();
+    workload_cidrs.sort();
+    workload_cidrs.dedup();
+    (!workload_cidrs.is_empty()).then_some(AppliedFirewall {
+        wireguard_interface: interface,
+        workload_cidrs,
+    })
+}
+
+/// Observes the live host. Outside the host root everything counts as live,
+/// matching how the reconcilers treat a test root.
+pub(crate) fn observe_live_network(root: &Path, applied: &AppliedNetwork) -> LiveNetwork {
+    if root != Path::new("/") {
+        return LiveNetwork {
+            links_up: applied
+                .wireguard
+                .iter()
+                .map(|wireguard| wireguard.interface.clone())
+                .collect(),
+            inet_table_exists: true,
+            bridge_table_exists: true,
+            corrosion_active: true,
+        };
+    }
+    let succeeds = |command: &mut Command| {
+        command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    LiveNetwork {
+        links_up: applied
+            .wireguard
+            .iter()
+            .filter(|wireguard| {
+                succeeds(Command::new("ip").args(["link", "show", "dev", &wireguard.interface]))
+            })
+            .map(|wireguard| wireguard.interface.clone())
+            .collect(),
+        inet_table_exists: applied.firewall.is_some()
+            && succeeds(Command::new("nft").args(["list", "table", "inet", COOLIFY_NFT_TABLE])),
+        bridge_table_exists: applied.firewall.is_some()
+            && succeeds(Command::new("nft").args([
+                "list",
+                "table",
+                "bridge",
+                COOLIFY_NFT_BRIDGE_TABLE,
+            ])),
+        corrosion_active: applied.corrosion.is_some()
+            && succeeds(Command::new("systemctl").args([
+                "is-active",
+                "--quiet",
+                "corrosion.service",
+            ])),
+    }
+}
+
+pub(crate) fn restore_plan(applied: &AppliedNetwork, live: &LiveNetwork) -> RestorePlan {
+    let mut plan = RestorePlan::default();
+    if let Some(firewall) = &applied.firewall {
+        plan.before_workloads.push(RestoreStep::BridgeSysctls);
+        if !(live.inet_table_exists && live.bridge_table_exists) {
+            plan.before_workloads.push(RestoreStep::LoadFirewall {
+                inet_table_exists: live.inet_table_exists,
+                bridge_table_exists: live.bridge_table_exists,
+            });
+        }
+        plan.after_workloads.push(RestoreStep::MeshNat {
+            interface: firewall.wireguard_interface.clone(),
+            workload_cidrs: firewall.workload_cidrs.clone(),
+        });
+    }
+    let mut link_restored = false;
+    for wireguard in &applied.wireguard {
+        if !live.links_up.contains(&wireguard.interface) {
+            link_restored = true;
+            plan.before_workloads.push(RestoreStep::WireguardUp {
+                interface: wireguard.interface.clone(),
+                address: wireguard.address.clone(),
+            });
+        }
+        // systemd-resolved forgets per-link DNS on reboot, even for a link that is up.
+        plan.before_workloads.push(RestoreStep::DiscoveryResolver {
+            interface: wireguard.interface.clone(),
+            address: wireguard.address.clone(),
+            peer_addresses: wireguard.peer_addresses.clone(),
+        });
+    }
+    if let Some(corrosion) = &applied.corrosion {
+        if !corrosion.units_current {
+            plan.before_workloads
+                .push(RestoreStep::RefreshCorrosionUnits);
+        }
+        // Corrosion binds the WireGuard address, so it must restart once the link is back.
+        if link_restored || !live.corrosion_active {
+            plan.before_workloads.push(RestoreStep::RestartCorrosion);
+        }
+        if corrosion.dns_unit_installed {
+            plan.before_workloads.push(RestoreStep::StartDiscoveryDns);
+        }
+    }
+    plan
+}
+
+pub(crate) fn apply_restore_step(root: &Path, step: &RestoreStep) -> Result<(), String> {
+    if let RestoreStep::BridgeSysctls = step {
+        return load_bridge_sysctls(root);
+    }
+    if root != Path::new("/") {
+        return Ok(());
+    }
+    match step {
+        RestoreStep::BridgeSysctls => Ok(()),
+        RestoreStep::LoadFirewall {
+            inet_table_exists,
+            bridge_table_exists,
+        } => restore_firewall_tables(root, *inet_table_exists, *bridge_table_exists),
+        RestoreStep::WireguardUp { interface, address } => {
+            restore_wireguard_link(interface, address)
+        }
+        RestoreStep::DiscoveryResolver {
+            interface,
+            address,
+            peer_addresses,
+        } => {
+            let peers = peer_addresses
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            configure_discovery_resolver(interface, address, &peers)
+        }
+        RestoreStep::RefreshCorrosionUnits => refresh_corrosion_units(root),
+        RestoreStep::RestartCorrosion => {
+            let _ = Command::new("systemctl")
+                .args(["reset-failed", "corrosion.service"])
+                .status();
+            run(
+                Command::new("systemctl").args(["restart", "corrosion.service"]),
+                "Corrosion could not restart.",
+            )
+        }
+        RestoreStep::StartDiscoveryDns => {
+            let _ = Command::new("systemctl")
+                .args(["reset-failed", "coolify-discovery-dns.service"])
+                .status();
+            run(
+                Command::new("systemctl").args(["start", "coolify-discovery-dns.service"]),
+                "The Coolify discovery DNS service could not start.",
+            )
+        }
+        RestoreStep::MeshNat {
+            interface,
+            workload_cidrs,
+        } => configure_mesh_nat(interface, workload_cidrs),
+    }
+}
+
+/// Loads the last known-good snapshot with the same transaction activation
+/// uses. There is no rollback timer: this is a known-good state, not a change.
+fn restore_firewall_tables(
+    root: &Path,
+    inet_table_exists: bool,
+    bridge_table_exists: bool,
+) -> Result<(), String> {
+    let snapshot = fs::read_to_string(state_path(root, "firewall.last-good.nft"))
+        .map_err(|_| "The last good firewall snapshot could not be read.")?;
+    let transaction_path = state_path(root, "firewall.transaction.nft");
+    atomic_write(
+        &transaction_path,
+        nft_transaction(&snapshot, inet_table_exists, bridge_table_exists).as_bytes(),
+        0o600,
+    )?;
+    run(
+        Command::new("nft")
+            .args(["--check", "--file"])
+            .arg(&transaction_path),
+        "The last good firewall snapshot is invalid.",
+    )?;
+    run(
+        Command::new("nft").arg("--file").arg(&transaction_path),
+        "The last good firewall snapshot could not be loaded.",
+    )?;
+    if !firewall_tables_active(root) {
+        return Err("The Coolify firewall tables are not active after the restore.".into());
+    }
+    Ok(())
+}
+
+fn restore_wireguard_link(interface: &str, address: &str) -> Result<(), String> {
+    let _ = Command::new("wg-quick")
+        .args(["down", interface])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    run(
+        Command::new("wg-quick").args(["up", interface]),
+        "WireGuard could not be brought up.",
+    )?;
+    let output = Command::new("ip")
+        .args(["-4", "-o", "address", "show", "dev", interface])
+        .output()
+        .map_err(|_| "WireGuard address validation failed.".to_string())?;
+    if !output.status.success()
+        || !String::from_utf8_lossy(&output.stdout).contains(&format!("inet {address}"))
+    {
+        return Err("WireGuard does not have the expected address.".into());
+    }
+    Ok(())
+}
+
+/// Rewrites the Corrosion units with the current templates, so a Node that was
+/// joined by an older Sentinel gets the restart policy without Coolify.
+fn refresh_corrosion_units(root: &Path) -> Result<(), String> {
+    atomic_write(
+        &root.join("etc/systemd/system/corrosion.service"),
+        corrosion_unit().as_bytes(),
+        0o644,
+    )?;
+    let dns_unit_path = root.join("etc/systemd/system/coolify-discovery-dns.service");
+    if dns_unit_path.exists()
+        && let Some(unit) = expected_dns_unit(root)
+    {
+        atomic_write(&dns_unit_path, unit.as_bytes(), 0o644)?;
+    }
+    if root != Path::new("/") {
+        return Ok(());
+    }
+    run(
+        Command::new("systemctl").arg("daemon-reload"),
+        "Systemd could not reload the Corrosion units.",
+    )
 }
 
 fn read_state_file(path: &Path) -> Option<(u64, String)> {
@@ -2049,6 +2499,318 @@ mod tests {
         for relative in managed {
             assert!(!temp.path().join(relative).exists());
         }
+    }
+
+    #[test]
+    fn corrosion_units_restart_forever_and_dns_does_not_stop_with_corrosion() {
+        let unit = corrosion_unit();
+        let (unit_section, service_section) = unit.split_once("[Service]").unwrap();
+        assert!(unit_section.contains("StartLimitIntervalSec=0\n"));
+        assert!(service_section.contains("Restart=always\nRestartSec=5s\n"));
+        assert!(!unit.contains("Restart=on-failure"));
+
+        let dns = corrosion_dns_unit("10.240.0.2").unwrap();
+        let (dns_unit_section, dns_service_section) = dns.split_once("[Service]").unwrap();
+        assert!(dns_unit_section.contains("After=corrosion.service\nWants=corrosion.service\n"));
+        assert!(dns_unit_section.contains("StartLimitIntervalSec=0\n"));
+        assert!(!dns.contains("Requires=corrosion.service"));
+        assert!(dns_service_section.contains("Restart=always\nRestartSec=5s\n"));
+    }
+
+    fn write(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    const WIREGUARD_CONFIG: &str = "[Interface]\nAddress = 10.240.0.2/32\nListenPort = 51820\nPrivateKey = private-secret\n\n[Peer]\nPublicKey = peer-a\nEndpoint = 192.0.2.3:51820\nAllowedIPs = 10.240.0.3/32, 100.64.1.0/24\nPersistentKeepalive = 25\n\n[Peer]\nPublicKey = peer-b\nEndpoint = 192.0.2.4:51820\nAllowedIPs = 10.240.0.4/32\nPersistentKeepalive = 25\n\n";
+
+    fn firewall_request() -> FirewallReconcileRequest {
+        FirewallReconcileRequest {
+            revision: 3,
+            wireguard_port: 51820,
+            cluster_cidr: "10.240.0.0/24".into(),
+            local_node_ip: "10.240.0.2".into(),
+            rules: vec![],
+            wireguard_interface: "coolify0".into(),
+            flux_probe_host: String::new(),
+            workload_cidrs: vec!["100.64.1.0/24".into(), "100.64.0.0/24".into()],
+            ingress_rules: vec![],
+        }
+    }
+
+    /// Writes the files a fully applied cluster network leaves behind.
+    fn applied_root() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write(root, "etc/wireguard/coolify0.conf", WIREGUARD_CONFIG);
+        write(root, "var/lib/coolify/network/coolify0.state", "7 hash\n");
+        write(root, "var/lib/coolify/network/firewall.state", "3 hash\n");
+        write(
+            root,
+            "var/lib/coolify/network/firewall.last-good.nft",
+            &render_firewall(&firewall_request()).unwrap(),
+        );
+        write(root, "etc/corrosion/config.toml", "config");
+        write(root, CORROSION_OWNER_FILE, "10.240.0.2\n");
+        write(
+            root,
+            "etc/systemd/system/corrosion.service",
+            corrosion_unit(),
+        );
+        write(
+            root,
+            "etc/systemd/system/coolify-discovery-dns.service",
+            &corrosion_dns_unit("10.240.0.2").unwrap(),
+        );
+        temp
+    }
+
+    fn live(links_up: &[&str], tables: bool, corrosion_active: bool) -> LiveNetwork {
+        LiveNetwork {
+            links_up: links_up.iter().map(|link| link.to_string()).collect(),
+            inet_table_exists: tables,
+            bridge_table_exists: tables,
+            corrosion_active,
+        }
+    }
+
+    #[test]
+    fn restore_reads_the_applied_network_without_keys() {
+        let temp = applied_root();
+        let applied = read_applied_network(temp.path());
+
+        assert_eq!(
+            applied.wireguard,
+            vec![AppliedWireguard {
+                interface: "coolify0".into(),
+                address: "10.240.0.2/32".into(),
+                peer_addresses: vec![
+                    "10.240.0.3/32".into(),
+                    "100.64.1.0/24".into(),
+                    "10.240.0.4/32".into(),
+                ],
+            }]
+        );
+        assert_eq!(
+            applied.firewall,
+            Some(AppliedFirewall {
+                wireguard_interface: "coolify0".into(),
+                workload_cidrs: vec!["100.64.0.0/24".into(), "100.64.1.0/24".into()],
+            })
+        );
+        assert_eq!(
+            applied.corrosion,
+            Some(AppliedCorrosion {
+                units_current: true,
+                dns_unit_installed: true,
+            })
+        );
+        assert!(applied.problems.is_empty());
+        assert!(!format!("{applied:?}").contains("private-secret"));
+    }
+
+    #[test]
+    fn restore_is_a_no_op_without_an_applied_network() {
+        let temp = tempfile::tempdir().unwrap();
+        // Files without their applied-state partner are not an applied network.
+        write(temp.path(), "etc/wireguard/coolify0.conf", WIREGUARD_CONFIG);
+        write(
+            temp.path(),
+            "var/lib/coolify/network/firewall.last-good.nft",
+            &render_firewall(&firewall_request()).unwrap(),
+        );
+        write(temp.path(), "etc/corrosion/config.toml", "config");
+        write(
+            temp.path(),
+            "var/lib/coolify/network/mesh9.state",
+            "1 hash\n",
+        );
+        write(
+            temp.path(),
+            "var/lib/coolify/network/firewall.state",
+            "3 hash\n",
+        );
+        fs::remove_file(state_path(temp.path(), "firewall.last-good.nft")).unwrap();
+
+        let applied = read_applied_network(temp.path());
+
+        assert!(applied.is_empty());
+        assert_eq!(
+            restore_plan(&applied, &live(&[], false, false)),
+            RestorePlan::default()
+        );
+    }
+
+    #[test]
+    fn restore_brings_back_a_missing_link_and_firewall_and_restarts_corrosion() {
+        let temp = applied_root();
+        let applied = read_applied_network(temp.path());
+
+        let plan = restore_plan(&applied, &live(&[], false, false));
+
+        assert_eq!(
+            plan.before_workloads,
+            vec![
+                RestoreStep::BridgeSysctls,
+                RestoreStep::LoadFirewall {
+                    inet_table_exists: false,
+                    bridge_table_exists: false,
+                },
+                RestoreStep::WireguardUp {
+                    interface: "coolify0".into(),
+                    address: "10.240.0.2/32".into(),
+                },
+                RestoreStep::DiscoveryResolver {
+                    interface: "coolify0".into(),
+                    address: "10.240.0.2/32".into(),
+                    peer_addresses: applied.wireguard[0].peer_addresses.clone(),
+                },
+                RestoreStep::RestartCorrosion,
+                RestoreStep::StartDiscoveryDns,
+            ]
+        );
+        assert_eq!(
+            plan.after_workloads,
+            vec![RestoreStep::MeshNat {
+                interface: "coolify0".into(),
+                workload_cidrs: vec!["100.64.0.0/24".into(), "100.64.1.0/24".into()],
+            }]
+        );
+        // A test root never runs host commands, so every step succeeds.
+        for step in plan.before_workloads.iter().chain(&plan.after_workloads) {
+            apply_restore_step(temp.path(), step).unwrap();
+        }
+    }
+
+    #[test]
+    fn restore_keeps_a_live_network_and_only_reapplies_non_persistent_state() {
+        let temp = applied_root();
+        let applied = read_applied_network(temp.path());
+
+        let plan = restore_plan(&applied, &live(&["coolify0"], true, true));
+
+        assert_eq!(
+            plan.before_workloads,
+            vec![
+                RestoreStep::BridgeSysctls,
+                RestoreStep::DiscoveryResolver {
+                    interface: "coolify0".into(),
+                    address: "10.240.0.2/32".into(),
+                    peer_addresses: applied.wireguard[0].peer_addresses.clone(),
+                },
+                RestoreStep::StartDiscoveryDns,
+            ]
+        );
+        assert_eq!(plan.after_workloads.len(), 1);
+
+        // Only one firewall table missing still reloads, replacing the other.
+        let plan = restore_plan(
+            &applied,
+            &LiveNetwork {
+                bridge_table_exists: false,
+                ..live(&["coolify0"], true, true)
+            },
+        );
+        assert!(plan.before_workloads.contains(&RestoreStep::LoadFirewall {
+            inet_table_exists: true,
+            bridge_table_exists: false,
+        }));
+        assert!(
+            !plan
+                .before_workloads
+                .contains(&RestoreStep::RestartCorrosion)
+        );
+
+        // A failed Corrosion restarts even when the link was already up.
+        let plan = restore_plan(&applied, &live(&["coolify0"], true, false));
+        assert!(
+            plan.before_workloads
+                .contains(&RestoreStep::RestartCorrosion)
+        );
+    }
+
+    #[test]
+    fn restore_refreshes_corrosion_units_written_by_an_older_sentinel() {
+        let temp = applied_root();
+        write(
+            temp.path(),
+            "etc/systemd/system/corrosion.service",
+            "[Service]\nRestart=on-failure\n",
+        );
+        write(
+            temp.path(),
+            "etc/systemd/system/coolify-discovery-dns.service",
+            "[Unit]\nRequires=corrosion.service\n",
+        );
+        let applied = read_applied_network(temp.path());
+        assert!(!applied.corrosion.as_ref().unwrap().units_current);
+
+        let plan = restore_plan(&applied, &live(&["coolify0"], true, true));
+        assert!(
+            plan.before_workloads
+                .contains(&RestoreStep::RefreshCorrosionUnits)
+        );
+
+        // The refresh writes the current templates; a test root skips systemd.
+        refresh_corrosion_units(temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join("etc/systemd/system/corrosion.service")).unwrap(),
+            corrosion_unit()
+        );
+        assert!(
+            read_applied_network(temp.path())
+                .corrosion
+                .unwrap()
+                .units_current
+        );
+    }
+
+    #[test]
+    fn restore_reports_applied_state_it_cannot_read() {
+        let temp = applied_root();
+        write(
+            temp.path(),
+            "etc/wireguard/coolify0.conf",
+            "[Interface]\nPrivateKey = private-secret\n",
+        );
+        write(
+            temp.path(),
+            "var/lib/coolify/network/firewall.last-good.nft",
+            "table inet coolify_cluster {}\n",
+        );
+
+        let applied = read_applied_network(temp.path());
+
+        assert!(applied.wireguard.is_empty());
+        assert!(applied.firewall.is_none());
+        assert_eq!(applied.problems.len(), 2);
+        assert!(!applied.is_empty());
+        assert!(!format!("{applied:?}").contains("private-secret"));
+    }
+
+    #[test]
+    fn firewall_snapshot_parsing_accepts_nft_list_output() {
+        let listed = "table inet coolify_cluster {\n\tset workload_networks {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\telements = { 100.64.0.0/24, 100.64.1.0/24,\n\t\t\t     100.64.2.5 }\n\t}\n\n\tchain input {\n\t\tiifname \"mesh0\" ip saddr != 10.240.0.0/24 ip saddr != @workload_networks drop\n\t}\n}\n";
+
+        assert_eq!(
+            parse_firewall_snapshot(listed),
+            Some(AppliedFirewall {
+                wireguard_interface: "mesh0".into(),
+                workload_cidrs: vec![
+                    "100.64.0.0/24".into(),
+                    "100.64.1.0/24".into(),
+                    "100.64.2.5/32".into(),
+                ],
+            })
+        );
+        assert_eq!(
+            parse_firewall_snapshot(
+                "iifname \"../eth0\" set workload_networks { elements = { 100.64.0.0/24 } }"
+            ),
+            None
+        );
+        assert_eq!(parse_firewall_snapshot("iifname \"mesh0\""), None);
     }
 
     #[test]

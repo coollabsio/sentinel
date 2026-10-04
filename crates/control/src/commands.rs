@@ -33,6 +33,7 @@ pub(crate) struct CommandExecutor {
     sentinel_version: String,
     journal: CommandJournal,
     network_root: PathBuf,
+    podman: PathBuf,
     system: System,
     discovery_trigger: Option<Arc<Notify>>,
 }
@@ -51,6 +52,7 @@ impl CommandExecutor {
             sentinel_version: sentinel_version.into(),
             journal,
             network_root: PathBuf::from("/"),
+            podman: PathBuf::from("podman"),
             system: host_system(),
             discovery_trigger: None,
         }
@@ -65,6 +67,12 @@ impl CommandExecutor {
     #[cfg(test)]
     pub(crate) fn with_network_root(mut self, root: &Path) -> Self {
         self.network_root = root.to_path_buf();
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_podman(mut self, podman: &Path) -> Self {
+        self.podman = podman.to_path_buf();
         self
     }
 
@@ -322,7 +330,7 @@ impl CommandExecutor {
                 Err(message) => failed(&command.command_id, "cluster_leave_failed", &message),
             }
         } else if let Some(Payload::WorkloadDeploy(request)) = command.payload {
-            match workload_deploy(&request) {
+            match workload_deploy(&self.network_root, &self.podman, &request) {
                 Ok(result) => CommandResult {
                     event_id: format!("{}:result", command.command_id),
                     command_id: command.command_id.clone(),
@@ -333,7 +341,7 @@ impl CommandExecutor {
                 Err(message) => failed(&command.command_id, "workload_deploy_failed", &message),
             }
         } else if let Some(Payload::WorkloadLifecycle(request)) = command.payload {
-            match workload_lifecycle(&request) {
+            match workload_lifecycle(&self.network_root, &self.podman, &request) {
                 Ok(result) => CommandResult {
                     event_id: format!("{}:result", command.command_id),
                     command_id: command.command_id.clone(),
@@ -455,20 +463,50 @@ fn wireguard_inspect(
     crate::network::inspect_wireguard(root, interface, expected_revision, expected_hash)
 }
 
+/// Runs a lifecycle action and keeps the durable stop marker in step with it.
+///
+/// A stop writes the marker before Podman runs, so a crash in between never
+/// leaves a stopped workload without one. If the stop fails, the marker goes
+/// back to its prior state: it is removed only when this stop created it.
+/// Start, restart and remove clear the marker only after Podman succeeded.
 fn workload_lifecycle(
+    root: &Path,
+    podman: &Path,
     request: &WorkloadLifecycleRequest,
 ) -> Result<WorkloadLifecycleResult, String> {
-    let output = std::process::Command::new("podman")
-        .args(podman_lifecycle_args(request)?)
+    let arguments = podman_lifecycle_args(request)?;
+    let stopping = request.action == WorkloadLifecycleAction::Stop as i32;
+    let previously_marked = if stopping {
+        Some(crate::restore::mark_stopped(root, &request.name)?)
+    } else {
+        None
+    };
+    let output = std::process::Command::new(podman)
+        .args(arguments)
         .output()
-        .map_err(|_| "Podman is unavailable.".to_string())?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if message.is_empty() {
-            "Podman could not change the workload state.".into()
-        } else {
-            message.chars().take(2_000).collect()
-        });
+        .map_err(|_| "Podman is unavailable.".to_string());
+    let failure = match output {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Some(if message.is_empty() {
+                "Podman could not change the workload state.".into()
+            } else {
+                message.chars().take(2_000).collect()
+            })
+        }
+        Err(message) => Some(message),
+    };
+    if let Some(message) = failure {
+        if previously_marked == Some(false)
+            && let Err(error) = crate::restore::clear_stopped(root, &request.name)
+        {
+            tracing::warn!(%error, container = %request.name, "could not remove the stop marker after a failed stop");
+        }
+        return Err(message);
+    }
+    if !stopping {
+        crate::restore::clear_stopped(root, &request.name)?;
     }
 
     Ok(WorkloadLifecycleResult {
@@ -480,13 +518,7 @@ fn workload_lifecycle(
 pub(crate) fn podman_lifecycle_args(
     request: &WorkloadLifecycleRequest,
 ) -> Result<Vec<String>, String> {
-    if request.name.is_empty()
-        || request.name.len() > 128
-        || !request
-            .name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
-    {
+    if !valid_container_name(&request.name) {
         return Err("The container name is invalid.".into());
     }
 
@@ -511,12 +543,29 @@ pub(crate) fn journal_request(command: &Command) -> Vec<u8> {
     command.encode_to_vec()
 }
 
-fn workload_deploy(request: &WorkloadDeployRequest) -> Result<WorkloadDeployResult, String> {
+/// Container names Podman accepts. They also name the durable stop markers,
+/// so a leading dot (`.`, `..`) is never allowed.
+pub(crate) fn valid_container_name(name: &str) -> bool {
+    name.len() <= 128
+        && name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+}
+
+fn workload_deploy(
+    root: &Path,
+    podman: &Path,
+    request: &WorkloadDeployRequest,
+) -> Result<WorkloadDeployResult, String> {
     let arguments = podman_deploy_args(request)?;
     if !request.network_name.is_empty() {
-        ensure_workload_network(&request.network_name, &request.network_subnet)?;
+        ensure_workload_network(podman, &request.network_name, &request.network_subnet)?;
     }
-    let output = std::process::Command::new("podman")
+    let output = std::process::Command::new(podman)
         .args(arguments)
         .output()
         .map_err(|_| "Podman is unavailable.".to_string())?;
@@ -532,6 +581,8 @@ fn workload_deploy(request: &WorkloadDeployRequest) -> Result<WorkloadDeployResu
     if runtime_id.is_empty() {
         return Err("Podman did not return a container ID.".into());
     }
+    // A deploy means "run": the workload must come back after a reboot.
+    crate::restore::clear_stopped(root, &request.name)?;
     Ok(WorkloadDeployResult {
         runtime_id,
         name: request.name.clone(),
@@ -539,8 +590,8 @@ fn workload_deploy(request: &WorkloadDeployRequest) -> Result<WorkloadDeployResu
     })
 }
 
-fn ensure_workload_network(name: &str, subnet: &str) -> Result<(), String> {
-    let inspected = std::process::Command::new("podman")
+fn ensure_workload_network(podman: &Path, name: &str, subnet: &str) -> Result<(), String> {
+    let inspected = std::process::Command::new(podman)
         .args(["network", "inspect", name])
         .output()
         .map_err(|_| "Podman is unavailable.".to_string())?;
@@ -549,14 +600,14 @@ fn ensure_workload_network(name: &str, subnet: &str) -> Result<(), String> {
             .then_some(())
             .ok_or_else(|| "The existing workload network uses a different subnet.".to_string());
     }
-    let created = std::process::Command::new("podman")
+    let created = std::process::Command::new(podman)
         .args(["network", "create", "--subnet", subnet, name])
         .output()
         .map_err(|_| "Podman is unavailable.".to_string())?;
     if created.status.success() {
         return Ok(());
     }
-    let raced = std::process::Command::new("podman")
+    let raced = std::process::Command::new(podman)
         .args(["network", "inspect", name])
         .output();
     if raced.is_ok_and(|output| {
@@ -625,13 +676,7 @@ fn valid_ipv4_subnet_and_address(subnet: &str, address: &str) -> bool {
 }
 
 pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<String>, String> {
-    if request.name.is_empty()
-        || request.name.len() > 128
-        || !request
-            .name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
-    {
+    if !valid_container_name(&request.name) {
         return Err("The container name is invalid.".into());
     }
     if request.image.is_empty()
@@ -978,7 +1023,7 @@ fn failed(command_id: &str, code: &str, message: &str) -> CommandResult {
     }
 }
 
-fn boot_id() -> String {
+pub(crate) fn boot_id() -> String {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|value| value.trim().to_string())
         .unwrap_or_else(|_| "unknown".into())

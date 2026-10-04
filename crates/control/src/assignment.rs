@@ -307,6 +307,15 @@ impl AssignmentClient {
             )
             .with_discovery_trigger(discovery_trigger.clone()),
         ));
+        // Restores the approved cluster network and stopped workloads once per
+        // boot. It needs neither Coolify nor Flux; commands that arrive while it
+        // runs wait for the command executor it holds.
+        let boot_restore = tokio::spawn(crate::restore::run(
+            std::path::PathBuf::from("/"),
+            crate::commands::boot_id(),
+            command_executor.clone(),
+            discovery_trigger.clone(),
+        ));
         // Publishes this Node's own discovery endpoints independently of the
         // Coolify and Flux connections, so DNS survives a control-plane outage.
         let discovery_publisher = tokio::spawn(crate::discovery::run(
@@ -395,6 +404,7 @@ impl AssignmentClient {
             }
         }
 
+        boot_restore.abort();
         discovery_publisher.abort();
         tracing::info!("Sentinel control assignment polling stopped");
     }
