@@ -88,6 +88,25 @@ fn decode_key(value: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
         .map_err(|_| "FLUX_SIGNING_PUBLIC_KEY must contain 32 bytes".into())
 }
 
+/// Waits for Ctrl-C or SIGTERM, so `docker stop` shuts Flux down gracefully.
+#[cfg(unix)]
+async fn shutdown() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(term) => term,
+        Err(error) => {
+            tracing::error!(%error, "failed to install SIGTERM handler");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => tracing::info!("received interrupt"),
+        _ = term.recv() => tracing::info!("received SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
 }
