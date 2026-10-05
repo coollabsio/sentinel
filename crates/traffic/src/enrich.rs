@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
 //! Enriches events using Cloudflare headers, GeoIP, and a bounded User-Agent
-//! parse cache. Header values take precedence over derived values.
+//! parse cache. Forwarding headers are trusted only from a local proxy or
+//! Cloudflare peer (see [`Enricher::enrich`]).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
@@ -131,6 +132,110 @@ fn detect_known_agent(ua: &str) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
+/// Networks whose peers are trusted local proxies (cloudflared, load balancers,
+/// the Docker bridge): loopback, private, unique-local, link-local, and CGNAT.
+const LOCAL_PROXY_NETS: &[(IpAddr, u8)] = &[
+    (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
+    (IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12),
+    (IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16),
+    (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8),
+    (IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16),
+    (IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10),
+    (IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
+    (IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)), 7),
+    (IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), 10),
+];
+
+/// Cloudflare edge networks, from <https://www.cloudflare.com/ips-v4/> and
+/// <https://www.cloudflare.com/ips-v6/>.
+const CLOUDFLARE_NETS: &[(IpAddr, u8)] = &[
+    (IpAddr::V4(Ipv4Addr::new(173, 245, 48, 0)), 20),
+    (IpAddr::V4(Ipv4Addr::new(103, 21, 244, 0)), 22),
+    (IpAddr::V4(Ipv4Addr::new(103, 22, 200, 0)), 22),
+    (IpAddr::V4(Ipv4Addr::new(103, 31, 4, 0)), 22),
+    (IpAddr::V4(Ipv4Addr::new(141, 101, 64, 0)), 18),
+    (IpAddr::V4(Ipv4Addr::new(108, 162, 192, 0)), 18),
+    (IpAddr::V4(Ipv4Addr::new(190, 93, 240, 0)), 20),
+    (IpAddr::V4(Ipv4Addr::new(188, 114, 96, 0)), 20),
+    (IpAddr::V4(Ipv4Addr::new(197, 234, 240, 0)), 22),
+    (IpAddr::V4(Ipv4Addr::new(198, 41, 128, 0)), 17),
+    (IpAddr::V4(Ipv4Addr::new(162, 158, 0, 0)), 15),
+    (IpAddr::V4(Ipv4Addr::new(104, 16, 0, 0)), 13),
+    (IpAddr::V4(Ipv4Addr::new(104, 24, 0, 0)), 14),
+    (IpAddr::V4(Ipv4Addr::new(172, 64, 0, 0)), 13),
+    (IpAddr::V4(Ipv4Addr::new(131, 0, 72, 0)), 22),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2400, 0xcb00, 0, 0, 0, 0, 0, 0)),
+        32,
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0)),
+        32,
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2803, 0xf800, 0, 0, 0, 0, 0, 0)),
+        32,
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2405, 0xb500, 0, 0, 0, 0, 0, 0)),
+        32,
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2405, 0x8100, 0, 0, 0, 0, 0, 0)),
+        32,
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2a06, 0x98c0, 0, 0, 0, 0, 0, 0)),
+        29,
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2c0f, 0xf248, 0, 0, 0, 0, 0, 0)),
+        32,
+    ),
+];
+
+/// How far the forwarding headers of a request can be trusted, by TCP peer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PeerTrust {
+    /// Local proxy: CF-Connecting-IP, X-Forwarded-For, and Cf-Ipcountry.
+    LocalProxy,
+    /// Cloudflare edge: CF-Connecting-IP and Cf-Ipcountry only.
+    Cloudflare,
+    /// Anyone else: no forwarding headers.
+    Untrusted,
+}
+
+/// Returns true when `ip` lies inside `net`/`prefix` (same address family only).
+fn in_net(ip: IpAddr, (net, prefix): (IpAddr, u8)) -> bool {
+    match (ip, net) {
+        (IpAddr::V4(ip), IpAddr::V4(net)) => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+            u32::from(ip) & mask == u32::from(net) & mask
+        }
+        (IpAddr::V6(ip), IpAddr::V6(net)) => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+            u128::from(ip) & mask == u128::from(net) & mask
+        }
+        _ => false,
+    }
+}
+
+/// Classifies a TCP peer. IPv4-mapped IPv6 addresses are checked as IPv4.
+fn peer_trust(peer: IpAddr) -> PeerTrust {
+    let peer = peer.to_canonical();
+    if LOCAL_PROXY_NETS.iter().any(|&net| in_net(peer, net)) {
+        PeerTrust::LocalProxy
+    } else if CLOUDFLARE_NETS.iter().any(|&net| in_net(peer, net)) {
+        PeerTrust::Cloudflare
+    } else {
+        PeerTrust::Untrusted
+    }
+}
+
+fn parse_ip(value: Option<&str>) -> Option<IpAddr> {
+    value.and_then(|s| s.trim().parse().ok())
+}
+
 /// Result of enriching a `RequestEvent`.
 pub struct Enriched {
     /// Resolved country code, if any.
@@ -149,7 +254,8 @@ pub struct Enriched {
     pub agent_name: Option<String>,
 }
 
-/// Enriches `RequestEvent`s with geolocation, UA parsing, and CF-header precedence.
+/// Enriches `RequestEvent`s with geolocation, UA parsing, and the client IP.
+/// Forwarding headers are trusted only when the TCP peer is a local proxy or Cloudflare.
 pub struct Enricher {
     geo: Arc<dyn CountryLookup>,
     ua_cache: Mutex<LruCache<String, UaInfo>>,
@@ -168,23 +274,26 @@ impl Enricher {
     }
 
     /// Enrich `ev`, applying client-IP, country, UA, and bot precedence rules.
+    /// Local proxy peer: CF-Connecting-IP, then first X-Forwarded-For, then peer.
+    /// Cloudflare peer: CF-Connecting-IP, then peer. Other or missing peer: peer only.
     pub fn enrich(&self, ev: &RequestEvent) -> Enriched {
-        let client_ip_str: Option<&str> = ev
-            .cf_connecting_ip
-            .as_deref()
-            .or_else(|| {
-                ev.xff
-                    .as_deref()
-                    .and_then(|xff| xff.split(',').next().map(str::trim))
-            })
-            .or(ev.client_ip.as_deref());
-        let client_ip: Option<IpAddr> = client_ip_str.and_then(|s| s.parse().ok());
+        let peer = parse_ip(ev.client_ip.as_deref());
+        let trust = peer.map_or(PeerTrust::Untrusted, peer_trust);
 
-        let country = ev
-            .cf_country
-            .as_deref()
-            .map(String::from)
-            .or_else(|| client_ip.and_then(|ip| self.geo.country(ip)));
+        let cf_ip = || parse_ip(ev.cf_connecting_ip.as_deref());
+        let xff_ip = || parse_ip(ev.xff.as_deref().and_then(|xff| xff.split(',').next()));
+        let client_ip = match trust {
+            PeerTrust::LocalProxy => cf_ip().or_else(xff_ip).or(peer),
+            PeerTrust::Cloudflare => cf_ip().or(peer),
+            PeerTrust::Untrusted => peer,
+        };
+
+        let country = match trust {
+            PeerTrust::LocalProxy | PeerTrust::Cloudflare => ev.cf_country.as_deref(),
+            PeerTrust::Untrusted => None,
+        }
+        .map(String::from)
+        .or_else(|| client_ip.and_then(|ip| self.geo.country(ip)));
 
         let ua = match ev.user_agent.as_deref() {
             Some(ua_str) => self.parse_ua_cached(ua_str),
