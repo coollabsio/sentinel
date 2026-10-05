@@ -36,6 +36,17 @@ enum CliCommand {
     },
 }
 
+/// Log filter when `RUST_LOG` is unset. `DEBUG=true` enables debug logs for
+/// Sentinel's own crates only: dependencies such as bollard, hyper and reqwest
+/// log full Docker API responses at debug, and those include container
+/// commands and environments that can hold secrets.
+const DEBUG_LOG_FILTER: &str = "info,sentinel=debug,api=debug,collector=debug,config=debug,\
+control=debug,docker=debug,push=debug,store=debug,traffic=debug";
+
+fn default_log_filter(debug: bool) -> &'static str {
+    if debug { DEBUG_LOG_FILTER } else { "info" }
+}
+
 fn unexpected_service_exit(
     result: Option<Result<Result<(), String>, tokio::task::JoinError>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -143,13 +154,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing_subscriber::registry()
             .with(
-                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                    if config.debug {
-                        "debug".into()
-                    } else {
-                        "info".into()
-                    }
-                }),
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| default_log_filter(config.debug).into()),
             )
             .with(tracing_subscriber::fmt::layer().log_internal_errors(true))
             .with(control::log_layer())

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use super::{Cli, CliCommand, assignment_client, unexpected_service_exit};
+use super::{Cli, CliCommand, assignment_client, default_log_filter, unexpected_service_exit};
 
 fn control_tls_config() -> config::ControlTlsConfig {
     config::ControlTlsConfig {
@@ -86,4 +86,53 @@ fn parses_the_private_discovery_dns_process_mode() {
         cli.command,
         Some(CliCommand::DiscoveryDns { bind, .. }) if bind.to_string() == "10.240.0.2:53"
     ));
+}
+
+fn enabled_debug_targets(debug: bool) -> Vec<String> {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    struct Targets(Arc<Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Targets {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(event.metadata().target().to_string());
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(default_log_filter(
+            debug,
+        )))
+        .with(Targets(seen.clone()));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::debug!(target: "sentinel", "own");
+        tracing::debug!(target: "push", "own");
+        tracing::debug!(target: "collector::storage", "own");
+        tracing::debug!(target: "bollard::docker", "--requirepass secret");
+        tracing::debug!(target: "hyper_util::client", "dependency");
+        tracing::debug!(target: "reqwest::connect", "dependency");
+        tracing::info!(target: "bollard::docker", "dependency info");
+    });
+    seen.lock().unwrap().clone()
+}
+
+#[test]
+fn debug_mode_enables_debug_logs_only_for_sentinel_crates() {
+    assert_eq!(
+        enabled_debug_targets(true),
+        ["sentinel", "push", "collector::storage", "bollard::docker"]
+    );
+}
+
+#[test]
+fn info_mode_drops_all_debug_logs() {
+    assert_eq!(enabled_debug_targets(false), ["bollard::docker"]);
 }
