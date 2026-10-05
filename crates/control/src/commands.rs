@@ -14,9 +14,10 @@ use sentinel_protocol::control::v1::{
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_INSPECT,
     CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT, CAPABILITY_FIREWALL_RECONCILE,
-    CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_TRUST_BUNDLE_UPDATE, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
-    CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO,
+    CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE, CAPABILITY_WIREGUARD_INSPECT,
+    CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY,
+    CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
@@ -36,6 +37,7 @@ pub(crate) struct CommandExecutor {
     podman: PathBuf,
     system: System,
     discovery_trigger: Option<Arc<Notify>>,
+    ingress_trigger: Option<Arc<Notify>>,
     control_tls: Option<config::ControlTlsConfig>,
 }
 
@@ -56,6 +58,7 @@ impl CommandExecutor {
             podman: PathBuf::from("podman"),
             system: host_system(),
             discovery_trigger: None,
+            ingress_trigger: None,
             control_tls: None,
         }
     }
@@ -72,6 +75,12 @@ impl CommandExecutor {
         self
     }
 
+    /// Wakes the ingress renderer after a command changes routes or workloads.
+    pub(crate) fn with_ingress_trigger(mut self, trigger: Arc<Notify>) -> Self {
+        self.ingress_trigger = Some(trigger);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_network_root(mut self, root: &Path) -> Self {
         self.network_root = root.to_path_buf();
@@ -82,6 +91,32 @@ impl CommandExecutor {
     pub(crate) fn with_podman(mut self, podman: &Path) -> Self {
         self.podman = podman.to_path_buf();
         self
+    }
+
+    /// Takes the endpoint of a container that stops or is removed out of
+    /// service first, so ingress sends its traffic to another endpoint of the
+    /// workload instead of a container that is going away.
+    fn drain_before_stopping(
+        &self,
+        request: &WorkloadLifecycleRequest,
+    ) -> Option<crate::discovery::Drain> {
+        let action = WorkloadLifecycleAction::try_from(request.action).ok()?;
+        if !matches!(
+            action,
+            WorkloadLifecycleAction::Stop | WorkloadLifecycleAction::Remove
+        ) || !valid_container_name(&request.name)
+        {
+            return None;
+        }
+        let (drain, wait) = crate::discovery::drain_endpoint(&self.network_root, &request.name);
+        if let Some(trigger) = &self.ingress_trigger {
+            trigger.notify_one();
+        }
+        if !wait.is_zero() {
+            tracing::info!(container = %request.name, seconds = wait.as_secs(), "draining the endpoint before the container stops");
+            std::thread::sleep(wait);
+        }
+        Some(drain)
     }
 
     pub(crate) fn execute(
@@ -189,6 +224,9 @@ impl CommandExecutor {
             (CAPABILITY_CORROSION_RECONCILE, Some(Payload::CorrosionReconcile(request))) => {
                 crate::network::render_corrosion(request).is_ok()
             }
+            (CAPABILITY_INGRESS_RECONCILE, Some(Payload::IngressReconcile(request))) => {
+                crate::ingress::validate_routes(request).is_ok()
+            }
             _ => false,
         };
         let accepted = !(command.command_id.is_empty()
@@ -209,6 +247,7 @@ impl CommandExecutor {
                     | CAPABILITY_FIREWALL_RECONCILE
                     | CAPABILITY_CORROSION_INSPECT
                     | CAPABILITY_CORROSION_RECONCILE
+                    | CAPABILITY_INGRESS_RECONCILE
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
@@ -377,6 +416,7 @@ impl CommandExecutor {
                 Err(message) => failed(&command.command_id, "workload_deploy_failed", &message),
             }
         } else if let Some(Payload::WorkloadLifecycle(request)) = command.payload {
+            let _drain = self.drain_before_stopping(&request);
             match workload_lifecycle(&self.network_root, &self.podman, &request) {
                 Ok(result) => CommandResult {
                     event_id: format!("{}:result", command.command_id),
@@ -449,6 +489,14 @@ impl CommandExecutor {
                 ),
                 Err(message) => failed(&command.command_id, "corrosion_reconcile_failed", &message),
             }
+        } else if let Some(Payload::IngressReconcile(request)) = command.payload {
+            match crate::ingress::reconcile(&self.network_root, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::IngressReconcile(result),
+                ),
+                Err(message) => failed(&command.command_id, "ingress_reconcile_failed", &message),
+            }
         } else {
             failed(
                 &command.command_id,
@@ -463,6 +511,17 @@ impl CommandExecutor {
                     | command_result::Payload::WorkloadLifecycle(_)
             )
         ) && let Some(trigger) = &self.discovery_trigger
+        {
+            trigger.notify_one();
+        }
+        if matches!(
+            result.payload,
+            Some(
+                command_result::Payload::IngressReconcile(_)
+                    | command_result::Payload::WorkloadDeploy(_)
+                    | command_result::Payload::WorkloadLifecycle(_)
+            )
+        ) && let Some(trigger) = &self.ingress_trigger
         {
             trigger.notify_one();
         }
@@ -711,6 +770,16 @@ fn valid_ipv4_subnet_and_address(subnet: &str, address: &str) -> bool {
         && address != network
 }
 
+/// A stable, locally administered MAC for a workload address, derived from it
+/// like Docker does. The workload keeps its address across restarts and
+/// redeploys; a random MAC per start would leave the host and other containers
+/// with a stale neighbor entry, so traffic to the address fails for up to a
+/// minute until the entry expires.
+pub(crate) fn container_mac_address(address: std::net::Ipv4Addr) -> String {
+    let [a, b, c, d] = address.octets();
+    format!("02:42:{a:02x}:{b:02x}:{c:02x}:{d:02x}")
+}
+
 pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<String>, String> {
     if !valid_container_name(&request.name) {
         return Err("The container name is invalid.".into());
@@ -784,6 +853,9 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
     if uses_managed_network {
         args.extend(["--network".into(), request.network_name.clone()]);
         args.extend(["--ip".into(), request.container_ip.clone()]);
+        if let Ok(address) = request.container_ip.parse::<std::net::Ipv4Addr>() {
+            args.extend(["--mac-address".into(), container_mac_address(address)]);
+        }
     }
     if !request.dns_server.is_empty() {
         args.extend(["--dns".into(), request.dns_server.clone()]);

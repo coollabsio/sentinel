@@ -11,17 +11,19 @@ use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
     ClusterLeaveRequest, Command, CommandResult, CommandStatus, ContainerListRequest,
     ContainerPort, CorrosionInspectRequest, CorrosionReconcileRequest, FirewallIngressRule,
-    FirewallInspectRequest, FirewallReconcileRequest, FirewallRule, LogSource, LogsReadRequest,
-    SystemInfoRequest, SystemPingRequest, TrustBundleUpdateRequest, WireguardInspectRequest,
-    WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest,
-    WorkloadEnvironmentVariable, WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
+    FirewallInspectRequest, FirewallReconcileRequest, FirewallRule, IngressReconcileRequest,
+    IngressRoute, LogSource, LogsReadRequest, SystemInfoRequest, SystemPingRequest,
+    TrustBundleUpdateRequest, WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer,
+    WireguardReconcileRequest, WorkloadDeployRequest, WorkloadEnvironmentVariable, WorkloadLabel,
+    WorkloadLifecycleAction, WorkloadLifecycleRequest,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_INSPECT,
     CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT, CAPABILITY_FIREWALL_RECONCILE,
-    CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
-    CAPABILITY_TRUST_BUNDLE_UPDATE, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
-    CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO,
+    CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE, CAPABILITY_WIREGUARD_INSPECT,
+    CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY,
+    CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -244,6 +246,26 @@ struct CorrosionReconcileApiRequest {
     node_dns_name: String,
 }
 
+#[derive(Deserialize)]
+struct IngressReconcileApiRequest {
+    server_id: String,
+    command_id: String,
+    enabled: bool,
+    #[serde(default)]
+    caddy_version: String,
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    routes: Vec<IngressRouteApiRequest>,
+}
+#[derive(Deserialize)]
+struct IngressRouteApiRequest {
+    host: String,
+    workload_id: String,
+    namespace: String,
+    port: u32,
+}
+
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum WorkloadLifecycleApiAction {
@@ -416,6 +438,7 @@ pub async fn serve(
             "/v1/commands/discovery.corrosion.reconcile",
             post(corrosion_reconcile),
         )
+        .route("/v1/commands/ingress.reconcile", post(ingress_reconcile))
         .with_state(ApiState { registry, token });
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "Flux internal command API is listening");
@@ -769,6 +792,50 @@ async fn corrosion_reconcile(
     Ok(Json(
         serde_json::json!({"command_id": request.command_id, "observed_at_unix_ms": result.observed_at_unix_ms, "changed": value.changed, "version": discovery.version, "member_state": discovery.member_state, "endpoint_count": discovery.endpoint_count, "last_convergence_unix_seconds": discovery.last_convergence_unix_seconds, "alive_member_count": discovery.alive_member_count}),
     ))
+}
+
+/// Forwards the HTTP ingress state and route table to one Node. Sentinel
+/// validates the routes and the pinned Caddy version.
+async fn ingress_reconcile(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<IngressReconcileApiRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = dispatch_network(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_INGRESS_RECONCILE,
+        Payload::IngressReconcile(IngressReconcileRequest {
+            enabled: request.enabled,
+            caddy_version: request.caddy_version,
+            revision: request.revision,
+            routes: request
+                .routes
+                .into_iter()
+                .map(|route| IngressRoute {
+                    host: route.host,
+                    workload_id: route.workload_id,
+                    namespace: route.namespace,
+                    port: route.port,
+                })
+                .collect(),
+        }),
+    )
+    .await?;
+    let Some(command_result::Payload::IngressReconcile(value)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
+    };
+    Ok(Json(serde_json::json!({
+        "command_id": request.command_id,
+        "observed_at_unix_ms": result.observed_at_unix_ms,
+        "enabled": value.enabled,
+        "caddy_version": value.caddy_version,
+        "active": value.active,
+        "revision": value.revision,
+        "route_count": value.route_count,
+    })))
 }
 
 async fn workload_lifecycle(

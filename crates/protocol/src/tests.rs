@@ -7,7 +7,9 @@ use super::*;
 #[test]
 fn network_capabilities_are_typed_and_versioned() {
     let capabilities = NETWORK_CAPABILITIES;
-    assert_eq!(capabilities.len(), 8);
+    assert_eq!(capabilities.len(), 9);
+    assert!(capabilities.contains(&CAPABILITY_INGRESS_RECONCILE));
+    assert_eq!(CAPABILITY_INGRESS_RECONCILE, "ingress.reconcile.v1");
     assert!(!capabilities.contains(&"discovery.corrosion.endpoints.reconcile.v1"));
     assert!(
         capabilities
@@ -234,6 +236,53 @@ fn trust_bundle_update_command_and_result_round_trip() {
             control::v1::TrustBundleUpdateResult {
                 installed_version: 2,
                 changed: true,
+            },
+        )),
+    };
+    assert_eq!(
+        control::v1::CommandResult::decode(result.encode_to_vec().as_slice()).unwrap(),
+        result
+    );
+}
+
+#[test]
+fn ingress_reconcile_command_and_result_round_trip() {
+    let command = control::v1::Command {
+        command_id: "ingress-1".into(),
+        command_type: CAPABILITY_INGRESS_RECONCILE.into(),
+        payload_version: 1,
+        created_at_unix_ms: 1,
+        payload: Some(control::v1::command::Payload::IngressReconcile(
+            control::v1::IngressReconcileRequest {
+                enabled: true,
+                caddy_version: "v2.11.7".into(),
+                revision: 4,
+                routes: vec![control::v1::IngressRoute {
+                    host: "app.example.com".into(),
+                    workload_id: "web".into(),
+                    namespace: "default".into(),
+                    port: 3000,
+                }],
+            },
+        )),
+        expires_at_unix_ms: 2,
+    };
+    assert_eq!(
+        control::v1::Command::decode(command.encode_to_vec().as_slice()).unwrap(),
+        command
+    );
+    let result = control::v1::CommandResult {
+        event_id: "ingress-1:result".into(),
+        command_id: "ingress-1".into(),
+        status: control::v1::CommandStatus::Succeeded.into(),
+        observed_at_unix_ms: 3,
+        payload: Some(control::v1::command_result::Payload::IngressReconcile(
+            control::v1::IngressReconcileResult {
+                enabled: true,
+                caddy_version: "v2.11.7".into(),
+                active: true,
+                revision: 4,
+                route_count: 1,
             },
         )),
     };

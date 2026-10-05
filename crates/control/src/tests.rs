@@ -505,7 +505,8 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "network.firewall.inspect.v1",
             "network.firewall.reconcile.v1",
             "discovery.corrosion.inspect.v1",
-            "discovery.corrosion.reconcile.v1"
+            "discovery.corrosion.reconcile.v1",
+            "ingress.reconcile.v1"
         ])
     );
 }
@@ -1232,6 +1233,12 @@ fn builds_shell_free_podman_deploy_arguments() {
     );
     assert!(arguments.windows(2).any(|v| v == ["--pull", "newer"]));
     assert!(arguments.windows(2).any(|v| v == ["--ip", "100.64.0.2"]));
+    // The MAC follows the address, so neighbor caches stay valid across restarts.
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--mac-address", "02:42:64:40:00:02"])
+    );
     assert!(arguments.windows(2).any(|v| v == ["--dns", "10.240.0.2"]));
     assert!(arguments.windows(2).any(|v| v == ["--cpus", "2.5"]));
     assert!(arguments.windows(2).any(|v| v == ["--cpu-shares", "1280"]));
@@ -2206,4 +2213,162 @@ async fn reconnects_with_an_updated_trust_bundle_without_a_restart() {
     let reconnected = crate::connection::connect_endpoint(&endpoint, &config).await;
     assert!(reconnected.is_ok(), "{reconnected:?}");
     assert_eq!(crate::trust::installed_version(&config), 2);
+}
+
+fn ingress_reconcile_command(
+    command_id: &str,
+    request: sentinel_protocol::control::v1::IngressReconcileRequest,
+) -> sentinel_protocol::control::v1::Command {
+    sentinel_protocol::control::v1::Command {
+        command_id: command_id.into(),
+        command_type: sentinel_protocol::CAPABILITY_INGRESS_RECONCILE.into(),
+        payload_version: 1,
+        payload: Some(sentinel_protocol::control::v1::command::Payload::IngressReconcile(request)),
+        expires_at_unix_ms: i64::MAX,
+        ..Default::default()
+    }
+}
+
+fn ingress_request(
+    enabled: bool,
+    caddy_version: &str,
+    host: &str,
+) -> sentinel_protocol::control::v1::IngressReconcileRequest {
+    sentinel_protocol::control::v1::IngressReconcileRequest {
+        enabled,
+        caddy_version: caddy_version.into(),
+        revision: 2,
+        routes: vec![sentinel_protocol::control::v1::IngressRoute {
+            host: host.into(),
+            workload_id: "web".into(),
+            namespace: "default".into(),
+            port: 3000,
+        }],
+    }
+}
+
+#[test]
+fn executes_capability_gated_ingress_reconciles_and_wakes_the_renderer() {
+    use sentinel_protocol::control::v1::command_result;
+
+    let root = tempfile::tempdir().unwrap();
+    for (file, contents) in [
+        ("etc/corrosion/coolify-owner", "10.240.0.2\n"),
+        ("etc/corrosion/coolify-node-name", "worker-1\n"),
+    ] {
+        let path = root.path().join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    let trigger = Arc::new(tokio::sync::Notify::new());
+    let mut executor = crate::commands::CommandExecutor::new("dev")
+        .with_network_root(root.path())
+        .with_ingress_trigger(trigger.clone());
+    let state = root.path().join("var/lib/coolify/network/ingress.state");
+
+    let refused = executor.execute(
+        ingress_reconcile_command(
+            "ingress-0",
+            ingress_request(true, "v2.11.7", "app.example.com"),
+        ),
+        false,
+    );
+    assert!(!refused.accepted);
+    assert!(!state.exists());
+
+    for (index, request) in [
+        ingress_request(true, "v2.11.7", "10.0.0.1"),
+        ingress_request(true, "v2.11.7", "*.example.com"),
+        ingress_request(true, "v2.11.7", "App.example.com"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let invalid = executor.execute(
+            ingress_reconcile_command(&format!("ingress-invalid-{index}"), request),
+            true,
+        );
+        assert!(!invalid.accepted);
+    }
+    assert!(!state.exists());
+
+    let wrong_version = executor.execute(
+        ingress_reconcile_command(
+            "ingress-1",
+            ingress_request(true, "v2.10.0", "app.example.com"),
+        ),
+        true,
+    );
+    assert!(wrong_version.accepted);
+    assert!(matches!(
+        wrong_version.result.payload,
+        Some(command_result::Payload::Error(error))
+            if error.code == "ingress_reconcile_failed" && error.message.contains("v2.11.7")
+    ));
+    assert!(!state.exists());
+
+    let enabled = executor.execute(
+        ingress_reconcile_command(
+            "ingress-2",
+            ingress_request(true, "v2.11.7", "app.example.com"),
+        ),
+        true,
+    );
+    assert_eq!(
+        enabled.result.payload,
+        Some(command_result::Payload::IngressReconcile(
+            sentinel_protocol::control::v1::IngressReconcileResult {
+                enabled: true,
+                caddy_version: "v2.11.7".into(),
+                active: false,
+                revision: 2,
+                route_count: 1,
+            }
+        ))
+    );
+    assert!(state.exists());
+    // The renderer was woken: a stored permit completes immediately.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(1), trigger.notified())
+            .await
+            .unwrap();
+    });
+
+    let disabled = executor.execute(
+        ingress_reconcile_command("ingress-3", ingress_request(false, "", "app.example.com")),
+        true,
+    );
+    assert!(matches!(
+        disabled.result.payload,
+        Some(command_result::Payload::IngressReconcile(result)) if !result.enabled && !result.active
+    ));
+    assert!(!state.exists());
+    assert!(!root.path().join("etc/coolify-ingress/caddy.json").exists());
+    assert!(
+        !root
+            .path()
+            .join("etc/systemd/system/coolify-ingress.service")
+            .exists()
+    );
+}
+
+#[test]
+fn container_mac_addresses_are_stable_locally_administered_and_unique_per_address() {
+    let mac = crate::commands::container_mac_address("100.64.3.254".parse().unwrap());
+
+    assert_eq!(mac, "02:42:64:40:03:fe");
+    assert_eq!(
+        mac,
+        crate::commands::container_mac_address("100.64.3.254".parse().unwrap())
+    );
+    assert_ne!(
+        mac,
+        crate::commands::container_mac_address("100.64.3.253".parse().unwrap())
+    );
+    // Locally administered unicast: bit 1 of the first octet set, bit 0 clear.
+    assert_eq!(u8::from_str_radix(&mac[..2], 16).unwrap() & 0b11, 0b10);
 }

@@ -302,12 +302,14 @@ impl AssignmentClient {
         let mut temporary_attempt = 0;
         let mut connection_attempt = 0;
         let discovery_trigger = Arc::new(tokio::sync::Notify::new());
+        let ingress_trigger = Arc::new(tokio::sync::Notify::new());
         let command_executor = Arc::new(tokio::sync::Mutex::new(
             crate::commands::CommandExecutor::with_journal(
                 &self.sentinel_version,
                 self.command_journal.clone(),
             )
             .with_discovery_trigger(discovery_trigger.clone())
+            .with_ingress_trigger(ingress_trigger.clone())
             .with_control_tls(self.control_tls.clone()),
         ));
         // Restores the approved cluster network and stopped workloads once per
@@ -324,6 +326,14 @@ impl AssignmentClient {
         let discovery_publisher = tokio::spawn(crate::discovery::run(
             std::path::PathBuf::from("/"),
             discovery_trigger,
+            ingress_trigger.clone(),
+            shutdown.clone(),
+        ));
+        // Renders this Node's Caddy configuration from the local Corrosion when
+        // ingress is enabled, so routing survives a control-plane outage too.
+        let ingress_renderer = tokio::spawn(crate::ingress::run(
+            std::path::PathBuf::from("/"),
+            ingress_trigger,
             shutdown.clone(),
         ));
 
@@ -409,6 +419,7 @@ impl AssignmentClient {
 
         boot_restore.abort();
         discovery_publisher.abort();
+        ingress_renderer.abort();
         tracing::info!("Sentinel control assignment polling stopped");
     }
 }

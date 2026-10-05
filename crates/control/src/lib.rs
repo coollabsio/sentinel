@@ -4,6 +4,7 @@ mod assignment;
 mod commands;
 mod connection;
 mod discovery;
+mod ingress;
 mod logs;
 mod network;
 mod restore;

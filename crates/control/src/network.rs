@@ -58,6 +58,12 @@ pub(crate) fn leave_cluster(
     // Hold the publisher lock so no endpoint publish can run between withdrawing
     // this Node's rows and removing the identity files that enable publishing.
     let _publisher = crate::discovery::publisher_lock();
+    // The ingress uses the cluster network, so it leaves with it. Its routes in
+    // Corrosion stay: they belong to the cluster, not to this Node.
+    {
+        let _ingress = crate::ingress::ingress_lock();
+        crate::ingress::remove(root)?;
+    }
 
     if root == Path::new("/") {
         match crate::discovery::withdraw_endpoints(&request.owner_node_ip) {
@@ -687,11 +693,28 @@ pub(crate) fn reconcile_wireguard(
     let config = render_wireguard(request, private_key.trim())?;
     let configuration_hash = hash(config.as_bytes());
     let prior = read_applied_state(root, &request.interface);
-    if prior
-        .as_ref()
-        .is_some_and(|state| state.0 == request.revision && state.1 == configuration_hash)
-        && firewall_tables_active(root)
-    {
+    let config_path = root
+        .join("etc/wireguard")
+        .join(format!("{}.conf", request.interface));
+    let unchanged = prior.as_ref().is_some_and(|state| {
+        state.1 == configuration_hash
+            && (state.0 == request.revision
+                || (fs::read(&config_path).ok().as_deref() == Some(config.as_bytes())
+                    && (root != Path::new("/") || validate_live_wireguard(request).is_ok())))
+    });
+    if unchanged && firewall_tables_active(root) {
+        // A new revision with the same configuration, such as a firewall-only change, keeps
+        // the link: `wg-quick down` would cut the mesh and every cross-Node connection.
+        if prior
+            .as_ref()
+            .is_some_and(|state| state.0 != request.revision)
+        {
+            atomic_write(
+                &state_path(root, &format!("{}.state", request.interface)),
+                format!("{} {}\n", request.revision, configuration_hash).as_bytes(),
+                0o600,
+            )?;
+        }
         return Ok(WireguardReconcileResult {
             state: Some(if root == Path::new("/") {
                 inspect_wireguard(
@@ -708,9 +731,6 @@ pub(crate) fn reconcile_wireguard(
         });
     }
 
-    let config_path = root
-        .join("etc/wireguard")
-        .join(format!("{}.conf", request.interface));
     let last_good_path = state_path(root, &format!("{}.last-good.conf", request.interface));
     let had_current = config_path.exists();
     if had_current {
@@ -1130,83 +1150,230 @@ fn firewall_state(
     }
 }
 
-pub(crate) fn reconcile_corrosion(
+/// What a Corrosion reconcile changed on disk. Only these decide whether the
+/// running services must be touched.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CorrosionChanges {
+    pub(crate) config: bool,
+    pub(crate) schema: bool,
+    pub(crate) unit: bool,
+    pub(crate) cluster_id: bool,
+    pub(crate) dns_unit: bool,
+    /// Owner address, Node DNS name or peer count: read by Sentinel, not by Corrosion.
+    pub(crate) metadata: bool,
+}
+
+impl CorrosionChanges {
+    fn any(self) -> bool {
+        self.config || self.schema || self.unit || self.cluster_id || self.dns_unit || self.metadata
+    }
+}
+
+/// One service action of a Corrosion reconcile on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CorrosionStep {
+    DaemonReload,
+    /// Restart, wait until active, set the cluster ID, and restart again.
+    RestartWithClusterId,
+    Restart,
+    /// `corrosion reload` re-reads the schema; a restart is the fallback.
+    ReloadSchema,
+    RestartDiscoveryDns,
+}
+
+/// The service actions a Corrosion reconcile needs. Unchanged inputs on an
+/// active Corrosion need none: a restart drops the endpoints that the Nodes
+/// replicate to each other, and every network revision runs this command.
+pub(crate) fn corrosion_steps(
+    changes: CorrosionChanges,
+    corrosion_active: bool,
+) -> Vec<CorrosionStep> {
+    let mut steps = Vec::new();
+    if changes.unit || changes.dns_unit {
+        steps.push(CorrosionStep::DaemonReload);
+    }
+    if changes.cluster_id {
+        steps.push(CorrosionStep::RestartWithClusterId);
+    } else if changes.config || changes.unit || !corrosion_active {
+        // A restart also loads a changed schema.
+        steps.push(CorrosionStep::Restart);
+    } else if changes.schema {
+        steps.push(CorrosionStep::ReloadSchema);
+    }
+    if changes.dns_unit {
+        steps.push(CorrosionStep::RestartDiscoveryDns);
+    }
+    steps
+}
+
+/// Writes the Corrosion files and reports which of them changed. The schema is
+/// only compared here: the caller writes it, or `ReloadSchema` does.
+fn write_corrosion_files(
     root: &Path,
     request: &CorrosionReconcileRequest,
-) -> Result<CorrosionReconcileResult, String> {
+) -> Result<CorrosionChanges, String> {
     if request.version != CORROSION_VERSION {
         return Err(format!(
             "Corrosion must use the tested version {CORROSION_VERSION}."
         ));
     }
     let config = render_corrosion(request)?;
-    let config_path = root.join("etc/corrosion/config.toml");
-    let changed = fs::read(&config_path).ok().as_deref() != Some(config.as_bytes());
-    atomic_write(&config_path, config.as_bytes(), 0o644)?;
-    atomic_write(
-        &root.join("etc/corrosion/schemas/coolify.sql"),
-        corrosion_schema().as_bytes(),
+    let cluster_id = corrosion_cluster_id(&request.cluster_id)?;
+    let dns_unit = corrosion_dns_unit(&request.bind_address)?;
+    let schema_path = root.join("etc/corrosion/schemas/coolify.sql");
+    let mut changes = CorrosionChanges {
+        schema: fs::read(&schema_path).ok().as_deref() != Some(corrosion_schema().as_bytes()),
+        ..CorrosionChanges::default()
+    };
+    changes.config = write_if_changed(
+        &root.join("etc/corrosion/config.toml"),
+        config.as_bytes(),
         0o644,
     )?;
-    atomic_write(
+    changes.unit = write_if_changed(
         &root.join("etc/systemd/system/corrosion.service"),
         corrosion_unit().as_bytes(),
         0o644,
     )?;
-    let cluster_id = corrosion_cluster_id(&request.cluster_id)?;
-    atomic_write(
-        &root.join(CORROSION_OWNER_FILE),
-        format!("{}\n", request.bind_address).as_bytes(),
-        0o644,
-    )?;
-    atomic_write(
-        &root.join(CORROSION_NODE_NAME_FILE),
-        format!("{}\n", request.node_dns_name).as_bytes(),
-        0o644,
-    )?;
-    atomic_write(
+    changes.cluster_id = write_if_changed(
         &root.join("etc/corrosion/coolify-cluster-id"),
         format!("{cluster_id}\n").as_bytes(),
         0o644,
     )?;
-    atomic_write(
-        &root.join("etc/corrosion/coolify-peer-count"),
-        format!("{}\n", request.peers.len()).as_bytes(),
-        0o644,
-    )?;
-    atomic_write(
+    changes.dns_unit = write_if_changed(
         &root.join("etc/systemd/system/coolify-discovery-dns.service"),
-        corrosion_dns_unit(&request.bind_address)?.as_bytes(),
+        dns_unit.as_bytes(),
         0o644,
     )?;
-    if root == Path::new("/") {
-        install_corrosion(request.version.as_str())?;
-        ensure_discovery_dns_user()?;
-        run(
+    for (path, contents) in [
+        (CORROSION_OWNER_FILE, format!("{}\n", request.bind_address)),
+        (
+            CORROSION_NODE_NAME_FILE,
+            format!("{}\n", request.node_dns_name),
+        ),
+        (
+            "etc/corrosion/coolify-peer-count",
+            format!("{}\n", request.peers.len()),
+        ),
+    ] {
+        changes.metadata |= write_if_changed(&root.join(path), contents.as_bytes(), 0o644)?;
+    }
+    Ok(changes)
+}
+
+/// Writes `contents` only when it differs. Returns whether it changed.
+pub(crate) fn write_if_changed(path: &Path, contents: &[u8], mode: u32) -> Result<bool, String> {
+    if fs::read(path).ok().as_deref() == Some(contents) {
+        return Ok(false);
+    }
+    atomic_write(path, contents, mode)?;
+    Ok(true)
+}
+
+fn service_enabled(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-enabled", "--quiet", unit])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn service_active(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", unit])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn apply_corrosion_step(root: &Path, step: CorrosionStep, cluster_id: u16) -> Result<(), String> {
+    match step {
+        CorrosionStep::DaemonReload => run(
             Command::new("systemctl").arg("daemon-reload"),
             "Systemd could not reload Corrosion.",
+        ),
+        CorrosionStep::Restart => {
+            let _ = Command::new("systemctl")
+                .args(["reset-failed", "corrosion.service"])
+                .status();
+            run(
+                Command::new("systemctl").args(["restart", "corrosion.service"]),
+                "Corrosion could not start.",
+            )
+        }
+        CorrosionStep::RestartWithClusterId => {
+            run(
+                Command::new("systemctl").args(["restart", "corrosion.service"]),
+                "Corrosion could not start.",
+            )?;
+            run(
+                Command::new("systemctl").args(["is-active", "--quiet", "corrosion.service"]),
+                "Corrosion did not become active.",
+            )?;
+            set_corrosion_cluster_id(cluster_id)?;
+            run(
+                Command::new("systemctl").args(["restart", "corrosion.service"]),
+                "Corrosion could not restart after its cluster ID was set.",
+            )
+        }
+        CorrosionStep::ReloadSchema => ensure_corrosion_schema(root).map(|_| ()),
+        CorrosionStep::RestartDiscoveryDns => run(
+            Command::new("systemctl").args(["restart", "coolify-discovery-dns.service"]),
+            "The Coolify discovery DNS service could not restart.",
+        ),
+    }
+}
+
+/// Applies `discovery.corrosion.reconcile.v1`. It runs on every network
+/// revision, so it only restarts or reloads Corrosion when its inputs changed
+/// or it is not running.
+pub(crate) fn reconcile_corrosion(
+    root: &Path,
+    request: &CorrosionReconcileRequest,
+) -> Result<CorrosionReconcileResult, String> {
+    let changes = write_corrosion_files(root, request)?;
+    let host = root == Path::new("/");
+    let steps = if host {
+        install_corrosion(request.version.as_str())?;
+        ensure_discovery_dns_user()?;
+        corrosion_steps(changes, service_active("corrosion.service"))
+    } else {
+        Vec::new()
+    };
+    if changes.schema && !steps.contains(&CorrosionStep::ReloadSchema) {
+        atomic_write(
+            &root.join("etc/corrosion/schemas/coolify.sql"),
+            corrosion_schema().as_bytes(),
+            0o644,
         )?;
-        run(
-            Command::new("systemctl").args(["enable", "corrosion.service"]),
-            "Corrosion could not be enabled.",
-        )?;
-        run(
-            Command::new("systemctl").args(["restart", "corrosion.service"]),
-            "Corrosion could not start.",
-        )?;
+    }
+    let changed = changes.any() || !steps.is_empty();
+    if host {
+        let cluster_id = corrosion_cluster_id(&request.cluster_id)?;
+        for step in steps {
+            apply_corrosion_step(root, step, cluster_id)?;
+        }
+        // `systemctl enable` reloads systemd, so it only runs for a unit that is not enabled yet.
+        if !service_enabled("corrosion.service") {
+            run(
+                Command::new("systemctl").args(["enable", "corrosion.service"]),
+                "Corrosion could not be enabled.",
+            )?;
+        }
         run(
             Command::new("systemctl").args(["is-active", "--quiet", "corrosion.service"]),
             "Corrosion did not become active.",
         )?;
-        set_corrosion_cluster_id(cluster_id)?;
-        run(
-            Command::new("systemctl").args(["restart", "corrosion.service"]),
-            "Corrosion could not restart after its cluster ID was set.",
-        )?;
-        run(
-            Command::new("systemctl").args(["enable", "--now", "coolify-discovery-dns.service"]),
-            "The Coolify discovery DNS service could not start.",
-        )?;
+        if !service_enabled("coolify-discovery-dns.service") {
+            run(
+                Command::new("systemctl").args(["enable", "coolify-discovery-dns.service"]),
+                "The Coolify discovery DNS service could not be enabled.",
+            )?;
+        }
+        if !service_active("coolify-discovery-dns.service") {
+            run(
+                Command::new("systemctl").args(["start", "coolify-discovery-dns.service"]),
+                "The Coolify discovery DNS service could not start.",
+            )?;
+        }
         run(
             Command::new("systemctl").args([
                 "is-active",
@@ -1470,8 +1637,53 @@ fn configure_discovery_resolver(
     Ok(())
 }
 
-fn corrosion_schema() -> &'static str {
-    "CREATE TABLE IF NOT EXISTS workload_endpoints (workload_id TEXT NOT NULL, namespace TEXT NOT NULL, owner_node_ip TEXT NOT NULL, container_ip TEXT NOT NULL, state TEXT NOT NULL DEFAULT '', health TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (namespace, workload_id, owner_node_ip, container_ip));\n"
+pub(crate) fn corrosion_schema() -> &'static str {
+    "CREATE TABLE IF NOT EXISTS workload_endpoints (workload_id TEXT NOT NULL, namespace TEXT NOT NULL, owner_node_ip TEXT NOT NULL, container_ip TEXT NOT NULL, state TEXT NOT NULL DEFAULT '', health TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (namespace, workload_id, owner_node_ip, container_ip));\nCREATE TABLE IF NOT EXISTS ingress_routes (host TEXT NOT NULL PRIMARY KEY, workload_id TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);\n"
+}
+
+/// Brings the installed Corrosion schema file up to date. A changed file is
+/// applied with `corrosion reload`, which re-reads the schema paths through
+/// the admin socket and creates new tables without a restart; a restart is the
+/// fallback. Returns whether the schema changed.
+pub(crate) fn ensure_corrosion_schema(root: &Path) -> Result<bool, String> {
+    let path = root.join("etc/corrosion/schemas/coolify.sql");
+    if fs::read(&path).ok().as_deref() == Some(corrosion_schema().as_bytes()) {
+        return Ok(false);
+    }
+    atomic_write(&path, corrosion_schema().as_bytes(), 0o644)?;
+    if root != Path::new("/") {
+        return Ok(true);
+    }
+    if let Err(error) = run(
+        Command::new("/usr/local/bin/corrosion").args([
+            "reload",
+            "--config",
+            "/etc/corrosion/config.toml",
+        ]),
+        "Corrosion could not reload its schema.",
+    ) {
+        tracing::warn!(%error, "Corrosion could not reload its schema; restarting it");
+        run(
+            Command::new("systemctl").args(["restart", "corrosion.service"]),
+            "Corrosion could not restart to apply its schema.",
+        )?;
+    }
+    let owner = fs::read_to_string(root.join(CORROSION_OWNER_FILE))
+        .map_err(|_| "The Corrosion owner address could not be read.".to_string())?;
+    let probe = serde_json::to_vec("SELECT COUNT(*) FROM ingress_routes").unwrap_or_default();
+    let mut last_error = String::new();
+    for _ in 0..30 {
+        match crate::discovery::corrosion_api(owner.trim(), "queries", &probe)
+            .and_then(|output| crate::ingress::parse_query_events(&output))
+        {
+            Ok(_) => return Ok(true),
+            Err(error) => last_error = error,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err(format!(
+        "Corrosion did not apply the ingress schema: {last_error}"
+    ))
 }
 
 fn corrosion_unit() -> &'static str {
@@ -1586,7 +1798,7 @@ fn ensure_discovery_dns_user() -> Result<(), String> {
     )
 }
 
-fn run(command: &mut Command, fallback: &str) -> Result<(), String> {
+pub(crate) fn run(command: &mut Command, fallback: &str) -> Result<(), String> {
     let output = command.output().map_err(|_| fallback.to_string())?;
     if output.status.success() {
         return Ok(());
@@ -1610,6 +1822,7 @@ pub(crate) struct AppliedNetwork {
     pub(crate) wireguard: Vec<AppliedWireguard>,
     pub(crate) firewall: Option<AppliedFirewall>,
     pub(crate) corrosion: Option<AppliedCorrosion>,
+    pub(crate) ingress: Option<AppliedIngress>,
     /// Applied state that exists but could not be read; the restore is incomplete.
     pub(crate) problems: Vec<String>,
 }
@@ -1619,6 +1832,7 @@ impl AppliedNetwork {
         self.wireguard.is_empty()
             && self.firewall.is_none()
             && self.corrosion.is_none()
+            && self.ingress.is_none()
             && self.problems.is_empty()
     }
 }
@@ -1640,6 +1854,11 @@ pub(crate) struct AppliedFirewall {
 pub(crate) struct AppliedCorrosion {
     pub(crate) units_current: bool,
     pub(crate) dns_unit_installed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppliedIngress {
+    pub(crate) unit_current: bool,
 }
 
 /// What is live on the host right now.
@@ -1674,6 +1893,8 @@ pub(crate) enum RestoreStep {
         interface: String,
         workload_cidrs: Vec<String>,
     },
+    RefreshIngressUnit,
+    StartIngress,
 }
 
 /// Network restore steps, split around the workload restart: the mesh NAT
@@ -1743,6 +1964,15 @@ pub(crate) fn read_applied_network(root: &Path) -> AppliedNetwork {
             units_current: dns_unit_current
                 && fs::read(&unit_path).ok().as_deref() == Some(corrosion_unit().as_bytes()),
             dns_unit_installed,
+        });
+    }
+
+    if crate::ingress::enabled(root) {
+        applied.ingress = Some(AppliedIngress {
+            unit_current: fs::read(root.join(crate::ingress::INGRESS_UNIT_FILE))
+                .ok()
+                .as_deref()
+                == Some(crate::ingress::ingress_unit().as_bytes()),
         });
     }
 
@@ -1911,12 +2141,23 @@ pub(crate) fn restore_plan(applied: &AppliedNetwork, live: &LiveNetwork) -> Rest
             plan.before_workloads.push(RestoreStep::StartDiscoveryDns);
         }
     }
+    // Caddy starts on boot with its last configuration; this only replaces a
+    // unit written by an older Sentinel and starts a unit that gave up.
+    if let Some(ingress) = &applied.ingress {
+        if !ingress.unit_current {
+            plan.before_workloads.push(RestoreStep::RefreshIngressUnit);
+        }
+        plan.before_workloads.push(RestoreStep::StartIngress);
+    }
     plan
 }
 
 pub(crate) fn apply_restore_step(root: &Path, step: &RestoreStep) -> Result<(), String> {
     if let RestoreStep::BridgeSysctls = step {
         return load_bridge_sysctls(root);
+    }
+    if let RestoreStep::RefreshIngressUnit = step {
+        return refresh_ingress_unit(root);
     }
     if root != Path::new("/") {
         return Ok(());
@@ -1964,7 +2205,46 @@ pub(crate) fn apply_restore_step(root: &Path, step: &RestoreStep) -> Result<(), 
             interface,
             workload_cidrs,
         } => configure_mesh_nat(interface, workload_cidrs),
+        RestoreStep::RefreshIngressUnit => Ok(()),
+        RestoreStep::StartIngress => {
+            let _ = Command::new("systemctl")
+                .args(["reset-failed", crate::ingress::INGRESS_UNIT])
+                .status();
+            run(
+                Command::new("systemctl").args(["start", crate::ingress::INGRESS_UNIT]),
+                "The Coolify ingress could not start.",
+            )
+        }
     }
+}
+
+/// Rewrites the ingress unit with the current template and restarts Caddy
+/// with it, so a Node keeps current hardening without Coolify.
+fn refresh_ingress_unit(root: &Path) -> Result<(), String> {
+    let _ingress = crate::ingress::ingress_lock();
+    if !crate::ingress::enabled(root) {
+        return Ok(());
+    }
+    atomic_write(
+        &root.join(crate::ingress::INGRESS_UNIT_FILE),
+        crate::ingress::ingress_unit().as_bytes(),
+        0o644,
+    )?;
+    if root != Path::new("/") {
+        return Ok(());
+    }
+    run(
+        Command::new("systemctl").arg("daemon-reload"),
+        "Systemd could not reload the ingress unit.",
+    )?;
+    run(
+        Command::new("systemctl").args(["enable", crate::ingress::INGRESS_UNIT]),
+        "The Coolify ingress could not be enabled.",
+    )?;
+    run(
+        Command::new("systemctl").args(["restart", crate::ingress::INGRESS_UNIT]),
+        "The Coolify ingress could not restart.",
+    )
 }
 
 /// Loads the last known-good snapshot with the same transaction activation
@@ -2216,6 +2496,34 @@ mod tests {
             0o600
         );
         assert!(!format!("{first:?}").contains("private-secret"));
+
+        // A new revision with the same peers keeps the link and records the revision.
+        let next = WireguardReconcileRequest {
+            revision: 8,
+            ..request.clone()
+        };
+        let third = reconcile_wireguard(temp.path(), &next).unwrap();
+        assert!(!third.changed);
+        assert_eq!(third.state.as_ref().unwrap().applied_revision, 8);
+        assert_eq!(read_applied_state(temp.path(), "coolify0").unwrap().0, 8);
+
+        // A changed peer set applies the new configuration.
+        let mut changed = next.clone();
+        changed.revision = 9;
+        changed.peers[0].allowed_ips.push("100.64.1.0/24".into());
+        assert!(reconcile_wireguard(temp.path(), &changed).unwrap().changed);
+
+        // A configuration file edited on the host is rewritten even with the same peers.
+        let edited = WireguardReconcileRequest {
+            revision: 10,
+            ..changed.clone()
+        };
+        fs::write(
+            temp.path().join("etc/wireguard/coolify0.conf"),
+            "[Interface]\n",
+        )
+        .unwrap();
+        assert!(reconcile_wireguard(temp.path(), &edited).unwrap().changed);
     }
 
     #[test]
@@ -2303,6 +2611,261 @@ mod tests {
         );
     }
 
+    /// A packet as the inet table sees it.
+    struct Packet<'a> {
+        iifname: &'a str,
+        saddr: &'a str,
+        daddr: &'a str,
+        protocol: &'a str,
+        dport: u32,
+        established: bool,
+    }
+
+    /// Evaluates one chain of the rendered `table inet` against a packet, for
+    /// the subset of nft syntax `render_firewall` emits. Returns the verdict.
+    fn evaluate_chain(
+        rendered: &str,
+        chain: &str,
+        workload_cidrs: &[&str],
+        packet: &Packet,
+    ) -> &'static str {
+        let inet = rendered.split("table bridge").next().unwrap();
+        let body = inet
+            .split_once(&format!("chain {chain} {{"))
+            .unwrap()
+            .1
+            .split_once("}\n")
+            .unwrap()
+            .0;
+        let in_set = |value: &str, address: &str| {
+            if value == "@workload_networks" {
+                workload_cidrs
+                    .iter()
+                    .any(|cidr| ipv4_in_cidr(address, cidr))
+            } else if value.contains('/') {
+                ipv4_in_cidr(address, value)
+            } else {
+                value == address
+            }
+        };
+        for statement in body.split(';').map(str::trim) {
+            if statement.is_empty()
+                || statement.starts_with("type ")
+                || statement.starts_with("policy ")
+            {
+                continue;
+            }
+            let tokens = statement.split_whitespace().collect::<Vec<_>>();
+            let mut index = 0;
+            let mut matched = true;
+            let mut verdict = None;
+            while index < tokens.len() && matched {
+                let negated = tokens.get(index + 2) == Some(&"!=");
+                let value_at = if negated { index + 3 } else { index + 2 };
+                match tokens[index] {
+                    "ct" => {
+                        matched = packet.established;
+                        index += 3;
+                    }
+                    "iifname" => {
+                        let negated = tokens[index + 1] == "!=";
+                        let value = tokens[index + if negated { 2 } else { 1 }].trim_matches('"');
+                        matched = (value == packet.iifname) != negated;
+                        index += if negated { 3 } else { 2 };
+                    }
+                    "ip" if tokens[index + 1] == "protocol" => {
+                        matched = packet.protocol == tokens[index + 2];
+                        index += 3;
+                    }
+                    "ip" => {
+                        let address = if tokens[index + 1] == "saddr" {
+                            packet.saddr
+                        } else {
+                            packet.daddr
+                        };
+                        matched = in_set(tokens[value_at], address) != negated;
+                        index = value_at + 1;
+                    }
+                    "tcp" | "udp" => {
+                        matched = packet.protocol == tokens[index]
+                            && tokens[index + 1] == "dport"
+                            && tokens[index + 2].parse::<u32>().unwrap() == packet.dport;
+                        index += 3;
+                    }
+                    "accept" => {
+                        verdict = Some("accept");
+                        index += 1;
+                    }
+                    "drop" => {
+                        verdict = Some("drop");
+                        index += 1;
+                    }
+                    other => panic!("unsupported nft token {other} in {statement}"),
+                }
+            }
+            if matched && let Some(verdict) = verdict {
+                return verdict;
+            }
+        }
+        "accept"
+    }
+
+    #[test]
+    fn ingress_rules_admit_caddy_on_the_same_and_on_another_node() {
+        let workload_cidrs = ["100.64.0.0/24", "100.64.1.0/24"];
+        let request = |local_node_ip: &str| FirewallReconcileRequest {
+            local_node_ip: local_node_ip.into(),
+            workload_cidrs: workload_cidrs.iter().map(|cidr| cidr.to_string()).collect(),
+            // Coolify renders the same cluster-wide ingress rules on every Node.
+            ingress_rules: vec![
+                FirewallIngressRule {
+                    destination_ip: "100.64.0.5".into(),
+                    protocol: "tcp".into(),
+                    port: 3000,
+                },
+                FirewallIngressRule {
+                    destination_ip: "100.64.1.7".into(),
+                    protocol: "tcp".into(),
+                    port: 8080,
+                },
+            ],
+            ..firewall_request()
+        };
+        // Node A (10.240.0.2) owns 100.64.0.0/24; Node B (10.240.0.3) owns 100.64.1.0/24.
+        let node_a = render_firewall(&request("10.240.0.2")).unwrap();
+        let node_b = render_firewall(&request("10.240.0.3")).unwrap();
+        let new = |iifname, saddr, daddr, dport| Packet {
+            iifname,
+            saddr,
+            daddr,
+            protocol: "tcp",
+            dport,
+            established: false,
+        };
+
+        // (a) Caddy on Node A reaches its own workload: host output through the
+        // Podman bridge, whose gateway address is the source.
+        let local = new("", "100.64.0.1", "100.64.0.5", 3000);
+        assert_eq!(
+            evaluate_chain(&node_a, "output", &workload_cidrs, &local),
+            "accept"
+        );
+        // The reply enters the host as established traffic.
+        let reply = Packet {
+            iifname: "podman1",
+            saddr: "100.64.0.5",
+            daddr: "100.64.0.1",
+            protocol: "tcp",
+            dport: 40000,
+            established: true,
+        };
+        assert_eq!(
+            evaluate_chain(&node_a, "input", &workload_cidrs, &reply),
+            "accept"
+        );
+
+        // (b) Caddy on Node B reaches the workload on Node A: it leaves B from
+        // B's WireGuard address and A forwards it from coolify0 to the bridge.
+        let remote = new("coolify0", "10.240.0.3", "100.64.0.5", 3000);
+        assert_eq!(
+            evaluate_chain(&node_b, "output", &workload_cidrs, &remote),
+            "accept"
+        );
+        assert_eq!(
+            evaluate_chain(&node_a, "forward", &workload_cidrs, &remote),
+            "accept"
+        );
+        let remote_reply = Packet {
+            iifname: "podman1",
+            saddr: "100.64.0.5",
+            daddr: "10.240.0.3",
+            protocol: "tcp",
+            dport: 40000,
+            established: true,
+        };
+        assert_eq!(
+            evaluate_chain(&node_a, "forward", &workload_cidrs, &remote_reply),
+            "accept"
+        );
+        assert_eq!(
+            evaluate_chain(
+                &node_b,
+                "input",
+                &workload_cidrs,
+                &Packet {
+                    iifname: "coolify0",
+                    ..remote_reply
+                }
+            ),
+            "accept"
+        );
+        // And the reverse direction for B's workload.
+        let to_b = new("coolify0", "10.240.0.2", "100.64.1.7", 8080);
+        assert_eq!(
+            evaluate_chain(&node_a, "output", &workload_cidrs, &to_b),
+            "accept"
+        );
+        assert_eq!(
+            evaluate_chain(&node_b, "forward", &workload_cidrs, &to_b),
+            "accept"
+        );
+
+        // Only the routed port is open: other ports and workloads stay closed.
+        for (iifname, saddr, daddr, dport) in [
+            ("coolify0", "10.240.0.3", "100.64.0.5", 22),
+            ("coolify0", "10.240.0.3", "100.64.0.6", 3000),
+            ("eth0", "203.0.113.9", "100.64.0.6", 3000),
+        ] {
+            assert_eq!(
+                evaluate_chain(
+                    &node_a,
+                    "forward",
+                    &workload_cidrs,
+                    &new(iifname, saddr, daddr, dport)
+                ),
+                "drop"
+            );
+        }
+        assert_eq!(
+            evaluate_chain(
+                &node_a,
+                "output",
+                &workload_cidrs,
+                &new("", "100.64.0.1", "100.64.0.5", 22)
+            ),
+            "drop"
+        );
+        assert_eq!(
+            evaluate_chain(
+                &node_b,
+                "output",
+                &workload_cidrs,
+                &new("", "10.240.0.3", "100.64.0.6", 3000)
+            ),
+            "drop"
+        );
+        // A workload cannot use an ingress rule to reach another workload.
+        assert_eq!(
+            evaluate_chain(
+                &node_a,
+                "forward",
+                &workload_cidrs,
+                &new("podman1", "100.64.0.9", "100.64.0.5", 3000)
+            ),
+            "drop"
+        );
+        // Public clients reach Caddy on port 80: the input policy accepts.
+        assert_eq!(
+            evaluate_chain(
+                &node_a,
+                "input",
+                &workload_cidrs,
+                &new("eth0", "203.0.113.9", "198.51.100.2", 80)
+            ),
+            "accept"
+        );
+    }
+
     #[test]
     fn firewall_reconciliation_never_changes_unrelated_rules() {
         let temp = tempfile::tempdir().unwrap();
@@ -2387,6 +2950,130 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(node_name_mode, 0o644);
+    }
+
+    fn corrosion_request(cluster_id: &str, peers: &[&str]) -> CorrosionReconcileRequest {
+        CorrosionReconcileRequest {
+            version: CORROSION_VERSION.into(),
+            cluster_id: cluster_id.into(),
+            bind_address: "10.240.0.2".into(),
+            peers: peers.iter().map(|peer| (*peer).into()).collect(),
+            node_dns_name: "worker-1".into(),
+        }
+    }
+
+    #[test]
+    fn corrosion_reconcile_with_unchanged_inputs_plans_no_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = corrosion_request("cluster-one", &["10.240.0.3:8787"]);
+
+        let first = write_corrosion_files(temp.path(), &request).unwrap();
+        assert!(first.config && first.unit && first.cluster_id && first.dns_unit && first.schema);
+        assert_eq!(
+            corrosion_steps(first, false),
+            [
+                CorrosionStep::DaemonReload,
+                CorrosionStep::RestartWithClusterId,
+                CorrosionStep::RestartDiscoveryDns,
+            ]
+        );
+        assert!(reconcile_corrosion(temp.path(), &request).unwrap().changed);
+
+        let again = write_corrosion_files(temp.path(), &request).unwrap();
+        assert_eq!(again, CorrosionChanges::default());
+        assert!(corrosion_steps(again, true).is_empty());
+        assert!(!reconcile_corrosion(temp.path(), &request).unwrap().changed);
+    }
+
+    #[test]
+    fn corrosion_reconcile_plans_the_action_each_change_needs() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = corrosion_request("cluster-one", &["10.240.0.3:8787"]);
+        reconcile_corrosion(temp.path(), &request).unwrap();
+
+        // A new peer changes the configuration: one restart, the cluster ID stays.
+        let peers = corrosion_request("cluster-one", &["10.240.0.3:8787", "10.240.0.4:8787"]);
+        let changes = write_corrosion_files(temp.path(), &peers).unwrap();
+        assert!(changes.config && changes.metadata && !changes.cluster_id);
+        assert_eq!(corrosion_steps(changes, true), [CorrosionStep::Restart]);
+
+        // Another cluster: restart, set the new cluster ID, restart.
+        let other = corrosion_request("cluster-two", &["10.240.0.3:8787", "10.240.0.4:8787"]);
+        let changes = write_corrosion_files(temp.path(), &other).unwrap();
+        assert!(changes.cluster_id && !changes.config);
+        assert_eq!(
+            corrosion_steps(changes, true),
+            [CorrosionStep::RestartWithClusterId]
+        );
+
+        // An outdated unit: reload systemd and restart.
+        write(
+            temp.path(),
+            "etc/systemd/system/corrosion.service",
+            "[Service]\nExecStart=/old\n",
+        );
+        let changes = write_corrosion_files(temp.path(), &other).unwrap();
+        assert!(changes.unit);
+        assert_eq!(
+            corrosion_steps(changes, true),
+            [CorrosionStep::DaemonReload, CorrosionStep::Restart]
+        );
+
+        // An outdated schema on a running Corrosion: reload, no restart.
+        write(
+            temp.path(),
+            "etc/corrosion/schemas/coolify.sql",
+            "CREATE TABLE IF NOT EXISTS workload_endpoints (old);\n",
+        );
+        let changes = write_corrosion_files(temp.path(), &other).unwrap();
+        assert_eq!(
+            changes,
+            CorrosionChanges {
+                schema: true,
+                ..CorrosionChanges::default()
+            }
+        );
+        assert_eq!(
+            corrosion_steps(changes, true),
+            [CorrosionStep::ReloadSchema]
+        );
+        // A stopped Corrosion restarts and loads the schema on start.
+        assert_eq!(corrosion_steps(changes, false), [CorrosionStep::Restart]);
+        assert!(reconcile_corrosion(temp.path(), &other).unwrap().changed);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("etc/corrosion/schemas/coolify.sql")).unwrap(),
+            corrosion_schema()
+        );
+
+        // Nothing changed, but Corrosion is not running: start it.
+        assert_eq!(
+            corrosion_steps(CorrosionChanges::default(), false),
+            [CorrosionStep::Restart]
+        );
+
+        // Only the DNS unit changed: reload systemd and restart the DNS service alone.
+        write(
+            temp.path(),
+            "etc/systemd/system/coolify-discovery-dns.service",
+            "[Service]\nExecStart=/old\n",
+        );
+        let changes = write_corrosion_files(temp.path(), &other).unwrap();
+        assert_eq!(
+            corrosion_steps(changes, true),
+            [
+                CorrosionStep::DaemonReload,
+                CorrosionStep::RestartDiscoveryDns
+            ]
+        );
+
+        // The owner metadata does not touch the services.
+        let renamed = CorrosionReconcileRequest {
+            node_dns_name: "worker-9".into(),
+            ..other.clone()
+        };
+        let changes = write_corrosion_files(temp.path(), &renamed).unwrap();
+        assert!(changes.metadata && changes.any());
+        assert!(corrosion_steps(changes, true).is_empty());
     }
 
     #[test]
@@ -2546,6 +3233,9 @@ mod tests {
             "etc/systemd/system/corrosion.service",
             "etc/systemd/system/coolify-discovery-dns.service",
             "var/lib/corrosion/db.sqlite",
+            "etc/systemd/system/coolify-ingress.service",
+            "etc/coolify-ingress/caddy.json",
+            "var/lib/coolify/network/ingress.state",
         ];
         for relative in managed {
             let path = temp.path().join(relative);
@@ -2569,6 +3259,7 @@ mod tests {
         for relative in managed {
             assert!(!temp.path().join(relative).exists());
         }
+        assert!(!temp.path().join("etc/coolify-ingress").exists());
     }
 
     #[test]
@@ -2834,6 +3525,93 @@ mod tests {
                 .unwrap()
                 .units_current
         );
+    }
+
+    #[test]
+    fn restore_starts_the_ingress_and_refreshes_an_outdated_unit() {
+        let temp = applied_root();
+        assert!(read_applied_network(temp.path()).ingress.is_none());
+
+        write(
+            temp.path(),
+            "var/lib/coolify/network/ingress.state",
+            "enabled v2.11.7\n",
+        );
+        write(
+            temp.path(),
+            crate::ingress::INGRESS_UNIT_FILE,
+            &crate::ingress::ingress_unit(),
+        );
+        let applied = read_applied_network(temp.path());
+        assert_eq!(applied.ingress, Some(AppliedIngress { unit_current: true }));
+        let plan = restore_plan(&applied, &live(&["coolify0"], true, true));
+        assert_eq!(
+            plan.before_workloads.last(),
+            Some(&RestoreStep::StartIngress)
+        );
+        assert!(
+            !plan
+                .before_workloads
+                .contains(&RestoreStep::RefreshIngressUnit)
+        );
+
+        write(
+            temp.path(),
+            crate::ingress::INGRESS_UNIT_FILE,
+            "[Service]\nExecStart=/usr/local/bin/caddy run\nRestart=on-failure\n",
+        );
+        let applied = read_applied_network(temp.path());
+        assert_eq!(
+            applied.ingress,
+            Some(AppliedIngress {
+                unit_current: false
+            })
+        );
+        let plan = restore_plan(&applied, &live(&["coolify0"], true, true));
+        assert_eq!(
+            plan.before_workloads[plan.before_workloads.len() - 2..],
+            [RestoreStep::RefreshIngressUnit, RestoreStep::StartIngress]
+        );
+
+        // The refresh writes the current template; a test root skips systemd.
+        for step in &plan.before_workloads {
+            apply_restore_step(temp.path(), step).unwrap();
+        }
+        assert_eq!(
+            fs::read_to_string(temp.path().join(crate::ingress::INGRESS_UNIT_FILE)).unwrap(),
+            crate::ingress::ingress_unit()
+        );
+        assert!(
+            read_applied_network(temp.path())
+                .ingress
+                .unwrap()
+                .unit_current
+        );
+    }
+
+    #[test]
+    fn restore_never_recreates_an_ingress_unit_that_was_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        apply_restore_step(temp.path(), &RestoreStep::RefreshIngressUnit).unwrap();
+        assert!(!temp.path().join(crate::ingress::INGRESS_UNIT_FILE).exists());
+        assert!(read_applied_network(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn corrosion_schema_declares_the_ingress_route_table_and_is_rewritten_when_outdated() {
+        assert!(corrosion_schema().contains("CREATE TABLE IF NOT EXISTS ingress_routes (host TEXT NOT NULL PRIMARY KEY, workload_id TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);"));
+        assert!(corrosion_schema().starts_with("CREATE TABLE IF NOT EXISTS workload_endpoints"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("etc/corrosion/schemas/coolify.sql");
+        write(
+            temp.path(),
+            "etc/corrosion/schemas/coolify.sql",
+            "CREATE TABLE IF NOT EXISTS workload_endpoints (old);\n",
+        );
+        assert!(ensure_corrosion_schema(temp.path()).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), corrosion_schema());
+        assert!(!ensure_corrosion_schema(temp.path()).unwrap());
     }
 
     #[test]

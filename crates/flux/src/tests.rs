@@ -1122,3 +1122,217 @@ fn negotiates_the_trust_bundle_update_capability_when_granted() {
         vec![sentinel_protocol::CAPABILITY_TRUST_BUNDLE_UPDATE]
     );
 }
+
+#[tokio::test]
+async fn ingress_reconcile_route_forwards_the_routes_and_returns_the_ingress_state() {
+    use sentinel_protocol::control::v1::{
+        CommandResult, CommandStatus, IngressReconcileRequest, IngressReconcileResult,
+        IngressRoute, command::Payload, command_result, control_message::Message,
+    };
+
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_INGRESS_RECONCILE.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let request = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/ingress.reconcile"))
+            .bearer_auth("internal-secret")
+            .json(&serde_json::json!({
+                "server_id": "server-1",
+                "command_id": "ingress-7",
+                "enabled": true,
+                "caddy_version": "v2.11.7",
+                "revision": 7,
+                "routes": [
+                    {"host": "app.example.com", "workload_id": "web", "namespace": "default", "port": 3000},
+                    {"host": "api.example.com", "workload_id": "api", "namespace": "default", "port": 8080}
+                ],
+            }))
+            .send(),
+    );
+
+    let message = receiver.recv().await.unwrap();
+    let Some(Message::Command(command)) = message.message else {
+        panic!("expected a command");
+    };
+    assert_eq!(command.command_id, "ingress-7");
+    assert_eq!(
+        command.command_type,
+        sentinel_protocol::CAPABILITY_INGRESS_RECONCILE
+    );
+    assert_eq!(
+        command.payload,
+        Some(Payload::IngressReconcile(IngressReconcileRequest {
+            enabled: true,
+            caddy_version: "v2.11.7".into(),
+            revision: 7,
+            routes: vec![
+                IngressRoute {
+                    host: "app.example.com".into(),
+                    workload_id: "web".into(),
+                    namespace: "default".into(),
+                    port: 3000,
+                },
+                IngressRoute {
+                    host: "api.example.com".into(),
+                    workload_id: "api".into(),
+                    namespace: "default".into(),
+                    port: 8080,
+                },
+            ],
+        }))
+    );
+    registry
+        .complete(
+            "server-1",
+            CommandResult {
+                event_id: "ingress-7:result".into(),
+                command_id: "ingress-7".into(),
+                status: CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: 1_700_000_000_500,
+                payload: Some(command_result::Payload::IngressReconcile(
+                    IngressReconcileResult {
+                        enabled: true,
+                        caddy_version: "v2.11.7".into(),
+                        active: true,
+                        revision: 7,
+                        route_count: 2,
+                    },
+                )),
+            },
+        )
+        .await;
+
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({
+            "command_id": "ingress-7",
+            "observed_at_unix_ms": 1_700_000_000_500_i64,
+            "enabled": true,
+            "caddy_version": "v2.11.7",
+            "active": true,
+            "revision": 7,
+            "route_count": 2,
+        })
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn ingress_reconcile_route_requires_auth_a_valid_request_and_the_capability() {
+    let registry = ConnectionRegistry::default();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![CAPABILITY_SYSTEM_PING.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry,
+        "internal-secret".into(),
+    ));
+    let body = |server_id: &str, command_id: &str| {
+        serde_json::json!({
+            "server_id": server_id,
+            "command_id": command_id,
+            "enabled": false,
+        })
+    };
+
+    for (token, request, status) in [
+        (
+            "wrong",
+            body("server-1", "ingress-1"),
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "internal-secret",
+            body("server-1", "bad id!"),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            serde_json::json!({"server_id": "server-1", "command_id": "ingress-1"}),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            body("offline", "ingress-1"),
+            reqwest::StatusCode::NOT_FOUND,
+        ),
+        (
+            "internal-secret",
+            body("server-1", "ingress-1"),
+            reqwest::StatusCode::CONFLICT,
+        ),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/ingress.reconcile"))
+            .bearer_auth(token)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{request}");
+    }
+    server.abort();
+}
+
+#[test]
+fn negotiates_the_ingress_reconcile_capability_when_granted() {
+    let claims = CredentialClaims {
+        subject: "server-1".into(),
+        capabilities: vec![sentinel_protocol::CAPABILITY_INGRESS_RECONCILE.into()],
+        protocol_min: 1,
+        protocol_max: 1,
+        expires_at: i64::MAX,
+    };
+    let hello = sentinel_protocol::control::v1::Hello {
+        server_id: "server-1".into(),
+        sentinel_version: "main".into(),
+        protocol_min: 1,
+        protocol_max: 1,
+        capabilities: vec![sentinel_protocol::CAPABILITY_INGRESS_RECONCILE.into()],
+        boot_id: "boot-1".into(),
+        trust_bundle_version: 2,
+    };
+
+    assert_eq!(
+        negotiate(&claims, &hello).unwrap().capabilities,
+        vec![sentinel_protocol::CAPABILITY_INGRESS_RECONCILE]
+    );
+    let ungranted = CredentialClaims {
+        capabilities: vec![],
+        ..claims
+    };
+    assert!(
+        negotiate(&ungranted, &hello)
+            .unwrap()
+            .capabilities
+            .is_empty()
+    );
+}

@@ -4,7 +4,7 @@
 //! `coolify.dns_name` labels). Liveness comes from what this Sentinel observes
 //! locally, so internal DNS keeps working while Coolify is unavailable.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -47,6 +47,120 @@ pub(crate) fn publisher_lock() -> MutexGuard<'static, ()> {
     PUBLISHER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Containers that are about to stop or be removed. Their endpoints are
+/// published as `removing`, so ingress and DNS stop using them while they still run.
+static DRAINING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// How long a drained endpoint stays out of service before its container
+/// stops, when another endpoint can take its traffic: Corrosion replicates the
+/// change within about a second and every ingress renderer reads it on its
+/// next pass, at most `ingress::RENDER_INTERVAL` (5 s) later.
+pub(crate) const DRAIN_DURATION: Duration = Duration::from_secs(7);
+
+fn draining() -> MutexGuard<'static, BTreeSet<String>> {
+    DRAINING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Keeps a container's endpoint drained until it is dropped.
+#[derive(Debug)]
+pub(crate) struct Drain {
+    name: String,
+}
+
+impl Drop for Drain {
+    fn drop(&mut self) {
+        draining().remove(&self.name);
+    }
+}
+
+/// Publishes draining containers as `removing`.
+pub(crate) fn mark_draining(containers: &mut [ContainerObservation]) {
+    let draining = draining();
+    for container in containers {
+        if draining.contains(&container.name) {
+            container.state = "removing".into();
+        }
+    }
+}
+
+/// Counts the other serving endpoints of a workload that has an ingress route.
+pub(crate) fn serving_elsewhere_sql() -> &'static str {
+    "SELECT COUNT(*) FROM workload_endpoints WHERE namespace = 'default' AND workload_id = ? AND state = 'running' AND health NOT IN ('unhealthy', 'starting') AND expires_at > unixepoch() AND EXISTS (SELECT 1 FROM ingress_routes WHERE ingress_routes.workload_id = workload_endpoints.workload_id AND ingress_routes.namespace = workload_endpoints.namespace)"
+}
+
+/// How long to wait before the container stops: only a routed workload with
+/// another serving endpoint has somewhere else to send its traffic.
+pub(crate) fn drain_wait(serving_elsewhere: i64) -> Duration {
+    if serving_elsewhere > 0 {
+        DRAIN_DURATION
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// Takes the endpoint of container `name` out of service before it stops,
+/// and returns how long to wait so every ingress Node stops using it. Draining
+/// is best effort: a failure only means no wait.
+pub(crate) fn drain_endpoint(root: &Path, name: &str) -> (Drain, Duration) {
+    draining().insert(name.to_string());
+    let drain = Drain { name: name.into() };
+    let wait = match drained_wait(root, name) {
+        Ok(wait) => wait,
+        Err(error) => {
+            tracing::warn!(%error, container = %name, "could not drain the endpoint before the container stops");
+            Duration::ZERO
+        }
+    };
+    (drain, wait)
+}
+
+fn drained_wait(root: &Path, name: &str) -> Result<Duration, String> {
+    if root != Path::new("/") {
+        return Ok(Duration::ZERO);
+    }
+    let Some(identity) = read_identity(root)? else {
+        return Ok(Duration::ZERO);
+    };
+    let output = Command::new("podman")
+        .args([
+            "container",
+            "inspect",
+            "--format",
+            &format!("{{{{ index .Config.Labels \"{DNS_NAME_LABEL}\" }}}}"),
+            name,
+        ])
+        .output()
+        .map_err(|_| "Podman is unavailable.".to_string())?;
+    let workload_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || !valid_discovery_label(&workload_id) {
+        return Ok(Duration::ZERO);
+    }
+    if !matches!(publish_once(root)?, PublishOutcome::Published { .. }) {
+        return Ok(Duration::ZERO);
+    }
+    // The local Caddy drops the endpoint now: the renderer task may not run
+    // while this command blocks its thread.
+    if let Err(error) =
+        crate::ingress::render_once(root, &mut crate::ingress::RenderState::default())
+    {
+        tracing::warn!(%error, "could not render the ingress configuration for a drain");
+    }
+    let rows = corrosion_api(
+        &identity.owner_node_ip,
+        "queries",
+        &serde_json::to_vec(&json!([serving_elsewhere_sql(), [workload_id]])).unwrap_or_default(),
+    )
+    .and_then(|output| crate::ingress::parse_query_events(&output))?;
+    let serving = rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    Ok(drain_wait(serving))
 }
 
 /// One `workload_endpoints` row.
@@ -329,9 +443,22 @@ pub(crate) fn withdraw_endpoints(owner_node_ip: &str) -> Result<(), String> {
     )
 }
 
-fn post_transaction(owner_node_ip: &str, transaction: &[Value]) -> Result<(), String> {
+pub(crate) fn post_transaction(owner_node_ip: &str, transaction: &[Value]) -> Result<(), String> {
     let body = serde_json::to_vec(transaction)
-        .map_err(|_| "The Corrosion endpoint transaction could not be encoded.".to_string())?;
+        .map_err(|_| "The Corrosion transaction could not be encoded.".to_string())?;
+    corrosion_api(owner_node_ip, "transactions", &body).map(|_| ())
+}
+
+/// POSTs `body` to this Node's Corrosion HTTP API at `/v1/{path}` and returns
+/// the response body.
+pub(crate) fn corrosion_api(
+    owner_node_ip: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<Vec<u8>, String> {
+    let owner = owner_node_ip
+        .parse::<Ipv4Addr>()
+        .map_err(|_| "The Node owner address is invalid.".to_string())?;
     // The body is streamed over stdin: a single argv entry is capped at 128 KiB.
     let mut child = Command::new("curl")
         .args([
@@ -347,7 +474,7 @@ fn post_transaction(owner_node_ip: &str, transaction: &[Value]) -> Result<(), St
             "--data-binary",
             "@-",
         ])
-        .arg(format!("http://{owner_node_ip}:8080/v1/transactions"))
+        .arg(format!("http://{owner}:8080/v1/{path}"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -359,23 +486,27 @@ fn post_transaction(owner_node_ip: &str, transaction: &[Value]) -> Result<(), St
         .ok_or("curl input is unavailable.")
         .and_then(|mut stdin| {
             stdin
-                .write_all(&body)
-                .map_err(|_| "The Corrosion transaction could not be sent.")
+                .write_all(body)
+                .map_err(|_| "The Corrosion request could not be sent.")
         });
     let output = child
         .wait_with_output()
-        .map_err(|_| "Corrosion could not publish the endpoint snapshot.".to_string())?;
+        .map_err(|_| "Corrosion could not be reached.".to_string())?;
     written?;
     if output.status.success() {
-        return Ok(());
+        return Ok(output.stdout);
     }
-    let message = String::from_utf8_lossy(&output.stderr)
-        .trim()
+    let message = [output.stdout.as_slice(), output.stderr.as_slice()]
+        .iter()
+        .map(|part| String::from_utf8_lossy(part).trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
         .chars()
         .take(500)
         .collect::<String>();
     Err(if message.is_empty() {
-        "Corrosion could not publish the endpoint snapshot.".into()
+        "Corrosion rejected the request.".into()
     } else {
         message
     })
@@ -403,8 +534,9 @@ pub(crate) fn publish_once(root: &Path) -> Result<PublishOutcome, String> {
     if !listed.status.success() {
         return Err("Podman could not list containers.".into());
     }
-    let containers =
+    let mut containers =
         crate::commands::parse_podman_containers(&listed.stdout).map_err(str::to_string)?;
+    mark_draining(&mut containers);
     let ids = containers
         .iter()
         .filter(|container| published_dns_name(container).is_some())
@@ -439,8 +571,14 @@ pub(crate) fn publish_once(root: &Path) -> Result<PublishOutcome, String> {
 }
 
 /// Publishes once at start, then every `PUBLISH_INTERVAL` and whenever
-/// `trigger` is notified, until shutdown.
-pub(crate) async fn run(root: PathBuf, trigger: Arc<Notify>, mut shutdown: watch::Receiver<bool>) {
+/// `trigger` is notified, until shutdown. `published` is notified after each
+/// successful publish, so the ingress renderer follows endpoint changes.
+pub(crate) async fn run(
+    root: PathBuf,
+    trigger: Arc<Notify>,
+    published: Arc<Notify>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut ticker = tokio::time::interval(PUBLISH_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_error: Option<String> = None;
@@ -463,6 +601,7 @@ pub(crate) async fn run(root: PathBuf, trigger: Arc<Notify>, mut shutdown: watch
                     tracing::info!(endpoints, "discovery endpoint publishing recovered");
                 }
                 tracing::debug!(endpoints, "published discovery endpoints");
+                published.notify_one();
             }
             Ok(PublishOutcome::Skipped(reason)) => {
                 last_error = None;
@@ -626,6 +765,39 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_draining_container_is_published_as_removing_until_the_drain_ends() {
+        let mut containers = vec![
+            container("drained-1", "running", &[]),
+            container("kept-1", "running", &[]),
+        ];
+        let (drain, wait) = drain_endpoint(Path::new("/nonexistent-root"), "container-drained-1");
+        assert_eq!(wait, Duration::ZERO);
+        mark_draining(&mut containers);
+        assert_eq!(containers[0].state, "removing");
+        assert_eq!(containers[1].state, "running");
+
+        drop(drain);
+        let mut containers = vec![container("drained-1", "running", &[])];
+        mark_draining(&mut containers);
+        assert_eq!(containers[0].state, "running");
+    }
+
+    #[test]
+    fn a_drained_endpoint_leaves_ingress_and_waits_only_when_another_endpoint_serves() {
+        assert!(ALLOWED_STATES.contains(&"removing"));
+        // Ingress only routes to running endpoints.
+        assert!(crate::ingress::endpoints_query_sql().contains("state = 'running'"));
+        let sql = serving_elsewhere_sql();
+        assert!(sql.contains("workload_id = ?") && sql.contains("state = 'running'"));
+        assert!(sql.contains("health NOT IN ('unhealthy', 'starting')"));
+        assert!(sql.contains("expires_at > unixepoch()"));
+        assert!(sql.contains("FROM ingress_routes"));
+        assert_eq!(drain_wait(0), Duration::ZERO);
+        assert_eq!(drain_wait(1), DRAIN_DURATION);
+        assert!(DRAIN_DURATION > crate::ingress::RENDER_INTERVAL);
     }
 
     #[test]
@@ -808,7 +980,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (sender, receiver) = watch::channel(false);
         let trigger = Arc::new(Notify::new());
-        let task = tokio::spawn(run(temp.path().to_path_buf(), trigger.clone(), receiver));
+        let task = tokio::spawn(run(
+            temp.path().to_path_buf(),
+            trigger.clone(),
+            Arc::new(Notify::new()),
+            receiver,
+        ));
         trigger.notify_one();
         sender.send(true).unwrap();
 

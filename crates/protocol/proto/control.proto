@@ -78,6 +78,7 @@ message Command {
     ClusterLeaveRequest cluster_leave = 24;
     LogsReadRequest logs_read = 25;
     TrustBundleUpdateRequest trust_bundle_update = 26;
+    IngressReconcileRequest ingress_reconcile = 27;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -118,6 +119,7 @@ message CommandResult {
     ClusterLeaveResult cluster_leave = 24;
     LogsReadResult logs_read = 25;
     TrustBundleUpdateResult trust_bundle_update = 26;
+    IngressReconcileResult ingress_reconcile = 27;
     CommandError error = 20;
   }
 }
@@ -317,6 +319,35 @@ message TrustBundleUpdateRequest {
 message TrustBundleUpdateResult {
   uint64 installed_version = 1;
   bool changed = 2;
+}
+
+// Converges this Node's HTTP ingress (Caddy on :80) and the cluster-wide route
+// table in Corrosion. Every Node with ingress receives the same request; the
+// route write is idempotent for the same revision and rejects older revisions.
+message IngressReconcileRequest {
+  bool enabled = 1;
+  // Must equal the Caddy version this Sentinel pins, for example "v2.11.7".
+  string caddy_version = 2;
+  uint64 revision = 3;
+  repeated IngressRoute routes = 4;
+}
+
+message IngressRoute {
+  // Lowercase hostname, for example "app.example.com".
+  string host = 1;
+  // Discovery DNS label of the workload.
+  string workload_id = 2;
+  string namespace = 3;
+  // Workload container port.
+  uint32 port = 4;
+}
+
+message IngressReconcileResult {
+  bool enabled = 1;
+  string caddy_version = 2;
+  bool active = 3;
+  uint64 revision = 4;
+  uint64 route_count = 5;
 }
 
 message CommandError {

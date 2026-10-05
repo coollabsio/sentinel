@@ -20,7 +20,8 @@ pub const CAPABILITY_FIREWALL_INSPECT: &str = "network.firewall.inspect.v1";
 pub const CAPABILITY_FIREWALL_RECONCILE: &str = "network.firewall.reconcile.v1";
 pub const CAPABILITY_CORROSION_INSPECT: &str = "discovery.corrosion.inspect.v1";
 pub const CAPABILITY_CORROSION_RECONCILE: &str = "discovery.corrosion.reconcile.v1";
-pub const NETWORK_CAPABILITIES: [&str; 8] = [
+pub const CAPABILITY_INGRESS_RECONCILE: &str = "ingress.reconcile.v1";
+pub const NETWORK_CAPABILITIES: [&str; 9] = [
     CAPABILITY_CLUSTER_LEAVE,
     CAPABILITY_WIREGUARD_KEY_ENSURE,
     CAPABILITY_WIREGUARD_INSPECT,
@@ -29,6 +30,7 @@ pub const NETWORK_CAPABILITIES: [&str; 8] = [
     CAPABILITY_FIREWALL_RECONCILE,
     CAPABILITY_CORROSION_INSPECT,
     CAPABILITY_CORROSION_RECONCILE,
+    CAPABILITY_INGRESS_RECONCILE,
 ];
 
 pub mod control {
