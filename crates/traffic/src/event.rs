@@ -30,10 +30,12 @@ pub struct RequestEvent<'a> {
     pub scheme: Cow<'a, str>,
     /// TLS version if applicable (e.g. "1.3"), normalized.
     pub tls_version: Option<Cow<'a, str>>,
-    /// Best real client IP (pre-CF precedence: raw connection IP).
+    /// TCP peer IP (Traefik `ClientHost`, Caddy `remote_ip`).
     pub client_ip: Option<Cow<'a, str>>,
-    /// X-Forwarded-For header raw value.
-    pub xff: Option<Cow<'a, str>>,
+    /// Client IP as vetted by the proxy: Traefik's logged X-Forwarded-For (it
+    /// drops the header unless the peer is in `forwardedHeaders.trustedIPs`;
+    /// the first entry is used) or Caddy's `client_ip` (honours `trusted_proxies`).
+    pub forwarded_ip: Option<Cow<'a, str>>,
     /// User-Agent header.
     pub user_agent: Option<Cow<'a, str>>,
     /// Referer header.

@@ -72,3 +72,15 @@ fn internal_router_is_dropped() {
     let line = br#"{"ClientAddr":"10.0.0.5:54321","ClientHost":"10.0.0.5","DownstreamContentSize":512,"DownstreamStatus":200,"Duration":1000000,"RequestContentSize":0,"RequestHost":"traefik.example.com","RequestMethod":"GET","RequestPath":"/dashboard/","RequestProtocol":"HTTP/1.1","RequestScheme":"https","RouterName":"api@internal","StartUTC":"2026-08-09T12:00:10.000000000Z","time":"2026-08-09T12:00:10Z"}"#;
     assert!(super::parse(line).is_none());
 }
+
+/// Traefik only logs X-Forwarded-For it trusts, so it is kept as the forwarded
+/// IP even from a public, non-Cloudflare peer (a third-party proxy).
+#[test]
+fn logged_xff_is_forwarded_ip_from_public_peer() {
+    let line = br#"{"ClientHost":"203.0.113.9","DownstreamContentSize":0,"DownstreamStatus":200,"Duration":1000000,"RequestContentSize":0,"RequestHost":"app.example.com","RequestMethod":"GET","RequestPath":"/","RequestProtocol":"HTTP/1.1","RequestScheme":"https","RouterName":"https-0-jc4wsgs@docker","StartUTC":"2026-08-09T12:00:00.000000000Z","request_X-Forwarded-For":"198.51.100.4, 203.0.113.9"}"#;
+    let ev = super::parse(line).unwrap();
+    assert_eq!(ev.client_ip.as_deref(), Some("203.0.113.9"));
+    let enriched =
+        crate::enrich::Enricher::new(std::sync::Arc::new(crate::enrich::NoGeo), 8).enrich(&ev);
+    assert_eq!(enriched.client_ip, "198.51.100.4".parse().ok());
+}

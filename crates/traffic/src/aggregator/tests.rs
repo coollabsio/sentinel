@@ -17,7 +17,7 @@ fn base_event() -> RequestEvent<'static> {
         scheme: "https".into(),
         tls_version: None,
         client_ip: None,
-        xff: None,
+        forwarded_ip: None,
         user_agent: None,
         referer: None,
         cf_connecting_ip: None,

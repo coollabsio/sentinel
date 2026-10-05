@@ -19,8 +19,6 @@ struct Headers<'a> {
     user_agent: Option<Vec<Cow<'a, str>>>,
     #[serde(rename = "Referer", borrow, default)]
     referer: Option<Vec<Cow<'a, str>>>,
-    #[serde(rename = "X-Forwarded-For", borrow, default)]
-    xff: Option<Vec<Cow<'a, str>>>,
     #[serde(rename = "Cf-Connecting-Ip", borrow, default)]
     cf_connecting_ip: Option<Vec<Cow<'a, str>>>,
     #[serde(rename = "Cf-Ipcountry", borrow, default)]
@@ -48,6 +46,10 @@ struct Req<'a> {
     proto: Cow<'a, str>,
     #[serde(borrow, default)]
     remote_ip: Option<Cow<'a, str>>,
+    /// Client IP after Caddy's `trusted_proxies` handling; equals `remote_ip`
+    /// when none are configured. Absent in older Caddy logs.
+    #[serde(borrow, default)]
+    client_ip: Option<Cow<'a, str>>,
     #[serde(default)]
     tls: Option<Tls>,
     headers: Headers<'a>,
@@ -136,7 +138,9 @@ pub fn parse(line: &[u8]) -> Option<RequestEvent<'_>> {
         scheme: Cow::Borrowed(scheme),
         tls_version,
         client_ip: raw.request.remote_ip,
-        xff: first_value(headers.xff),
+        // Caddy logs X-Forwarded-For as sent by the client; `client_ip` is
+        // the value Caddy itself vetted against `trusted_proxies`.
+        forwarded_ip: raw.request.client_ip,
         user_agent: first_value(headers.user_agent),
         referer: first_value(headers.referer),
         cf_connecting_ip: first_value(headers.cf_connecting_ip),

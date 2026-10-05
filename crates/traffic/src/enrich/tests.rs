@@ -24,7 +24,7 @@ fn base_event() -> RequestEvent<'static> {
         scheme: "".into(),
         tls_version: None,
         client_ip: None,
-        xff: None,
+        forwarded_ip: None,
         user_agent: None,
         referer: None,
         cf_connecting_ip: None,
@@ -62,10 +62,10 @@ fn falls_back_to_geoip_when_no_cf() {
 fn client_ip_precedence() {
     let enricher = Enricher::new(Arc::new(NoGeo), 8);
 
-    // cf_connecting_ip beats xff and client_ip.
+    // cf_connecting_ip beats forwarded_ip and client_ip.
     let mut ev = base_event();
     ev.cf_connecting_ip = Some("10.0.0.1".into());
-    ev.xff = Some("10.0.0.2, 10.0.0.3".into());
+    ev.forwarded_ip = Some("10.0.0.2, 10.0.0.3".into());
     ev.client_ip = Some("10.0.0.4".into());
     let result = enricher.enrich(&ev);
     assert_eq!(
@@ -73,9 +73,9 @@ fn client_ip_precedence() {
         Some("10.0.0.1".parse::<IpAddr>().unwrap())
     );
 
-    // xff beats client_ip when cf_connecting_ip is absent.
+    // The first forwarded_ip entry beats client_ip when cf_connecting_ip is absent.
     let mut ev = base_event();
-    ev.xff = Some("10.0.0.2, 10.0.0.3".into());
+    ev.forwarded_ip = Some("10.0.0.2, 10.0.0.3".into());
     ev.client_ip = Some("10.0.0.4".into());
     let result = enricher.enrich(&ev);
     assert_eq!(
@@ -83,7 +83,7 @@ fn client_ip_precedence() {
         Some("10.0.0.2".parse::<IpAddr>().unwrap())
     );
 
-    // client_ip used when neither cf_connecting_ip nor xff present.
+    // client_ip used when neither cf_connecting_ip nor forwarded_ip present.
     let mut ev = base_event();
     ev.client_ip = Some("10.0.0.4".into());
     let result = enricher.enrich(&ev);
@@ -97,16 +97,18 @@ fn ip(s: &str) -> Option<IpAddr> {
     Some(s.parse().unwrap())
 }
 
+/// A third-party proxy with a public IP (Hetzner LB, a CDN, nginx on another
+/// VPS) that the proxy itself trusts: its forwarded IP is used, not the proxy's.
 #[test]
-fn public_peer_ignores_spoofed_xff() {
+fn public_peer_forwarded_ip_is_used() {
     let enricher = Enricher::new(Arc::new(NoGeo), 8);
     let mut ev = base_event();
     ev.client_ip = Some("8.8.8.8".into());
-    ev.xff = Some("1.2.3.4".into());
+    ev.forwarded_ip = Some("1.2.3.4, 8.8.8.8".into());
 
     let result = enricher.enrich(&ev);
 
-    assert_eq!(result.client_ip, ip("8.8.8.8"));
+    assert_eq!(result.client_ip, ip("1.2.3.4"));
 }
 
 #[test]
@@ -124,29 +126,31 @@ fn public_peer_ignores_spoofed_cloudflare_headers() {
 }
 
 #[test]
+fn public_peer_spoofed_cf_ip_falls_back_to_forwarded_ip() {
+    let enricher = Enricher::new(Arc::new(NoGeo), 8);
+    let mut ev = base_event();
+    ev.client_ip = Some("8.8.8.8".into());
+    ev.cf_connecting_ip = Some("1.2.3.4".into());
+    ev.forwarded_ip = Some("5.6.7.8".into());
+
+    let result = enricher.enrich(&ev);
+
+    assert_eq!(result.client_ip, ip("5.6.7.8"));
+}
+
+#[test]
 fn cloudflare_peer_trusts_cf_connecting_ip_and_country() {
     let enricher = Enricher::new(Arc::new(FakeGeo), 8);
     let mut ev = base_event();
     ev.client_ip = Some("172.70.1.1".into());
     ev.cf_connecting_ip = Some("1.2.3.4".into());
     ev.cf_country = Some("US".into());
+    ev.forwarded_ip = Some("5.6.7.8".into());
 
     let result = enricher.enrich(&ev);
 
     assert_eq!(result.client_ip, ip("1.2.3.4"));
     assert_eq!(result.country, Some("US".to_string()));
-}
-
-#[test]
-fn cloudflare_peer_ignores_xff() {
-    let enricher = Enricher::new(Arc::new(NoGeo), 8);
-    let mut ev = base_event();
-    ev.client_ip = Some("104.16.0.10".into());
-    ev.xff = Some("1.2.3.4".into());
-
-    let result = enricher.enrich(&ev);
-
-    assert_eq!(result.client_ip, ip("104.16.0.10"));
 }
 
 #[test]
@@ -162,8 +166,8 @@ fn ipv6_cloudflare_peer_trusts_cf_connecting_ip() {
 }
 
 #[test]
-fn private_and_loopback_peers_trust_xff() {
-    let enricher = Enricher::new(Arc::new(NoGeo), 8);
+fn local_peers_trust_cloudflare_headers() {
+    let enricher = Enricher::new(Arc::new(FakeGeo), 8);
     for peer in [
         "172.18.0.1",
         "127.0.0.1",
@@ -173,11 +177,13 @@ fn private_and_loopback_peers_trust_xff() {
     ] {
         let mut ev = base_event();
         ev.client_ip = Some(peer.into());
-        ev.xff = Some("1.2.3.4, 5.6.7.8".into());
+        ev.cf_connecting_ip = Some("1.2.3.4".into());
+        ev.cf_country = Some("US".into());
 
         let result = enricher.enrich(&ev);
 
         assert_eq!(result.client_ip, ip("1.2.3.4"), "peer {peer}");
+        assert_eq!(result.country, Some("US".to_string()), "peer {peer}");
     }
 }
 
@@ -186,7 +192,7 @@ fn ipv4_mapped_public_peer_is_untrusted() {
     let enricher = Enricher::new(Arc::new(NoGeo), 8);
     let mut ev = base_event();
     ev.client_ip = Some("::ffff:8.8.8.8".into());
-    ev.xff = Some("1.2.3.4".into());
+    ev.cf_connecting_ip = Some("1.2.3.4".into());
 
     let result = enricher.enrich(&ev);
 
@@ -194,11 +200,10 @@ fn ipv4_mapped_public_peer_is_untrusted() {
 }
 
 #[test]
-fn missing_peer_ignores_forwarding_headers() {
+fn missing_peer_ignores_cloudflare_headers() {
     let enricher = Enricher::new(Arc::new(FakeGeo), 8);
     let mut ev = base_event();
     ev.cf_connecting_ip = Some("1.2.3.4".into());
-    ev.xff = Some("5.6.7.8".into());
     ev.cf_country = Some("US".into());
 
     let result = enricher.enrich(&ev);
@@ -208,15 +213,16 @@ fn missing_peer_ignores_forwarding_headers() {
 }
 
 #[test]
-fn unparseable_peer_ignores_forwarding_headers() {
+fn unparseable_peer_ignores_cloudflare_headers() {
     let enricher = Enricher::new(Arc::new(NoGeo), 8);
     let mut ev = base_event();
     ev.client_ip = Some("not-an-ip".into());
     ev.cf_connecting_ip = Some("1.2.3.4".into());
+    ev.forwarded_ip = Some("5.6.7.8".into());
 
     let result = enricher.enrich(&ev);
 
-    assert_eq!(result.client_ip, None);
+    assert_eq!(result.client_ip, ip("5.6.7.8"));
 }
 
 #[test]
@@ -225,7 +231,7 @@ fn unparseable_header_ip_falls_back_to_peer() {
     let mut ev = base_event();
     ev.client_ip = Some("10.0.0.4".into());
     ev.cf_connecting_ip = Some("garbage".into());
-    ev.xff = Some("also-garbage".into());
+    ev.forwarded_ip = Some("also-garbage".into());
 
     let result = enricher.enrich(&ev);
 

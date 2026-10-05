@@ -95,7 +95,9 @@ pub fn parse(line: &[u8]) -> Option<RequestEvent<'_>> {
         scheme: raw.request_scheme,
         tls_version: raw.tls_version,
         client_ip: raw.client_host,
-        xff: raw.xff,
+        // Traefik strips X-Forwarded-For before logging unless the peer is in
+        // `forwardedHeaders.trustedIPs`, so a logged value is already vetted.
+        forwarded_ip: raw.xff,
         user_agent: raw.user_agent,
         referer: raw.referer,
         cf_connecting_ip: raw.cf_connecting_ip,
