@@ -2768,3 +2768,43 @@ fn container_logs_commands_are_not_journaled() {
         2
     );
 }
+
+#[test]
+fn passes_any_podman_environment_variable_and_rejects_unpassable_ones() {
+    let variable =
+        |key: &str, value: &str| sentinel_protocol::control::v1::WorkloadEnvironmentVariable {
+            key: key.into(),
+            value: value.into(),
+        };
+    let request = |environment| sentinel_protocol::control::v1::WorkloadDeployRequest {
+        name: "coolify-test-web".into(),
+        image: "docker.io/library/alpine:latest".into(),
+        restart_policy: "unless-stopped".into(),
+        environment,
+        ..Default::default()
+    };
+    let long_value = "x".repeat(10_000);
+    let mut environment = vec![variable("app.name", "demo"), variable("1BAD", &long_value)];
+    environment.extend((0..300).map(|index| variable(&format!("VAR_{index}"), "value")));
+
+    let arguments = crate::commands::podman_deploy_args(&request(environment)).unwrap();
+
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--env", "app.name=demo"])
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v[0] == "--env" && v[1] == format!("1BAD={long_value}"))
+    );
+    for invalid in [
+        variable("", "x"),
+        variable("A=B", "x"),
+        variable("A\0B", "x"),
+        variable("A", "x\0y"),
+    ] {
+        assert!(crate::commands::podman_deploy_args(&request(vec![invalid])).is_err());
+    }
+}

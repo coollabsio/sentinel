@@ -814,11 +814,7 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
         "always" => "always",
         _ => return Err("The image pull policy is invalid.".into()),
     };
-    if request.command.len() > 64
-        || request.environment.len() > 256
-        || request.labels.len() > 128
-        || request.ports.len() > 128
-    {
+    if request.command.len() > 64 || request.labels.len() > 128 || request.ports.len() > 128 {
         return Err("The workload configuration is too large.".into());
     }
     let uses_managed_network = !request.network_name.is_empty()
@@ -888,14 +884,8 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
     for variable in &request.environment {
         let key = &variable.key;
         let value = &variable.value;
-        if key.is_empty()
-            || key.len() > 255
-            || value.len() > 4_096
-            || value.contains('\0')
-            || !key.chars().enumerate().all(|(i, c)| {
-                c == '_' || c.is_ascii_alphanumeric() && (i > 0 || !c.is_ascii_digit())
-            })
-        {
+        // Podman accepts any name and value; only `=` in a name and null bytes cannot be passed as `--env KEY=VALUE`.
+        if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
             return Err("An environment variable is invalid.".into());
         }
         args.extend(["--env".into(), format!("{key}={value}")]);
