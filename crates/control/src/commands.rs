@@ -12,12 +12,12 @@ use sentinel_protocol::control::v1::{
     WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
-    CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_INSPECT,
-    CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT, CAPABILITY_FIREWALL_RECONCILE,
-    CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO,
-    CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE, CAPABILITY_WIREGUARD_INSPECT,
-    CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY,
-    CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
+    CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT,
+    CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ,
+    CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
+    CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
@@ -125,9 +125,13 @@ impl CommandExecutor {
         capability_accepted: bool,
     ) -> CommandExecution {
         let request = journal_request(&command);
-        // logs.read is a read-only, frequently polled command. Its results are
-        // never replayed, so it is not journaled; a repeated ID reads again.
-        let journaled = command.command_type != CAPABILITY_LOGS_READ;
+        // logs.read and container.logs are read-only, frequently polled
+        // commands. Their results are never replayed, so they are not
+        // journaled; a repeated ID reads again.
+        let journaled = !matches!(
+            command.command_type.as_str(),
+            CAPABILITY_LOGS_READ | CAPABILITY_CONTAINER_LOGS
+        );
         let lookup = if journaled {
             self.journal.lookup(&command.command_id, &request)
         } else {
@@ -193,6 +197,9 @@ impl CommandExecutor {
                         Ok(LogSource::Sentinel | LogSource::Corrosion | LogSource::DiscoveryDns)
                     )
             }
+            (CAPABILITY_CONTAINER_LOGS, Some(Payload::ContainerLogs(request))) => {
+                crate::container_logs::validate(request).is_ok()
+            }
             (CAPABILITY_CLUSTER_LEAVE, Some(Payload::ClusterLeave(request))) => {
                 crate::network::validate_cluster_leave(request).is_ok()
             }
@@ -237,6 +244,7 @@ impl CommandExecutor {
                     | CAPABILITY_SYSTEM_INFO
                     | CAPABILITY_CONTAINER_LIST
                     | CAPABILITY_LOGS_READ
+                    | CAPABILITY_CONTAINER_LOGS
                     | CAPABILITY_TRUST_BUNDLE_UPDATE
                     | CAPABILITY_WORKLOAD_DEPLOY
                     | CAPABILITY_WORKLOAD_LIFECYCLE
@@ -368,6 +376,14 @@ impl CommandExecutor {
                     }),
                 ),
                 Err(message) => failed(&command.command_id, "logs_read_failed", &message),
+            }
+        } else if let Some(Payload::ContainerLogs(request)) = command.payload {
+            match crate::container_logs::read(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::ContainerLogs(result),
+                ),
+                Err(message) => failed(&command.command_id, "container_logs_failed", &message),
             }
         } else if let Some(Payload::TrustBundleUpdate(request)) = command.payload {
             match self.control_tls.as_ref() {
@@ -641,14 +657,7 @@ pub(crate) fn journal_request(command: &Command) -> Vec<u8> {
 /// Container names Podman accepts. They also name the durable stop markers,
 /// so a leading dot (`.`, `..`) is never allowed.
 pub(crate) fn valid_container_name(name: &str) -> bool {
-    name.len() <= 128
-        && name
-            .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_alphanumeric())
-        && name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+    sentinel_protocol::valid_container_name(name)
 }
 
 fn workload_deploy(

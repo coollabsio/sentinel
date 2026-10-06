@@ -1336,3 +1336,314 @@ fn negotiates_the_ingress_reconcile_capability_when_granted() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn container_logs_route_returns_the_container_output() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_CONTAINER_LOGS.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let request = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/container.logs"))
+            .bearer_auth("internal-secret")
+            .json(&serde_json::json!({
+                "server_id": "server-1",
+                "command_id": "container-logs-1",
+                "name": "coolify-app",
+                "lines": 200,
+                "since_unix_seconds": 1_700_000_000,
+            }))
+            .send(),
+    );
+
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    assert_eq!(command.command_id, "container-logs-1");
+    assert_eq!(
+        command.command_type,
+        sentinel_protocol::CAPABILITY_CONTAINER_LOGS
+    );
+    assert_eq!(command.payload_version, 1);
+    assert_eq!(
+        command.payload,
+        Some(
+            sentinel_protocol::control::v1::command::Payload::ContainerLogs(
+                sentinel_protocol::control::v1::ContainerLogsRequest {
+                    name: "coolify-app".into(),
+                    lines: 200,
+                    since_unix_seconds: Some(1_700_000_000),
+                }
+            )
+        )
+    );
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: "container-logs-1:result".into(),
+                command_id: "container-logs-1".into(),
+                status: sentinel_protocol::control::v1::CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: 1_700_000_000_500,
+                payload: Some(
+                    sentinel_protocol::control::v1::command_result::Payload::ContainerLogs(
+                        sentinel_protocol::control::v1::ContainerLogsResult {
+                            name: "coolify-app".into(),
+                            logs: "2026-10-06T10:00:00.000000001Z ready\n".into(),
+                            truncated: true,
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({
+            "command_id": "container-logs-1",
+            "observed_at_unix_ms": 1_700_000_000_500_i64,
+            "name": "coolify-app",
+            "logs": "2026-10-06T10:00:00.000000001Z ready\n",
+            "truncated": true,
+        })
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn container_logs_route_omits_since_and_reports_sentinel_errors() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_CONTAINER_LOGS.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let request = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/container.logs"))
+            .bearer_auth("internal-secret")
+            .json(&serde_json::json!({
+                "server_id": "server-1",
+                "command_id": "container-logs-2",
+                "name": "unmanaged",
+                "lines": 10,
+            }))
+            .send(),
+    );
+
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    assert!(matches!(
+        command.payload,
+        Some(
+            sentinel_protocol::control::v1::command::Payload::ContainerLogs(
+                sentinel_protocol::control::v1::ContainerLogsRequest {
+                    since_unix_seconds: None,
+                    lines: 10,
+                    ..
+                }
+            )
+        )
+    ));
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: "container-logs-2:result".into(),
+                command_id: "container-logs-2".into(),
+                status: sentinel_protocol::control::v1::CommandStatus::Failed.into(),
+                observed_at_unix_ms: 1,
+                payload: Some(
+                    sentinel_protocol::control::v1::command_result::Payload::Error(
+                        sentinel_protocol::control::v1::CommandError {
+                            code: "container_logs_failed".into(),
+                            message: "The container is not managed by Coolify.".into(),
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response.text().await.unwrap(),
+        "The container is not managed by Coolify."
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn container_logs_route_validates_auth_the_request_and_the_capability() {
+    let registry = ConnectionRegistry::default();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![CAPABILITY_SYSTEM_PING.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry,
+        "internal-secret".into(),
+    ));
+    let valid = serde_json::json!({
+        "server_id": "server-1",
+        "command_id": "container-logs-1",
+        "name": "coolify-app",
+        "lines": 100,
+    });
+    let with = |field: &str, value: serde_json::Value| {
+        let mut body = valid.clone();
+        body[field] = value;
+        body
+    };
+
+    for (token, body, status) in [
+        ("wrong", valid.clone(), reqwest::StatusCode::UNAUTHORIZED),
+        (
+            "internal-secret",
+            with("name", "".into()),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            with("name", ".hidden".into()),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            with("name", "a;rm -rf /".into()),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            with("name", "a".repeat(129).into()),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            with("lines", 0.into()),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            with("lines", 10_001.into()),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            with("since_unix_seconds", 0.into()),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            with("since_unix_seconds", (-5).into()),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            with("command_id", "bad id!".into()),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "internal-secret",
+            with("server_id", "offline".into()),
+            reqwest::StatusCode::NOT_FOUND,
+        ),
+        (
+            "internal-secret",
+            valid.clone(),
+            reqwest::StatusCode::CONFLICT,
+        ),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/container.logs"))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{token} {body}");
+    }
+    server.abort();
+}
+
+#[test]
+fn negotiates_the_container_logs_capability_when_granted() {
+    let claims = CredentialClaims {
+        subject: "server-1".into(),
+        capabilities: vec![sentinel_protocol::CAPABILITY_CONTAINER_LOGS.into()],
+        protocol_min: 1,
+        protocol_max: 1,
+        expires_at: i64::MAX,
+    };
+    let hello = sentinel_protocol::control::v1::Hello {
+        server_id: "server-1".into(),
+        sentinel_version: "main".into(),
+        protocol_min: 1,
+        protocol_max: 1,
+        capabilities: vec![sentinel_protocol::CAPABILITY_CONTAINER_LOGS.into()],
+        boot_id: "boot-1".into(),
+        trust_bundle_version: 2,
+    };
+
+    assert_eq!(
+        negotiate(&claims, &hello).unwrap().capabilities,
+        vec![sentinel_protocol::CAPABILITY_CONTAINER_LOGS]
+    );
+    let ungranted = CredentialClaims {
+        capabilities: vec![],
+        ..claims
+    };
+    assert!(
+        negotiate(&ungranted, &hello)
+            .unwrap()
+            .capabilities
+            .is_empty()
+    );
+}

@@ -7,6 +7,7 @@ pub const PROTOCOL_MAX: u32 = 1;
 pub const CAPABILITY_SYSTEM_PING: &str = "system.ping.v1";
 pub const CAPABILITY_SYSTEM_INFO: &str = "system.info.v1";
 pub const CAPABILITY_CONTAINER_LIST: &str = "container.list.v1";
+pub const CAPABILITY_CONTAINER_LOGS: &str = "container.logs.v1";
 pub const CAPABILITY_LOGS_READ: &str = "logs.read.v1";
 pub const CAPABILITY_TRUST_BUNDLE_UPDATE: &str = "trust.bundle.update.v1";
 pub const CAPABILITY_WORKLOAD_DEPLOY: &str = "workload.deploy.v1";
@@ -37,6 +38,20 @@ pub mod control {
     pub mod v1 {
         tonic::include_proto!("coolify.sentinel.control.v1");
     }
+}
+
+/// Container names that Podman accepts and that Sentinel also uses for file
+/// names: 1 to 128 ASCII letters, digits, `.`, `-` or `_`, starting with a
+/// letter or digit (so never `.` or `..`).
+pub fn valid_container_name(name: &str) -> bool {
+    name.len() <= 128
+        && name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
 }
 
 pub fn select_protocol(

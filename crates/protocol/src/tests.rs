@@ -129,6 +129,68 @@ fn logs_read_command_and_result_round_trip() {
 }
 
 #[test]
+fn container_logs_command_and_result_round_trip() {
+    assert_eq!(CAPABILITY_CONTAINER_LOGS, "container.logs.v1");
+    let command = control::v1::Command {
+        command_id: "container-logs-1".into(),
+        command_type: CAPABILITY_CONTAINER_LOGS.into(),
+        payload_version: 1,
+        created_at_unix_ms: 1,
+        payload: Some(control::v1::command::Payload::ContainerLogs(
+            control::v1::ContainerLogsRequest {
+                name: "coolify-app".into(),
+                lines: 100,
+                since_unix_seconds: Some(1_700_000_000),
+            },
+        )),
+        expires_at_unix_ms: 2,
+    };
+    assert_eq!(
+        control::v1::Command::decode(command.encode_to_vec().as_slice()).unwrap(),
+        command
+    );
+
+    let result = control::v1::CommandResult {
+        event_id: "container-logs-1:result".into(),
+        command_id: "container-logs-1".into(),
+        status: control::v1::CommandStatus::Succeeded.into(),
+        observed_at_unix_ms: 3,
+        payload: Some(control::v1::command_result::Payload::ContainerLogs(
+            control::v1::ContainerLogsResult {
+                name: "coolify-app".into(),
+                logs: "2026-10-06T10:00:00.123456789Z ready\n".into(),
+                truncated: true,
+            },
+        )),
+    };
+    assert_eq!(
+        control::v1::CommandResult::decode(result.encode_to_vec().as_slice()).unwrap(),
+        result
+    );
+}
+
+#[test]
+fn validates_container_names() {
+    for name in ["a", "coolify-app_1.web", "0abc", &"a".repeat(128)] {
+        assert!(valid_container_name(name), "{name}");
+    }
+    for name in [
+        "",
+        ".hidden",
+        "..",
+        "-flag",
+        "_x",
+        "has space",
+        "semi;colon",
+        "slash/name",
+        "dollar$x",
+        &"a".repeat(129),
+    ] {
+        assert!(!valid_container_name(name), "{name}");
+    }
+}
+
+#[test]
 fn selects_the_highest_overlapping_protocol() {
     assert_eq!(select_protocol(1, 3, 2, 4), Some(3));
     assert_eq!(select_protocol(1, 1, 1, 1), Some(1));

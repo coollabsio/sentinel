@@ -442,6 +442,18 @@ Result: `source`, `events` (oldest first; each has `timestamp_unix_ms`, `level`,
 
 Flux exposes it as `POST /v1/commands/logs.read` with `{"server_id", "source", "limit"}`.
 
+### `container.logs.v1`
+
+Request: `name` (the deploy/lifecycle container-name rule), `lines` (1 to 10,000), and optional `since_unix_seconds` (positive). Result: `name`, `logs`, and `truncated`.
+
+- Sentinel runs `podman container inspect <name>` and refuses containers without the label `coolify.managed=true` ("The container is not managed by Coolify.") and unknown containers ("The container does not exist.").
+- It then runs `podman logs --timestamps --tail <lines> [--since <unix seconds>] <container ID>` without a shell. Using the inspected ID means a container replaced under the same name in between is never read.
+- Podman writes container stdout to its stdout and container stderr to its stderr, one write per line. Both go into one pipe, so `logs` keeps Podman's output order (`2>&1`). Each line starts with an RFC 3339 timestamp with nanoseconds and a space, like `docker logs --timestamps`.
+- `logs` holds at most 4 MiB. Older output is dropped at a line boundary and `truncated` is set. Invalid UTF-8 is replaced. Inspect and logs share a 20-second timeout.
+- Results are not written to the command journal. A repeated command ID reads the logs again.
+
+Flux exposes it as `POST /v1/commands/container.logs` with `{"server_id", "command_id", "name", "lines", "since_unix_seconds"?}` and returns `{"command_id", "observed_at_unix_ms", "name", "logs", "truncated"}`.
+
 ### `trust.bundle.update.v1`
 
 Request: `version` and `bundle_pem`. Result: `installed_version` and `changed`.

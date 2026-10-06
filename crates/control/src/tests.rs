@@ -497,6 +497,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "workload.resources.v1",
             "workload.lifecycle.v1",
             "logs.read.v1",
+            "container.logs.v1",
             "trust.bundle.update.v1",
             "network.cluster.leave.v1",
             "network.wireguard.key.ensure.v1",
@@ -2371,4 +2372,392 @@ fn container_mac_addresses_are_stable_locally_administered_and_unique_per_addres
     );
     // Locally administered unicast: bit 1 of the first octet set, bit 0 clear.
     assert_eq!(u8::from_str_radix(&mac[..2], 16).unwrap() & 0b11, 0b10);
+}
+
+const MANAGED_CONTAINER_ID: &str =
+    "4f1c2b0e9d8a7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b";
+
+/// A fake Podman for `container.logs.v1`. It records its arguments, answers
+/// `container inspect` for `coolify-app` (managed), `unmanaged`, and anything
+/// else (missing), and prints interleaved stdout and stderr lines for `logs`.
+fn fake_logs_podman(root: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = root.join("fake-podman");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+echo "$@" >> '{root}/podman.log'
+if [ "$1 $2" = "container inspect" ]; then
+  case "$3" in
+    coolify-app) echo '[{{"Id":"{id}","Name":"coolify-app","Config":{{"Labels":{{"coolify.managed":"true"}}}}}}]' ;;
+    unmanaged) echo '[{{"Id":"{id}","Name":"unmanaged","Config":{{"Labels":{{"coolify.managed":"false"}}}}}}]' ;;
+    *) echo '[]'; echo "Error: no such container $3" >&2; exit 125 ;;
+  esac
+  exit 0
+fi
+if [ "$1" = logs ]; then
+  echo '2026-10-06T10:00:00.000000001Z out one'
+  echo '2026-10-06T10:00:00.000000002Z err one' >&2
+  echo '2026-10-06T10:00:00.000000003Z out two'
+  echo '2026-10-06T10:00:00.000000004Z err two' >&2
+  exit 0
+fi
+exit 125
+"#,
+            root = root.display(),
+            id = MANAGED_CONTAINER_ID,
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    script
+}
+
+fn container_logs_command(
+    command_id: &str,
+    name: &str,
+    lines: u32,
+    since_unix_seconds: Option<i64>,
+) -> sentinel_protocol::control::v1::Command {
+    sentinel_protocol::control::v1::Command {
+        command_id: command_id.into(),
+        command_type: sentinel_protocol::CAPABILITY_CONTAINER_LOGS.into(),
+        payload_version: 1,
+        payload: Some(
+            sentinel_protocol::control::v1::command::Payload::ContainerLogs(
+                sentinel_protocol::control::v1::ContainerLogsRequest {
+                    name: name.into(),
+                    lines,
+                    since_unix_seconds,
+                },
+            ),
+        ),
+        expires_at_unix_ms: i64::MAX,
+        ..Default::default()
+    }
+}
+
+fn command_error_message(result: &sentinel_protocol::control::v1::CommandResult) -> String {
+    match &result.payload {
+        Some(sentinel_protocol::control::v1::command_result::Payload::Error(error)) => {
+            assert_eq!(error.code, "container_logs_failed");
+            error.message.clone()
+        }
+        other => panic!("expected a command error, got {other:?}"),
+    }
+}
+
+#[test]
+fn validates_container_logs_requests() {
+    use sentinel_protocol::control::v1::ContainerLogsRequest;
+
+    let valid = ContainerLogsRequest {
+        name: "coolify-app".into(),
+        lines: 100,
+        since_unix_seconds: None,
+    };
+    assert!(crate::container_logs::validate(&valid).is_ok());
+    for lines in [1, 10_000] {
+        assert!(
+            crate::container_logs::validate(&ContainerLogsRequest {
+                lines,
+                ..valid.clone()
+            })
+            .is_ok()
+        );
+    }
+    assert!(
+        crate::container_logs::validate(&ContainerLogsRequest {
+            since_unix_seconds: Some(1),
+            ..valid.clone()
+        })
+        .is_ok()
+    );
+
+    for name in [
+        "",
+        ".hidden",
+        "-flag",
+        "a b",
+        "a;rm",
+        "a/b",
+        "$(id)",
+        &"a".repeat(129),
+    ] {
+        assert!(
+            crate::container_logs::validate(&ContainerLogsRequest {
+                name: name.into(),
+                ..valid.clone()
+            })
+            .is_err(),
+            "{name}"
+        );
+    }
+    for lines in [0, 10_001] {
+        assert!(
+            crate::container_logs::validate(&ContainerLogsRequest {
+                lines,
+                ..valid.clone()
+            })
+            .is_err(),
+            "{lines}"
+        );
+    }
+    for since in [0, -1] {
+        assert!(
+            crate::container_logs::validate(&ContainerLogsRequest {
+                since_unix_seconds: Some(since),
+                ..valid.clone()
+            })
+            .is_err(),
+            "{since}"
+        );
+    }
+}
+
+#[test]
+fn rejects_invalid_or_ungranted_container_logs_commands() {
+    for (index, (name, lines, since)) in [
+        ("", 10, None),
+        ("bad name", 10, None),
+        ("coolify-app", 0, None),
+        ("coolify-app", 10_001, None),
+        ("coolify-app", 10, Some(0)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let execution = crate::commands::CommandExecutor::new("dev").execute(
+            container_logs_command(
+                &format!("container-logs-invalid-{index}"),
+                name,
+                lines,
+                since,
+            ),
+            true,
+        );
+        assert!(!execution.accepted, "{name} {lines} {since:?}");
+    }
+    assert!(
+        !crate::commands::CommandExecutor::new("dev")
+            .execute(
+                container_logs_command("container-logs-not-granted", "coolify-app", 10, None),
+                false
+            )
+            .accepted
+    );
+}
+
+#[test]
+fn builds_podman_container_logs_arguments_without_a_shell() {
+    assert_eq!(
+        crate::container_logs::podman_inspect_args("coolify-app"),
+        ["container", "inspect", "coolify-app"]
+    );
+    assert_eq!(
+        crate::container_logs::podman_logs_args(MANAGED_CONTAINER_ID, 100, None),
+        [
+            "logs",
+            "--timestamps",
+            "--tail",
+            "100",
+            MANAGED_CONTAINER_ID
+        ]
+    );
+    assert_eq!(
+        crate::container_logs::podman_logs_args(MANAGED_CONTAINER_ID, 5, Some(1_700_000_000)),
+        [
+            "logs",
+            "--timestamps",
+            "--tail",
+            "5",
+            "--since",
+            "1700000000",
+            MANAGED_CONTAINER_ID
+        ]
+    );
+}
+
+#[test]
+fn only_reads_logs_of_containers_managed_by_coolify() {
+    let managed = |labels: Value| {
+        serde_json::to_vec(&json!([{
+            "Id": MANAGED_CONTAINER_ID,
+            "Name": "coolify-app",
+            "Config": {"Labels": labels}
+        }]))
+        .unwrap()
+    };
+
+    assert_eq!(
+        crate::container_logs::managed_container_id(&managed(json!({"coolify.managed": "true"})))
+            .unwrap(),
+        MANAGED_CONTAINER_ID
+    );
+    for labels in [
+        json!({"coolify.managed": "false"}),
+        json!({"coolify.managed": "TRUE"}),
+        json!({"coolify.managed": true}),
+        json!({"other": "true"}),
+        json!({}),
+        Value::Null,
+    ] {
+        assert_eq!(
+            crate::container_logs::managed_container_id(&managed(labels.clone())).unwrap_err(),
+            "The container is not managed by Coolify.",
+            "{labels}"
+        );
+    }
+    assert_eq!(
+        crate::container_logs::managed_container_id(b"[]").unwrap_err(),
+        "The container does not exist."
+    );
+    assert_eq!(
+        crate::container_logs::managed_container_id(b"not json").unwrap_err(),
+        "Podman returned invalid container data."
+    );
+    let bad_id = serde_json::to_vec(&json!([{
+        "Id": "abc; rm -rf /",
+        "Config": {"Labels": {"coolify.managed": "true"}}
+    }]))
+    .unwrap();
+    assert_eq!(
+        crate::container_logs::managed_container_id(&bad_id).unwrap_err(),
+        "Podman returned invalid container data."
+    );
+}
+
+#[test]
+fn container_logs_truncation_keeps_the_newest_whole_lines() {
+    let output = b"line one\nline two\nline three\n";
+
+    assert_eq!(
+        crate::container_logs::keep_newest(output, output.len()),
+        (&output[..], false)
+    );
+    // The cut lands inside "line two", so the partial line is dropped too.
+    assert_eq!(
+        crate::container_logs::keep_newest(output, 16),
+        (&b"line three\n"[..], true)
+    );
+    // The cut lands exactly on a line start.
+    assert_eq!(
+        crate::container_logs::keep_newest(output, 20),
+        (&b"line two\nline three\n"[..], true)
+    );
+    // One line longer than the limit keeps its newest bytes.
+    assert_eq!(
+        crate::container_logs::keep_newest(b"0123456789", 4),
+        (&b"6789"[..], true)
+    );
+
+    let lines: Vec<u8> = (0..50_000)
+        .flat_map(|index| format!("2026-10-06T10:00:00Z line {index}\n").into_bytes())
+        .collect();
+    let streamed = crate::container_logs::read_newest(std::io::Cursor::new(&lines), 1_000).unwrap();
+    assert!(streamed.len() <= 2 * 1_001);
+    let (kept, truncated) = crate::container_logs::keep_newest(&streamed, 1_000);
+    assert!(truncated);
+    assert_eq!(kept, crate::container_logs::keep_newest(&lines, 1_000).0);
+    assert!(kept.len() <= 1_000);
+    assert!(kept.ends_with(b"line 49999\n"));
+    assert!(kept.starts_with(b"2026-10-06T10:00:00Z line "));
+}
+
+#[test]
+fn reads_managed_container_logs_with_stdout_and_stderr_in_order() {
+    use sentinel_protocol::control::v1::command_result;
+
+    let root = tempfile::tempdir().unwrap();
+    let podman = fake_logs_podman(root.path());
+    let mut executor = crate::commands::CommandExecutor::new("dev").with_podman(&podman);
+
+    let execution = executor.execute(
+        container_logs_command("container-logs-1", "coolify-app", 100, Some(1_700_000_000)),
+        true,
+    );
+
+    assert!(execution.accepted);
+    let Some(command_result::Payload::ContainerLogs(result)) = execution.result.payload else {
+        panic!(
+            "expected container logs, got {:?}",
+            execution.result.payload
+        );
+    };
+    assert_eq!(result.name, "coolify-app");
+    assert!(!result.truncated);
+    assert_eq!(
+        result.logs,
+        "2026-10-06T10:00:00.000000001Z out one\n\
+         2026-10-06T10:00:00.000000002Z err one\n\
+         2026-10-06T10:00:00.000000003Z out two\n\
+         2026-10-06T10:00:00.000000004Z err two\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("podman.log")).unwrap(),
+        format!(
+            "container inspect coolify-app\nlogs --timestamps --tail 100 --since 1700000000 {MANAGED_CONTAINER_ID}\n"
+        )
+    );
+}
+
+#[test]
+fn refuses_to_read_logs_of_unmanaged_or_missing_containers() {
+    let root = tempfile::tempdir().unwrap();
+    let podman = fake_logs_podman(root.path());
+    let mut executor = crate::commands::CommandExecutor::new("dev").with_podman(&podman);
+
+    let unmanaged = executor.execute(
+        container_logs_command("container-logs-unmanaged", "unmanaged", 10, None),
+        true,
+    );
+    assert!(unmanaged.accepted);
+    assert_eq!(
+        command_error_message(&unmanaged.result),
+        "The container is not managed by Coolify."
+    );
+
+    let missing = executor.execute(
+        container_logs_command("container-logs-missing", "missing", 10, None),
+        true,
+    );
+    assert!(missing.accepted);
+    assert_eq!(
+        command_error_message(&missing.result),
+        "The container does not exist."
+    );
+
+    // Podman never read the logs of either container.
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("podman.log")).unwrap(),
+        "container inspect unmanaged\ncontainer inspect missing\n"
+    );
+}
+
+#[test]
+fn container_logs_commands_are_not_journaled() {
+    let root = tempfile::tempdir().unwrap();
+    let podman = fake_logs_podman(root.path());
+    let journal = store::CommandJournal::open_in_memory(7, 100_000).unwrap();
+    let mut executor =
+        crate::commands::CommandExecutor::with_journal("dev", journal.clone()).with_podman(&podman);
+    let logs = container_logs_command("container-logs-unjournaled", "coolify-app", 10, None);
+
+    assert!(executor.execute(logs.clone(), true).accepted);
+    assert!(executor.execute(logs.clone(), true).accepted);
+
+    assert!(matches!(
+        journal.lookup(&logs.command_id, &crate::commands::journal_request(&logs)),
+        Ok(store::CommandLookup::Missing)
+    ));
+    // A repeated ID reads the logs again instead of replaying a result.
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("podman.log"))
+            .unwrap()
+            .matches("logs --timestamps")
+            .count(),
+        2
+    );
 }

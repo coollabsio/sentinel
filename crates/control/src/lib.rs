@@ -3,6 +3,7 @@
 mod assignment;
 mod commands;
 mod connection;
+mod container_logs;
 mod discovery;
 mod ingress;
 mod logs;

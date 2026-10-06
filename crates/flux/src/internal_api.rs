@@ -10,20 +10,20 @@ use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
     ClusterLeaveRequest, Command, CommandResult, CommandStatus, ContainerListRequest,
-    ContainerPort, CorrosionInspectRequest, CorrosionReconcileRequest, FirewallIngressRule,
-    FirewallInspectRequest, FirewallReconcileRequest, FirewallRule, IngressReconcileRequest,
-    IngressRoute, LogSource, LogsReadRequest, SystemInfoRequest, SystemPingRequest,
-    TrustBundleUpdateRequest, WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer,
-    WireguardReconcileRequest, WorkloadDeployRequest, WorkloadEnvironmentVariable, WorkloadLabel,
-    WorkloadLifecycleAction, WorkloadLifecycleRequest,
+    ContainerLogsRequest, ContainerPort, CorrosionInspectRequest, CorrosionReconcileRequest,
+    FirewallIngressRule, FirewallInspectRequest, FirewallReconcileRequest, FirewallRule,
+    IngressReconcileRequest, IngressRoute, LogSource, LogsReadRequest, SystemInfoRequest,
+    SystemPingRequest, TrustBundleUpdateRequest, WireguardInspectRequest,
+    WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest,
+    WorkloadEnvironmentVariable, WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
 };
 use sentinel_protocol::{
-    CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CORROSION_INSPECT,
-    CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT, CAPABILITY_FIREWALL_RECONCILE,
-    CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO,
-    CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE, CAPABILITY_WIREGUARD_INSPECT,
-    CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_DEPLOY,
-    CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
+    CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT,
+    CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ,
+    CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
+    CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -33,6 +33,10 @@ use crate::{CommandDispatchError, ConnectionRegistry, now_millis};
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+/// Sentinel stops reading container logs after 20 seconds.
+const CONTAINER_LOGS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Matches Sentinel's `container.logs.v1` limit.
+const CONTAINER_LOGS_MAX_LINES: u32 = 10_000;
 /// Matches Sentinel's limit. A CA certificate is about 1 KiB.
 const MAX_TRUST_BUNDLE_BYTES: usize = 64 * 1024;
 
@@ -83,6 +87,16 @@ impl LogsReadApiSource {
             Self::DiscoveryDns => LogSource::DiscoveryDns,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct ContainerLogsApiRequest {
+    server_id: String,
+    command_id: String,
+    name: String,
+    lines: u32,
+    #[serde(default)]
+    since_unix_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -348,6 +362,15 @@ struct LogEventResponse {
 }
 
 #[derive(Serialize)]
+pub struct ContainerLogsResponse {
+    command_id: String,
+    observed_at_unix_ms: i64,
+    name: String,
+    logs: String,
+    truncated: bool,
+}
+
+#[derive(Serialize)]
 pub struct ContainerListResponse {
     command_id: String,
     observed_at_unix_ms: i64,
@@ -403,6 +426,7 @@ pub async fn serve(
         .route("/v1/commands/system.info", post(system_info))
         .route("/v1/commands/container.list", post(container_list))
         .route("/v1/commands/logs.read", post(logs_read))
+        .route("/v1/commands/container.logs", post(container_logs))
         .route(
             "/v1/commands/trust.bundle.update",
             post(trust_bundle_update),
@@ -1196,6 +1220,81 @@ async fn logs_read(
                 fields: event.fields.into_iter().collect(),
             })
             .collect(),
+    }))
+}
+
+/// Reads the newest output of one Coolify-managed container. Sentinel checks
+/// the `coolify.managed` label; Flux validates the request shape. Like
+/// `logs.read`, the command is not journaled, so a repeated ID reads again.
+async fn container_logs(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ContainerLogsApiRequest>,
+) -> Result<Json<ContainerLogsResponse>, ApiError> {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    if authorization != Some(&format!("Bearer {}", state.token)) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
+    }
+    if request.server_id.is_empty()
+        || request.server_id.len() > 255
+        || request.command_id.is_empty()
+        || request.command_id.len() > 128
+        || !request
+            .command_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
+    {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request").into());
+    }
+    if !sentinel_protocol::valid_container_name(&request.name) {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid container name").into());
+    }
+    if !(1..=CONTAINER_LOGS_MAX_LINES).contains(&request.lines) {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid lines").into());
+    }
+    if request.since_unix_seconds.is_some_and(|since| since <= 0) {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid since").into());
+    }
+    let now = now_millis();
+    let result = state
+        .registry
+        .dispatch(
+            &request.server_id,
+            Command {
+                command_id: request.command_id.clone(),
+                command_type: CAPABILITY_CONTAINER_LOGS.into(),
+                payload_version: 1,
+                created_at_unix_ms: now,
+                payload: Some(Payload::ContainerLogs(ContainerLogsRequest {
+                    name: request.name.clone(),
+                    lines: request.lines,
+                    since_unix_seconds: request.since_unix_seconds,
+                })),
+                expires_at_unix_ms: now + CONTAINER_LOGS_TIMEOUT.as_millis() as i64,
+            },
+            CONTAINER_LOGS_TIMEOUT,
+        )
+        .await
+        .map_err(dispatch_error)?;
+    if result.status != CommandStatus::Succeeded as i32 {
+        return Err(command_failed(result));
+    }
+    let observed_at_unix_ms = result.observed_at_unix_ms;
+    let Some(command_result::Payload::ContainerLogs(logs)) = result.payload else {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
+    };
+    if logs.name != request.name {
+        return Err((StatusCode::BAD_GATEWAY, "invalid Sentinel response").into());
+    }
+
+    Ok(Json(ContainerLogsResponse {
+        command_id: request.command_id,
+        observed_at_unix_ms,
+        name: logs.name,
+        logs: logs.logs,
+        truncated: logs.truncated,
     }))
 }
 
