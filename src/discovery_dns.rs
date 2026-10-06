@@ -190,12 +190,22 @@ fn build_ptr_response(
     response
 }
 
-fn endpoint_lookup_sql() -> &'static str {
-    "SELECT container_ip FROM workload_endpoints WHERE workload_id = ? AND namespace = ? AND state = 'running' AND health IN ('healthy', 'unknown') AND expires_at > unixepoch() ORDER BY container_ip"
+/// Node names are endpoint rows of their own. Workload names map to a
+/// workload ID through `workload_names`, which Coolify writes, so a rename
+/// applies without touching the containers.
+const NODE_NAMESPACE: &str = "nodes";
+
+fn endpoint_lookup_sql(namespace: &str) -> &'static str {
+    if namespace == NODE_NAMESPACE {
+        "SELECT container_ip FROM workload_endpoints WHERE workload_id = ? AND namespace = ? AND state = 'running' AND health IN ('healthy', 'unknown') AND expires_at > unixepoch() ORDER BY container_ip"
+    } else {
+        "SELECT e.container_ip FROM workload_names n JOIN workload_endpoints e ON e.namespace = n.namespace AND e.workload_id = n.workload_id WHERE n.name = ? AND n.namespace = ? AND n.revision = (SELECT MAX(revision) FROM workload_names) AND e.state = 'running' AND e.health IN ('healthy', 'unknown') AND e.expires_at > unixepoch() ORDER BY e.container_ip"
+    }
 }
 
+/// Takes the address twice: once for Node rows, once for workload rows.
 fn reverse_lookup_sql() -> &'static str {
-    "SELECT workload_id || '.' || namespace FROM workload_endpoints WHERE container_ip = ? AND state = 'running' AND health IN ('healthy', 'unknown') AND expires_at > unixepoch() ORDER BY namespace, workload_id"
+    "SELECT workload_id || '.' || namespace AS fqdn FROM workload_endpoints WHERE container_ip = ? AND namespace = 'nodes' AND state = 'running' AND health IN ('healthy', 'unknown') AND expires_at > unixepoch() UNION SELECT n.name || '.' || n.namespace FROM workload_endpoints e JOIN workload_names n ON n.namespace = e.namespace AND n.workload_id = e.workload_id WHERE e.container_ip = ? AND e.namespace != 'nodes' AND n.revision = (SELECT MAX(revision) FROM workload_names) AND e.state = 'running' AND e.health IN ('healthy', 'unknown') AND e.expires_at > unixepoch() ORDER BY fqdn"
 }
 
 fn lookup_endpoints(
@@ -211,7 +221,7 @@ fn lookup_endpoints(
             workload,
             "--param",
             namespace,
-            endpoint_lookup_sql(),
+            endpoint_lookup_sql(namespace),
         ])
         .output()
         .map_err(|_| "Corrosion is unavailable.".to_string())?;
@@ -243,7 +253,13 @@ fn lookup_names(
     let output = Command::new("/usr/local/bin/corrosion")
         .args(["query", "--config"])
         .arg(corrosion_config)
-        .args(["--param", &address.to_string(), reverse_lookup_sql()])
+        .args([
+            "--param",
+            &address.to_string(),
+            "--param",
+            &address.to_string(),
+            reverse_lookup_sql(),
+        ])
         .output()
         .map_err(|_| "Corrosion is unavailable.".to_string())?;
     if !output.status.success() {
@@ -520,22 +536,80 @@ mod tests {
         assert_eq!(&tcp_response[6..8], &[0, 64]);
     }
 
-    #[test]
-    fn endpoint_lookup_excludes_unhealthy_and_expired_rows() {
-        let sql = super::endpoint_lookup_sql();
+    /// A database with the Corrosion schema: two Nodes, `api` on two
+    /// containers, a stale name of an older revision, and inactive endpoints.
+    fn database() -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(&format!(
+                "{}
+                INSERT INTO workload_endpoints VALUES
+                    ('worker-1', 'nodes', '10.240.0.1', '10.240.0.1', 'running', 'healthy', 1, unixepoch() + 60),
+                    ('uuid-api', 'default', '10.240.0.1', '10.241.0.2', 'running', 'healthy', 1, unixepoch() + 60),
+                    ('uuid-api', 'default', '10.240.0.2', '10.241.1.2', 'running', 'unknown', 1, unixepoch() + 60),
+                    ('uuid-api', 'default', '10.240.0.2', '10.241.1.3', 'running', 'unhealthy', 1, unixepoch() + 60),
+                    ('uuid-api', 'default', '10.240.0.2', '10.241.1.4', 'running', 'healthy', 1, unixepoch() - 1),
+                    ('uuid-web', 'default', '10.240.0.1', '10.241.0.3', 'removing', 'healthy', 1, unixepoch() + 60);
+                INSERT INTO workload_names VALUES
+                    ('default', 'api', 'uuid-api', 4, 1),
+                    ('default', 'web', 'uuid-web', 4, 1),
+                    ('default', 'old-api', 'uuid-api', 3, 1);",
+                control::corrosion_schema()
+            ))
+            .unwrap();
+        connection
+    }
 
-        assert!(sql.contains("state = 'running'"));
-        assert!(sql.contains("health IN ('healthy', 'unknown')"));
-        assert!(sql.contains("expires_at > unixepoch()"));
+    fn rows(connection: &rusqlite::Connection, sql: &str, params: &[&str]) -> Vec<String> {
+        let mut statement = connection.prepare(sql).unwrap();
+        statement
+            .query_map(rusqlite::params_from_iter(params), |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
     }
 
     #[test]
-    fn reverse_lookup_returns_only_active_workload_names_for_an_address() {
-        let sql = super::reverse_lookup_sql();
+    fn endpoint_lookup_resolves_names_through_the_current_name_table() {
+        let connection = database();
+        let lookup = |name: &str, namespace: &str| {
+            rows(
+                &connection,
+                super::endpoint_lookup_sql(namespace),
+                &[name, namespace],
+            )
+        };
 
-        assert!(sql.contains("container_ip = ?"));
-        assert!(sql.contains("state = 'running'"));
-        assert!(sql.contains("health IN ('healthy', 'unknown')"));
-        assert!(sql.contains("expires_at > unixepoch()"));
+        // Only running, healthy or unknown, unexpired endpoints answer.
+        assert_eq!(lookup("api", "default"), ["10.241.0.2", "10.241.1.2"]);
+        assert!(lookup("web", "default").is_empty());
+        // A name of an older revision no longer resolves, and a workload ID is
+        // not a name.
+        assert!(lookup("old-api", "default").is_empty());
+        assert!(lookup("uuid-api", "default").is_empty());
+        assert_eq!(lookup("worker-1", "nodes"), ["10.240.0.1"]);
+    }
+
+    #[test]
+    fn reverse_lookup_returns_current_names_for_an_address() {
+        let connection = database();
+        let lookup = |address: &str| {
+            rows(
+                &connection,
+                super::reverse_lookup_sql(),
+                &[address, address],
+            )
+        };
+
+        assert_eq!(lookup("10.241.0.2"), ["api.default"]);
+        assert_eq!(lookup("10.240.0.1"), ["worker-1.nodes"]);
+        assert!(lookup("10.241.1.3").is_empty());
+        assert!(lookup("10.241.0.3").is_empty());
+
+        // A rename applies without touching the endpoint.
+        connection
+            .execute_batch("UPDATE workload_names SET name = 'backend' WHERE name = 'api'")
+            .unwrap();
+        assert_eq!(lookup("10.241.0.2"), ["backend.default"]);
     }
 }

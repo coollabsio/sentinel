@@ -16,6 +16,7 @@ use sentinel_protocol::control::v1::{
     SystemPingRequest, TrustBundleUpdateRequest, WireguardInspectRequest,
     WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest,
     WorkloadEnvironmentVariable, WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
+    WorkloadName,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -271,6 +272,14 @@ struct IngressReconcileApiRequest {
     revision: u64,
     #[serde(default)]
     routes: Vec<IngressRouteApiRequest>,
+    #[serde(default)]
+    names: Vec<WorkloadNameApiRequest>,
+}
+#[derive(Deserialize)]
+struct WorkloadNameApiRequest {
+    name: String,
+    workload_id: String,
+    namespace: String,
 }
 #[derive(Deserialize)]
 struct IngressRouteApiRequest {
@@ -818,8 +827,8 @@ async fn corrosion_reconcile(
     ))
 }
 
-/// Forwards the HTTP ingress state and route table to one Node. Sentinel
-/// validates the routes and the pinned Caddy version.
+/// Forwards the HTTP ingress state, route table and internal names to one
+/// Node. Sentinel validates them and the pinned Caddy version.
 async fn ingress_reconcile(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -845,6 +854,15 @@ async fn ingress_reconcile(
                     port: route.port,
                 })
                 .collect(),
+            names: request
+                .names
+                .into_iter()
+                .map(|name| WorkloadName {
+                    name: name.name,
+                    workload_id: name.workload_id,
+                    namespace: name.namespace,
+                })
+                .collect(),
         }),
     )
     .await?;
@@ -859,6 +877,7 @@ async fn ingress_reconcile(
         "active": value.active,
         "revision": value.revision,
         "route_count": value.route_count,
+        "name_count": value.name_count,
     })))
 }
 

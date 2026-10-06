@@ -1637,8 +1637,9 @@ fn configure_discovery_resolver(
     Ok(())
 }
 
-pub(crate) fn corrosion_schema() -> &'static str {
-    "CREATE TABLE IF NOT EXISTS workload_endpoints (workload_id TEXT NOT NULL, namespace TEXT NOT NULL, owner_node_ip TEXT NOT NULL, container_ip TEXT NOT NULL, state TEXT NOT NULL DEFAULT '', health TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (namespace, workload_id, owner_node_ip, container_ip));\nCREATE TABLE IF NOT EXISTS ingress_routes (host TEXT NOT NULL PRIMARY KEY, workload_id TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);\n"
+/// The Corrosion schema that Sentinel installs on every cluster Node.
+pub fn corrosion_schema() -> &'static str {
+    "CREATE TABLE IF NOT EXISTS workload_endpoints (workload_id TEXT NOT NULL, namespace TEXT NOT NULL, owner_node_ip TEXT NOT NULL, container_ip TEXT NOT NULL, state TEXT NOT NULL DEFAULT '', health TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (namespace, workload_id, owner_node_ip, container_ip));\nCREATE TABLE IF NOT EXISTS ingress_routes (host TEXT NOT NULL PRIMARY KEY, workload_id TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);\nCREATE TABLE IF NOT EXISTS workload_names (namespace TEXT NOT NULL, name TEXT NOT NULL, workload_id TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (namespace, name));\n"
 }
 
 /// Brings the installed Corrosion schema file up to date. A changed file is

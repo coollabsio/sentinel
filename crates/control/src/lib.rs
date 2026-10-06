@@ -16,6 +16,7 @@ pub use assignment::{
 };
 pub use connection::{FluxConnectionError, FluxTransport};
 pub use logs::{LogLayer, log_layer};
+pub use network::corrosion_schema;
 
 #[cfg(test)]
 mod tests;

@@ -1124,10 +1124,10 @@ fn negotiates_the_trust_bundle_update_capability_when_granted() {
 }
 
 #[tokio::test]
-async fn ingress_reconcile_route_forwards_the_routes_and_returns_the_ingress_state() {
+async fn ingress_reconcile_route_forwards_routes_and_names_and_returns_the_ingress_state() {
     use sentinel_protocol::control::v1::{
         CommandResult, CommandStatus, IngressReconcileRequest, IngressReconcileResult,
-        IngressRoute, command::Payload, command_result, control_message::Message,
+        IngressRoute, WorkloadName, command::Payload, command_result, control_message::Message,
     };
 
     let registry = ConnectionRegistry::default();
@@ -1162,6 +1162,9 @@ async fn ingress_reconcile_route_forwards_the_routes_and_returns_the_ingress_sta
                     {"host": "app.example.com", "workload_id": "web", "namespace": "default", "port": 3000},
                     {"host": "api.example.com", "workload_id": "api", "namespace": "default", "port": 8080}
                 ],
+                "names": [
+                    {"name": "frontend", "workload_id": "web", "namespace": "default"}
+                ],
             }))
             .send(),
     );
@@ -1195,6 +1198,11 @@ async fn ingress_reconcile_route_forwards_the_routes_and_returns_the_ingress_sta
                     port: 8080,
                 },
             ],
+            names: vec![WorkloadName {
+                name: "frontend".into(),
+                workload_id: "web".into(),
+                namespace: "default".into(),
+            }],
         }))
     );
     registry
@@ -1212,6 +1220,7 @@ async fn ingress_reconcile_route_forwards_the_routes_and_returns_the_ingress_sta
                         active: true,
                         revision: 7,
                         route_count: 2,
+                        name_count: 1,
                     },
                 )),
             },
@@ -1230,6 +1239,7 @@ async fn ingress_reconcile_route_forwards_the_routes_and_returns_the_ingress_sta
             "active": true,
             "revision": 7,
             "route_count": 2,
+            "name_count": 1,
         })
     );
     server.abort();

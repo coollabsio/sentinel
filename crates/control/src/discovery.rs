@@ -1,8 +1,10 @@
 //! Sentinel-owned publication of this Node's workload endpoints into Corrosion.
 //!
 //! Coolify only supplies identity (the Node DNS name and the container
-//! `coolify.dns_name` labels). Liveness comes from what this Sentinel observes
-//! locally, so internal DNS keeps working while Coolify is unavailable.
+//! `coolify.workload` labels). Endpoints are keyed by that stable workload ID;
+//! Coolify maps internal names and domains to it in Corrosion, so a rename
+//! needs no redeploy. Liveness comes from what this Sentinel observes locally,
+//! so internal DNS keeps working while Coolify is unavailable.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
@@ -22,7 +24,7 @@ pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_secs(15);
 pub(crate) const ENDPOINT_TTL_SECONDS: i64 = 120;
 const MAX_ENDPOINTS: usize = 10_000;
 const MANAGED_LABEL: &str = "coolify.managed";
-const DNS_NAME_LABEL: &str = "coolify.dns_name";
+const WORKLOAD_LABEL: &str = "coolify.workload";
 const WORKLOAD_NAMESPACE: &str = "default";
 const NODE_NAMESPACE: &str = "nodes";
 const WORKLOAD_NETWORK_PREFIX: &str = "coolify-";
@@ -130,7 +132,7 @@ fn drained_wait(root: &Path, name: &str) -> Result<Duration, String> {
             "container",
             "inspect",
             "--format",
-            &format!("{{{{ index .Config.Labels \"{DNS_NAME_LABEL}\" }}}}"),
+            &format!("{{{{ index .Config.Labels \"{WORKLOAD_LABEL}\" }}}}"),
             name,
         ])
         .output()
@@ -245,14 +247,14 @@ fn read_optional(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
-/// Returns the DNS label of a container that should be published.
-fn published_dns_name(container: &ContainerObservation) -> Option<&str> {
+/// Returns the workload ID of a container that should be published.
+fn published_workload_id(container: &ContainerObservation) -> Option<&str> {
     if container.labels.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
         return None;
     }
     container
         .labels
-        .get(DNS_NAME_LABEL)
+        .get(WORKLOAD_LABEL)
         .map(String::as_str)
         .filter(|name| valid_discovery_label(name))
 }
@@ -351,7 +353,7 @@ pub(crate) fn endpoint_rows(
     rows.insert(endpoint_key(&node), node);
 
     for container in containers {
-        let Some(dns_name) = published_dns_name(container) else {
+        let Some(workload_id) = published_workload_id(container) else {
             continue;
         };
         let Some(observed) = inspected.get(&container.runtime_id) else {
@@ -366,12 +368,12 @@ pub(crate) fn endpoint_rows(
             .or(container.health_status.as_deref());
         let endpoint = row(
             WORKLOAD_NAMESPACE,
-            dns_name,
+            workload_id,
             ip,
             normalize_state(&container.state),
             normalize_health(health),
         );
-        // Two containers may briefly share a name and IP during a replace;
+        // Two containers may briefly share a workload and IP during a replace;
         // prefer the running one so DNS keeps answering.
         let key = endpoint_key(&endpoint);
         match rows.get(&key) {
@@ -539,7 +541,7 @@ pub(crate) fn publish_once(root: &Path) -> Result<PublishOutcome, String> {
     mark_draining(&mut containers);
     let ids = containers
         .iter()
-        .filter(|container| published_dns_name(container).is_some())
+        .filter(|container| published_workload_id(container).is_some())
         .map(|container| container.runtime_id.as_str())
         .collect::<Vec<_>>();
     let inspected = if ids.is_empty() {
@@ -651,10 +653,10 @@ mod tests {
         }
     }
 
-    fn managed(dns_name: &str) -> Vec<(&'static str, String)> {
+    fn managed(workload_id: &str) -> Vec<(&'static str, String)> {
         vec![
             ("coolify.managed", "true".into()),
-            ("coolify.dns_name", dns_name.into()),
+            ("coolify.workload", workload_id.into()),
         ]
     }
 
@@ -716,11 +718,11 @@ mod tests {
         let containers = vec![
             container("web", "running", &labels(&web)),
             container("bad", "running", &labels(&bad)),
-            container("unmanaged", "running", &[("coolify.dns_name", "unmanaged")]),
+            container("unmanaged", "running", &[("coolify.workload", "unmanaged")]),
             container(
                 "not-true",
                 "running",
-                &[("coolify.managed", "false"), ("coolify.dns_name", "nope")],
+                &[("coolify.managed", "false"), ("coolify.workload", "nope")],
             ),
             container("no-label", "running", &[("coolify.managed", "true")]),
             container("stopped", "exited", &labels(&stopped)),

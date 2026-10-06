@@ -1,11 +1,13 @@
 //! Thin HTTP ingress: Caddy on port 80 of every ingress Node, with the
 //! cluster-wide route table in Corrosion.
 //!
-//! Coolify writes routes (host to workload and port) through
-//! `ingress.reconcile.v1`. Every ingress Node then renders its own Caddy
-//! configuration from its local Corrosion: the routes plus the live workload
-//! endpoints that the Sentinels publish. A Node therefore keeps routing, and
-//! follows workload moves, while Coolify is unavailable.
+//! Coolify writes routes (host to workload and port) and internal names (DNS
+//! label to workload) through `ingress.reconcile.v1`, sent to every Node.
+//! Workloads are identified by their `coolify.workload` container label, so a
+//! domain or name change needs no redeploy. Every ingress Node then renders its
+//! own Caddy configuration from its local Corrosion: the routes plus the live
+//! workload endpoints that the Sentinels publish. A Node therefore keeps
+//! routing, and follows workload moves, while Coolify is unavailable.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -17,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use sentinel_protocol::control::v1::{
-    IngressReconcileRequest, IngressReconcileResult, IngressRoute,
+    IngressReconcileRequest, IngressReconcileResult, IngressRoute, WorkloadName,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha512};
@@ -36,6 +38,7 @@ const CADDY_SHA512_LINUX_AMD64: &str = "a7a433a1b133efc3c8d10eb0b99d52a24b5ef5c3
 const CADDY_SHA512_LINUX_ARM64: &str = "3db36ba90c7a6e8dda40ee3dd71fa08844c76b5fb08f61b31e5e78d2ed38e71c51dc7baed875e50d1ca1279196e84302967237386ae87c91ae9f2aaceada682e";
 
 pub(crate) const MAX_ROUTES: usize = 10_000;
+pub(crate) const MAX_NAMES: usize = 10_000;
 pub(crate) const RENDER_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const INGRESS_UNIT: &str = "coolify-ingress.service";
 pub(crate) const INGRESS_UNIT_FILE: &str = "etc/systemd/system/coolify-ingress.service";
@@ -102,10 +105,12 @@ pub(crate) fn valid_ingress_host(host: &str) -> bool {
     })
 }
 
-/// Validates the routes and revision. The Caddy version is checked by
+/// Validates the routes, names and revision. The Caddy version is checked by
 /// [`validate_request`] so that a version mismatch gets a specific error.
 pub(crate) fn validate_routes(request: &IngressReconcileRequest) -> Result<(), String> {
-    if request.revision > i64::MAX as u64 || (request.enabled && request.revision == 0) {
+    // Revision 0 only disables Caddy: it carries no tables to write.
+    let has_tables = request.enabled || !request.routes.is_empty() || !request.names.is_empty();
+    if request.revision > i64::MAX as u64 || (has_tables && request.revision == 0) {
         return Err("The ingress revision is invalid.".into());
     }
     if request.routes.len() > MAX_ROUTES {
@@ -127,6 +132,22 @@ pub(crate) fn validate_routes(request: &IngressReconcileRequest) -> Result<(), S
         }
         if !hosts.insert(route.host.as_str()) {
             return Err("Ingress route hosts must be unique.".into());
+        }
+    }
+    if request.names.len() > MAX_NAMES {
+        return Err(format!("At most {MAX_NAMES} internal names are allowed."));
+    }
+    let mut names = HashSet::with_capacity(request.names.len());
+    for name in &request.names {
+        if !valid_discovery_label(&name.name)
+            || !valid_discovery_label(&name.workload_id)
+            || !valid_discovery_label(&name.namespace)
+            || name.namespace == NODE_NAMESPACE
+        {
+            return Err("An internal name is invalid.".into());
+        }
+        if !names.insert((name.namespace.as_str(), name.name.as_str())) {
+            return Err("Internal names must be unique.".into());
         }
     }
     Ok(())
@@ -165,11 +186,31 @@ impl From<&IngressRoute> for StoredRoute {
     }
 }
 
-/// The routes at the highest stored revision.
+/// One `workload_names` row, without bookkeeping columns.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct StoredName {
+    pub(crate) namespace: String,
+    pub(crate) name: String,
+    pub(crate) workload_id: String,
+}
+
+impl From<&WorkloadName> for StoredName {
+    fn from(name: &WorkloadName) -> Self {
+        Self {
+            namespace: name.namespace.clone(),
+            name: name.name.clone(),
+            workload_id: name.workload_id.clone(),
+        }
+    }
+}
+
+/// The routes and names at the highest stored revision of each table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct StoredRoutes {
     pub(crate) revision: Option<u64>,
     pub(crate) routes: Vec<StoredRoute>,
+    pub(crate) names_revision: Option<u64>,
+    pub(crate) names: Vec<StoredName>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -183,43 +224,103 @@ pub(crate) fn routes_query_sql() -> &'static str {
     "SELECT host, workload_id, namespace, port, revision FROM ingress_routes WHERE revision = (SELECT MAX(revision) FROM ingress_routes) ORDER BY host"
 }
 
+pub(crate) fn names_query_sql() -> &'static str {
+    "SELECT namespace, name, workload_id, revision FROM workload_names WHERE revision = (SELECT MAX(revision) FROM workload_names) ORDER BY namespace, name"
+}
+
 pub(crate) fn endpoints_query_sql() -> &'static str {
     "SELECT workload_id, namespace, owner_node_ip, container_ip FROM workload_endpoints WHERE namespace != 'nodes' AND state = 'running' AND health NOT IN ('unhealthy', 'starting') AND expires_at > unixepoch() ORDER BY namespace, workload_id, owner_node_ip, container_ip"
 }
 
-/// Decides how to bring Corrosion to the requested revision. An older request
-/// is a stale writer and fails; the same revision must carry the same routes.
+/// Whether a table must be written to reach `revision`. An older request is a
+/// stale writer and fails; the same revision must carry the same rows.
+fn table_needs_write<T: Ord + Clone>(
+    table: &str,
+    stored_revision: Option<u64>,
+    stored: &[T],
+    mut requested: Vec<T>,
+    revision: u64,
+) -> Result<bool, String> {
+    let Some(stored_revision) = stored_revision else {
+        return Ok(true);
+    };
+    if stored_revision > revision {
+        return Err(format!(
+            "The {table} are stale: revision {revision} is older than the stored revision {stored_revision}."
+        ));
+    }
+    if stored_revision < revision {
+        return Ok(true);
+    }
+    let mut existing = stored.to_vec();
+    existing.sort();
+    requested.sort();
+    if requested == existing {
+        return Ok(false);
+    }
+    Err(format!(
+        "Revision {revision} is already stored with different {table}."
+    ))
+}
+
+/// Decides how to bring the route and name tables in Corrosion to the
+/// requested revision.
 pub(crate) fn plan_route_write(
     stored: &StoredRoutes,
     request: &IngressReconcileRequest,
     now: i64,
 ) -> Result<RouteWrite, String> {
-    if let Some(stored_revision) = stored.revision {
-        if stored_revision > request.revision {
-            return Err(format!(
-                "The ingress routes are stale: revision {} is older than the stored revision {stored_revision}.",
-                request.revision
-            ));
-        }
-        if stored_revision == request.revision {
-            let mut requested = request
-                .routes
-                .iter()
-                .map(StoredRoute::from)
-                .collect::<Vec<_>>();
-            requested.sort();
-            let mut existing = stored.routes.clone();
-            existing.sort();
-            if requested == existing {
-                return Ok(RouteWrite::Unchanged);
-            }
-            return Err(format!(
-                "Ingress revision {} is already stored with different routes.",
-                request.revision
-            ));
-        }
+    let write_routes = table_needs_write(
+        "ingress routes",
+        stored.revision,
+        &stored.routes,
+        request.routes.iter().map(StoredRoute::from).collect(),
+        request.revision,
+    )?;
+    let write_names = table_needs_write(
+        "internal names",
+        stored.names_revision,
+        &stored.names,
+        request.names.iter().map(StoredName::from).collect(),
+        request.revision,
+    )?;
+    let mut transaction = Vec::new();
+    if write_routes {
+        transaction.extend(route_transaction(request, now)?);
     }
-    Ok(RouteWrite::Write(route_transaction(request, now)?))
+    if write_names {
+        transaction.extend(name_transaction(request, now)?);
+    }
+    if transaction.is_empty() {
+        return Ok(RouteWrite::Unchanged);
+    }
+    Ok(RouteWrite::Write(transaction))
+}
+
+/// Upserts every name at the request revision, then deletes names of older
+/// revisions, like [`route_transaction`].
+pub(crate) fn name_transaction(
+    request: &IngressReconcileRequest,
+    now: i64,
+) -> Result<Vec<Value>, String> {
+    validate_routes(request)?;
+    let revision = i64::try_from(request.revision)
+        .map_err(|_| "The ingress revision is invalid.".to_string())?;
+    let mut names = request.names.iter().collect::<Vec<_>>();
+    names
+        .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    let mut transaction = Vec::with_capacity(names.len() + 1);
+    for name in names {
+        transaction.push(json!([
+            "INSERT INTO workload_names (namespace, name, workload_id, revision, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (namespace, name) DO UPDATE SET workload_id = excluded.workload_id, revision = excluded.revision, updated_at = excluded.updated_at WHERE excluded.revision >= workload_names.revision",
+            [name.namespace, name.name, name.workload_id, revision, now]
+        ]));
+    }
+    transaction.push(json!([
+        "DELETE FROM workload_names WHERE revision < ?",
+        [revision]
+    ]));
+    Ok(transaction)
 }
 
 /// Upserts every route at the request revision, then deletes routes of older
@@ -317,6 +418,33 @@ pub(crate) fn parse_stored_routes(rows: &[Vec<Value>]) -> Result<StoredRoutes, S
         });
     }
     Ok(stored)
+}
+
+pub(crate) fn parse_stored_names(
+    rows: &[Vec<Value>],
+    stored: &mut StoredRoutes,
+) -> Result<(), String> {
+    for row in rows {
+        let text = |index: usize| row.get(index).and_then(Value::as_str).map(str::to_string);
+        let (Some(namespace), Some(name), Some(workload_id)) = (text(0), text(1), text(2)) else {
+            return Err("Corrosion returned an invalid internal name.".into());
+        };
+        let revision = row
+            .get(3)
+            .and_then(Value::as_u64)
+            .ok_or("Corrosion returned an invalid internal name.")?;
+        stored.names_revision = Some(
+            stored
+                .names_revision
+                .map_or(revision, |known| known.max(revision)),
+        );
+        stored.names.push(StoredName {
+            namespace,
+            name,
+            workload_id,
+        });
+    }
+    Ok(())
 }
 
 /// A live workload endpoint that may receive ingress traffic.
@@ -628,12 +756,17 @@ fn ensure_config_dir(root: &Path) -> Result<(), String> {
 }
 
 fn read_stored_routes(owner_node_ip: &str) -> Result<StoredRoutes, String> {
-    let output = crate::discovery::corrosion_api(
-        owner_node_ip,
-        "queries",
-        &serde_json::to_vec(routes_query_sql()).unwrap_or_default(),
-    )?;
-    parse_stored_routes(&parse_query_events(&output)?)
+    let query = |sql: &str| {
+        crate::discovery::corrosion_api(
+            owner_node_ip,
+            "queries",
+            &serde_json::to_vec(sql).unwrap_or_default(),
+        )
+        .and_then(|output| parse_query_events(&output))
+    };
+    let mut stored = parse_stored_routes(&query(routes_query_sql())?)?;
+    parse_stored_names(&query(names_query_sql())?, &mut stored)?;
+    Ok(stored)
 }
 
 /// Applies `ingress.reconcile.v1`.
@@ -643,6 +776,25 @@ pub(crate) fn reconcile(
 ) -> Result<IngressReconcileResult, String> {
     validate_request(request)?;
     let _ingress = ingress_lock();
+    let identity = crate::discovery::read_identity(root)?;
+    if request.enabled && identity.is_none() {
+        return Err("This Node is not in a cluster, so it cannot serve ingress.".into());
+    }
+    let host = root == Path::new("/");
+    // Every cluster Node writes the tables, so names resolve without an ingress Node.
+    if let Some(identity) = &identity
+        && request.revision > 0
+    {
+        crate::network::ensure_corrosion_schema(root)?;
+        if host {
+            let stored = read_stored_routes(&identity.owner_node_ip)?;
+            if let RouteWrite::Write(transaction) =
+                plan_route_write(&stored, request, crate::network::unix_seconds())?
+            {
+                crate::discovery::post_transaction(&identity.owner_node_ip, &transaction)?;
+            }
+        }
+    }
     if !request.enabled {
         remove(root)?;
         return Ok(IngressReconcileResult {
@@ -650,22 +802,9 @@ pub(crate) fn reconcile(
             caddy_version: request.caddy_version.clone(),
             active: false,
             revision: request.revision,
-            route_count: 0,
+            route_count: request.routes.len() as u64,
+            name_count: request.names.len() as u64,
         });
-    }
-
-    let Some(identity) = crate::discovery::read_identity(root)? else {
-        return Err("This Node is not in a cluster, so it cannot serve ingress.".into());
-    };
-    crate::network::ensure_corrosion_schema(root)?;
-    let host = root == Path::new("/");
-    if host {
-        let stored = read_stored_routes(&identity.owner_node_ip)?;
-        if let RouteWrite::Write(transaction) =
-            plan_route_write(&stored, request, crate::network::unix_seconds())?
-        {
-            crate::discovery::post_transaction(&identity.owner_node_ip, &transaction)?;
-        }
     }
 
     let binary_changed = if host { install_caddy()? } else { false };
@@ -713,6 +852,7 @@ pub(crate) fn reconcile(
         active: host,
         revision: request.revision,
         route_count: request.routes.len() as u64,
+        name_count: request.names.len() as u64,
     })
 }
 
@@ -978,6 +1118,22 @@ mod tests {
             caddy_version: CADDY_VERSION.into(),
             revision,
             routes,
+            names: vec![],
+        }
+    }
+
+    fn name(name: &str, workload_id: &str) -> WorkloadName {
+        WorkloadName {
+            name: name.into(),
+            workload_id: workload_id.into(),
+            namespace: "default".into(),
+        }
+    }
+
+    fn named(revision: u64, names: Vec<WorkloadName>) -> IngressReconcileRequest {
+        IngressReconcileRequest {
+            names,
+            ..request(revision, vec![])
         }
     }
 
@@ -1163,6 +1319,8 @@ mod tests {
                 stored("b.example.com", "api", 4000),
                 stored("a.example.com", "web", 3000),
             ],
+            names_revision: Some(5),
+            names: vec![],
         };
 
         // Nothing stored yet: write.
@@ -1190,11 +1348,133 @@ mod tests {
                 10
             )
             .unwrap_err()
-            .contains("different routes")
+            .contains("different ingress routes")
         );
         // An older revision is a stale writer.
         let stale = plan_route_write(&current, &request(4, routes), 10).unwrap_err();
         assert!(stale.contains("stale"), "{stale}");
+    }
+
+    #[test]
+    fn names_are_validated_like_routes() {
+        assert!(validate_request(&named(1, vec![name("api", "uuid-api")])).is_ok());
+        // Revision 0 may only disable Caddy, without tables.
+        let mut disable = named(0, vec![]);
+        disable.enabled = false;
+        assert!(validate_request(&disable).is_ok());
+        disable.names = vec![name("api", "uuid-api")];
+        assert!(validate_request(&disable).is_err());
+
+        let invalid = [
+            ("name label", vec![name("api.v1", "uuid-api")]),
+            ("empty name", vec![name("", "uuid-api")]),
+            ("workload label", vec![name("api", "uuid_api")]),
+            (
+                "duplicate names",
+                vec![name("api", "uuid-api"), name("api", "uuid-web")],
+            ),
+        ];
+        for (label, names) in invalid {
+            assert!(
+                validate_request(&named(1, names)).is_err(),
+                "{label} must fail"
+            );
+        }
+        // Node names are endpoint rows of their own, never mapped names.
+        let mut node = named(1, vec![name("worker-1", "uuid-api")]);
+        node.names[0].namespace = "nodes".into();
+        assert!(validate_request(&node).is_err());
+        // Two names may point at one workload.
+        assert!(
+            validate_request(&named(
+                1,
+                vec![name("api", "uuid-api"), name("backend", "uuid-api")]
+            ))
+            .is_ok()
+        );
+
+        let too_many = (0..=MAX_NAMES)
+            .map(|index| name(&format!("app-{index}"), "uuid-api"))
+            .collect::<Vec<_>>();
+        assert!(validate_request(&named(1, too_many[..MAX_NAMES].to_vec())).is_ok());
+        assert!(validate_request(&named(1, too_many)).is_err());
+    }
+
+    #[test]
+    fn name_writes_are_revisioned_independently_of_routes() {
+        let request = IngressReconcileRequest {
+            names: vec![name("web", "uuid-web"), name("api", "uuid-api")],
+            ..self::request(5, vec![route("a.example.com", "uuid-web", 3000)])
+        };
+        let routes_only = StoredRoutes {
+            revision: Some(5),
+            routes: vec![stored("a.example.com", "uuid-web", 3000)],
+            ..StoredRoutes::default()
+        };
+
+        // The routes are current, so only the names are written: sorted, then
+        // older revisions are deleted.
+        let RouteWrite::Write(transaction) = plan_route_write(&routes_only, &request, 10).unwrap()
+        else {
+            panic!("the names must be written");
+        };
+        assert_eq!(transaction.len(), 3);
+        assert_eq!(
+            transaction[0],
+            json!([
+                "INSERT INTO workload_names (namespace, name, workload_id, revision, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (namespace, name) DO UPDATE SET workload_id = excluded.workload_id, revision = excluded.revision, updated_at = excluded.updated_at WHERE excluded.revision >= workload_names.revision",
+                ["default", "api", "uuid-api", 5, 10]
+            ])
+        );
+        assert_eq!(
+            transaction[1][1],
+            json!(["default", "web", "uuid-web", 5, 10])
+        );
+        assert_eq!(
+            transaction[2],
+            json!(["DELETE FROM workload_names WHERE revision < ?", [5]])
+        );
+
+        // Both tables current: nothing to write.
+        let current = StoredRoutes {
+            names_revision: Some(5),
+            names: request.names.iter().rev().map(StoredName::from).collect(),
+            ..routes_only.clone()
+        };
+        assert_eq!(
+            plan_route_write(&current, &request, 10).unwrap(),
+            RouteWrite::Unchanged
+        );
+        // A rename at the same revision conflicts; an older revision is stale.
+        let mut renamed = request.clone();
+        renamed.names[0].name = "frontend".into();
+        assert!(
+            plan_route_write(&current, &renamed, 10)
+                .unwrap_err()
+                .contains("different internal names")
+        );
+        let stale = StoredRoutes {
+            names_revision: Some(6),
+            ..current
+        };
+        assert!(
+            plan_route_write(&stale, &request, 10)
+                .unwrap_err()
+                .contains("internal names are stale")
+        );
+
+        let mut parsed = StoredRoutes::default();
+        parse_stored_names(
+            &[
+                vec![json!("default"), json!("api"), json!("uuid-api"), json!(4)],
+                vec![json!("default"), json!("web"), json!("uuid-web"), json!(4)],
+            ],
+            &mut parsed,
+        )
+        .unwrap();
+        assert_eq!(parsed.names_revision, Some(4));
+        assert_eq!(parsed.names[1], StoredName::from(&name("web", "uuid-web")));
+        assert!(parse_stored_names(&[vec![json!("default")]], &mut parsed).is_err());
     }
 
     #[test]
@@ -1583,6 +1863,7 @@ mod tests {
                 active: false,
                 revision: 3,
                 route_count: 1,
+                name_count: 0,
             }
         );
         assert!(enabled(root));
@@ -1616,11 +1897,11 @@ mod tests {
             b"{\"rendered\":true}\n"
         );
 
+        // A Node that is not an ingress Node gets the same tables.
         let disable = IngressReconcileRequest {
             enabled: false,
-            caddy_version: CADDY_VERSION.into(),
-            revision: 3,
-            routes: vec![],
+            names: vec![name("web", "web")],
+            ..enable.clone()
         };
         for _ in 0..2 {
             assert_eq!(
@@ -1630,7 +1911,8 @@ mod tests {
                     caddy_version: CADDY_VERSION.into(),
                     active: false,
                     revision: 3,
-                    route_count: 0,
+                    route_count: 1,
+                    name_count: 1,
                 }
             );
             assert!(!enabled(root));

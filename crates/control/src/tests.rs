@@ -2245,6 +2245,11 @@ fn ingress_request(
             namespace: "default".into(),
             port: 3000,
         }],
+        names: vec![sentinel_protocol::control::v1::WorkloadName {
+            name: "frontend".into(),
+            workload_id: "web".into(),
+            namespace: "default".into(),
+        }],
     }
 }
 
@@ -2324,6 +2329,7 @@ fn executes_capability_gated_ingress_reconciles_and_wakes_the_renderer() {
                 active: false,
                 revision: 2,
                 route_count: 1,
+                name_count: 1,
             }
         ))
     );
@@ -2345,7 +2351,8 @@ fn executes_capability_gated_ingress_reconciles_and_wakes_the_renderer() {
     );
     assert!(matches!(
         disabled.result.payload,
-        Some(command_result::Payload::IngressReconcile(result)) if !result.enabled && !result.active
+        Some(command_result::Payload::IngressReconcile(result))
+            if !result.enabled && !result.active && result.route_count == 1 && result.name_count == 1
     ));
     assert!(!state.exists());
     assert!(!root.path().join("etc/coolify-ingress/caddy.json").exists());

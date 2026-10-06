@@ -325,6 +325,11 @@ fn ingress_reconcile_command_and_result_round_trip() {
                     namespace: "default".into(),
                     port: 3000,
                 }],
+                names: vec![control::v1::WorkloadName {
+                    name: "web".into(),
+                    workload_id: "uuid-web".into(),
+                    namespace: "default".into(),
+                }],
             },
         )),
         expires_at_unix_ms: 2,
@@ -345,6 +350,7 @@ fn ingress_reconcile_command_and_result_round_trip() {
                 active: true,
                 revision: 4,
                 route_count: 1,
+                name_count: 1,
             },
         )),
     };

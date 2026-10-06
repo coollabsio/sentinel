@@ -2440,6 +2440,7 @@ dependencies = [
  "dotenvy",
  "http-body-util",
  "push",
+ "rusqlite",
  "serde_json",
  "store",
  "tokio",
