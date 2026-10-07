@@ -81,7 +81,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "api"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "axum",
  "collector",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "collector"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "config",
  "docker",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "thiserror",
  "url",
@@ -496,7 +496,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "control"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "axum",
  "config",
@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "docker"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "bollard",
  "futures-util",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "flux"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1965,7 +1965,7 @@ checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
 
 [[package]]
 name = "protocol"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "prost",
  "prost-build",
@@ -1997,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "push"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "config",
  "docker",
@@ -2428,7 +2428,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sentinel"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "api",
  "axum",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-bench"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "clap",
  "collector",
@@ -2678,7 +2678,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "store"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "rusqlite",
  "thiserror",
@@ -3127,7 +3127,7 @@ dependencies = [
 
 [[package]]
 name = "traffic"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "arc-swap",
  "config",
