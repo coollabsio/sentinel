@@ -45,6 +45,7 @@ fn test_config(access_log_path: PathBuf, sample_threshold: u32) -> config::Confi
             access_log_path,
             proxy_type: "auto".into(),
             topn: 50,
+            ip_mode: config::IpMode::Full,
             sample_threshold,
             retention_1m_hours: 48,
             retention_1h_days: 30,
@@ -487,4 +488,61 @@ fn open_retry_delay_doubles_up_to_the_cap() {
         seen.push(delay.as_secs());
     }
     assert_eq!(seen, vec![1, 2, 4, 8, 16, 30, 30, 30]);
+}
+
+/// A switch to a more private `TRAFFIC_IP_MODE` also deletes the IPs that
+/// the earlier mode stored, at service start.
+#[tokio::test]
+async fn build_deletes_stored_ips_that_the_ip_mode_does_not_allow() {
+    let store = AnalyticsStore::open_in_memory().expect("open store");
+    let ip_row = |value: &str| store::traffic::BreakdownRow {
+        bucket: 60_000,
+        app: APP.into(),
+        dimension: "ip".into(),
+        value: value.into(),
+        requests: 1,
+        bytes_out: 0,
+    };
+    store
+        .write_rows(
+            Tier::H1,
+            &[],
+            &[],
+            &[ip_row("203.0.113.7"), ip_row("203.0.113.0/24")],
+        )
+        .expect("seed ip rows");
+    let ips = |store: &AnalyticsStore| -> Vec<String> {
+        store
+            .breakdown_range(Tier::H1, APP, "ip", 0, i64::MAX, 10)
+            .expect("breakdown_range")
+            .into_iter()
+            .map(|r| r.value)
+            .collect()
+    };
+
+    let mut cfg = test_config(PathBuf::from("/nonexistent/access.log"), 0);
+    cfg.traffic.ip_mode = config::IpMode::Anonymized;
+    let interval = Duration::from_millis(10);
+    TrafficService::build_with_intervals(
+        &cfg,
+        store.clone(),
+        Arc::new(NoGeo),
+        100,
+        interval,
+        interval,
+    )
+    .await;
+    assert_eq!(ips(&store), ["203.0.113.0/24"]);
+
+    cfg.traffic.ip_mode = config::IpMode::Off;
+    TrafficService::build_with_intervals(
+        &cfg,
+        store.clone(),
+        Arc::new(NoGeo),
+        100,
+        interval,
+        interval,
+    )
+    .await;
+    assert!(ips(&store).is_empty());
 }

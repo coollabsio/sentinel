@@ -97,6 +97,7 @@ Inert unless Sentinel is built with the `traffic` Cargo feature. See [Traffic An
 | `TRAFFIC_ACCESS_LOG_PATH` | `/data/coolify/proxy/access.log` | Reverse-proxy JSON access log to tail |
 | `TRAFFIC_PROXY_TYPE` | `auto` | `traefik`, `caddy`, or `auto` (sniffs the format; Nginx is deferred) |
 | `TRAFFIC_TOPN` | `50` | Top-N cap per dimension (paths, countries, browsers, ...); overflow folds into a `__other__` row |
+| `TRAFFIC_IP_MODE` | `full` | How the `ip` dimension stores client IPs: `full`, `anonymized` (only the IPv4 /24 or IPv6 /48 network, as `1.2.3.0/24`), or `off` (no `ip` rows). At start, Sentinel deletes stored `ip` rows that the mode does not allow. Unique-visitor counts always use a HyperLogLog sketch, which stores no IPs |
 | `TRAFFIC_SAMPLE_THRESHOLD` | `0` (off) | Events/sec above which to start sampling under extreme load |
 | `TRAFFIC_RETENTION_1M_HOURS` | `48` | Safety net, **not** a queryable window — see note below |
 | `TRAFFIC_RETENTION_1H_DAYS` | `30` | How long hourly rollups are kept; this is your real fine-grained history |

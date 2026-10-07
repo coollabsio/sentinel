@@ -33,6 +33,8 @@ pub enum ConfigError {
     NotPositive(&'static str),
     #[error("invalid {0}: must be true or false")]
     InvalidBool(&'static str),
+    #[error("invalid TRAFFIC_IP_MODE: must be full, anonymized, or off")]
+    InvalidIpMode,
     #[error("FLUX_CA_PATH environment variable is required when CONTROL_PLANE_ENABLED is true")]
     MissingFluxCaPath,
     #[error("FLUX_TRUST_BUNDLE_VERSION must be a positive integer")]
@@ -50,12 +52,27 @@ pub struct ControlTlsConfig {
 /// `enabled` (TRAFFIC_ENABLED) is set and the binary is built with the
 /// `traffic` feature. All fields have safe defaults so the zero-config path
 /// is opt-out-clean.
+/// How the `ip` breakdown dimension stores client IPs (TRAFFIC_IP_MODE).
+/// Unique-visitor counts always hash the full IP into an HLL sketch, which
+/// never stores the address itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpMode {
+    /// The full client IP.
+    #[default]
+    Full,
+    /// Only the network: IPv4 /24, IPv6 /48, as CIDR text (`1.2.3.0/24`).
+    Anonymized,
+    /// No `ip` dimension.
+    Off,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrafficSettings {
     pub enabled: bool,
     pub access_log_path: PathBuf,
     pub proxy_type: String,
     pub topn: u32,
+    pub ip_mode: IpMode,
     pub sample_threshold: u32,
     pub retention_1m_hours: u32,
     pub retention_1h_days: u32,
@@ -159,6 +176,7 @@ impl Config {
             ),
             proxy_type: non_empty("TRAFFIC_PROXY_TYPE").unwrap_or_else(|| "auto".to_string()),
             topn: u32_from_env("TRAFFIC_TOPN", 50)?,
+            ip_mode: ip_mode_from_env()?,
             // Sampling is off by default; 0 is a valid "disabled" sentinel, so it
             // uses a non-positive-tolerant parse rather than positive_from_env.
             sample_threshold: u32_nonneg_from_env("TRAFFIC_SAMPLE_THRESHOLD", 0)?,
@@ -263,6 +281,7 @@ impl Config {
                 access_log_path: PathBuf::from("/data/coolify/proxy/access.log"),
                 proxy_type: "auto".to_string(),
                 topn: 50,
+                ip_mode: IpMode::Full,
                 sample_threshold: 0,
                 retention_1m_hours: 48,
                 retention_1h_days: 30,
@@ -294,6 +313,15 @@ fn bool_from_env(key: &'static str, fallback: bool) -> Result<bool, ConfigError>
             "0" | "f" | "F" | "false" | "FALSE" | "False" => Ok(false),
             _ => Err(ConfigError::InvalidBool(key)),
         },
+    }
+}
+
+fn ip_mode_from_env() -> Result<IpMode, ConfigError> {
+    match non_empty("TRAFFIC_IP_MODE").as_deref() {
+        None | Some("full") => Ok(IpMode::Full),
+        Some("anonymized") => Ok(IpMode::Anonymized),
+        Some("off") => Ok(IpMode::Off),
+        Some(_) => Err(ConfigError::InvalidIpMode),
     }
 }
 

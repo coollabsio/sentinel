@@ -327,6 +327,82 @@ fn ip_dimension_is_absent_when_client_ip_unresolved() {
     );
 }
 
+fn ip_values(mode: IpMode, ips: &[&str]) -> Vec<String> {
+    let mut a = Aggregator::new(50).with_ip_mode(mode);
+    let ev = base_event();
+    for ip in ips {
+        let mut en = base_enriched();
+        en.client_ip = Some(ip.parse::<IpAddr>().unwrap());
+        a.record(&ev, &en);
+    }
+    let mut values: Vec<String> = a
+        .take_rollup(60_000)
+        .breakdown
+        .into_iter()
+        .filter(|r| r.dimension == "ip")
+        .map(|r| r.value)
+        .collect();
+    values.sort();
+    values
+}
+
+#[test]
+fn anonymized_ip_mode_records_only_the_network() {
+    assert_eq!(
+        ip_values(
+            IpMode::Anonymized,
+            &[
+                "203.0.113.7",
+                "203.0.113.99",
+                "::ffff:198.51.100.4",
+                "2001:db8:1:2::5"
+            ],
+        ),
+        ["198.51.100.0/24", "2001:db8:1::/48", "203.0.113.0/24"],
+    );
+}
+
+#[test]
+fn off_ip_mode_records_no_ip_rows_but_keeps_uniques() {
+    assert!(ip_values(IpMode::Off, &["203.0.113.7"]).is_empty());
+
+    let mut a = Aggregator::new(50).with_ip_mode(IpMode::Off);
+    let mut en = base_enriched();
+    for ip in ["203.0.113.7", "203.0.113.8"] {
+        en.client_ip = Some(ip.parse::<IpAddr>().unwrap());
+        a.record(&base_event(), &en);
+    }
+    let rollup = a.take_rollup(60_000);
+    let mut uniques = Uniques::from_bytes(&rollup.stats[0].uniques_hll).unwrap();
+    assert_eq!(uniques.count(), 2, "unique visitors still count every IP");
+}
+
+#[test]
+fn ip_value_allowed_matches_each_mode() {
+    for value in ["203.0.113.7", "203.0.113.0/24", "__other__"] {
+        assert!(ip_value_allowed(IpMode::Full, value));
+        assert!(!ip_value_allowed(IpMode::Off, value));
+    }
+    for allowed in ["203.0.113.0/24", "2001:db8:1::/48", "__other__"] {
+        assert!(ip_value_allowed(IpMode::Anonymized, allowed), "{allowed}");
+    }
+    for rejected in [
+        "203.0.113.7",
+        "203.0.113.0",
+        "203.0.113.7/24",
+        "203.0.113.0/16",
+        "2001:db8:1:2::5",
+        "2001:db8:1::/64",
+        "::ffff:203.0.113.0/24",
+        "not-an-ip",
+    ] {
+        assert!(
+            !ip_value_allowed(IpMode::Anonymized, rejected),
+            "{rejected}"
+        );
+    }
+}
+
 #[test]
 fn useragent_dimension_records_the_raw_user_agent() {
     let mut a = Aggregator::new(50);

@@ -5,7 +5,9 @@
 //! the window into `store::traffic` rows.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use config::IpMode;
 use foldhash::fast::RandomState;
 use store::traffic::{BreakdownRow, PathRow, StatsRow};
 
@@ -48,6 +50,7 @@ pub struct WindowRollup {
 /// (computed via [`Aggregator::bucket_of`]) to drain it.
 pub struct Aggregator {
     topn: usize,
+    ip_mode: IpMode,
     /// Exact counters + sketches per `(app, host)`.
     per_key: HashMap<(String, String), StatsAcc, RandomState>,
     /// Per-app top-N of paths (by request count).
@@ -70,6 +73,7 @@ impl Aggregator {
     pub fn new(topn: usize) -> Self {
         Self {
             topn,
+            ip_mode: IpMode::Full,
             per_key: HashMap::default(),
             paths: HashMap::default(),
             path_latency: HashMap::default(),
@@ -77,6 +81,12 @@ impl Aggregator {
             path_other_errors: HashMap::default(),
             breakdown: HashMap::default(),
         }
+    }
+
+    /// Sets how the `ip` breakdown dimension stores client IPs.
+    pub fn with_ip_mode(mut self, ip_mode: IpMode) -> Self {
+        self.ip_mode = ip_mode;
+        self
     }
 
     /// Floors a millisecond timestamp to its containing minute boundary.
@@ -196,10 +206,14 @@ impl Aggregator {
         // CF/XFF-resolved in `enrich` (CF-Connecting-IP → first X-Forwarded-For
         // entry → raw connection IP), so this dimension naturally holds the real
         // visitor behind Cloudflare / a reverse proxy, not the proxy's own IP.
-        // Rendered into a local binding so the borrow outlives the call.
-        // `skip_empty=true` drops requests with no resolvable IP.
-        let ip = en.client_ip.map(|ip| ip.to_string()).unwrap_or_default();
-        record_breakdown(dims, "ip", &ip, bytes, topn, true);
+        // `ip_mode` decides if it is stored in full, as its network, or not
+        // at all. `skip_empty=true` drops requests with no resolvable IP.
+        if let Some(ip) = en
+            .client_ip
+            .and_then(|ip| ip_dimension_value(self.ip_mode, ip))
+        {
+            record_breakdown(dims, "ip", &ip, bytes, topn, true);
+        }
 
         // `useragent` — the raw User-Agent header, recorded verbatim (never
         // lowercased or normalized) so the UI can show the full agent string.
@@ -358,6 +372,47 @@ fn record_breakdown(
     dims.entry(dim)
         .or_default()
         .add_bounded(value, 1, bytes_out, topn);
+}
+
+/// The `ip` breakdown value for `ip` under `mode`, or `None` when the mode
+/// stores no IPs.
+pub fn ip_dimension_value(mode: IpMode, ip: IpAddr) -> Option<String> {
+    match mode {
+        IpMode::Full => Some(ip.to_string()),
+        IpMode::Anonymized => Some(anonymize_ip(ip)),
+        IpMode::Off => None,
+    }
+}
+
+/// Whether a stored `ip` breakdown value can stay under `mode`. Startup uses
+/// this to delete rows that an earlier, less private mode wrote.
+pub fn ip_value_allowed(mode: IpMode, value: &str) -> bool {
+    match mode {
+        IpMode::Full => true,
+        IpMode::Off => false,
+        IpMode::Anonymized => {
+            value == "__other__"
+                || value
+                    .split_once('/')
+                    .and_then(|(addr, _)| addr.parse::<IpAddr>().ok())
+                    .is_some_and(|addr| anonymize_ip(addr) == value)
+        }
+    }
+}
+
+/// The client network as CIDR text: IPv4 /24 (`1.2.3.0/24`), IPv6 /48
+/// (`2001:db8:1::/48`). IPv4-mapped IPv6 addresses count as IPv4.
+fn anonymize_ip(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            format!("{}/24", Ipv4Addr::new(a, b, c, 0))
+        }
+        IpAddr::V6(v6) => {
+            let masked = u128::from(v6) & (u128::MAX << 80);
+            format!("{}/48", Ipv6Addr::from(masked))
+        }
+    }
 }
 
 #[cfg(test)]

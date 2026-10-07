@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use store::traffic::AnalyticsStore;
 
-use crate::aggregator::{Aggregator, WindowRollup};
+use crate::aggregator::{Aggregator, WindowRollup, ip_value_allowed};
 use crate::enrich::{CountryLookup, Enricher};
 use crate::parser::{ProxyType, detect, parse_line};
 use crate::tailer::Tailer;
@@ -151,6 +151,8 @@ impl TrafficService {
         poll_interval: Duration,
         flush_check_interval: Duration,
     ) -> Self {
+        Self::delete_disallowed_ips(&store, cfg.traffic.ip_mode).await;
+
         let path = &cfg.traffic.access_log_path;
         let (tailer, last_open_error) = match Tailer::open(path) {
             Ok(tailer) => (Some(tailer), None),
@@ -186,7 +188,8 @@ impl TrafficService {
             open_retry_initial: OPEN_RETRY_INITIAL,
             open_retry_max: OPEN_RETRY_MAX,
             enricher: Enricher::new(geo, UA_CACHE_CAP),
-            aggregator: Aggregator::new(cfg.traffic.topn as usize),
+            aggregator: Aggregator::new(cfg.traffic.topn as usize)
+                .with_ip_mode(cfg.traffic.ip_mode),
             proxy,
             sample_threshold: cfg.traffic.sample_threshold,
             window_ms,
@@ -435,6 +438,32 @@ impl TrafficService {
         }
         self.sample_count += 1;
         true
+    }
+
+    /// Deletes stored `ip` breakdown rows that `ip_mode` does not allow, so
+    /// a switch to `anonymized` or `off` also removes the IPs an earlier mode
+    /// stored. A failure is logged and dropped, like a flush failure.
+    async fn delete_disallowed_ips(store: &AnalyticsStore, ip_mode: config::IpMode) {
+        if ip_mode == config::IpMode::Full {
+            return;
+        }
+        let store = store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            store.delete_breakdown_values("ip", |value| ip_value_allowed(ip_mode, value))
+        })
+        .await;
+        match result {
+            Ok(Ok(0)) => {}
+            Ok(Ok(deleted)) => {
+                tracing::info!(
+                    deleted,
+                    ?ip_mode,
+                    "deleted stored IPs not allowed by TRAFFIC_IP_MODE"
+                )
+            }
+            Ok(Err(e)) => tracing::warn!(error = %e, "deleting stored IPs failed"),
+            Err(e) => tracing::warn!(error = %e, "deleting stored IPs task failed"),
+        }
     }
 
     /// Writes one drained window on a blocking thread. A flush failure (or a

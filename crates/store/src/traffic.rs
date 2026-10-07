@@ -704,6 +704,36 @@ impl AnalyticsStore {
         Ok(total)
     }
 
+    /// Deletes every `dimension` breakdown row, in all tiers, whose value
+    /// `keep` rejects, in one transaction; returns rows removed.
+    pub fn delete_breakdown_values(
+        &self,
+        dimension: &str,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<usize, StoreError> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            let mut total = 0;
+            for tier in [Tier::M1, Tier::H1, Tier::D1] {
+                let table = format!("traffic_breakdown_{}", suffix(tier));
+                let values: Vec<String> = tx
+                    .prepare(&format!(
+                        "SELECT DISTINCT value FROM {table} WHERE dimension = ?1"
+                    ))?
+                    .query_map([dimension], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let mut delete = tx.prepare(&format!(
+                    "DELETE FROM {table} WHERE dimension = ?1 AND value = ?2"
+                ))?;
+                for value in values.iter().filter(|value| !keep(value)) {
+                    total += delete.execute([dimension, value.as_str()])?;
+                }
+            }
+            tx.commit()?;
+            Ok(total)
+        })
+    }
+
     /// Applies the per-tier retention windows (48h / 30d / 395d), deleting
     /// everything older than `now - window` in each tier; returns rows removed.
     /// Pure SQL deletion — no sketch merging (that lives in `traffic::compaction`).

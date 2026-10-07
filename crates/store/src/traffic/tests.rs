@@ -1020,3 +1020,36 @@ fn resource_queries_use_the_app_index() {
         );
     }
 }
+
+#[test]
+fn delete_breakdown_values_removes_rejected_values_in_every_tier() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    for tier in [Tier::M1, Tier::H1, Tier::D1] {
+        s.write_rows(
+            tier,
+            &[],
+            &[],
+            &[
+                breakdown_row(60_000, "a", "ip", "203.0.113.7", 2),
+                breakdown_row(60_000, "a", "ip", "203.0.113.0/24", 3),
+                breakdown_row(60_000, "a", "country", "203.0.113.7", 1),
+            ],
+        )
+        .unwrap();
+    }
+
+    let deleted = s
+        .delete_breakdown_values("ip", |value| value.ends_with("/24"))
+        .unwrap();
+
+    assert_eq!(deleted, 3, "one rejected ip row per tier");
+    for tier in [Tier::M1, Tier::H1, Tier::D1] {
+        let ips = s.breakdown_range(tier, "a", "ip", 0, 120_000, 10).unwrap();
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips[0].value, "203.0.113.0/24");
+        let other = s
+            .breakdown_range(tier, "a", "country", 0, 120_000, 10)
+            .unwrap();
+        assert_eq!(other.len(), 1, "other dimensions stay");
+    }
+}

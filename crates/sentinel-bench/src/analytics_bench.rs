@@ -193,6 +193,7 @@ fn traffic_settings(opts: &AnalyticsOpts) -> TrafficSettings {
         access_log_path: PathBuf::from("/dev/null"),
         proxy_type: "traefik".into(),
         topn: 50,
+        ip_mode: config::IpMode::Full,
         sample_threshold: 0,
         retention_1m_hours: 48,
         retention_1h_days: 30,

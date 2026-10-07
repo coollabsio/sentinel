@@ -309,6 +309,7 @@ fn traffic_defaults() {
         ("TRAFFIC_ENABLED", ""),
         ("TRAFFIC_PROXY_TYPE", ""),
         ("TRAFFIC_TOPN", ""),
+        ("TRAFFIC_IP_MODE", ""),
         ("TRAFFIC_SAMPLE_THRESHOLD", ""),
         ("GEOIP_ENABLED", ""),
         ("GEOIP_DB_URL", ""),
@@ -320,6 +321,7 @@ fn traffic_defaults() {
     assert!(!c.traffic.enabled);
     assert_eq!(c.traffic.proxy_type, "auto");
     assert_eq!(c.traffic.topn, 50);
+    assert_eq!(c.traffic.ip_mode, IpMode::Full);
     assert_eq!(c.traffic.sample_threshold, 0);
     assert_eq!(c.traffic.retention_1m_hours, 48);
     assert_eq!(c.traffic.retention_1h_days, 30);
@@ -440,4 +442,31 @@ fn control_plane_configuration_allows_plaintext_only_for_explicit_development() 
     );
     assert_eq!(control_tls.trust_bundle_version, 1);
     assert!(control_tls.allow_plaintext);
+}
+
+#[test]
+fn traffic_ip_mode_reads_env_and_rejects_unknown_values() {
+    let _l = env_lock().lock().unwrap();
+    for (value, expected) in [
+        ("full", IpMode::Full),
+        ("anonymized", IpMode::Anonymized),
+        ("off", IpMode::Off),
+    ] {
+        let _g = EnvGuard::set(&[
+            ("TOKEN", "t"),
+            ("PUSH_ENDPOINT", "https://example.com"),
+            ("TRAFFIC_IP_MODE", value),
+        ]);
+        assert_eq!(Config::load(false).unwrap().traffic.ip_mode, expected);
+    }
+
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "https://example.com"),
+        ("TRAFFIC_IP_MODE", "hashed"),
+    ]);
+    assert!(matches!(
+        Config::load(false),
+        Err(ConfigError::InvalidIpMode)
+    ));
 }
