@@ -578,3 +578,22 @@ fn take_rollup_clears_the_city_coordinates() {
 
     assert!(a.take_rollup(120_000).city_coords.is_empty());
 }
+
+/// A flood of distinct cities in one window must not grow the coordinate
+/// map past the bound the top-N already has.
+#[test]
+fn city_coordinates_stay_bounded_within_a_window() {
+    let mut a = Aggregator::new(1);
+    for i in 0..500 {
+        a.record(
+            &base_event(),
+            &city(&format!("DE|BE|City{i}"), Some((52.0, 13.0))),
+        );
+    }
+
+    assert!(
+        a.city_coords.len() <= crate::sketches::SOFT_CAP_TRIGGER,
+        "{} coordinate entries kept",
+        a.city_coords.len()
+    );
+}

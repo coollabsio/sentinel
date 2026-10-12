@@ -258,7 +258,7 @@ impl Default for Uniques {
 pub const MAX_KEY_BYTES: usize = 512;
 
 /// Multiple of `topn` at which [`TopN::add_bounded`] trims mid-window.
-const SOFT_CAP_TRIGGER: usize = 8;
+pub(crate) const SOFT_CAP_TRIGGER: usize = 8;
 
 /// Multiple of `topn` that a mid-window trim keeps. See
 /// [`TopN::add_bounded`] for why this is wider than `topn` itself.

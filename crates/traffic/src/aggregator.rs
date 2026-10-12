@@ -13,7 +13,7 @@ use store::traffic::{BreakdownRow, CityCoordRow, PathRow, StatsRow};
 
 use crate::enrich::Enriched;
 use crate::event::{RequestEvent, StatusClass, status_class};
-use crate::sketches::{LatencyDigest, TopN, Uniques, truncate_key};
+use crate::sketches::{LatencyDigest, SOFT_CAP_TRIGGER, TopN, Uniques, truncate_key};
 
 /// Per-`(app, host)` exact counters plus mergeable sketches, accumulated
 /// over the current minute window.
@@ -233,6 +233,28 @@ impl Aggregator {
         // `skip_empty=true` drops requests without a User-Agent.
         let user_agent = ev.user_agent.as_deref().unwrap_or("");
         record_breakdown(dims, "useragent", user_agent, bytes, topn, true);
+
+        self.prune_city_coords();
+    }
+
+    /// Drops coordinates of cities that no app still counts, so a flood of
+    /// distinct cities cannot grow the map past the top-N soft cap.
+    fn prune_city_coords(&mut self) {
+        let limit = self
+            .topn
+            .max(1)
+            .saturating_mul(SOFT_CAP_TRIGGER)
+            .saturating_mul(self.breakdown.len().max(1));
+        if self.city_coords.len() <= limit {
+            return;
+        }
+        let breakdown = &self.breakdown;
+        self.city_coords.retain(|key, _| {
+            breakdown.values().any(|dims| {
+                dims.get("city")
+                    .is_some_and(|cities| cities.counts.contains_key(key))
+            })
+        });
     }
 
     /// Drains the current window into row types for `bucket`, capping
