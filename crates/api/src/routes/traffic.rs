@@ -742,7 +742,7 @@ async fn run_paths(state: Arc<AppState>, target: Target, q: TopQuery) -> Respons
     description = "Top values of one dimension for one app, summed across every bucket\nin range. A synthetic `__other__` entry absorbs the long tail past\nthe server's top-N cap (TRAFFIC_TOPN). An unrecognized dimension\nreturns an empty array, not an error.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
     params(
         ("uuid" = String, Path, description = "App UUID"),
-        ("dimension" = String, Path, description = "One of: status, method, country, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. The\n`agent` dimension holds the bot/AI-agent name (e.g. GPTBot,\nClaudeBot) and is only present for bot traffic. `ip` holds the\nresolved real client IP (respecting Cloudflare CF-Connecting-IP\nand X-Forwarded-For); `useragent` holds the raw User-Agent header."),
+        ("dimension" = String, Path, description = "One of: status, method, country, city, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. The\n`agent` dimension holds the bot/AI-agent name (e.g. GPTBot,\nClaudeBot) and is only present for bot traffic. `ip` holds the\nresolved real client IP (respecting Cloudflare CF-Connecting-IP\nand X-Forwarded-For); `useragent` holds the raw User-Agent header."),
         TopQuery
     ),
     responses(
@@ -771,7 +771,7 @@ async fn breakdown(
     description = "Per-resource variant of the app dimension breakdown, merged by `value`\nacross every key of the resource.\n\nReads the key `{uuid}` and every key that starts with `{uuid}-`\n(Compose services, previews, Compose previews). A key such as\n`{uuid}x…` (no dash) is not included.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
     params(
         ("uuid" = String, Path, description = "Coolify resource UUID. Matched literally (`%` and `_` are not wildcards)."),
-        ("dimension" = String, Path, description = "One of: status, method, country, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. An\nunrecognized dimension returns an empty array, not an error."),
+        ("dimension" = String, Path, description = "One of: status, method, country, city, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. An\nunrecognized dimension returns an empty array, not an error."),
         TopQuery
     ),
     responses(
@@ -823,7 +823,7 @@ async fn run_breakdown(
             warn_if_truncated("breakdown", &label, r.len(), budget);
             rows.extend(r);
         }
-        Ok::<_, store::StoreError>(top_breakdown(rows, limit))
+        ranked_breakdown(&analytics, &dimension, rows, limit)
     })
     .await;
     drop(permit);
@@ -951,7 +951,7 @@ async fn server_paths(State(state): State<Arc<AppState>>, Query(q): Query<TopQue
     summary = "Get server-wide dimension breakdown",
     description = "Top values of one dimension across every app on the box, summed over\nthe range. An unrecognized dimension returns an empty array, not an\nerror.\n\nRequires Sentinel built with the `traffic` Cargo feature AND `TRAFFIC_ENABLED=true` at runtime; returns 404 otherwise.",
     params(
-        ("dimension" = String, Path, description = "One of: status, method, country, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. The\n`agent` dimension holds the bot/AI-agent name (e.g. GPTBot,\nClaudeBot) and is only present for bot traffic. `ip` holds the\nresolved real client IP (respecting Cloudflare CF-Connecting-IP\nand X-Forwarded-For); `useragent` holds the raw User-Agent header."),
+        ("dimension" = String, Path, description = "One of: status, method, country, city, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. The\n`agent` dimension holds the bot/AI-agent name (e.g. GPTBot,\nClaudeBot) and is only present for bot traffic. `ip` holds the\nresolved real client IP (respecting Cloudflare CF-Connecting-IP\nand X-Forwarded-For); `useragent` holds the raw User-Agent header."),
         TopQuery
     ),
     responses(
@@ -992,7 +992,7 @@ async fn server_breakdown(
             warn_if_truncated("server_breakdown", "*", r.len(), budget);
             rows.extend(r);
         }
-        Ok::<_, store::StoreError>(top_breakdown(rows, limit))
+        ranked_breakdown(&analytics, &dimension, rows, limit)
     })
     .await;
     drop(permit);
@@ -1160,10 +1160,33 @@ fn top_breakdown(rows: Vec<BreakdownRow>, limit: usize) -> Vec<TrafficBreakdownE
             value,
             requests,
             bytes_out,
+            lat: None,
+            lon: None,
         })
         .collect();
     sort_and_truncate(&mut out, limit, |e| (e.requests, e.value.clone()));
     out
+}
+
+/// [`top_breakdown`], plus coordinates on the entries of the `city` dimension.
+fn ranked_breakdown(
+    analytics: &AnalyticsStore,
+    dimension: &str,
+    rows: Vec<BreakdownRow>,
+    limit: usize,
+) -> Result<Vec<TrafficBreakdownEntry>, store::StoreError> {
+    let mut entries = top_breakdown(rows, limit);
+    if dimension == "city" {
+        let values: Vec<String> = entries.iter().map(|e| e.value.clone()).collect();
+        let coords = analytics.city_coords(&values)?;
+        for entry in &mut entries {
+            if let Some((lat, lon)) = coords.get(&entry.value) {
+                entry.lat = Some(*lat);
+                entry.lon = Some(*lon);
+            }
+        }
+    }
+    Ok(entries)
 }
 
 /// Sorts by request count descending, breaking ties on the key ascending so
@@ -1322,10 +1345,11 @@ fn build_dashboard(
             warn_if_truncated("dashboard_breakdown", &label, r.len(), MAX_SCAN_ROWS);
             rows.extend(r);
         }
-        Ok(top_breakdown(rows, p.breakdown_limit))
+        ranked_breakdown(analytics, name, rows, p.breakdown_limit)
     };
     let breakdowns = TrafficBreakdowns {
         country: dim("country")?,
+        city: dim("city")?,
         referer: dim("referer")?,
         browser: dim("browser")?,
         os: dim("os")?,

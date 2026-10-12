@@ -35,7 +35,7 @@
           {
             "name": "dimension",
             "in": "path",
-            "description": "One of: status, method, country, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. The\n`agent` dimension holds the bot/AI-agent name (e.g. GPTBot,\nClaudeBot) and is only present for bot traffic. `ip` holds the\nresolved real client IP (respecting Cloudflare CF-Connecting-IP\nand X-Forwarded-For); `useragent` holds the raw User-Agent header.",
+            "description": "One of: status, method, country, city, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. The\n`agent` dimension holds the bot/AI-agent name (e.g. GPTBot,\nClaudeBot) and is only present for bot traffic. `ip` holds the\nresolved real client IP (respecting Cloudflare CF-Connecting-IP\nand X-Forwarded-For); `useragent` holds the raw User-Agent header.",
             "required": true,
             "schema": {
               "type": "string"
@@ -1321,7 +1321,7 @@
           {
             "name": "dimension",
             "in": "path",
-            "description": "One of: status, method, country, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. An\nunrecognized dimension returns an empty array, not an error.",
+            "description": "One of: status, method, country, city, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. An\nunrecognized dimension returns an empty array, not an error.",
             "required": true,
             "schema": {
               "type": "string"
@@ -1847,7 +1847,7 @@
           {
             "name": "dimension",
             "in": "path",
-            "description": "One of: status, method, country, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. The\n`agent` dimension holds the bot/AI-agent name (e.g. GPTBot,\nClaudeBot) and is only present for bot traffic. `ip` holds the\nresolved real client IP (respecting Cloudflare CF-Connecting-IP\nand X-Forwarded-For); `useragent` holds the raw User-Agent header.",
+            "description": "One of: status, method, country, city, referer, browser, os, device,\nprotocol, scheme, tls, cache, bot, agent, ip, useragent. The\n`agent` dimension holds the bot/AI-agent name (e.g. GPTBot,\nClaudeBot) and is only present for bot traffic. `ip` holds the\nresolved real client IP (respecting Cloudflare CF-Connecting-IP\nand X-Forwarded-For); `useragent` holds the raw User-Agent header.",
             "required": true,
             "schema": {
               "type": "string"
@@ -2817,7 +2817,7 @@
       },
       "TrafficBreakdownEntry": {
         "type": "object",
-        "description": "One value of a breakdown dimension (country, device, status class, ...),\nsummed over every bucket in the range.",
+        "description": "One value of a breakdown dimension (country, device, status class, ...),\nsummed over every bucket in the range. `lat`/`lon` are present only on\n`city` values that have coordinates.",
         "required": [
           "value",
           "requests",
@@ -2827,6 +2827,20 @@
           "bytes_out": {
             "type": "integer",
             "format": "int64"
+          },
+          "lat": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "lon": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
           },
           "requests": {
             "type": "integer",
@@ -2839,9 +2853,10 @@
       },
       "TrafficBreakdowns": {
         "type": "object",
-        "description": "The eleven breakdown dimensions Coolify renders, each a top-N list in the\nsame shape as `GET /traffic/breakdown/{dim}`. A fixed struct rather than a\nmap so the dimension set is the single source of truth and always complete.",
+        "description": "The twelve breakdown dimensions Coolify renders, each a top-N list in the\nsame shape as `GET /traffic/breakdown/{dim}`. A fixed struct rather than a\nmap so the dimension set is the single source of truth and always complete.",
         "required": [
           "country",
+          "city",
           "referer",
           "browser",
           "os",
@@ -2871,6 +2886,13 @@
             "items": {
               "$ref": "#/components/schemas/TrafficBreakdownEntry"
             }
+          },
+          "city": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrafficBreakdownEntry"
+            },
+            "description": "Values are `CC|subdivision|City`; `CC||` is an unknown city."
           },
           "country": {
             "type": "array",

@@ -300,12 +300,17 @@ pub struct TrafficPath {
 }
 
 /// One value of a breakdown dimension (country, device, status class, ...),
-/// summed over every bucket in the range.
+/// summed over every bucket in the range. `lat`/`lon` are present only on
+/// `city` values that have coordinates.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficBreakdownEntry {
     pub value: String,
     pub requests: i64,
     pub bytes_out: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lat: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lon: Option<f64>,
 }
 
 /// One time bucket of traffic totals, for the series endpoints. `bucket` is
@@ -358,12 +363,14 @@ pub struct TrafficDashboard {
     pub apps: Option<Vec<TrafficAppEntry>>,
 }
 
-/// The eleven breakdown dimensions Coolify renders, each a top-N list in the
+/// The twelve breakdown dimensions Coolify renders, each a top-N list in the
 /// same shape as `GET /traffic/breakdown/{dim}`. A fixed struct rather than a
 /// map so the dimension set is the single source of truth and always complete.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficBreakdowns {
     pub country: Vec<TrafficBreakdownEntry>,
+    /// Values are `CC|subdivision|City`; `CC||` is an unknown city.
+    pub city: Vec<TrafficBreakdownEntry>,
     pub referer: Vec<TrafficBreakdownEntry>,
     pub browser: Vec<TrafficBreakdownEntry>,
     pub os: Vec<TrafficBreakdownEntry>,
