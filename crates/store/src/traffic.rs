@@ -5,7 +5,8 @@
 //! in `traffic::compaction` (merging sketch BLOBs needs its types — `store →
 //! traffic` would be a cycle), driven via `compact_window`, which moves one bucket up atomically.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -63,6 +64,15 @@ CREATE TABLE IF NOT EXISTS traffic_breakdown_{sfx} (
 CREATE INDEX IF NOT EXISTS idx_tb_{sfx}_app_bucket ON traffic_breakdown_{sfx} (app, bucket, dimension);
 ";
 
+/// Coordinates of `city` breakdown values. Not tiered: one row for each city.
+const CITY_COORDS_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS traffic_city_coords (
+    value TEXT PRIMARY KEY,
+    lat   REAL NOT NULL,
+    lon   REAL NOT NULL
+) STRICT;
+";
+
 pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     let mut ddl = String::new();
     for tier in [Tier::M1, Tier::H1, Tier::D1] {
@@ -71,6 +81,7 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             ddl.push_str(&template.replace("{sfx}", sfx));
         }
     }
+    ddl.push_str(CITY_COORDS_SCHEMA);
     conn.execute_batch(&ddl)?;
     for tier in [Tier::M1, Tier::H1, Tier::D1] {
         let table = format!("traffic_paths_{}", suffix(tier));
@@ -241,6 +252,14 @@ pub struct BreakdownRow {
     pub value: String,
     pub requests: i64,
     pub bytes_out: i64,
+}
+
+/// Coordinates of one `city` breakdown value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CityCoordRow {
+    pub value: String,
+    pub lat: f64,
+    pub lon: f64,
 }
 
 /// One bucket window's rows across all three tables of a single tier.
@@ -443,6 +462,49 @@ impl AnalyticsStore {
             insert_rows(&tx, tier, stats, paths, breakdown)?;
             tx.commit()?;
             Ok(())
+        })
+    }
+
+    /// Stores coordinates of `city` breakdown values. The first coordinates
+    /// of a value stay.
+    pub fn record_city_coords(&self, rows: &[CityCoordRow]) -> Result<(), StoreError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            {
+                let mut stmt = tx.prepare_cached(
+                    "INSERT OR IGNORE INTO traffic_city_coords (value, lat, lon) \
+                     VALUES (?1, ?2, ?3)",
+                )?;
+                for row in rows {
+                    stmt.execute((&row.value, row.lat, row.lon))?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// `(lat, lon)` of each of `values` that has coordinates.
+    pub fn city_coords(
+        &self,
+        values: &[String],
+    ) -> Result<HashMap<String, (f64, f64)>, StoreError> {
+        self.with_reader(|c| {
+            let mut stmt =
+                c.prepare_cached("SELECT lat, lon FROM traffic_city_coords WHERE value = ?1")?;
+            let mut out = HashMap::with_capacity(values.len());
+            for value in values {
+                let hit = stmt
+                    .query_row([value], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                if let Some(coords) = hit {
+                    out.insert(value.clone(), coords);
+                }
+            }
+            Ok(out)
         })
     }
 

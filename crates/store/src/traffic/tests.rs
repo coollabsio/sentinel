@@ -1053,3 +1053,58 @@ fn delete_breakdown_values_removes_rejected_values_in_every_tier() {
         assert_eq!(other.len(), 1, "other dimensions stay");
     }
 }
+
+fn coord(value: &str, lat: f64, lon: f64) -> CityCoordRow {
+    CityCoordRow {
+        value: value.into(),
+        lat,
+        lon,
+    }
+}
+
+#[test]
+fn city_coords_keep_the_first_coordinates_of_a_value() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    s.record_city_coords(&[coord("DE|BE|Berlin", 52.52, 13.405)])
+        .unwrap();
+    s.record_city_coords(&[coord("DE|BE|Berlin", 1.0, 2.0)])
+        .unwrap();
+
+    let got = s.city_coords(&["DE|BE|Berlin".to_string()]).unwrap();
+
+    assert_eq!(got.get("DE|BE|Berlin"), Some(&(52.52, 13.405)));
+}
+
+#[test]
+fn city_coords_returns_only_the_requested_known_values() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    s.record_city_coords(&[
+        coord("DE|BE|Berlin", 52.52, 13.405),
+        coord("FR|IDF|Paris", 48.85, 2.35),
+    ])
+    .unwrap();
+
+    let got = s
+        .city_coords(&["FR|IDF|Paris".to_string(), "DE||".to_string()])
+        .unwrap();
+
+    assert_eq!(got.len(), 1);
+    assert_eq!(got.get("FR|IDF|Paris"), Some(&(48.85, 2.35)));
+}
+
+/// A database file from before this table existed gets it on the next open.
+#[test]
+fn apply_adds_the_city_coords_table_to_an_existing_database() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    s.execute_batch_for_test("DROP TABLE traffic_city_coords")
+        .unwrap();
+
+    s.with_conn(|c| Ok(apply(c)?)).unwrap();
+
+    s.record_city_coords(&[coord("DE|BE|Berlin", 52.52, 13.405)])
+        .unwrap();
+    assert_eq!(
+        s.city_coords(&["DE|BE|Berlin".to_string()]).unwrap().len(),
+        1
+    );
+}
