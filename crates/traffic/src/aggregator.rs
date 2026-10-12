@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use config::IpMode;
 use foldhash::fast::RandomState;
-use store::traffic::{BreakdownRow, PathRow, StatsRow};
+use store::traffic::{BreakdownRow, CityCoordRow, PathRow, StatsRow};
 
 use crate::enrich::Enriched;
 use crate::event::{RequestEvent, StatusClass, status_class};
@@ -41,6 +41,7 @@ pub struct WindowRollup {
     pub stats: Vec<StatsRow>,
     pub paths: Vec<PathRow>,
     pub breakdown: Vec<BreakdownRow>,
+    pub city_coords: Vec<CityCoordRow>,
 }
 
 /// In-memory accumulator for the current 1-minute window.
@@ -65,6 +66,8 @@ pub struct Aggregator {
     /// per-app map once and then looks up each dimension by a `&'static str`,
     /// rather than allocating a fresh `(app, dimension)` key per dimension.
     breakdown: HashMap<String, DimMap, RandomState>,
+    /// First `(lat, lon)` seen for each `city` breakdown value in the window.
+    city_coords: HashMap<String, (f64, f64), RandomState>,
 }
 
 impl Aggregator {
@@ -80,6 +83,7 @@ impl Aggregator {
             path_errors: HashMap::default(),
             path_other_errors: HashMap::default(),
             breakdown: HashMap::default(),
+            city_coords: HashMap::default(),
         }
     }
 
@@ -170,6 +174,15 @@ impl Aggregator {
         record_breakdown(dims, "method", &ev.method, bytes, topn, false);
         if let Some(country) = &en.country {
             record_breakdown(dims, "country", country, bytes, topn, true);
+        }
+        if let Some(city) = &en.city {
+            record_breakdown(dims, "city", &city.key, bytes, topn, true);
+            if let Some(coords) = city.coords {
+                let key = truncate_key(&city.key);
+                if !self.city_coords.contains_key(key) {
+                    self.city_coords.insert(key.to_string(), coords);
+                }
+            }
         }
         if let Some(referer) = ev.referer.as_deref() {
             record_breakdown(dims, "referer", referer, bytes, topn, true);
@@ -296,9 +309,21 @@ impl Aggregator {
         self.path_other_errors.clear();
 
         let mut breakdown = Vec::new();
+        let mut city_coords = Vec::new();
         for (app, dims) in self.breakdown.drain() {
             for (dim, mut topn) in dims {
                 topn.cap(self.topn);
+                if dim == "city" {
+                    for value in topn.counts.keys() {
+                        if let Some((lat, lon)) = self.city_coords.remove(value) {
+                            city_coords.push(CityCoordRow {
+                                value: value.clone(),
+                                lat,
+                                lon,
+                            });
+                        }
+                    }
+                }
                 for (value, (reqs, bytes)) in topn.counts.into_iter() {
                     breakdown.push(BreakdownRow {
                         bucket,
@@ -322,10 +347,13 @@ impl Aggregator {
             }
         }
 
+        self.city_coords.clear();
+
         WindowRollup {
             stats,
             paths,
             breakdown,
+            city_coords,
         }
     }
 }
@@ -353,8 +381,8 @@ fn fold_evicted_path_errors(
 /// Adds one value to a dimension's top-N within an app's [`DimMap`]. With
 /// `skip_empty`, an empty
 /// `value` (a woothee UA-parse fallback, or an absent event field) is dropped
-/// rather than recorded — used by the ten optional dimensions (`country`,
-/// `referer`, `browser`, `os`, `device`, `tls`, `cache`, `agent`, `ip`,
+/// rather than recorded — used by the eleven optional dimensions (`country`,
+/// `city`, `referer`, `browser`, `os`, `device`, `tls`, `cache`, `agent`, `ip`,
 /// `useragent`). The five always-recorded dimensions (`status`, `method`,
 /// `protocol`, `scheme`, `bot`), drawn from required fields, pass
 /// `skip_empty=false` so an empty value is never silently dropped.

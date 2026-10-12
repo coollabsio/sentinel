@@ -546,3 +546,56 @@ async fn build_deletes_stored_ips_that_the_ip_mode_does_not_allow() {
     .await;
     assert!(ips(&store).is_empty());
 }
+
+struct BerlinGeo;
+
+impl crate::enrich::GeoLookup for BerlinGeo {
+    fn locate(&self, _ip: std::net::IpAddr) -> Option<crate::enrich::GeoLocation> {
+        Some(crate::enrich::GeoLocation {
+            country: Some("DE".to_string()),
+            subdivision: Some("BE".to_string()),
+            city: Some("Berlin".to_string()),
+            lat: Some(52.52),
+            lon: Some(13.405),
+        })
+    }
+}
+
+/// The flush writes the city rows and their coordinates.
+#[tokio::test]
+async fn the_flush_writes_city_rows_and_coordinates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("access.log");
+    std::fs::File::create(&log).expect("create access log");
+
+    let store = AnalyticsStore::open_in_memory().expect("open store");
+    let cfg = test_config(log.clone(), 0);
+
+    let svc = TrafficService::build_with_intervals(
+        &cfg,
+        store.clone(),
+        Arc::new(BerlinGeo),
+        100,
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    )
+    .await;
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(svc.run(rx));
+
+    append(&log, &format!("{}\n", traefik_line("/", 200, 1)));
+    let total = wait_for_requests(&store, 1, Duration::from_secs(5)).await;
+    assert_eq!(total, 1);
+
+    tx.send(true).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("run() must return promptly after shutdown")
+        .expect("run() task must not panic");
+
+    let coords = store
+        .city_coords(&["DE|BE|Berlin".to_string()])
+        .expect("read coordinates");
+    assert_eq!(coords.get("DE|BE|Berlin"), Some(&(52.52, 13.405)));
+}

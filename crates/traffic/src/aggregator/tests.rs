@@ -468,3 +468,113 @@ fn always_recorded_dimensions_bypass_empty_skip() {
     assert_eq!(method_row.value, "");
     assert_eq!(method_row.requests, 1);
 }
+
+use crate::enrich::CityHit;
+
+fn city(key: &str, coords: Option<(f64, f64)>) -> Enriched {
+    let mut en = base_enriched();
+    en.city = Some(CityHit {
+        key: key.to_string(),
+        coords,
+    });
+    en
+}
+
+fn city_rows(rollup: &WindowRollup) -> Vec<(String, i64)> {
+    let mut rows: Vec<_> = rollup
+        .breakdown
+        .iter()
+        .filter(|r| r.dimension == "city")
+        .map(|r| (r.value.clone(), r.requests))
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[test]
+fn city_dimension_counts_the_key_and_keeps_the_first_coordinates() {
+    let mut a = Aggregator::new(50);
+    a.record(&base_event(), &city("DE|BE|Berlin", Some((52.52, 13.405))));
+    a.record(&base_event(), &city("DE|BE|Berlin", Some((1.0, 2.0))));
+
+    let rollup = a.take_rollup(60_000);
+
+    assert_eq!(city_rows(&rollup), vec![("DE|BE|Berlin".to_string(), 2)]);
+    assert_eq!(
+        rollup.city_coords,
+        vec![CityCoordRow {
+            value: "DE|BE|Berlin".to_string(),
+            lat: 52.52,
+            lon: 13.405,
+        }]
+    );
+}
+
+#[test]
+fn a_city_with_no_coordinates_has_a_row_but_no_coordinate_row() {
+    let mut a = Aggregator::new(50);
+    a.record(&base_event(), &city("DE||", None));
+
+    let rollup = a.take_rollup(60_000);
+
+    assert_eq!(city_rows(&rollup), vec![("DE||".to_string(), 1)]);
+    assert!(rollup.city_coords.is_empty());
+}
+
+#[test]
+fn no_city_gives_no_city_row() {
+    let mut a = Aggregator::new(50);
+    a.record(&base_event(), &base_enriched());
+
+    let rollup = a.take_rollup(60_000);
+
+    assert!(city_rows(&rollup).is_empty());
+    assert!(rollup.city_coords.is_empty());
+}
+
+/// A city that the top-N limit moved into `__other__` gets no coordinate row.
+#[test]
+fn coordinates_are_kept_only_for_cities_inside_the_top_n() {
+    let mut a = Aggregator::new(1);
+    for _ in 0..3 {
+        a.record(&base_event(), &city("DE|BE|Berlin", Some((52.52, 13.405))));
+    }
+    a.record(&base_event(), &city("FR|IDF|Paris", Some((48.85, 2.35))));
+
+    let rollup = a.take_rollup(60_000);
+
+    assert_eq!(
+        city_rows(&rollup),
+        vec![
+            ("DE|BE|Berlin".to_string(), 3),
+            ("__other__".to_string(), 1)
+        ]
+    );
+    assert_eq!(rollup.city_coords.len(), 1);
+    assert_eq!(rollup.city_coords[0].value, "DE|BE|Berlin");
+}
+
+/// The breakdown truncates long keys. The coordinate key must be the same
+/// truncated value, or the API cannot join them.
+#[test]
+fn a_long_city_key_uses_the_same_truncated_value_for_coordinates() {
+    let long_key = format!("DE|BE|{}", "x".repeat(2_000));
+    let mut a = Aggregator::new(50);
+    a.record(&base_event(), &city(&long_key, Some((52.52, 13.405))));
+
+    let rollup = a.take_rollup(60_000);
+
+    let rows = city_rows(&rollup);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].0.len() < long_key.len());
+    assert_eq!(rollup.city_coords[0].value, rows[0].0);
+}
+
+#[test]
+fn take_rollup_clears_the_city_coordinates() {
+    let mut a = Aggregator::new(50);
+    a.record(&base_event(), &city("DE|BE|Berlin", Some((52.52, 13.405))));
+    a.take_rollup(60_000);
+
+    assert!(a.take_rollup(120_000).city_coords.is_empty());
+}
