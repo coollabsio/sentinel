@@ -23,7 +23,7 @@ use reqwest::StatusCode;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 
 use crate::TrafficError;
-use crate::enrich::CountryLookup;
+use crate::enrich::{GeoLocation, GeoLookup};
 
 /// Default database source: a GeoLite2-City mirror published on npm and
 /// served by the jsDelivr CDN. Requires no MaxMind account.
@@ -249,7 +249,7 @@ enum Fetched {
     },
 }
 
-/// A memory-mapped GeoIP country database with lock-free reads and atomic
+/// A memory-mapped GeoIP database with lock-free reads and atomic
 /// hot-reload.
 pub struct GeoIp {
     db: ArcSwap<Reader<Mmap>>,
@@ -539,12 +539,28 @@ impl GeoIp {
     }
 }
 
-impl CountryLookup for GeoIp {
-    fn country(&self, ip: IpAddr) -> Option<String> {
+/// Maps a decoded record onto the fields Sentinel keeps. A country-only
+/// database decodes to a record with only the country set.
+fn location_from(record: &geoip2::City<'_>) -> GeoLocation {
+    let subdivision = record
+        .subdivisions
+        .first()
+        .and_then(|s| s.iso_code.or(s.names.english));
+    GeoLocation {
+        country: record.country.iso_code.map(str::to_string),
+        subdivision: subdivision.map(str::to_string),
+        city: record.city.names.english.map(str::to_string),
+        lat: record.location.latitude,
+        lon: record.location.longitude,
+    }
+}
+
+impl GeoLookup for GeoIp {
+    fn locate(&self, ip: IpAddr) -> Option<GeoLocation> {
         let guard = self.db.load();
         let result = guard.lookup(ip).ok()?;
-        let record = result.decode::<geoip2::Country>().ok()??;
-        record.country.iso_code.map(str::to_string)
+        let record = result.decode::<geoip2::City>().ok()??;
+        Some(location_from(&record))
     }
 }
 

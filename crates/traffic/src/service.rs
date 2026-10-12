@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use store::traffic::AnalyticsStore;
 
 use crate::aggregator::{Aggregator, WindowRollup, ip_value_allowed};
-use crate::enrich::{CountryLookup, Enricher};
+use crate::enrich::{Enricher, GeoLookup};
 use crate::parser::{ProxyType, detect, parse_line};
 use crate::tailer::Tailer;
 
@@ -127,7 +127,7 @@ impl TrafficService {
     pub async fn build(
         cfg: &config::Config,
         store: AnalyticsStore,
-        geo: Arc<dyn CountryLookup>,
+        geo: Arc<dyn GeoLookup>,
     ) -> Self {
         Self::build_with_intervals(
             cfg,
@@ -146,7 +146,7 @@ impl TrafficService {
     pub(crate) async fn build_with_intervals(
         cfg: &config::Config,
         store: AnalyticsStore,
-        geo: Arc<dyn CountryLookup>,
+        geo: Arc<dyn GeoLookup>,
         window_ms: i64,
         poll_interval: Duration,
         flush_check_interval: Duration,

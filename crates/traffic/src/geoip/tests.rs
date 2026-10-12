@@ -293,6 +293,64 @@ fn attribution_is_none_for_an_unrecognized_override() {
     );
 }
 
+fn city_record<'a>() -> geoip2::City<'a> {
+    let mut record = geoip2::City::default();
+    record.country.iso_code = Some("DE");
+    record.city.names.english = Some("Berlin");
+    record.location.latitude = Some(52.52);
+    record.location.longitude = Some(13.405);
+    record
+}
+
+#[test]
+fn location_from_maps_a_city_record() {
+    let mut record = city_record();
+    record.subdivisions.push(geoip2::city::Subdivision {
+        iso_code: Some("BE"),
+        ..Default::default()
+    });
+
+    assert_eq!(
+        location_from(&record),
+        GeoLocation {
+            country: Some("DE".to_string()),
+            subdivision: Some("BE".to_string()),
+            city: Some("Berlin".to_string()),
+            lat: Some(52.52),
+            lon: Some(13.405),
+        }
+    );
+}
+
+/// DB-IP has no ISO subdivision code, only a name.
+#[test]
+fn location_from_uses_the_subdivision_name_when_there_is_no_code() {
+    let mut record = city_record();
+    let mut subdivision = geoip2::city::Subdivision::default();
+    subdivision.names.english = Some("Land Berlin");
+    record.subdivisions.push(subdivision);
+
+    assert_eq!(
+        location_from(&record).subdivision,
+        Some("Land Berlin".to_string())
+    );
+}
+
+/// A country-only database decodes to a record with only the country set.
+#[test]
+fn location_from_a_country_only_record_has_no_city() {
+    let mut record = geoip2::City::default();
+    record.country.iso_code = Some("DE");
+
+    assert_eq!(
+        location_from(&record),
+        GeoLocation {
+            country: Some("DE".to_string()),
+            ..GeoLocation::default()
+        }
+    );
+}
+
 /// `GeoIp::attribution` is a thin wrapper over `classify_attribution`
 /// applied to `meta.source_url` (see the tests above for the
 /// classification cases); building a full `GeoIp` needs a real mmap'd
@@ -307,11 +365,13 @@ async fn bootstrap_downloads_and_looks_up() {
     let cfg = default_settings();
 
     let geo = GeoIp::bootstrap(&cfg, dir.path()).await.unwrap();
-    let country = geo.country("89.160.20.128".parse().unwrap());
+    let location = geo.locate("89.160.20.128".parse().unwrap()).unwrap();
     assert!(
-        country.is_some(),
+        location.country.is_some(),
         "expected a country for a known public IP"
     );
+    assert!(location.city.is_some(), "expected a city: {location:?}");
+    assert!(location.lat.is_some() && location.lon.is_some());
     assert!(
         geo.attribution().is_some(),
         "the default source chain always resolves to an attributable source"
@@ -320,11 +380,32 @@ async fn bootstrap_downloads_and_looks_up() {
     // A second pass either 304s (Ok(false)) or re-downloads (Ok(true));
     // either way the database stays usable and only one file remains.
     let swapped = geo.refresh(&cfg, dir.path()).await.unwrap();
-    assert!(geo.country("89.160.20.128".parse().unwrap()).is_some());
+    assert!(geo.locate("89.160.20.128".parse().unwrap()).is_some());
     let dbs = std::fs::read_dir(dir.path())
         .unwrap()
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with("geoip-"))
         .count();
     assert_eq!(dbs, 1, "swapped={swapped}");
+}
+
+/// Network-gated: the DB-IP city database decodes with the same record type.
+/// Run manually with `cargo test -p traffic geoip -- --ignored`.
+#[tokio::test]
+#[ignore = "hits the network"]
+async fn dbip_city_database_resolves_a_city() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = default_settings();
+    let now = time::OffsetDateTime::now_utc();
+    cfg.geoip_db_url = Some(dbip_url(now.year(), now.month() as u32));
+
+    let geo = GeoIp::bootstrap(&cfg, dir.path()).await.unwrap();
+    let location = geo.locate("89.160.20.128".parse().unwrap()).unwrap();
+
+    assert!(location.country.is_some(), "{location:?}");
+    assert!(location.city.is_some(), "{location:?}");
+    assert!(
+        location.lat.is_some() && location.lon.is_some(),
+        "{location:?}"
+    );
 }

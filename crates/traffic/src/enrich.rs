@@ -13,19 +13,60 @@ use lru::LruCache;
 
 use crate::event::RequestEvent;
 
-/// Looks up a country code for an IP address (e.g. backed by a GeoIP database).
-pub trait CountryLookup: Send + Sync {
-    /// Return an ISO country code for `ip`, or `None` if unknown.
-    fn country(&self, ip: IpAddr) -> Option<String>;
+/// What a GeoIP lookup resolved for one IP address.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GeoLocation {
+    /// ISO 3166-1 alpha-2 country code.
+    pub country: Option<String>,
+    /// ISO 3166-2 subdivision code, else its English name.
+    pub subdivision: Option<String>,
+    /// English city name.
+    pub city: Option<String>,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
 }
 
-/// A no-op `CountryLookup` that never resolves a country.
+/// Looks up the location of an IP address (e.g. backed by a GeoIP database).
+pub trait GeoLookup: Send + Sync {
+    /// Return the location of `ip`, or `None` if unknown.
+    fn locate(&self, ip: IpAddr) -> Option<GeoLocation>;
+}
+
+/// A no-op `GeoLookup` that never resolves a location.
 pub struct NoGeo;
 
-impl CountryLookup for NoGeo {
-    fn country(&self, _ip: IpAddr) -> Option<String> {
+impl GeoLookup for NoGeo {
+    fn locate(&self, _ip: IpAddr) -> Option<GeoLocation> {
         None
     }
+}
+
+/// The `city` breakdown value of a request and its `(lat, lon)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CityHit {
+    pub key: String,
+    pub coords: Option<(f64, f64)>,
+}
+
+/// The `city` breakdown value: `CC|subdivision|City`. Absent parts stay empty.
+pub fn city_key(country: &str, subdivision: Option<&str>, city: Option<&str>) -> String {
+    let part = |s: Option<&str>| s.unwrap_or("").replace('|', " ");
+    format!("{country}|{}|{}", part(subdivision), part(city))
+}
+
+/// `None` without a country. Without a city the key is `CC||`, so each
+/// country has one unknown-city row, and there are no coordinates.
+fn city_hit(location: &GeoLocation) -> Option<CityHit> {
+    let country = location.country.as_deref()?;
+    let city = location.city.as_deref().filter(|c| !c.is_empty());
+    let subdivision = city.and(location.subdivision.as_deref());
+    let coords = city
+        .and(location.lat.zip(location.lon))
+        .filter(|(lat, lon)| lat.is_finite() && lon.is_finite());
+    Some(CityHit {
+        key: city_key(country, subdivision, city),
+        coords,
+    })
 }
 
 /// Parsed User-Agent metadata.
@@ -229,6 +270,8 @@ fn parse_ip(value: Option<&str>) -> Option<IpAddr> {
 pub struct Enriched {
     /// Resolved country code, if any.
     pub country: Option<String>,
+    /// City breakdown value and coordinates, from the GeoIP lookup only.
+    pub city: Option<CityHit>,
     /// Parsed User-Agent metadata.
     pub ua: UaInfo,
     /// Resolved client IP address, if any.
@@ -246,15 +289,15 @@ pub struct Enriched {
 /// Enriches `RequestEvent`s with geolocation, UA parsing, and the client IP.
 /// Cloudflare headers are trusted only when the TCP peer is a local proxy or Cloudflare.
 pub struct Enricher {
-    geo: Arc<dyn CountryLookup>,
+    geo: Arc<dyn GeoLookup>,
     ua_cache: Mutex<LruCache<String, UaInfo>>,
 }
 
 impl Enricher {
-    /// Create a new `Enricher` backed by `geo` for country lookups, with a UA-parse
+    /// Create a new `Enricher` backed by `geo` for location lookups, with a UA-parse
     /// cache holding up to `ua_cache_cap` entries. A `ua_cache_cap` of `0` degrades
     /// to a 1-entry cache rather than panicking.
-    pub fn new(geo: Arc<dyn CountryLookup>, ua_cache_cap: usize) -> Self {
+    pub fn new(geo: Arc<dyn GeoLookup>, ua_cache_cap: usize) -> Self {
         let cap = NonZeroUsize::new(ua_cache_cap).unwrap_or(NonZeroUsize::new(1).unwrap());
         Self {
             geo,
@@ -277,12 +320,14 @@ impl Enricher {
         };
         let client_ip = cf_ip.or_else(forwarded_ip).or(peer);
 
+        let location = client_ip.and_then(|ip| self.geo.locate(ip));
         let country = ev
             .cf_country
             .as_deref()
             .filter(|_| cf_trusted)
             .map(String::from)
-            .or_else(|| client_ip.and_then(|ip| self.geo.country(ip)));
+            .or_else(|| location.as_ref().and_then(|l| l.country.clone()));
+        let city = location.as_ref().and_then(city_hit);
 
         let ua = match ev.user_agent.as_deref() {
             Some(ua_str) => self.parse_ua_cached(ua_str),
@@ -305,6 +350,7 @@ impl Enricher {
 
         Enriched {
             country,
+            city,
             ua,
             client_ip,
             cache,

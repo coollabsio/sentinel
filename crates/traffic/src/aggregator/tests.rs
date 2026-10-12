@@ -30,6 +30,7 @@ fn base_event() -> RequestEvent<'static> {
 fn base_enriched() -> Enriched {
     Enriched {
         country: None,
+        city: None,
         ua: UaInfo::default(),
         client_ip: None,
         cache: None,

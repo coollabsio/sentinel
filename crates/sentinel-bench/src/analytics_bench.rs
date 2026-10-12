@@ -13,7 +13,7 @@ use reqwest::Client;
 use store::traffic::{AnalyticsStore, Tier};
 use traffic::aggregator::Aggregator;
 use traffic::compaction::{compact_1h_to_1d, compact_1m_to_1h};
-use traffic::enrich::{CountryLookup, Enricher, NoGeo};
+use traffic::enrich::{Enricher, GeoLookup, NoGeo};
 use traffic::geoip::{self, GeoIp};
 use traffic::parser::{ProxyType, parse_line};
 
@@ -209,7 +209,7 @@ fn traffic_settings(opts: &AnalyticsOpts) -> TrafficSettings {
 
 async fn load_geoip(
     opts: &AnalyticsOpts,
-) -> Result<Arc<dyn CountryLookup>, Box<dyn std::error::Error>> {
+) -> Result<Arc<dyn GeoLookup>, Box<dyn std::error::Error>> {
     if opts.no_geoip {
         println!("[geoip] disabled (--no-geoip); CF-header lines only get country");
         return Ok(Arc::new(NoGeo));

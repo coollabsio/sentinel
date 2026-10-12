@@ -442,7 +442,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("geoip disabled");
             None
         };
-        let lookup: Arc<dyn traffic::enrich::CountryLookup> = match &geoip {
+        let lookup: Arc<dyn traffic::enrich::GeoLookup> = match &geoip {
             Some(geoip) => geoip.clone(),
             None => Arc::new(traffic::enrich::NoGeo),
         };

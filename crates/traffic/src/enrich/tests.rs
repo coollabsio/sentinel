@@ -1,12 +1,40 @@
 use super::*;
 
-/// A fake `CountryLookup` that always resolves to "ZZ", for tests.
+/// A fake `GeoLookup` that always resolves to country "ZZ", for tests.
 struct FakeGeo;
 
-impl CountryLookup for FakeGeo {
-    fn country(&self, _ip: IpAddr) -> Option<String> {
-        Some("ZZ".to_string())
+impl GeoLookup for FakeGeo {
+    fn locate(&self, _ip: IpAddr) -> Option<GeoLocation> {
+        Some(GeoLocation {
+            country: Some("ZZ".to_string()),
+            ..GeoLocation::default()
+        })
     }
+}
+
+/// A fake `GeoLookup` that returns one fixed location.
+struct FixedGeo(GeoLocation);
+
+impl GeoLookup for FixedGeo {
+    fn locate(&self, _ip: IpAddr) -> Option<GeoLocation> {
+        Some(self.0.clone())
+    }
+}
+
+fn berlin() -> GeoLocation {
+    GeoLocation {
+        country: Some("DE".to_string()),
+        subdivision: Some("BE".to_string()),
+        city: Some("Berlin".to_string()),
+        lat: Some(52.52),
+        lon: Some(13.405),
+    }
+}
+
+fn enrich_with(location: GeoLocation) -> Enriched {
+    let mut ev = base_event();
+    ev.client_ip = Some("1.2.3.4".into());
+    Enricher::new(Arc::new(FixedGeo(location)), 8).enrich(&ev)
 }
 
 fn base_event() -> RequestEvent<'static> {
@@ -381,4 +409,95 @@ fn ua_cache_memoizes() {
 
     assert_eq!(first.ua.browser, second.ua.browser);
     assert!(!first.ua.browser.is_empty());
+}
+
+#[test]
+fn city_key_joins_the_parts_and_replaces_pipes() {
+    assert_eq!(city_key("DE", Some("BE"), Some("Berlin")), "DE|BE|Berlin");
+    assert_eq!(city_key("SG", None, Some("Singapore")), "SG||Singapore");
+    assert_eq!(city_key("US", Some("A|B"), Some("C|D")), "US|A B|C D");
+}
+
+#[test]
+fn city_comes_from_the_lookup_with_coordinates() {
+    let result = enrich_with(berlin());
+
+    assert_eq!(result.country, Some("DE".to_string()));
+    assert_eq!(
+        result.city,
+        Some(CityHit {
+            key: "DE|BE|Berlin".to_string(),
+            coords: Some((52.52, 13.405)),
+        })
+    );
+}
+
+/// A country-only database, or a network with no city, gives one `CC||` row
+/// for each country and no coordinates.
+#[test]
+fn a_country_with_no_city_is_the_unknown_key() {
+    let mut location = berlin();
+    location.city = None;
+
+    let result = enrich_with(location);
+
+    assert_eq!(
+        result.city,
+        Some(CityHit {
+            key: "DE||".to_string(),
+            coords: None,
+        })
+    );
+}
+
+#[test]
+fn no_country_gives_no_city() {
+    let mut location = berlin();
+    location.country = None;
+
+    assert_eq!(enrich_with(location).city, None);
+}
+
+#[test]
+fn coordinates_that_are_not_finite_are_dropped() {
+    let mut location = berlin();
+    location.lat = Some(f64::NAN);
+
+    let city = enrich_with(location).city.unwrap();
+
+    assert_eq!(city.key, "DE|BE|Berlin");
+    assert_eq!(city.coords, None);
+}
+
+#[test]
+fn one_missing_coordinate_drops_both() {
+    let mut location = berlin();
+    location.lon = None;
+
+    assert_eq!(enrich_with(location).city.unwrap().coords, None);
+}
+
+/// The Cloudflare header sets the country dimension only. The city key keeps
+/// the country of the lookup, so it agrees with the coordinates.
+#[test]
+fn the_cf_country_header_does_not_change_the_city_key() {
+    let enricher = Enricher::new(Arc::new(FixedGeo(berlin())), 8);
+    let mut ev = base_event();
+    ev.cf_country = Some("US".into());
+    ev.client_ip = Some("172.18.0.1".into());
+
+    let result = enricher.enrich(&ev);
+
+    assert_eq!(result.country, Some("US".to_string()));
+    assert_eq!(result.city.unwrap().key, "DE|BE|Berlin");
+}
+
+#[test]
+fn no_geo_gives_no_city() {
+    let mut ev = base_event();
+    ev.client_ip = Some("1.2.3.4".into());
+
+    let result = Enricher::new(Arc::new(NoGeo), 8).enrich(&ev);
+
+    assert_eq!(result.city, None);
 }
