@@ -188,7 +188,7 @@ impl Config {
             geoip_db_url: non_empty("GEOIP_DB_URL"),
             geoip_maxmind_key: non_empty("GEOIP_MAXMIND_LICENSE_KEY"),
             geoip_maxmind_edition: non_empty("GEOIP_MAXMIND_EDITION")
-                .unwrap_or_else(|| "GeoLite2-Country".to_string()),
+                .unwrap_or_else(|| "GeoLite2-City".to_string()),
             geoip_refresh_days: u32_from_env("GEOIP_REFRESH_DAYS", 30)?,
         };
 
@@ -290,7 +290,7 @@ impl Config {
                 geoip_enabled: true,
                 geoip_db_url: None,
                 geoip_maxmind_key: None,
-                geoip_maxmind_edition: "GeoLite2-Country".to_string(),
+                geoip_maxmind_edition: "GeoLite2-City".to_string(),
                 geoip_refresh_days: 30,
             },
         }

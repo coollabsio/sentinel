@@ -25,10 +25,9 @@ use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use crate::TrafficError;
 use crate::enrich::CountryLookup;
 
-/// Default database source: a GeoLite2-Country mirror published on npm and
+/// Default database source: a GeoLite2-City mirror published on npm and
 /// served by the jsDelivr CDN. Requires no MaxMind account.
-pub const MIRROR_URL: &str =
-    "https://cdn.jsdelivr.net/npm/geolite2-country/GeoLite2-Country.mmdb.gz";
+pub const MIRROR_URL: &str = "https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite2-City.mmdb.gz";
 
 /// Gzip magic number; used to sanity-check URL-derived archive detection.
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
@@ -39,9 +38,9 @@ const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Refuse *decompressed* payloads larger than this. [`MAX_DOWNLOAD_BYTES`]
 /// bounds only the compressed body — a hostile `GEOIP_DB_URL` can serve a few
-/// KiB that inflate to gigabytes and OOM the agent. Real country databases are
-/// a few MiB, so 64 MiB is a wide margin, not an operational limit.
-const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+/// KiB that inflate to gigabytes and OOM the agent. GeoLite2-City is ~50 MiB
+/// and DB-IP city lite ~125 MiB.
+const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 
 /// How the bytes at a source URL are packaged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,9 +142,9 @@ pub fn maxmind_url(key: &str, edition: &str) -> String {
     )
 }
 
-/// DB-IP's free country-lite download URL for a given year and month.
+/// DB-IP's free city-lite download URL for a given year and month.
 pub fn dbip_url(year: i32, month: u32) -> String {
-    format!("https://download.db-ip.com/free/dbip-country-lite-{year:04}-{month:02}.mmdb.gz")
+    format!("https://download.db-ip.com/free/dbip-city-lite-{year:04}-{month:02}.mmdb.gz")
 }
 
 /// Guess the packaging of `url` from its path suffix (query/fragment ignored).
@@ -518,7 +517,7 @@ const DBIP_ATTRIBUTION: &str = "IP Geolocation by DB-IP (https://db-ip.com)";
 /// `GEOIP_DB_URL` — their responsibility, not ours).
 fn classify_attribution(source_url: &str) -> Option<String> {
     if source_url == MIRROR_URL || source_url.starts_with("https://cdn.jsdelivr.net/") {
-        // The mirror redistributes MaxMind GeoLite2-Country data.
+        // The mirror redistributes MaxMind GeoLite2 data.
         Some(MAXMIND_ATTRIBUTION.to_string())
     } else if source_url.starts_with("https://download.maxmind.com/") {
         Some(MAXMIND_ATTRIBUTION.to_string())

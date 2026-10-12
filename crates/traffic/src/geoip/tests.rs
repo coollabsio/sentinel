@@ -87,7 +87,7 @@ fn maxmind_url_format() {
 fn dbip_url_format() {
     assert_eq!(
         dbip_url(2026, 8),
-        "https://download.db-ip.com/free/dbip-country-lite-2026-08.mmdb.gz"
+        "https://download.db-ip.com/free/dbip-city-lite-2026-08.mmdb.gz"
     );
 }
 
@@ -98,7 +98,7 @@ fn resolve_default_is_mirror_then_dbip() {
     assert_eq!(s[0].url, MIRROR_URL);
     assert!(
         s[1].url
-            .starts_with("https://download.db-ip.com/free/dbip-country-lite-")
+            .starts_with("https://download.db-ip.com/free/dbip-city-lite-")
     );
     assert!(matches!(s[0].archive, Archive::Gz));
     // Third candidate is the previous month's DB-IP file: the current
@@ -106,9 +106,18 @@ fn resolve_default_is_mirror_then_dbip() {
     assert_eq!(s.len(), 3);
     assert!(
         s[2].url
-            .starts_with("https://download.db-ip.com/free/dbip-country-lite-")
+            .starts_with("https://download.db-ip.com/free/dbip-city-lite-")
     );
     assert_ne!(s[1].url, s[2].url);
+}
+
+#[test]
+fn default_sources_are_city_databases() {
+    let sources = resolve_sources(&default_settings());
+    assert_eq!(
+        sources[0].url,
+        "https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite2-City.mmdb.gz"
+    );
 }
 
 #[test]
