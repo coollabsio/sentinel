@@ -9,7 +9,7 @@
 //! only after the new mapping is live.
 
 use std::borrow::Cow;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -18,9 +18,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use config::TrafficSettings;
 use flate2::read::GzDecoder;
-use maxminddb::{Mmap, Reader, geoip2};
+use maxminddb::{Mmap, Reader};
 use reqwest::StatusCode;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+use serde::{Deserialize, Serialize};
 
 use crate::TrafficError;
 use crate::enrich::{GeoLocation, GeoLookup};
@@ -28,6 +29,13 @@ use crate::enrich::{GeoLocation, GeoLookup};
 /// Default database source: a GeoLite2-City mirror published on npm and
 /// served by the jsDelivr CDN. Requires no MaxMind account.
 pub const MIRROR_URL: &str = "https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite2-City.mmdb.gz";
+
+/// Sidecar next to the database: which file is live, where it came from, and
+/// its HTTP validators. Lets the next start reuse the file with no download.
+const META_FILE: &str = "geoip.meta.json";
+
+/// Where a download body is spooled before it is unpacked.
+const DOWNLOAD_FILE: &str = "geoip-download.tmp";
 
 /// Gzip magic number; used to sanity-check URL-derived archive detection.
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
@@ -188,14 +196,25 @@ fn copy_bounded<R: Read>(reader: R, out: &mut impl Write, what: &str) -> Result<
     Ok(())
 }
 
-/// Unpack a downloaded body into `out` as raw `.mmdb` bytes. Streams, so the
-/// decompressed database is never held in memory.
-fn extract_mmdb(bytes: &[u8], archive: &Archive, out: &mut impl Write) -> Result<(), TrafficError> {
-    match reconcile_archive(archive, bytes) {
-        Archive::Raw => Ok(out.write_all(bytes)?),
-        Archive::Gz => copy_bounded(GzDecoder::new(bytes), out, "gunzip"),
+/// Unpack a downloaded body into `out` as raw `.mmdb` bytes. Streams, so
+/// neither the body nor the decompressed database is held in memory.
+fn extract_mmdb(
+    body: impl Read,
+    archive: &Archive,
+    out: &mut impl Write,
+) -> Result<(), TrafficError> {
+    let mut body = BufReader::new(body);
+    let head = body
+        .fill_buf()
+        .map_err(|e| TrafficError::Decompress(format!("read body: {e}")))?;
+    match reconcile_archive(archive, head) {
+        Archive::Raw => {
+            std::io::copy(&mut body, out)?;
+            Ok(())
+        }
+        Archive::Gz => copy_bounded(GzDecoder::new(body), out, "gunzip"),
         Archive::TarGz => {
-            let mut tar = tar::Archive::new(GzDecoder::new(bytes));
+            let mut tar = tar::Archive::new(GzDecoder::new(body));
             let entries = tar
                 .entries()
                 .map_err(|e| TrafficError::Decompress(format!("tar entries: {e}")))?;
@@ -239,12 +258,22 @@ struct Meta {
 enum Fetched {
     /// Server answered `304 Not Modified`.
     NotModified,
-    /// Server answered with a body.
+    /// Server answered with a body, spooled to the file at `body`.
     Body {
-        bytes: Vec<u8>,
+        body: PathBuf,
         etag: Option<String>,
         last_modified: Option<String>,
     },
+}
+
+/// On-disk form of [`Meta`], stored in [`META_FILE`]. `source` is the
+/// redacted URL, so a MaxMind license key is never written to disk.
+#[derive(Serialize, Deserialize)]
+struct SavedMeta {
+    file: String,
+    source: String,
+    etag: Option<String>,
+    last_modified: Option<String>,
 }
 
 /// A memory-mapped GeoIP database with lock-free reads and atomic
@@ -255,6 +284,34 @@ pub struct GeoIp {
 }
 
 impl GeoIp {
+    /// Map the database a previous run left in `db_dir`, with no network
+    /// access. `None` when there is none, or when it came from a source the
+    /// current configuration no longer uses. The caller refreshes afterwards;
+    /// the saved validators make that a `304` when nothing changed.
+    pub fn open_cached(cfg: &TrafficSettings, db_dir: &Path) -> Option<Arc<GeoIp>> {
+        let saved = std::fs::read(db_dir.join(META_FILE)).ok()?;
+        let saved: SavedMeta = serde_json::from_slice(&saved).ok()?;
+        if !is_db_name(&saved.file) {
+            return None;
+        }
+        let source = resolve_sources(cfg)
+            .into_iter()
+            .find(|s| s.redacted_url() == saved.source)?;
+        let path = db_dir.join(&saved.file);
+        let reader = map_database(&path).ok()?;
+        tracing::info!(path = %path.display(), "geoip database loaded from disk");
+        prune_old(db_dir, &path);
+        Some(Arc::new(GeoIp {
+            db: ArcSwap::new(Arc::new(reader)),
+            meta: Mutex::new(Meta {
+                etag: saved.etag,
+                last_modified: saved.last_modified,
+                path,
+                source_url: source.url,
+            }),
+        }))
+    }
+
     /// Download and map a database, trying each [`resolve_sources`] candidate
     /// in order. Returns `Err` only when *every* candidate fails (the caller
     /// falls back to [`crate::enrich::NoGeo`]); on success the `GeoIp` always
@@ -268,13 +325,16 @@ impl GeoIp {
 
         let mut last_err: Option<TrafficError> = None;
         for source in resolve_sources(cfg) {
-            let (bytes, etag, last_modified) = match Self::fetch(&client, &source, None, None).await
+            let (body, etag, last_modified) = match Self::fetch(
+                &client, &source, db_dir, None, None,
+            )
+            .await
             {
                 Ok(Fetched::Body {
-                    bytes,
+                    body,
                     etag,
                     last_modified,
-                }) => (bytes, etag, last_modified),
+                }) => (body, etag, last_modified),
                 // No conditional headers were sent, so 304 is a protocol
                 // violation; treat it as a failed candidate.
                 Ok(Fetched::NotModified) => {
@@ -291,17 +351,19 @@ impl GeoIp {
                 }
             };
 
-            match Self::install(bytes, &source, db_dir).await {
+            match Self::install(body, &source, db_dir).await {
                 Ok((reader, path)) => {
                     tracing::info!(url = %source.redacted_url(), path = %path.display(), "geoip database loaded");
+                    let meta = Meta {
+                        etag,
+                        last_modified,
+                        path: path.clone(),
+                        source_url: source.url.clone(),
+                    };
+                    save_meta(db_dir, &meta);
                     let geo = Arc::new(GeoIp {
                         db: ArcSwap::new(Arc::new(reader)),
-                        meta: Mutex::new(Meta {
-                            etag,
-                            last_modified,
-                            path: path.clone(),
-                            source_url: source.url.clone(),
-                        }),
+                        meta: Mutex::new(meta),
                     });
                     // Only now that the new file is mapped and published is it
                     // safe to remove anything else left in the directory.
@@ -350,14 +412,16 @@ impl GeoIp {
                 (None, None)
             };
 
-            let (bytes, new_etag, new_lm) = match Self::fetch(&client, &source, cond_etag, cond_lm)
-                .await
+            let (body, new_etag, new_lm) = match Self::fetch(
+                &client, &source, db_dir, cond_etag, cond_lm,
+            )
+            .await
             {
                 Ok(Fetched::Body {
-                    bytes,
+                    body,
                     etag,
                     last_modified,
-                }) => (bytes, etag, last_modified),
+                }) => (body, etag, last_modified),
                 Ok(Fetched::NotModified) => {
                     tracing::debug!(url = %source.redacted_url(), "geoip database unchanged");
                     return Ok(false);
@@ -369,7 +433,7 @@ impl GeoIp {
                 }
             };
 
-            let (reader, path) = match Self::install(bytes, &source, db_dir).await {
+            let (reader, path) = match Self::install(body, &source, db_dir).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::debug!(url = %source.redacted_url(), error = %e, "geoip refresh source unusable");
@@ -387,6 +451,7 @@ impl GeoIp {
                 meta.etag = new_etag;
                 meta.last_modified = new_lm;
                 meta.source_url = source.url.clone();
+                save_meta(db_dir, &meta);
             }
             tracing::info!(url = %source.redacted_url(), path = %path.display(), "geoip database refreshed");
             // Only now: the superseded file is unlinked strictly after the new
@@ -402,11 +467,13 @@ impl GeoIp {
         }))
     }
 
-    /// Conditional GET of `source`. `etag`/`last_modified` are the validators
-    /// for the *currently loaded* copy of this exact URL, if any.
+    /// Conditional GET of `source`, with the body spooled to a file in
+    /// `db_dir`. `etag`/`last_modified` are the validators for the *currently
+    /// loaded* copy of this exact URL, if any.
     async fn fetch(
         client: &reqwest::Client,
         source: &Source,
+        db_dir: &Path,
         etag: Option<&str>,
         last_modified: Option<&str>,
     ) -> Result<Fetched, TrafficError> {
@@ -418,7 +485,7 @@ impl GeoIp {
             req = req.header(IF_MODIFIED_SINCE, lm);
         }
 
-        let resp = req
+        let mut resp = req
             .send()
             .await
             .map_err(|e| TrafficError::Download(format!("{}: {e}", source.redacted_url())))?;
@@ -451,68 +518,125 @@ impl GeoIp {
         let etag = header(ETAG);
         let last_modified = header(LAST_MODIFIED);
 
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| TrafficError::Download(format!("{}: body: {e}", source.redacted_url())))?;
-        if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
-            return Err(TrafficError::Download(format!(
-                "{}: body of {} bytes exceeds {MAX_DOWNLOAD_BYTES}",
-                source.redacted_url(),
-                bytes.len()
-            )));
+        let body = db_dir.join(DOWNLOAD_FILE);
+        if let Err(e) = Self::spool(&mut resp, source, &body).await {
+            let _ = std::fs::remove_file(&body);
+            return Err(e);
         }
 
         Ok(Fetched::Body {
-            bytes: bytes.into(),
+            body,
             etag,
             last_modified,
         })
     }
 
+    /// Write the response body to `path` chunk by chunk, so a city database
+    /// is never held in memory.
+    async fn spool(
+        resp: &mut reqwest::Response,
+        source: &Source,
+        path: &Path,
+    ) -> Result<(), TrafficError> {
+        let mut file = std::fs::File::create(path)?;
+        let mut total = 0u64;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| TrafficError::Download(format!("{}: body: {e}", source.redacted_url())))?
+        {
+            total += chunk.len() as u64;
+            if total > MAX_DOWNLOAD_BYTES {
+                return Err(TrafficError::Download(format!(
+                    "{}: body exceeds {MAX_DOWNLOAD_BYTES} bytes",
+                    source.redacted_url()
+                )));
+            }
+            file.write_all(&chunk)?;
+        }
+        Ok(())
+    }
+
     /// [`Self::install_blocking`] on a blocking thread: the gunzip, write and
     /// fsync of a city database take seconds.
     async fn install(
-        bytes: Vec<u8>,
+        body: PathBuf,
         source: &Source,
         db_dir: &Path,
     ) -> Result<(Reader<Mmap>, PathBuf), TrafficError> {
         let archive = source.archive;
         let db_dir = db_dir.to_path_buf();
-        tokio::task::spawn_blocking(move || Self::install_blocking(&bytes, &archive, &db_dir))
-            .await
-            .map_err(|e| TrafficError::GeoIp(format!("install task: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            let installed = Self::install_blocking(&body, &archive, &db_dir);
+            let _ = std::fs::remove_file(&body);
+            installed
+        })
+        .await
+        .map_err(|e| TrafficError::GeoIp(format!("install task: {e}")))?
     }
 
-    /// Unpack `bytes`, write them to a brand-new file under `db_dir`, and map
-    /// it. Never touches an existing file.
+    /// Unpack the spooled `body`, write it to a brand-new file under `db_dir`,
+    /// and map it. Never touches an existing database file.
     fn install_blocking(
-        bytes: &[u8],
+        body: &Path,
         archive: &Archive,
         db_dir: &Path,
     ) -> Result<(Reader<Mmap>, PathBuf), TrafficError> {
-        let path = write_fresh(db_dir, |file| extract_mmdb(bytes, archive, file))?;
-
-        // SAFETY: `Reader::open_mmap` requires that the mapped file is never
-        // modified or truncated for as long as the returned `Reader` lives.
-        // `write_fresh` above created `path` with `create_new(true)`, so it is
-        // a filename no other file has ever occupied, and it was fully written
-        // and closed before this call. Nothing in this crate ever reopens a
-        // `geoip-*.mmdb` file for writing: every download lands on a new
-        // timestamped path, and the only other operation performed on these
-        // files is `prune_old`'s unlink of paths *other* than the live one.
-        // Unlinking is not modification or truncation, and on Linux an
-        // existing mapping survives its file being unlinked, so even a reader
-        // still in flight during a swap stays sound.
-        #[allow(unsafe_code)]
-        let reader = unsafe { Reader::open_mmap(&path) }.map_err(|e| {
+        let body = std::fs::File::open(body)?;
+        let path = write_fresh(db_dir, |file| extract_mmdb(body, archive, file))?;
+        let reader = map_database(&path).inspect_err(|_| {
             // The file is unusable; drop it rather than leave it for prune.
             let _ = std::fs::remove_file(&path);
-            TrafficError::GeoIp(format!("open {}: {e}", path.display()))
         })?;
-
         Ok((reader, path))
     }
+}
+
+/// Memory-map the database file at `path`.
+fn map_database(path: &Path) -> Result<Reader<Mmap>, TrafficError> {
+    // SAFETY: `Reader::open_mmap` requires that the mapped file is never
+    // modified or truncated for as long as the returned `Reader` lives.
+    // `write_fresh` created `path` with `create_new(true)`, so it is a
+    // filename no other file has ever occupied, and it was fully written,
+    // synced and closed before this call (in this run, or in the earlier run
+    // that `open_cached` reuses). Nothing in this crate ever reopens a
+    // `geoip-*.mmdb` file for writing: every download lands on a new
+    // timestamped path, and the only other operation performed on these
+    // files is `prune_old`'s unlink of paths *other* than the live one.
+    // Unlinking is not modification or truncation, and on Linux an
+    // existing mapping survives its file being unlinked, so even a reader
+    // still in flight during a swap stays sound.
+    #[allow(unsafe_code)]
+    unsafe { Reader::open_mmap(path) }
+        .map_err(|e| TrafficError::GeoIp(format!("open {}: {e}", path.display())))
+}
+
+/// Best-effort write of the [`META_FILE`] sidecar for the live database. A
+/// failure only costs the next start a download.
+fn save_meta(db_dir: &Path, meta: &Meta) {
+    let Some(file) = meta.path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let saved = SavedMeta {
+        file: file.to_string(),
+        source: redact_url(&meta.source_url).into_owned(),
+        etag: meta.etag.clone(),
+        last_modified: meta.last_modified.clone(),
+    };
+    // Rename, so a crash never leaves a half-written sidecar.
+    let tmp = db_dir.join(format!("{META_FILE}.tmp"));
+    let written = serde_json::to_vec(&saved)
+        .map_err(std::io::Error::other)
+        .and_then(|json| std::fs::write(&tmp, json))
+        .and_then(|()| std::fs::rename(&tmp, db_dir.join(META_FILE)));
+    if let Err(e) = written {
+        tracing::debug!(dir = %db_dir.display(), error = %e, "geoip meta not saved");
+    }
+}
+
+/// True for the file names [`write_fresh`] makes.
+fn is_db_name(name: &str) -> bool {
+    name.starts_with("geoip-") && name.ends_with(".mmdb") && !name.contains(['/', '\\'])
 }
 
 /// MaxMind's required GeoLite2 attribution string (MaxMind's EULA — see
@@ -550,17 +674,54 @@ impl GeoIp {
     }
 }
 
+/// The fields of a GeoLite2 / DB-IP record that Sentinel keeps. Much smaller
+/// than `geoip2::City`, so the per-request decode skips everything else.
+#[derive(Debug, Default, Deserialize)]
+struct Record<'a> {
+    #[serde(borrow, default)]
+    country: Place<'a>,
+    #[serde(borrow, default)]
+    subdivisions: Vec<Place<'a>>,
+    #[serde(borrow, default)]
+    city: Place<'a>,
+    #[serde(default)]
+    location: Location,
+}
+
+/// A country, subdivision or city entry.
+#[derive(Debug, Default, Deserialize)]
+struct Place<'a> {
+    #[serde(borrow, default)]
+    iso_code: Option<&'a str>,
+    #[serde(borrow, default)]
+    names: Names<'a>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Names<'a> {
+    #[serde(borrow, default)]
+    en: Option<&'a str>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Location {
+    #[serde(default)]
+    latitude: Option<f64>,
+    #[serde(default)]
+    longitude: Option<f64>,
+}
+
 /// Maps a decoded record onto the fields Sentinel keeps. A country-only
 /// database decodes to a record with only the country set.
-fn location_from(record: &geoip2::City<'_>) -> GeoLocation {
+fn location_from(record: &Record<'_>) -> GeoLocation {
     let subdivision = record
         .subdivisions
         .first()
-        .and_then(|s| s.iso_code.or(s.names.english));
+        .and_then(|s| s.iso_code.or(s.names.en));
     GeoLocation {
         country: record.country.iso_code.map(str::to_string),
         subdivision: subdivision.map(str::to_string),
-        city: record.city.names.english.map(str::to_string),
+        city: record.city.names.en.map(str::to_string),
         lat: record.location.latitude,
         lon: record.location.longitude,
     }
@@ -570,7 +731,7 @@ impl GeoLookup for GeoIp {
     fn locate(&self, ip: IpAddr) -> Option<GeoLocation> {
         let guard = self.db.load();
         let result = guard.lookup(ip).ok()?;
-        let record = result.decode::<geoip2::City>().ok()??;
+        let record = result.decode::<Record>().ok()??;
         Some(location_from(&record))
     }
 }
@@ -645,7 +806,7 @@ fn prune_old(db_dir: &Path, keep: &Path) {
         let is_db = path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("geoip-") && n.ends_with(".mmdb"));
+            .is_some_and(is_db_name);
         if !is_db {
             continue;
         }

@@ -50,8 +50,14 @@ pub struct CityHit {
 
 /// The `city` breakdown value: `CC|subdivision|City`. Absent parts stay empty.
 pub fn city_key(country: &str, subdivision: Option<&str>, city: Option<&str>) -> String {
-    let part = |s: Option<&str>| s.unwrap_or("").replace('|', " ");
-    format!("{country}|{}|{}", part(subdivision), part(city))
+    let (subdivision, city) = (subdivision.unwrap_or(""), city.unwrap_or(""));
+    let mut key = String::with_capacity(country.len() + subdivision.len() + city.len() + 2);
+    key.push_str(country);
+    for part in [subdivision, city] {
+        key.push('|');
+        key.extend(part.chars().map(|c| if c == '|' { ' ' } else { c }));
+    }
+    key
 }
 
 /// `None` without a country. Without a city the key is `CC||`, so each

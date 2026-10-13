@@ -373,9 +373,13 @@ surfaces.
 
 **Country enrichment is mixed**, matching production: by default **50%** of lines include Cloudflare
 `request_Cf-Ipcountry` (header wins in the enricher); the rest **omit** CF country and use public
-client IPs so enrichment must hit GeoIP. Phase A reports `cf_country` / `geoip_country` /
-`unresolved` counts. The harness downloads the same default GeoIP chain as Sentinel (jsDelivr
-mirror → DB-IP) into `--geoip-dir` unless `--no-geoip` is set. Live phase E polls
+client IPs so enrichment must hit GeoIP. Those IPs come from a deterministic pool of 2048 addresses
+spread over the address space, so lookups reach many countries and cities. Phase A reports
+`cf_country` / `geoip_country` / `unresolved` counts and `city` (lines that got a city with
+coordinates). The harness downloads the same default GeoIP chain as Sentinel (jsDelivr
+mirror → DB-IP) into `--geoip-dir` unless `--no-geoip` is set. Like a Sentinel restart, a later run
+reuses the database in `--geoip-dir` and prints the load time; delete the directory to measure the
+download. Live phase E polls
 `GET /api/traffic/attribution` so measurements start after the target agent has a database.
 
 ```bash
@@ -421,9 +425,9 @@ mirror → DB-IP) into `--geoip-dir` unless `--no-geoip` is set. Live phase E po
 | `--max-error-pct` | `1.0` | Maximum successful-response error percentage |
 | `--max-p99-ms` | `0` | Optional query p99 ceiling; `0` disables |
 
-Reported phases are: **[A]** parse+enrich+aggregate events/s plus CF/GeoIP country counts, **[B]**
-SQLite minute flush rows and latency, **[C]** minute→hour and hour→day compaction rows/latency,
-**[D]** populated store query p50/p95/p99, and **[E]** live attribution wait, tail-to-visible
+Reported phases are: **[A]** parse+enrich+aggregate events/s plus CF/GeoIP country and city counts, **[B]**
+SQLite minute flush rows, city coordinate rows and latency, **[C]** minute→hour and hour→day compaction rows/latency,
+**[D]** populated store query p50/p95/p99 (stats, paths, country, city with coordinates, apps), and **[E]** live attribution wait, tail-to-visible
 latency, plus HTTP query p50/p95/p99. Phase E exits non-zero if ingestion is not visible before
 `--timeout-secs` (with a 70-second floor so a minute bucket can flush), or if an analytics endpoint
 does not return success. With `--access-log`, **[F]** simultaneously appends Traefik records at

@@ -419,7 +419,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // lost. Bound the whole bootstrap instead, and treat exhausting it
         // exactly like a bootstrap error: no country enrichment, everything
         // else runs.
-        let geoip = if config.traffic.geoip_enabled {
+        // A database left by a previous run is used as it is, with no
+        // download before the tailer opens; the refresh task below checks it.
+        let cached = if config.traffic.geoip_enabled {
+            traffic::geoip::GeoIp::open_cached(&config.traffic, &db_dir)
+        } else {
+            None
+        };
+        let geoip_from_disk = cached.is_some();
+        let geoip = if let Some(geoip) = cached {
+            Some(geoip)
+        } else if config.traffic.geoip_enabled {
             let bootstrap = traffic::geoip::GeoIp::bootstrap(&config.traffic, &db_dir);
             match tokio::time::timeout(GEOIP_BOOTSTRAP_TIMEOUT, bootstrap).await {
                 Ok(Ok(geoip)) => Some(geoip),
@@ -554,10 +564,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
 
-        // GeoIP refresh, every GEOIP_REFRESH_DAYS. Unlike the tickers above,
-        // the interval's immediate first tick is consumed rather than acted on:
-        // `bootstrap` fetched a fresh database moments ago, so refreshing now
-        // would be a redundant round-trip.
+        // GeoIP refresh, every GEOIP_REFRESH_DAYS. After a `bootstrap`, the
+        // interval's immediate first tick is consumed rather than acted on:
+        // the database is moments old. A database reused from disk can be
+        // any age, so there the first tick does a (conditional) refresh.
         if let Some(geoip) = geoip {
             let settings = config.traffic.clone();
             let period = std::time::Duration::from_secs(
@@ -567,7 +577,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut rx = shutdown_rx.clone();
             services.spawn(async move {
                 let mut ticker = tokio::time::interval(period);
-                ticker.tick().await;
+                if !geoip_from_disk {
+                    ticker.tick().await;
+                }
                 loop {
                     tokio::select! {
                         _ = rx.changed() => return Ok::<(), String>(()),

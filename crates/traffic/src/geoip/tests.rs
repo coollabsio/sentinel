@@ -310,22 +310,31 @@ fn attribution_is_none_for_an_unrecognized_override() {
     );
 }
 
-fn city_record<'a>() -> geoip2::City<'a> {
-    let mut record = geoip2::City::default();
-    record.country.iso_code = Some("DE");
-    record.city.names.english = Some("Berlin");
-    record.location.latitude = Some(52.52);
-    record.location.longitude = Some(13.405);
-    record
+fn place<'a>(iso_code: Option<&'a str>, name: Option<&'a str>) -> Place<'a> {
+    Place {
+        iso_code,
+        names: Names { en: name },
+    }
+}
+
+fn city_record<'a>() -> Record<'a> {
+    Record {
+        country: place(Some("DE"), None),
+        subdivisions: Vec::new(),
+        city: place(None, Some("Berlin")),
+        location: Location {
+            latitude: Some(52.52),
+            longitude: Some(13.405),
+        },
+    }
 }
 
 #[test]
 fn location_from_maps_a_city_record() {
     let mut record = city_record();
-    record.subdivisions.push(geoip2::city::Subdivision {
-        iso_code: Some("BE"),
-        ..Default::default()
-    });
+    record
+        .subdivisions
+        .push(place(Some("BE"), Some("Land Berlin")));
 
     assert_eq!(
         location_from(&record),
@@ -343,9 +352,7 @@ fn location_from_maps_a_city_record() {
 #[test]
 fn location_from_uses_the_subdivision_name_when_there_is_no_code() {
     let mut record = city_record();
-    let mut subdivision = geoip2::city::Subdivision::default();
-    subdivision.names.english = Some("Land Berlin");
-    record.subdivisions.push(subdivision);
+    record.subdivisions.push(place(None, Some("Land Berlin")));
 
     assert_eq!(
         location_from(&record).subdivision,
@@ -356,8 +363,10 @@ fn location_from_uses_the_subdivision_name_when_there_is_no_code() {
 /// A country-only database decodes to a record with only the country set.
 #[test]
 fn location_from_a_country_only_record_has_no_city() {
-    let mut record = geoip2::City::default();
-    record.country.iso_code = Some("DE");
+    let record = Record {
+        country: place(Some("DE"), None),
+        ..Record::default()
+    };
 
     assert_eq!(
         location_from(&record),
@@ -366,6 +375,76 @@ fn location_from_a_country_only_record_has_no_city() {
             ..GeoLocation::default()
         }
     );
+}
+
+fn meta(dir: &Path, file: &str, source_url: &str) -> Meta {
+    Meta {
+        etag: Some("\"v1\"".to_string()),
+        last_modified: None,
+        path: dir.join(file),
+        source_url: source_url.to_string(),
+    }
+}
+
+/// The sidecar must never hold the MaxMind license key.
+#[test]
+fn save_meta_redacts_the_license_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = maxmind_url("SECRETKEY", "GeoLite2-City");
+
+    save_meta(dir.path(), &meta(dir.path(), "geoip-1.mmdb", &url));
+
+    let saved = std::fs::read_to_string(dir.path().join(META_FILE)).unwrap();
+    assert!(!saved.contains("SECRETKEY"), "{saved}");
+    assert!(saved.contains("geoip-1.mmdb"), "{saved}");
+}
+
+#[test]
+fn open_cached_is_none_with_no_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    write_bytes(dir.path(), b"not reused").unwrap();
+
+    assert!(GeoIp::open_cached(&default_settings(), dir.path()).is_none());
+}
+
+/// A database from a source the configuration no longer uses (for example
+/// the country edition from before an upgrade) must be downloaded again.
+#[test]
+fn open_cached_is_none_when_the_source_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_bytes(dir.path(), b"old").unwrap();
+    let file = path.file_name().unwrap().to_str().unwrap();
+    save_meta(
+        dir.path(),
+        &meta(
+            dir.path(),
+            file,
+            "https://example.com/GeoLite2-Country.mmdb",
+        ),
+    );
+
+    assert!(GeoIp::open_cached(&default_settings(), dir.path()).is_none());
+}
+
+/// A sidecar must not point the mapping at a file outside the directory.
+#[test]
+fn open_cached_refuses_a_file_name_that_is_not_a_database() {
+    let dir = tempfile::tempdir().unwrap();
+    for file in ["../geoip-1.mmdb", "analytics.sqlite"] {
+        save_meta(dir.path(), &meta(dir.path(), file, MIRROR_URL));
+        assert!(GeoIp::open_cached(&default_settings(), dir.path()).is_none());
+    }
+}
+
+/// A file that is not a database fails to map; the caller then downloads.
+#[test]
+fn open_cached_is_none_when_the_file_is_not_a_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_bytes(dir.path(), b"garbage").unwrap();
+    let file = path.file_name().unwrap().to_str().unwrap();
+    save_meta(dir.path(), &meta(dir.path(), file, MIRROR_URL));
+
+    assert!(GeoIp::open_cached(&default_settings(), dir.path()).is_none());
 }
 
 /// `GeoIp::attribution` is a thin wrapper over `classify_attribution`
@@ -404,6 +483,14 @@ async fn bootstrap_downloads_and_looks_up() {
         .filter(|e| e.file_name().to_string_lossy().starts_with("geoip-"))
         .count();
     assert_eq!(dbs, 1, "swapped={swapped}");
+    assert!(!dir.path().join(DOWNLOAD_FILE).exists());
+
+    // A new start reuses the file with no download, and its first refresh
+    // is a conditional request.
+    let cached = GeoIp::open_cached(&cfg, dir.path()).expect("database on disk is reused");
+    assert!(cached.locate("89.160.20.128".parse().unwrap()).is_some());
+    assert_eq!(cached.attribution(), geo.attribution());
+    assert!(!cached.refresh(&cfg, dir.path()).await.unwrap());
 }
 
 /// Network-gated: the DB-IP city database decodes with the same record type.
