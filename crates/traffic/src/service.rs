@@ -480,8 +480,12 @@ impl TrafficService {
         );
         let store = store.clone();
         let result = tokio::task::spawn_blocking(move || {
-            store.flush_window(&rollup.stats, &rollup.paths, &rollup.breakdown)?;
-            store.record_city_coords(&rollup.city_coords)
+            store.flush_window_with_coords(
+                &rollup.stats,
+                &rollup.paths,
+                &rollup.breakdown,
+                &rollup.city_coords,
+            )
         })
         .await;
         match result {

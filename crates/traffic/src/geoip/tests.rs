@@ -145,11 +145,21 @@ fn archive_detection() {
     assert!(matches!(archive_from_url("a.mmdb"), Archive::Raw));
 }
 
+fn extract(bytes: &[u8], archive: &Archive) -> Result<Vec<u8>, TrafficError> {
+    let mut out = Vec::new();
+    extract_mmdb(bytes, archive, &mut out)?;
+    Ok(out)
+}
+
+fn write_bytes(db_dir: &Path, bytes: &[u8]) -> Result<PathBuf, TrafficError> {
+    write_fresh(db_dir, |file| Ok(file.write_all(bytes)?))
+}
+
 #[test]
 fn extract_gz_roundtrip() {
     let original = b"a fake mmdb payload".repeat(64);
     let compressed = gz(&original);
-    let out = extract_mmdb(&compressed, &Archive::Gz).unwrap();
+    let out = extract(&compressed, &Archive::Gz).unwrap();
     assert_eq!(out, original);
 }
 
@@ -163,13 +173,13 @@ fn extract_targz_finds_mmdb_member() {
         ("GeoLite2-Country_20260801/GeoLite2-Country.mmdb", &payload),
     ]);
 
-    let out = extract_mmdb(&archive, &Archive::TarGz).unwrap();
+    let out = extract(&archive, &Archive::TarGz).unwrap();
     assert_eq!(out, payload);
 }
 
 #[test]
 fn extract_raw_is_passthrough() {
-    assert_eq!(extract_mmdb(b"abc", &Archive::Raw).unwrap(), b"abc");
+    assert_eq!(extract(b"abc", &Archive::Raw).unwrap(), b"abc");
 }
 
 /// `MAX_DOWNLOAD_BYTES` bounds the *compressed* body only. A gzip bomb —
@@ -184,7 +194,7 @@ fn extract_gz_refuses_a_decompression_bomb() {
         "the fixture must pass the compressed-size check to test the decompressed one"
     );
 
-    let err = extract_mmdb(&bomb, &Archive::Gz).expect_err("a gzip bomb must be refused");
+    let err = extract(&bomb, &Archive::Gz).expect_err("a gzip bomb must be refused");
 
     assert!(
         matches!(err, TrafficError::Decompress(_)),
@@ -198,7 +208,7 @@ fn extract_gz_refuses_a_decompression_bomb() {
 #[test]
 fn extract_gz_accepts_a_payload_exactly_at_the_limit() {
     let original = vec![7u8; MAX_DECOMPRESSED_BYTES as usize];
-    let out = extract_mmdb(&gz(&original), &Archive::Gz).unwrap();
+    let out = extract(&gz(&original), &Archive::Gz).unwrap();
     assert_eq!(out.len(), original.len());
 }
 
@@ -209,41 +219,48 @@ fn extract_targz_refuses_an_oversized_member() {
     let payload = vec![0u8; (MAX_DECOMPRESSED_BYTES + 4096) as usize];
     let archive = targz(&[("x/GeoLite2-Country.mmdb", &payload)]);
 
-    let err =
-        extract_mmdb(&archive, &Archive::TarGz).expect_err("an oversized member must be refused");
+    let err = extract(&archive, &Archive::TarGz).expect_err("an oversized member must be refused");
     assert!(matches!(err, TrafficError::Decompress(_)), "{err}");
 }
 
 #[test]
 fn magic_reconciles_mismatched_suffix() {
     // A server that hands back a bare .mmdb from a .gz URL still works.
-    assert_eq!(
-        extract_mmdb(b"raw bytes", &Archive::Gz).unwrap(),
-        b"raw bytes"
-    );
+    assert_eq!(extract(b"raw bytes", &Archive::Gz).unwrap(), b"raw bytes");
     // ...and vice versa.
     let compressed = gz(b"payload");
-    assert_eq!(
-        extract_mmdb(&compressed, &Archive::Raw).unwrap(),
-        b"payload"
-    );
+    assert_eq!(extract(&compressed, &Archive::Raw).unwrap(), b"payload");
 }
 
 #[test]
 fn write_fresh_never_reuses_a_path() {
     let dir = tempfile::tempdir().unwrap();
-    let a = write_fresh(dir.path(), b"first").unwrap();
-    let b = write_fresh(dir.path(), b"second").unwrap();
+    let a = write_bytes(dir.path(), b"first").unwrap();
+    let b = write_bytes(dir.path(), b"second").unwrap();
     assert_ne!(a, b);
     assert_eq!(std::fs::read(&a).unwrap(), b"first");
     assert_eq!(std::fs::read(&b).unwrap(), b"second");
 }
 
+/// A failed extraction must not leave a partial file for a later map.
+#[test]
+fn write_fresh_removes_the_file_when_the_fill_fails() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let result = write_fresh(dir.path(), |file| {
+        file.write_all(b"partial")?;
+        Err(TrafficError::Decompress("truncated".to_string()))
+    });
+
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
 #[test]
 fn prune_old_keeps_the_live_file_only() {
     let dir = tempfile::tempdir().unwrap();
-    let old = write_fresh(dir.path(), b"old").unwrap();
-    let live = write_fresh(dir.path(), b"live").unwrap();
+    let old = write_bytes(dir.path(), b"old").unwrap();
+    let live = write_bytes(dir.path(), b"live").unwrap();
     std::fs::write(dir.path().join("unrelated.sqlite"), b"x").unwrap();
 
     prune_old(dir.path(), &live);

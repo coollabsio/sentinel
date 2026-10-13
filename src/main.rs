@@ -13,8 +13,9 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// Ceiling on the whole GeoIP bootstrap: `bootstrap` tries up to three sources
 /// at 180s each (~9min), during which the tailer hasn't opened and every
 /// appended line is lost. On timeout, enrichment stays off until the next refresh.
+/// Sized for the city database (tens of MiB) on a slow link.
 #[cfg(feature = "traffic")]
-const GEOIP_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const GEOIP_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 #[derive(Parser)]
 #[command(version = config::VERSION, about = "Collect and push server metrics")]

@@ -172,30 +172,28 @@ fn reconcile_archive(archive: &Archive, bytes: &[u8]) -> Archive {
     }
 }
 
-/// Read `reader` to EOF, refusing anything past [`MAX_DECOMPRESSED_BYTES`].
-/// Reads one byte past the limit so hitting it is distinguishable from
-/// legitimately ending there: an over-long payload is a
+/// Copy `reader` to EOF into `out`, refusing anything past
+/// [`MAX_DECOMPRESSED_BYTES`]. Reads one byte past the limit so hitting it is
+/// distinguishable from legitimately ending there: an over-long payload is a
 /// [`TrafficError::Decompress`], never a silent truncation handing a
 /// half-written `.mmdb` to the parser.
-fn read_bounded<R: Read>(reader: R, what: &str) -> Result<Vec<u8>, TrafficError> {
-    let mut out = Vec::new();
-    let read = reader
-        .take(MAX_DECOMPRESSED_BYTES + 1)
-        .read_to_end(&mut out)
-        .map_err(|e| TrafficError::Decompress(format!("{what}: {e}")))? as u64;
-    if read > MAX_DECOMPRESSED_BYTES {
+fn copy_bounded<R: Read>(reader: R, out: &mut impl Write, what: &str) -> Result<(), TrafficError> {
+    let copied = std::io::copy(&mut reader.take(MAX_DECOMPRESSED_BYTES + 1), out)
+        .map_err(|e| TrafficError::Decompress(format!("{what}: {e}")))?;
+    if copied > MAX_DECOMPRESSED_BYTES {
         return Err(TrafficError::Decompress(format!(
             "{what}: decompressed size exceeds {MAX_DECOMPRESSED_BYTES} bytes"
         )));
     }
-    Ok(out)
+    Ok(())
 }
 
-/// Unpack a downloaded body into raw `.mmdb` bytes.
-fn extract_mmdb(bytes: &[u8], archive: &Archive) -> Result<Vec<u8>, TrafficError> {
+/// Unpack a downloaded body into `out` as raw `.mmdb` bytes. Streams, so the
+/// decompressed database is never held in memory.
+fn extract_mmdb(bytes: &[u8], archive: &Archive, out: &mut impl Write) -> Result<(), TrafficError> {
     match reconcile_archive(archive, bytes) {
-        Archive::Raw => Ok(bytes.to_vec()),
-        Archive::Gz => read_bounded(GzDecoder::new(bytes), "gunzip"),
+        Archive::Raw => Ok(out.write_all(bytes)?),
+        Archive::Gz => copy_bounded(GzDecoder::new(bytes), out, "gunzip"),
         Archive::TarGz => {
             let mut tar = tar::Archive::new(GzDecoder::new(bytes));
             let entries = tar
@@ -214,7 +212,7 @@ fn extract_mmdb(bytes: &[u8], archive: &Archive) -> Result<Vec<u8>, TrafficError
                 if !is_mmdb {
                     continue;
                 }
-                return read_bounded(entry, "tar member");
+                return copy_bounded(entry, out, "tar member");
             }
             Err(TrafficError::Decompress(
                 "no .mmdb member in tar.gz".to_string(),
@@ -293,7 +291,7 @@ impl GeoIp {
                 }
             };
 
-            match Self::install(&bytes, &source, db_dir) {
+            match Self::install(bytes, &source, db_dir).await {
                 Ok((reader, path)) => {
                     tracing::info!(url = %source.redacted_url(), path = %path.display(), "geoip database loaded");
                     let geo = Arc::new(GeoIp {
@@ -371,7 +369,7 @@ impl GeoIp {
                 }
             };
 
-            let (reader, path) = match Self::install(&bytes, &source, db_dir) {
+            let (reader, path) = match Self::install(bytes, &source, db_dir).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::debug!(url = %source.redacted_url(), error = %e, "geoip refresh source unusable");
@@ -466,21 +464,34 @@ impl GeoIp {
         }
 
         Ok(Fetched::Body {
-            bytes: bytes.to_vec(),
+            bytes: bytes.into(),
             etag,
             last_modified,
         })
     }
 
-    /// Unpack `bytes`, write them to a brand-new file under `db_dir`, and map
-    /// it. Never touches an existing file.
-    fn install(
-        bytes: &[u8],
+    /// [`Self::install_blocking`] on a blocking thread: the gunzip, write and
+    /// fsync of a city database take seconds.
+    async fn install(
+        bytes: Vec<u8>,
         source: &Source,
         db_dir: &Path,
     ) -> Result<(Reader<Mmap>, PathBuf), TrafficError> {
-        let mmdb = extract_mmdb(bytes, &source.archive)?;
-        let path = write_fresh(db_dir, &mmdb)?;
+        let archive = source.archive;
+        let db_dir = db_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::install_blocking(&bytes, &archive, &db_dir))
+            .await
+            .map_err(|e| TrafficError::GeoIp(format!("install task: {e}")))?
+    }
+
+    /// Unpack `bytes`, write them to a brand-new file under `db_dir`, and map
+    /// it. Never touches an existing file.
+    fn install_blocking(
+        bytes: &[u8],
+        archive: &Archive,
+        db_dir: &Path,
+    ) -> Result<(Reader<Mmap>, PathBuf), TrafficError> {
+        let path = write_fresh(db_dir, |file| extract_mmdb(bytes, archive, file))?;
 
         // SAFETY: `Reader::open_mmap` requires that the mapped file is never
         // modified or truncated for as long as the returned `Reader` lives.
@@ -574,8 +585,12 @@ fn http_client() -> Result<reqwest::Client, TrafficError> {
         .map_err(|e| TrafficError::Download(format!("client: {e}")))
 }
 
-/// Write `mmdb` to a path under `db_dir` that did not previously exist.
-fn write_fresh(db_dir: &Path, mmdb: &[u8]) -> Result<PathBuf, TrafficError> {
+/// Create a path under `db_dir` that did not previously exist and let `fill`
+/// write the database into it. A failed `fill` removes the partial file.
+fn write_fresh(
+    db_dir: &Path,
+    fill: impl FnOnce(&mut std::fs::File) -> Result<(), TrafficError>,
+) -> Result<PathBuf, TrafficError> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -595,8 +610,11 @@ fn write_fresh(db_dir: &Path, mmdb: &[u8]) -> Result<PathBuf, TrafficError> {
             .open(&path)
         {
             Ok(mut file) => {
-                file.write_all(mmdb)?;
-                file.sync_all()?;
+                let written = fill(&mut file).and_then(|()| Ok(file.sync_all()?));
+                if let Err(e) = written {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
                 return Ok(path);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,

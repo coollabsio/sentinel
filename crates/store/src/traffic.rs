@@ -447,6 +447,24 @@ impl AnalyticsStore {
         self.write_rows(Tier::M1, stats, paths, breakdown)
     }
 
+    /// [`Self::flush_window`], plus the window's city coordinates in the same
+    /// transaction, so a reader never sees a city row before its coordinates.
+    pub fn flush_window_with_coords(
+        &self,
+        stats: &[StatsRow],
+        paths: &[PathRow],
+        breakdown: &[BreakdownRow],
+        city_coords: &[CityCoordRow],
+    ) -> Result<(), StoreError> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            insert_rows(&tx, Tier::M1, stats, paths, breakdown)?;
+            insert_city_coords(&tx, city_coords)?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Upserts a batch into `tier`'s three tables in one transaction. On
     /// conflict counters sum but sketch blobs replace (callers hand fully-merged
     /// sketches). Compaction clears its window first, so it relies on neither.
@@ -473,15 +491,7 @@ impl AnalyticsStore {
         }
         self.with_conn(|c| {
             let tx = c.unchecked_transaction()?;
-            {
-                let mut stmt = tx.prepare_cached(
-                    "INSERT OR IGNORE INTO traffic_city_coords (value, lat, lon) \
-                     VALUES (?1, ?2, ?3)",
-                )?;
-                for row in rows {
-                    stmt.execute((&row.value, row.lat, row.lon))?;
-                }
-            }
+            insert_city_coords(&tx, rows)?;
             tx.commit()?;
             Ok(())
         })
@@ -859,6 +869,18 @@ impl AnalyticsStore {
             Ok(rows)
         })
     }
+}
+
+/// Inserts city coordinates on an existing connection. The first coordinates
+/// of a value stay.
+fn insert_city_coords(conn: &Connection, rows: &[CityCoordRow]) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO traffic_city_coords (value, lat, lon) VALUES (?1, ?2, ?3)",
+    )?;
+    for row in rows {
+        stmt.execute((&row.value, row.lat, row.lon))?;
+    }
+    Ok(())
 }
 
 /// Upserts a batch into `tier`'s three tables on an existing connection. Shared
