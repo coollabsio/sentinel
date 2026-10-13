@@ -130,3 +130,82 @@ fn exits_nonzero_when_port_already_in_use() {
     );
     std::fs::remove_dir_all(workdir).ok();
 }
+
+/// A legacy schema migration can take minutes on a large history. Coolify
+/// restarts a Sentinel whose health check fails, which rolls the migration
+/// back, so `/api/health` must answer while the migration runs.
+#[test]
+fn health_answers_during_legacy_schema_migration() {
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    let workdir = std::env::temp_dir().join(format!("sentinel-migrating-{}", std::process::id()));
+    std::fs::create_dir_all(workdir.join("db")).unwrap();
+    let db = rusqlite::Connection::open(workdir.join("db/metrics.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE container_cpu_usage (
+            time VARCHAR, container_id VARCHAR, percent VARCHAR,
+            PRIMARY KEY (time, container_id));
+        WITH RECURSIVE t(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM t WHERE i < 99999),
+            c(j) AS (SELECT 0 UNION ALL SELECT j + 1 FROM c WHERE j < 19)
+        INSERT INTO container_cpu_usage
+            SELECT CAST(1700000000000 + i * 10000 AS TEXT), 'container-' || j, '12.50' FROM t, c;",
+    )
+    .unwrap();
+    drop(db);
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = sentinel_command()
+        .current_dir(&workdir)
+        .env("TOKEN", "t")
+        .env("PUSH_ENDPOINT", "https://example.com")
+        .env("SENTINEL_DEVELOPMENT", "1")
+        .env("COLLECTOR_ENABLED", "false")
+        .env("PORT", port.to_string())
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let migration_started = BufReader::new(child.stdout.take().unwrap())
+        .lines()
+        .map_while(Result::ok)
+        .any(|line| line.contains("legacy metrics schema detected"));
+    let get = |path: &str| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    };
+    let (health, cpu) = if migration_started {
+        (get("/api/health"), get("/api/cpu"))
+    } else {
+        Default::default()
+    };
+
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(workdir).ok();
+
+    assert!(
+        migration_started,
+        "the legacy schema migration did not start"
+    );
+    assert!(
+        health.starts_with("HTTP/1.1 200"),
+        "health response was: {health}"
+    );
+    assert!(health.ends_with("ok"), "health response was: {health}");
+    // The full API answers 401 without a token, so 503 proves that the
+    // migration was still running.
+    assert!(cpu.starts_with("HTTP/1.1 503"), "cpu response was: {cpu}");
+}

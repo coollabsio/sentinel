@@ -164,10 +164,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(version = %config.version, "Sentinel is starting");
 
+    // Bind eagerly: a bind failure surfaces via `?` here, and health checks
+    // answer as soon as the process is up. The startup API answers until the
+    // full API accepts on a clone of the same socket below, because opening
+    // the store can run a legacy schema migration that takes minutes.
+    let listener = bind_listener(config.bind_addr).await?.into_std()?;
+    let addr = listener.local_addr().unwrap_or(config.bind_addr);
+    tracing::info!(%addr, "api listening");
+    let (api_ready_tx, api_ready_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(
+        axum::serve(
+            tokio::net::TcpListener::from_std(listener.try_clone()?)?,
+            api::startup_router(config.version.clone()),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = api_ready_rx.await;
+        })
+        .into_future(),
+    );
+
     // Store + sampler are required by the API. Docker is only needed by the
-    // collector and pusher, so it is opened *after* the listener binds —
-    // keeping the path to `/api/health` as short as possible.
-    let store = store::Store::open(&config.metrics_file)?;
+    // collector and pusher, so it is opened *after* the full API starts.
+    let metrics_file = config.metrics_file.clone();
+    let store = tokio::task::spawn_blocking(move || store::Store::open(&metrics_file)).await??;
     let command_journal = if config.control_plane_enabled {
         store::CommandJournal::open(
             &config.command_journal_file,
@@ -233,14 +252,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut services = tokio::task::JoinSet::new();
     let mut control_services = tokio::task::JoinSet::new();
 
-    // HTTP API. Bind eagerly, before spawning: a bind failure surfaces via `?`
-    // here rather than having to cascade out of a spawned task, and health
-    // checks answer as soon as the process is up (before Docker/collectors).
+    // Full HTTP API, on the socket bound before the store opened.
     {
-        let listener = bind_listener(config.bind_addr).await?;
-        let addr = listener.local_addr().unwrap_or(config.bind_addr);
-        tracing::info!(%addr, "api listening");
-
+        let listener = tokio::net::TcpListener::from_std(listener)?;
         let state = Arc::new(api::AppState {
             auth_header: format!("Bearer {}", config.token),
             config: config.clone(),
@@ -267,6 +281,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|error| format!("API service failed: {error}"))
         });
     }
+    // The full API accepts now. The startup API stops accepting and finishes
+    // its open connections.
+    let _ = api_ready_tx.send(());
 
     // Refresh the in-memory host snapshot independently of request volume.
     // /proc/meminfo can be a comparatively expensive FUSE read inside LXC,

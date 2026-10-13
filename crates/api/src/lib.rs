@@ -166,6 +166,20 @@ pub fn router(state: Arc<AppState>) -> Router {
     .with_state(state)
 }
 
+/// Serves the public health and version endpoints while the metrics store
+/// opens. A legacy schema migration can take minutes on a large history. A
+/// failed health check during it makes Coolify restart Sentinel, which rolls
+/// the migration back, so it never finishes. Other paths answer 503.
+pub fn startup_router(version: String) -> Router {
+    Router::new()
+        .route("/api/health", axum::routing::get(health))
+        .route(
+            "/api/version",
+            axum::routing::get(move || async move { version }),
+        )
+        .fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE })
+}
+
 #[utoipa::path(
     get,
     path = "/api/health",
