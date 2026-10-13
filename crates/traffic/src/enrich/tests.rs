@@ -495,3 +495,19 @@ fn no_geo_gives_no_city() {
 
     assert_eq!(result.city, None);
 }
+
+#[test]
+fn coordinates_outside_the_map_range_are_dropped() {
+    for (lat, lon) in [(90.1, 0.0), (-90.1, 0.0), (0.0, 180.1), (0.0, -180.1)] {
+        let mut location = berlin();
+        location.lat = Some(lat);
+        location.lon = Some(lon);
+        assert_eq!(enrich_with(location).city.unwrap().coords, None);
+    }
+    for (lat, lon) in [(90.0, 180.0), (-90.0, -180.0)] {
+        let mut location = berlin();
+        location.lat = Some(lat);
+        location.lon = Some(lon);
+        assert_eq!(enrich_with(location).city.unwrap().coords, Some((lat, lon)));
+    }
+}

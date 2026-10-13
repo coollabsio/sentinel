@@ -523,3 +523,37 @@ async fn dbip_city_database_resolves_a_city() {
         "{location:?}"
     );
 }
+
+#[tokio::test]
+async fn fetch_errors_do_not_expose_the_license_key() {
+    // Keep the port open without answering: the request times out.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let source = Source {
+        url: format!(
+            "http://{}/db?license_key=SECRETKEY",
+            listener.local_addr().unwrap()
+        ),
+        archive: Archive::Raw,
+    };
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(50))
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let error = GeoIp::fetch(&client, &source, dir.path(), None, None)
+        .await
+        .err()
+        .expect("request must fail");
+    let message = error.to_string();
+    assert!(!message.contains("SECRETKEY"), "{message}");
+    assert!(message.contains("REDACTED"), "{message}");
+}
+
+#[test]
+fn extract_raw_refuses_an_oversized_database() {
+    let body = std::io::repeat(0).take(MAX_DECOMPRESSED_BYTES + 1);
+    let error = extract_mmdb(body, &Archive::Raw, &mut std::io::sink())
+        .expect_err("raw databases must obey the same limit as gzip databases");
+    assert!(matches!(error, TrafficError::Decompress(_)), "{error}");
+}

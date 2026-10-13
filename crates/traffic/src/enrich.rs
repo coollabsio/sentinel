@@ -70,7 +70,7 @@ fn city_hit(location: &GeoLocation) -> Option<CityHit> {
     let coords = location
         .lat
         .zip(location.lon)
-        .filter(|(lat, lon)| lat.is_finite() && lon.is_finite());
+        .filter(|(lat, lon)| (-90.0..=90.0).contains(lat) && (-180.0..=180.0).contains(lon));
     Some(CityHit {
         key: city_key(country, location.subdivision.as_deref(), city),
         coords,

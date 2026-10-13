@@ -5,7 +5,7 @@
 
 //! GeoIP database management and lookup. Sources are tried in configured
 //! priority order, then decompressed, memory-mapped, and published through
-//! [`ArcSwap`] for lock-free lookups during refresh. The old file is removed
+//! [`ArcSwapOption`] for lock-free lookups during refresh. The old file is removed
 //! only after the new mapping is live.
 
 use std::borrow::Cow;
@@ -208,10 +208,7 @@ fn extract_mmdb(
         .fill_buf()
         .map_err(|e| TrafficError::Decompress(format!("read body: {e}")))?;
     match reconcile_archive(archive, head) {
-        Archive::Raw => {
-            std::io::copy(&mut body, out)?;
-            Ok(())
-        }
+        Archive::Raw => copy_bounded(body, out, "raw database"),
         Archive::Gz => copy_bounded(GzDecoder::new(body), out, "gunzip"),
         Archive::TarGz => {
             let mut tar = tar::Archive::new(GzDecoder::new(body));
@@ -446,10 +443,9 @@ impl GeoIp {
             req = req.header(IF_MODIFIED_SINCE, lm);
         }
 
-        let mut resp = req
-            .send()
-            .await
-            .map_err(|e| TrafficError::Download(format!("{}: {e}", source.redacted_url())))?;
+        let mut resp = req.send().await.map_err(|e| {
+            TrafficError::Download(format!("{}: {}", source.redacted_url(), e.without_url()))
+        })?;
 
         if resp.status() == StatusCode::NOT_MODIFIED {
             // With no conditional headers sent, 304 is a protocol violation;
@@ -509,11 +505,13 @@ impl GeoIp {
     ) -> Result<(), TrafficError> {
         let mut file = std::fs::File::create(path)?;
         let mut total = 0u64;
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| TrafficError::Download(format!("{}: body: {e}", source.redacted_url())))?
-        {
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
+            TrafficError::Download(format!(
+                "{}: body: {}",
+                source.redacted_url(),
+                e.without_url()
+            ))
+        })? {
             total += chunk.len() as u64;
             if total > MAX_DOWNLOAD_BYTES {
                 return Err(TrafficError::Download(format!(
