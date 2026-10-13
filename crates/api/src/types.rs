@@ -369,7 +369,7 @@ pub struct TrafficDashboard {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TrafficBreakdowns {
     pub country: Vec<TrafficBreakdownEntry>,
-    /// Values are `CC|subdivision|City`; `CC||` is an unknown city.
+    /// Values are `CC|subdivision|City`. Requests with no known city have no row.
     pub city: Vec<TrafficBreakdownEntry>,
     pub referer: Vec<TrafficBreakdownEntry>,
     pub browser: Vec<TrafficBreakdownEntry>,

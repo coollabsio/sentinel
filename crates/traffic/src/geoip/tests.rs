@@ -386,6 +386,16 @@ fn meta(dir: &Path, file: &str, source_url: &str) -> Meta {
     }
 }
 
+/// Before the first database is loaded, lookups resolve nothing.
+#[test]
+fn an_empty_geoip_resolves_nothing() {
+    let geo = GeoIp::empty();
+
+    assert!(!geo.is_loaded());
+    assert!(geo.locate("89.160.20.128".parse().unwrap()).is_none());
+    assert!(geo.attribution().is_none());
+}
+
 /// The sidecar must never hold the MaxMind license key.
 #[test]
 fn save_meta_redacts_the_license_key() {

@@ -2892,7 +2892,7 @@
             "items": {
               "$ref": "#/components/schemas/TrafficBreakdownEntry"
             },
-            "description": "Values are `CC|subdivision|City`; `CC||` is an unknown city."
+            "description": "Values are `CC|subdivision|City`. Requests with no known city have no row."
           },
           "country": {
             "type": "array",

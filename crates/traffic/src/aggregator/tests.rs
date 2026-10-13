@@ -513,11 +513,11 @@ fn city_dimension_counts_the_key_and_keeps_the_first_coordinates() {
 #[test]
 fn a_city_with_no_coordinates_has_a_row_but_no_coordinate_row() {
     let mut a = Aggregator::new(50);
-    a.record(&base_event(), &city("DE||", None));
+    a.record(&base_event(), &city("SG||Singapore", None));
 
     let rollup = a.take_rollup(60_000);
 
-    assert_eq!(city_rows(&rollup), vec![("DE||".to_string(), 1)]);
+    assert_eq!(city_rows(&rollup), vec![("SG||Singapore".to_string(), 1)]);
     assert!(rollup.city_coords.is_empty());
 }
 

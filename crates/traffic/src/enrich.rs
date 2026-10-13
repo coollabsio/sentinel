@@ -48,9 +48,10 @@ pub struct CityHit {
     pub coords: Option<(f64, f64)>,
 }
 
-/// The `city` breakdown value: `CC|subdivision|City`. Absent parts stay empty.
-pub fn city_key(country: &str, subdivision: Option<&str>, city: Option<&str>) -> String {
-    let (subdivision, city) = (subdivision.unwrap_or(""), city.unwrap_or(""));
+/// The `city` breakdown value: `CC|subdivision|City`. An absent subdivision
+/// stays empty.
+pub fn city_key(country: &str, subdivision: Option<&str>, city: &str) -> String {
+    let subdivision = subdivision.unwrap_or("");
     let mut key = String::with_capacity(country.len() + subdivision.len() + city.len() + 2);
     key.push_str(country);
     for part in [subdivision, city] {
@@ -60,17 +61,18 @@ pub fn city_key(country: &str, subdivision: Option<&str>, city: Option<&str>) ->
     key
 }
 
-/// `None` without a country. Without a city the key is `CC||`, so each
-/// country has one unknown-city row, and there are no coordinates.
+/// `None` without a country or a city, as the `country` dimension has no row
+/// for an unknown country. Unknown-city rows would only repeat the country
+/// breakdown and take top-N slots from real cities.
 fn city_hit(location: &GeoLocation) -> Option<CityHit> {
     let country = location.country.as_deref()?;
-    let city = location.city.as_deref().filter(|c| !c.is_empty());
-    let subdivision = city.and(location.subdivision.as_deref());
-    let coords = city
-        .and(location.lat.zip(location.lon))
+    let city = location.city.as_deref().filter(|c| !c.is_empty())?;
+    let coords = location
+        .lat
+        .zip(location.lon)
         .filter(|(lat, lon)| lat.is_finite() && lon.is_finite());
     Some(CityHit {
-        key: city_key(country, subdivision, city),
+        key: city_key(country, location.subdivision.as_deref(), city),
         coords,
     })
 }

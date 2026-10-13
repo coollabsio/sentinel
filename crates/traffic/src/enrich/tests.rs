@@ -413,9 +413,9 @@ fn ua_cache_memoizes() {
 
 #[test]
 fn city_key_joins_the_parts_and_replaces_pipes() {
-    assert_eq!(city_key("DE", Some("BE"), Some("Berlin")), "DE|BE|Berlin");
-    assert_eq!(city_key("SG", None, Some("Singapore")), "SG||Singapore");
-    assert_eq!(city_key("US", Some("A|B"), Some("C|D")), "US|A B|C D");
+    assert_eq!(city_key("DE", Some("BE"), "Berlin"), "DE|BE|Berlin");
+    assert_eq!(city_key("SG", None, "Singapore"), "SG||Singapore");
+    assert_eq!(city_key("US", Some("A|B"), "C|D"), "US|A B|C D");
 }
 
 #[test]
@@ -432,22 +432,16 @@ fn city_comes_from_the_lookup_with_coordinates() {
     );
 }
 
-/// A country-only database, or a network with no city, gives one `CC||` row
-/// for each country and no coordinates.
+/// A country-only database, or a network with no city, gives no city row.
 #[test]
-fn a_country_with_no_city_is_the_unknown_key() {
+fn a_country_with_no_city_gives_no_city() {
     let mut location = berlin();
     location.city = None;
 
     let result = enrich_with(location);
 
-    assert_eq!(
-        result.city,
-        Some(CityHit {
-            key: "DE||".to_string(),
-            coords: None,
-        })
-    );
+    assert_eq!(result.country, Some("DE".to_string()));
+    assert_eq!(result.city, None);
 }
 
 #[test]

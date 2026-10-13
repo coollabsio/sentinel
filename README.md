@@ -102,7 +102,7 @@ Inert unless Sentinel is built with the `traffic` Cargo feature. See [Traffic An
 | `TRAFFIC_RETENTION_1M_HOURS` | `48` | Safety net, **not** a queryable window — see note below |
 | `TRAFFIC_RETENTION_1H_DAYS` | `30` | How long hourly rollups are kept; this is your real fine-grained history |
 | `TRAFFIC_RETENTION_1D_DAYS` | `395` | How long daily rollups are kept before deletion (~13 months) |
-| `GEOIP_ENABLED` | `true` | Enable/disable country and city enrichment |
+| `GEOIP_ENABLED` | `true` | Enable/disable country and city enrichment. The database downloads in the background and is reused from disk on the next start |
 | `GEOIP_DB_URL` | *(unset)* | Explicit GeoIP database URL; when set, used with no fallback |
 | `GEOIP_MAXMIND_LICENSE_KEY` | *(unset)* | MaxMind license key; when set, GeoLite2 is downloaded directly from MaxMind, taking priority over `GEOIP_DB_URL` |
 | `GEOIP_MAXMIND_EDITION` | `GeoLite2-City` | MaxMind edition ID used when `GEOIP_MAXMIND_LICENSE_KEY` is set. A country edition gives country data only |

@@ -162,7 +162,7 @@ fn city_bd(bucket: i64, app: &str, value: &str, requests: i64) -> BreakdownRow {
 }
 
 /// `seeded()` plus city rows: Berlin on two apps and two buckets with
-/// coordinates, an unknown-city row and an `__other__` row with none.
+/// coordinates, a city and an `__other__` row with none.
 fn seeded_cities() -> AnalyticsStore {
     let a = seeded();
     a.flush_window(
@@ -171,7 +171,7 @@ fn seeded_cities() -> AnalyticsStore {
         &[
             city_bd(BUCKET, "app-a", "DE|BE|Berlin", 5),
             city_bd(NEXT_BUCKET, "app-a", "DE|BE|Berlin", 4),
-            city_bd(BUCKET, "app-a", "DE||", 2),
+            city_bd(BUCKET, "app-a", "SG||Singapore", 2),
             city_bd(BUCKET, "app-a", "__other__", 1),
             city_bd(BUCKET, "app-b", "DE|BE|Berlin", 6),
         ],
@@ -1507,7 +1507,7 @@ async fn city_breakdown_has_coordinates_only_where_they_are_known() {
     assert_eq!(rows[0]["lat"], 52.52);
     assert_eq!(rows[0]["lon"], 13.405);
 
-    assert_eq!(rows[1]["value"], "DE||");
+    assert_eq!(rows[1]["value"], "SG||Singapore");
     assert!(rows[1].get("lat").is_none());
     assert!(rows[1].get("lon").is_none());
 

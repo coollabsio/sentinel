@@ -10,12 +10,10 @@ mod discovery_dns;
 
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Ceiling on the whole GeoIP bootstrap: `bootstrap` tries up to three sources
-/// at 180s each (~9min), during which the tailer hasn't opened and every
-/// appended line is lost. On timeout, enrichment stays off until the next refresh.
-/// Sized for the city database (tens of MiB) on a slow link.
+/// How long to wait before the next GeoIP download attempt while no database
+/// is loaded.
 #[cfg(feature = "traffic")]
-const GEOIP_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const GEOIP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 #[derive(Parser)]
 #[command(version = config::VERSION, about = "Collect and push server metrics")]
@@ -220,7 +218,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let memory = Arc::new(api::CachedMemory::new(host_sampler.sample_memory()));
     let sampler = Arc::new(Mutex::new(host_sampler));
 
-    // Published once `GeoIp::bootstrap` resolves (late; see the traffic block
+    // Published once a GeoIP database is loaded (late; see the traffic block
     // below) and re-published on every refresh swap. Unconditional so `AppState`
     // needs no cfg gate — it holds a plain string, not a `traffic` type.
     let geoip_attribution: Arc<std::sync::RwLock<Option<String>>> =
@@ -389,11 +387,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // both enabled and its database opened, so this one binding gates the whole
     // section.
     //
-    // Deliberately last in the startup sequence: `GeoIp::bootstrap` downloads a
-    // database, and nothing above — API, collectors, pusher — should wait on
-    // that. (A signal arriving during the download still terminates the process
-    // at its default disposition, exactly as one arriving during any other part
-    // of startup does; `wait_for_signal` has not installed a handler yet.)
     #[cfg(feature = "traffic")]
     if let Some(analytics) = analytics {
         // GeoIP databases live next to analytics.sqlite (spec §6). `parent()`
@@ -408,47 +401,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        // Country enrichment is optional: if every candidate source is
-        // unreachable the country breakdown is simply empty, which is not a
-        // reason to run without traffic analytics altogether.
-        // The outer timeout is not redundant with `bootstrap`'s internal
-        // per-source one: it tries up to three candidates at 180s each, so a
-        // host with blackholed outbound network can sit here for ~9 minutes.
-        // That blocks `TrafficService::build`, and the tailer seeks to EOF
-        // when it finally opens — every log line written during the stall is
-        // lost. Bound the whole bootstrap instead, and treat exhausting it
-        // exactly like a bootstrap error: no country enrichment, everything
-        // else runs.
-        // A database left by a previous run is used as it is, with no
-        // download before the tailer opens; the refresh task below checks it.
-        let cached = if config.traffic.geoip_enabled {
-            traffic::geoip::GeoIp::open_cached(&config.traffic, &db_dir)
-        } else {
-            None
-        };
-        let geoip_from_disk = cached.is_some();
-        let geoip = if let Some(geoip) = cached {
-            Some(geoip)
-        } else if config.traffic.geoip_enabled {
-            let bootstrap = traffic::geoip::GeoIp::bootstrap(&config.traffic, &db_dir);
-            match tokio::time::timeout(GEOIP_BOOTSTRAP_TIMEOUT, bootstrap).await {
-                Ok(Ok(geoip)) => Some(geoip),
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        error = %e,
-                        "geoip bootstrap failed, continuing without country enrichment"
-                    );
-                    None
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        timeout_secs = GEOIP_BOOTSTRAP_TIMEOUT.as_secs(),
-                        "geoip bootstrap timed out, continuing without country enrichment; \
-                         the next scheduled refresh will retry"
-                    );
-                    None
-                }
-            }
+        // GeoIP never delays startup: a database left by a previous run is
+        // mapped as it is, and with none the lookup starts empty. The refresh
+        // task below downloads in the background, so the tailer opens at once
+        // and no log line is lost while a download runs. Enrichment is
+        // optional: until a database is loaded, the country and city
+        // breakdowns are simply empty.
+        let geoip = if config.traffic.geoip_enabled {
+            let cached = traffic::geoip::GeoIp::open_cached(&config.traffic, &db_dir);
+            Some(cached.unwrap_or_else(traffic::geoip::GeoIp::empty))
         } else {
             tracing::info!("geoip disabled");
             None
@@ -564,10 +525,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
 
-        // GeoIP refresh, every GEOIP_REFRESH_DAYS. After a `bootstrap`, the
-        // interval's immediate first tick is consumed rather than acted on:
-        // the database is moments old. A database reused from disk can be
-        // any age, so there the first tick does a (conditional) refresh.
+        // GeoIP refresh, every GEOIP_REFRESH_DAYS. The first pass runs at
+        // once: with no database it is the first download, and a database
+        // reused from disk can be any age (the request is conditional, so an
+        // unchanged one costs a `304`). While no database is loaded, the
+        // download is retried at the shorter GEOIP_RETRY_INTERVAL.
         if let Some(geoip) = geoip {
             let settings = config.traffic.clone();
             let period = std::time::Duration::from_secs(
@@ -576,18 +538,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let geoip_attribution = geoip_attribution.clone();
             let mut rx = shutdown_rx.clone();
             services.spawn(async move {
-                let mut ticker = tokio::time::interval(period);
-                if !geoip_from_disk {
-                    ticker.tick().await;
-                }
+                let mut wait = std::time::Duration::ZERO;
                 loop {
                     tokio::select! {
                         _ = rx.changed() => return Ok::<(), String>(()),
-                        _ = ticker.tick() => {
+                        _ = tokio::time::sleep(wait) => {
                             // `Err` means every candidate source failed, which
                             // `refresh` documents as leaving the currently
                             // mapped database untouched and still serving
-                            // lookups. Log it and wait for the next tick —
+                            // lookups. Log it and wait for the next pass —
                             // returning would trip `unexpected_service_exit`
                             // and take the whole agent down over a failed
                             // background download.
@@ -602,16 +561,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     // API would keep answering with whatever
                                     // license string was true at startup.
                                     let attribution = geoip.attribution();
+                                    if let Some(attribution) = &attribution {
+                                        tracing::info!(attribution = %attribution, "geoip attribution");
+                                    }
                                     *geoip_attribution
                                         .write()
                                         .unwrap_or_else(|e| e.into_inner()) = attribution;
                                 }
                                 Ok(false) => tracing::debug!("geoip database already current"),
-                                Err(e) => tracing::warn!(
+                                Err(e) if geoip.is_loaded() => tracing::warn!(
                                     error = %e,
                                     "geoip refresh failed, keeping the current database"
                                 ),
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    retry_secs = GEOIP_RETRY_INTERVAL.as_secs(),
+                                    "geoip download failed, continuing without country and city enrichment"
+                                ),
                             }
+                            wait = if geoip.is_loaded() {
+                                period
+                            } else {
+                                GEOIP_RETRY_INTERVAL
+                            };
                         }
                     }
                 }

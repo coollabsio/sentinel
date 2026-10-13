@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use arc_swap::ArcSwap;
+use arc_swap::ArcSwapOption;
 use config::TrafficSettings;
 use flate2::read::GzDecoder;
 use maxminddb::{Mmap, Reader};
@@ -279,8 +279,9 @@ struct SavedMeta {
 /// A memory-mapped GeoIP database with lock-free reads and atomic
 /// hot-reload.
 pub struct GeoIp {
-    db: ArcSwap<Reader<Mmap>>,
-    meta: Mutex<Meta>,
+    /// `None` until the first database is loaded.
+    db: ArcSwapOption<Reader<Mmap>>,
+    meta: Mutex<Option<Meta>>,
 }
 
 impl GeoIp {
@@ -302,88 +303,45 @@ impl GeoIp {
         tracing::info!(path = %path.display(), "geoip database loaded from disk");
         prune_old(db_dir, &path);
         Some(Arc::new(GeoIp {
-            db: ArcSwap::new(Arc::new(reader)),
-            meta: Mutex::new(Meta {
+            db: ArcSwapOption::from_pointee(reader),
+            meta: Mutex::new(Some(Meta {
                 etag: saved.etag,
                 last_modified: saved.last_modified,
                 path,
                 source_url: source.url,
-            }),
+            })),
         }))
     }
 
+    /// A `GeoIp` with no database: lookups resolve nothing until a
+    /// [`Self::refresh`] succeeds.
+    pub fn empty() -> Arc<GeoIp> {
+        Arc::new(GeoIp {
+            db: ArcSwapOption::empty(),
+            meta: Mutex::new(None),
+        })
+    }
+
+    /// True when a database is loaded.
+    pub fn is_loaded(&self) -> bool {
+        self.db.load().is_some()
+    }
+
     /// Download and map a database, trying each [`resolve_sources`] candidate
-    /// in order. Returns `Err` only when *every* candidate fails (the caller
-    /// falls back to [`crate::enrich::NoGeo`]); on success the `GeoIp` always
-    /// has a live mapping.
+    /// in order. Returns `Err` only when *every* candidate fails; on success
+    /// the `GeoIp` always has a live mapping.
     pub async fn bootstrap(
         cfg: &TrafficSettings,
         db_dir: &Path,
     ) -> Result<Arc<GeoIp>, TrafficError> {
-        std::fs::create_dir_all(db_dir)?;
-        let client = http_client()?;
-
-        let mut last_err: Option<TrafficError> = None;
-        for source in resolve_sources(cfg) {
-            let (body, etag, last_modified) = match Self::fetch(
-                &client, &source, db_dir, None, None,
-            )
-            .await
-            {
-                Ok(Fetched::Body {
-                    body,
-                    etag,
-                    last_modified,
-                }) => (body, etag, last_modified),
-                // No conditional headers were sent, so 304 is a protocol
-                // violation; treat it as a failed candidate.
-                Ok(Fetched::NotModified) => {
-                    last_err = Some(TrafficError::Download(format!(
-                        "{}: unexpected 304 without conditional request",
-                        source.redacted_url()
-                    )));
-                    continue;
-                }
-                Err(e) => {
-                    tracing::debug!(url = %source.redacted_url(), error = %e, "geoip source failed");
-                    last_err = Some(e);
-                    continue;
-                }
-            };
-
-            match Self::install(body, &source, db_dir).await {
-                Ok((reader, path)) => {
-                    tracing::info!(url = %source.redacted_url(), path = %path.display(), "geoip database loaded");
-                    let meta = Meta {
-                        etag,
-                        last_modified,
-                        path: path.clone(),
-                        source_url: source.url.clone(),
-                    };
-                    save_meta(db_dir, &meta);
-                    let geo = Arc::new(GeoIp {
-                        db: ArcSwap::new(Arc::new(reader)),
-                        meta: Mutex::new(meta),
-                    });
-                    // Only now that the new file is mapped and published is it
-                    // safe to remove anything else left in the directory.
-                    prune_old(db_dir, &path);
-                    return Ok(geo);
-                }
-                Err(e) => {
-                    tracing::debug!(url = %source.redacted_url(), error = %e, "geoip source unusable");
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| {
-            TrafficError::GeoIp("no geoip sources resolved from configuration".to_string())
-        }))
+        let geo = Self::empty();
+        geo.refresh(cfg, db_dir).await?;
+        Ok(geo)
     }
 
-    /// Re-check the sources and hot-swap in a newer database. `Ok(true)` if a
-    /// new database was swapped in, `Ok(false)` if the active source answered
+    /// Re-check the sources and hot-swap in a newer database; on an empty
+    /// `GeoIp` this is the first load. `Ok(true)` if a new database was
+    /// swapped in, `Ok(false)` if the active source answered
     /// `304 Not Modified`, `Err` if every candidate failed. The live database
     /// is never disturbed on `Ok(false)` or `Err`.
     pub async fn refresh(
@@ -396,17 +354,20 @@ impl GeoIp {
 
         let (active_url, etag, last_modified) = {
             let meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                meta.source_url.clone(),
-                meta.etag.clone(),
-                meta.last_modified.clone(),
-            )
+            match meta.as_ref() {
+                Some(meta) => (
+                    Some(meta.source_url.clone()),
+                    meta.etag.clone(),
+                    meta.last_modified.clone(),
+                ),
+                None => (None, None, None),
+            }
         };
 
         let mut last_err: Option<TrafficError> = None;
         for source in resolve_sources(cfg) {
             // Validators are only meaningful for the URL they came from.
-            let (cond_etag, cond_lm) = if source.url == active_url {
+            let (cond_etag, cond_lm) = if active_url.as_deref() == Some(source.url.as_str()) {
                 (etag.as_deref(), last_modified.as_deref())
             } else {
                 (None, None)
@@ -444,16 +405,16 @@ impl GeoIp {
 
             // The new file is written and mapped; publish it before touching
             // the old one.
-            self.db.store(Arc::new(reader));
-            {
-                let mut meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
-                meta.path = path.clone();
-                meta.etag = new_etag;
-                meta.last_modified = new_lm;
-                meta.source_url = source.url.clone();
-                save_meta(db_dir, &meta);
-            }
-            tracing::info!(url = %source.redacted_url(), path = %path.display(), "geoip database refreshed");
+            self.db.store(Some(Arc::new(reader)));
+            let meta = Meta {
+                etag: new_etag,
+                last_modified: new_lm,
+                path: path.clone(),
+                source_url: source.url.clone(),
+            };
+            save_meta(db_dir, &meta);
+            *self.meta.lock().unwrap_or_else(|e| e.into_inner()) = Some(meta);
+            tracing::info!(url = %source.redacted_url(), path = %path.display(), "geoip database loaded");
             // Only now: the superseded file is unlinked strictly after the new
             // one is mapped and published. Readers still holding the old
             // mapping are unaffected — unlinking a mapped file does not
@@ -491,6 +452,14 @@ impl GeoIp {
             .map_err(|e| TrafficError::Download(format!("{}: {e}", source.redacted_url())))?;
 
         if resp.status() == StatusCode::NOT_MODIFIED {
+            // With no conditional headers sent, 304 is a protocol violation;
+            // treat it as a failed candidate.
+            if etag.is_none() && last_modified.is_none() {
+                return Err(TrafficError::Download(format!(
+                    "{}: unexpected 304 without conditional request",
+                    source.redacted_url()
+                )));
+            }
             return Ok(Fetched::NotModified);
         }
         if !resp.status().is_success() {
@@ -670,7 +639,7 @@ impl GeoIp {
     /// still yields its last value, an unrecognized URL yields `None`.
     pub fn attribution(&self) -> Option<String> {
         let meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
-        classify_attribution(&meta.source_url)
+        classify_attribution(&meta.as_ref()?.source_url)
     }
 }
 
@@ -730,7 +699,7 @@ fn location_from(record: &Record<'_>) -> GeoLocation {
 impl GeoLookup for GeoIp {
     fn locate(&self, ip: IpAddr) -> Option<GeoLocation> {
         let guard = self.db.load();
-        let result = guard.lookup(ip).ok()?;
+        let result = guard.as_ref()?.lookup(ip).ok()?;
         let record = result.decode::<Record>().ok()??;
         Some(location_from(&record))
     }
