@@ -152,6 +152,7 @@ impl TrafficService {
         flush_check_interval: Duration,
     ) -> Self {
         Self::delete_disallowed_ips(&store, cfg.traffic.ip_mode).await;
+        Self::delete_disallowed_cities(&store, cfg.traffic.ip_mode).await;
 
         let path = &cfg.traffic.access_log_path;
         let (tailer, last_open_error) = match Tailer::open(path) {
@@ -463,6 +464,31 @@ impl TrafficService {
             }
             Ok(Err(e)) => tracing::warn!(error = %e, "deleting stored IPs failed"),
             Err(e) => tracing::warn!(error = %e, "deleting stored IPs task failed"),
+        }
+    }
+
+    /// Deletes stored `city` breakdown rows when `ip_mode` is `off`, which
+    /// records no city. Their coordinates go on the next retention pass. A
+    /// failure is logged and dropped, like a flush failure.
+    async fn delete_disallowed_cities(store: &AnalyticsStore, ip_mode: config::IpMode) {
+        if ip_mode != config::IpMode::Off {
+            return;
+        }
+        let store = store.clone();
+        let result =
+            tokio::task::spawn_blocking(move || store.delete_breakdown_values("city", |_| false))
+                .await;
+        match result {
+            Ok(Ok(0)) => {}
+            Ok(Ok(deleted)) => {
+                tracing::info!(
+                    deleted,
+                    ?ip_mode,
+                    "deleted stored cities not allowed by TRAFFIC_IP_MODE"
+                )
+            }
+            Ok(Err(e)) => tracing::warn!(error = %e, "deleting stored cities failed"),
+            Err(e) => tracing::warn!(error = %e, "deleting stored cities task failed"),
         }
     }
 

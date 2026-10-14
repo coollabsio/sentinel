@@ -18,7 +18,7 @@ use crate::event::RequestEvent;
 pub struct GeoLocation {
     /// ISO 3166-1 alpha-2 country code.
     pub country: Option<String>,
-    /// ISO 3166-2 subdivision code, else its English name.
+    /// English subdivision name, else its ISO 3166-2 code.
     pub subdivision: Option<String>,
     /// English city name.
     pub city: Option<String>,
@@ -30,6 +30,12 @@ pub struct GeoLocation {
 pub trait GeoLookup: Send + Sync {
     /// Return the location of `ip`, or `None` if unknown.
     fn locate(&self, ip: IpAddr) -> Option<GeoLocation>;
+
+    /// Changes whenever [`Self::locate`] may answer differently (a database
+    /// swap). `0` means no results may be cached, e.g. nothing is loaded yet.
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 
 /// A no-op `GeoLookup` that never resolves a location.
@@ -294,10 +300,29 @@ pub struct Enriched {
     pub agent_name: Option<String>,
 }
 
+/// GeoIP results kept per client IP. Not config-exposed: entries are small,
+/// and visitors repeat within minutes.
+const GEO_CACHE_CAP: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
+
+/// What [`Enricher::enrich`] keeps from one GeoIP lookup.
+#[derive(Clone, Default)]
+struct GeoHit {
+    /// The lookup's country, before any CF-IPCountry override.
+    country: Option<String>,
+    city: Option<CityHit>,
+}
+
+/// GeoIP results by client IP, all from one [`GeoLookup::generation`].
+struct GeoCache {
+    generation: u64,
+    hits: LruCache<IpAddr, GeoHit>,
+}
+
 /// Enriches `RequestEvent`s with geolocation, UA parsing, and the client IP.
 /// Cloudflare headers are trusted only when the TCP peer is a local proxy or Cloudflare.
 pub struct Enricher {
     geo: Arc<dyn GeoLookup>,
+    geo_cache: Mutex<GeoCache>,
     ua_cache: Mutex<LruCache<String, UaInfo>>,
 }
 
@@ -309,6 +334,10 @@ impl Enricher {
         let cap = NonZeroUsize::new(ua_cache_cap).unwrap_or(NonZeroUsize::new(1).unwrap());
         Self {
             geo,
+            geo_cache: Mutex::new(GeoCache {
+                generation: 0,
+                hits: LruCache::new(GEO_CACHE_CAP),
+            }),
             ua_cache: Mutex::new(LruCache::new(cap)),
         }
     }
@@ -328,14 +357,16 @@ impl Enricher {
         };
         let client_ip = cf_ip.or_else(forwarded_ip).or(peer);
 
-        let location = client_ip.and_then(|ip| self.geo.locate(ip));
+        let geo = client_ip
+            .map(|ip| self.locate_cached(ip))
+            .unwrap_or_default();
         let country = ev
             .cf_country
             .as_deref()
             .filter(|_| cf_trusted)
             .map(String::from)
-            .or_else(|| location.as_ref().and_then(|l| l.country.clone()));
-        let city = location.as_ref().and_then(city_hit);
+            .or(geo.country);
+        let city = geo.city;
 
         let ua = match ev.user_agent.as_deref() {
             Some(ua_str) => self.parse_ua_cached(ua_str),
@@ -365,6 +396,37 @@ impl Enricher {
             bot,
             agent_name,
         }
+    }
+
+    /// The GeoIP result for `ip`, cached while the lookup's generation holds.
+    /// Generation `0` is never cached, so misses from before the first
+    /// database load do not outlive it. The lookup runs outside the lock.
+    fn locate_cached(&self, ip: IpAddr) -> GeoHit {
+        let generation = self.geo.generation();
+        if generation != 0 {
+            let mut cache = self.geo_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.generation != generation {
+                cache.hits.clear();
+                cache.generation = generation;
+            }
+            if let Some(hit) = cache.hits.get(&ip) {
+                return hit.clone();
+            }
+        }
+
+        let location = self.geo.locate(ip);
+        let hit = GeoHit {
+            city: location.as_ref().and_then(city_hit),
+            country: location.and_then(|l| l.country),
+        };
+        if generation != 0 {
+            let mut cache = self.geo_cache.lock().unwrap_or_else(|e| e.into_inner());
+            // A newer database may have arrived during the lookup.
+            if cache.generation == generation {
+                cache.hits.put(ip, hit.clone());
+            }
+        }
+        hit
     }
 
     fn parse_ua_cached(&self, ua_str: &str) -> UaInfo {

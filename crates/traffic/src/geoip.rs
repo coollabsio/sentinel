@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,6 +34,9 @@ pub const MIRROR_URL: &str = "https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite
 /// Sidecar next to the database: which file is live, where it came from, and
 /// its HTTP validators. Lets the next start reuse the file with no download.
 const META_FILE: &str = "geoip.meta.json";
+
+/// [`META_FILE`] is written here first, then renamed over it.
+const META_TMP_FILE: &str = "geoip.meta.json.tmp";
 
 /// Where a download body is spooled before it is unpacked.
 const DOWNLOAD_FILE: &str = "geoip-download.tmp";
@@ -150,6 +154,9 @@ pub fn maxmind_url(key: &str, edition: &str) -> String {
     )
 }
 
+/// Prefix shared by every DB-IP download URL.
+const DBIP_PREFIX: &str = "https://download.db-ip.com/";
+
 /// DB-IP's free city-lite download URL for a given year and month.
 pub fn dbip_url(year: i32, month: u32) -> String {
     format!("https://download.db-ip.com/free/dbip-city-lite-{year:04}-{month:02}.mmdb.gz")
@@ -184,10 +191,22 @@ fn reconcile_archive(archive: &Archive, bytes: &[u8]) -> Archive {
 /// [`MAX_DECOMPRESSED_BYTES`]. Reads one byte past the limit so hitting it is
 /// distinguishable from legitimately ending there: an over-long payload is a
 /// [`TrafficError::Decompress`], never a silent truncation handing a
-/// half-written `.mmdb` to the parser.
+/// half-written `.mmdb` to the parser. A failed write (a full disk) is a
+/// [`TrafficError::Io`], so [`GeoIp::refresh`] can tell it from a bad body.
 fn copy_bounded<R: Read>(reader: R, out: &mut impl Write, what: &str) -> Result<(), TrafficError> {
-    let copied = std::io::copy(&mut reader.take(MAX_DECOMPRESSED_BYTES + 1), out)
-        .map_err(|e| TrafficError::Decompress(format!("{what}: {e}")))?;
+    let mut reader = reader.take(MAX_DECOMPRESSED_BYTES + 1);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut copied = 0u64;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(TrafficError::Decompress(format!("{what}: {e}"))),
+        };
+        out.write_all(&buf[..n])?;
+        copied += n as u64;
+    }
     if copied > MAX_DECOMPRESSED_BYTES {
         return Err(TrafficError::Decompress(format!(
             "{what}: decompressed size exceeds {MAX_DECOMPRESSED_BYTES} bytes"
@@ -251,6 +270,25 @@ struct Meta {
     source_url: String,
 }
 
+/// A file removed on drop unless kept: a failed download, or one shutdown
+/// drops mid-body, leaves no partial file behind.
+struct PartialFile(PathBuf);
+
+impl PartialFile {
+    /// The path, no longer removed on drop.
+    fn keep(mut self) -> PathBuf {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for PartialFile {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
 /// Outcome of a conditional GET.
 enum Fetched {
     /// Server answered `304 Not Modified`.
@@ -278,7 +316,13 @@ struct SavedMeta {
 pub struct GeoIp {
     /// `None` until the first database is loaded.
     db: ArcSwapOption<Reader<Mmap>>,
+    /// Bumped after each database `db` stores; `0` while there is none. See
+    /// [`GeoLookup::generation`].
+    generation: AtomicU64,
     meta: Mutex<Option<Meta>>,
+    /// Held for a whole [`Self::refresh`]: every refresh spools to the same
+    /// [`DOWNLOAD_FILE`] and deletes a leftover one first.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl GeoIp {
@@ -287,26 +331,60 @@ impl GeoIp {
     /// current configuration no longer uses. The caller refreshes afterwards;
     /// the saved validators make that a `304` when nothing changed.
     pub fn open_cached(cfg: &TrafficSettings, db_dir: &Path) -> Option<Arc<GeoIp>> {
-        let saved = std::fs::read(db_dir.join(META_FILE)).ok()?;
-        let saved: SavedMeta = serde_json::from_slice(&saved).ok()?;
+        remove_partial_files(db_dir);
+        let saved = match std::fs::read(db_dir.join(META_FILE)) {
+            Ok(saved) => saved,
+            Err(e) => {
+                tracing::debug!(dir = %db_dir.display(), error = %e, "geoip cache not used: no meta");
+                return None;
+            }
+        };
+        let saved: SavedMeta = match serde_json::from_slice(&saved) {
+            Ok(saved) => saved,
+            Err(e) => {
+                tracing::debug!(error = %e, "geoip cache not used: bad meta");
+                return None;
+            }
+        };
         if !is_db_name(&saved.file) {
+            tracing::debug!(file = %saved.file, "geoip cache not used: bad file name");
             return None;
         }
-        let source = resolve_sources(cfg)
-            .into_iter()
-            .find(|s| s.redacted_url() == saved.source)?;
+        let sources = resolve_sources(cfg);
+        let source_url =
+            if let Some(source) = sources.iter().find(|s| s.redacted_url() == saved.source) {
+                source.url.clone()
+            } else if saved.source.starts_with(DBIP_PREFIX)
+                && sources.iter().any(|s| s.url.starts_with(DBIP_PREFIX))
+            {
+                // DB-IP names a month in its URL, so an earlier month is no
+                // longer a candidate but is still the configured provider. The
+                // URL holds no secret; the next refresh walks the chain as usual.
+                saved.source
+            } else {
+                tracing::debug!(source = %saved.source, "geoip cache not used: source changed");
+                return None;
+            };
         let path = db_dir.join(&saved.file);
-        let reader = map_database(&path).ok()?;
+        let reader = match map_database(&path) {
+            Ok(reader) => reader,
+            Err(e) => {
+                tracing::debug!(error = %e, "geoip cache not used: map failed");
+                return None;
+            }
+        };
         tracing::info!(path = %path.display(), "geoip database loaded from disk");
         prune_old(db_dir, &path);
         Some(Arc::new(GeoIp {
             db: ArcSwapOption::from_pointee(reader),
+            generation: AtomicU64::new(1),
             meta: Mutex::new(Some(Meta {
                 etag: saved.etag,
                 last_modified: saved.last_modified,
                 path,
-                source_url: source.url,
+                source_url,
             })),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -315,7 +393,9 @@ impl GeoIp {
     pub fn empty() -> Arc<GeoIp> {
         Arc::new(GeoIp {
             db: ArcSwapOption::empty(),
+            generation: AtomicU64::new(0),
             meta: Mutex::new(None),
+            refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -339,15 +419,32 @@ impl GeoIp {
     /// Re-check the sources and hot-swap in a newer database; on an empty
     /// `GeoIp` this is the first load. `Ok(true)` if a new database was
     /// swapped in, `Ok(false)` if the active source answered
-    /// `304 Not Modified`, `Err` if every candidate failed. The live database
-    /// is never disturbed on `Ok(false)` or `Err`.
+    /// `304 Not Modified`, `Err` if every candidate failed or a local error
+    /// (disk I/O) stopped the chain. The live database is never disturbed on
+    /// `Ok(false)` or `Err`. Concurrent calls run one after another.
     pub async fn refresh(
         self: &Arc<Self>,
         cfg: &TrafficSettings,
         db_dir: &Path,
     ) -> Result<bool, TrafficError> {
+        let client = client_builder(READ_TIMEOUT)
+            .build()
+            .map_err(|e| TrafficError::Download(format!("client: {e}")))?;
+        self.refresh_from(resolve_sources(cfg), db_dir, &client)
+            .await
+    }
+
+    /// [`Self::refresh`] over an explicit source list and client.
+    async fn refresh_from(
+        self: &Arc<Self>,
+        sources: Vec<Source>,
+        db_dir: &Path,
+        client: &reqwest::Client,
+    ) -> Result<bool, TrafficError> {
+        let _refreshing = self.refresh_lock.lock().await;
         std::fs::create_dir_all(db_dir)?;
-        let client = http_client()?;
+        // A refresh cut short (shutdown drops it mid-download) leaves these.
+        remove_partial_files(db_dir);
 
         let (active_url, etag, last_modified) = {
             let meta = self.meta.lock().unwrap_or_else(|e| e.into_inner());
@@ -362,7 +459,7 @@ impl GeoIp {
         };
 
         let mut last_err: Option<TrafficError> = None;
-        for source in resolve_sources(cfg) {
+        for source in sources {
             // Validators are only meaningful for the URL they came from.
             let (cond_etag, cond_lm) = if active_url.as_deref() == Some(source.url.as_str()) {
                 (etag.as_deref(), last_modified.as_deref())
@@ -371,7 +468,7 @@ impl GeoIp {
             };
 
             let (body, new_etag, new_lm) = match Self::fetch(
-                &client, &source, db_dir, cond_etag, cond_lm,
+                client, &source, db_dir, cond_etag, cond_lm,
             )
             .await
             {
@@ -384,6 +481,8 @@ impl GeoIp {
                     tracing::debug!(url = %source.redacted_url(), "geoip database unchanged");
                     return Ok(false);
                 }
+                // A full disk fails every source the same way.
+                Err(e @ TrafficError::Io(_)) => return Err(e),
                 Err(e) => {
                     tracing::debug!(url = %source.redacted_url(), error = %e, "geoip refresh source failed");
                     last_err = Some(e);
@@ -393,6 +492,7 @@ impl GeoIp {
 
             let (reader, path) = match Self::install(body, &source, db_dir).await {
                 Ok(v) => v,
+                Err(e @ TrafficError::Io(_)) => return Err(e),
                 Err(e) => {
                     tracing::debug!(url = %source.redacted_url(), error = %e, "geoip refresh source unusable");
                     last_err = Some(e);
@@ -403,6 +503,9 @@ impl GeoIp {
             // The new file is written and mapped; publish it before touching
             // the old one.
             self.db.store(Some(Arc::new(reader)));
+            // After the store: a reader that sees the new generation also
+            // sees the new database.
+            self.generation.fetch_add(1, Ordering::Release);
             let meta = Meta {
                 etag: new_etag,
                 last_modified: new_lm,
@@ -444,7 +547,7 @@ impl GeoIp {
         }
 
         let mut resp = req.send().await.map_err(|e| {
-            TrafficError::Download(format!("{}: {}", source.redacted_url(), e.without_url()))
+            TrafficError::Download(format!("{}: {}", source.redacted_url(), describe(e)))
         })?;
 
         if resp.status() == StatusCode::NOT_MODIFIED {
@@ -483,14 +586,11 @@ impl GeoIp {
         let etag = header(ETAG);
         let last_modified = header(LAST_MODIFIED);
 
-        let body = db_dir.join(DOWNLOAD_FILE);
-        if let Err(e) = Self::spool(&mut resp, source, &body).await {
-            let _ = std::fs::remove_file(&body);
-            return Err(e);
-        }
+        let body = PartialFile(db_dir.join(DOWNLOAD_FILE));
+        Self::spool(&mut resp, source, &body.0).await?;
 
         Ok(Fetched::Body {
-            body,
+            body: body.keep(),
             etag,
             last_modified,
         })
@@ -506,11 +606,7 @@ impl GeoIp {
         let mut file = std::fs::File::create(path)?;
         let mut total = 0u64;
         while let Some(chunk) = resp.chunk().await.map_err(|e| {
-            TrafficError::Download(format!(
-                "{}: body: {}",
-                source.redacted_url(),
-                e.without_url()
-            ))
+            TrafficError::Download(format!("{}: body: {}", source.redacted_url(), describe(e)))
         })? {
             total += chunk.len() as u64;
             if total > MAX_DOWNLOAD_BYTES {
@@ -591,13 +687,29 @@ fn save_meta(db_dir: &Path, meta: &Meta) {
         last_modified: meta.last_modified.clone(),
     };
     // Rename, so a crash never leaves a half-written sidecar.
-    let tmp = db_dir.join(format!("{META_FILE}.tmp"));
+    let tmp = db_dir.join(META_TMP_FILE);
     let written = serde_json::to_vec(&saved)
         .map_err(std::io::Error::other)
         .and_then(|json| std::fs::write(&tmp, json))
         .and_then(|()| std::fs::rename(&tmp, db_dir.join(META_FILE)));
     if let Err(e) = written {
         tracing::debug!(dir = %db_dir.display(), error = %e, "geoip meta not saved");
+    }
+}
+
+/// Best-effort removal of the temporary files an interrupted refresh leaves:
+/// the spooled body and a half-written sidecar. Callers must hold no refresh
+/// in progress in `db_dir` (see [`GeoIp::refresh`]'s lock).
+fn remove_partial_files(db_dir: &Path) {
+    for name in [DOWNLOAD_FILE, META_TMP_FILE] {
+        let path = db_dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::debug!(path = %path.display(), "geoip partial file removed"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::debug!(path = %path.display(), error = %e, "geoip partial file not removed")
+            }
+        }
     }
 }
 
@@ -623,7 +735,7 @@ fn classify_attribution(source_url: &str) -> Option<String> {
         Some(MAXMIND_ATTRIBUTION.to_string())
     } else if source_url.starts_with("https://download.maxmind.com/") {
         Some(MAXMIND_ATTRIBUTION.to_string())
-    } else if source_url.starts_with("https://download.db-ip.com/") {
+    } else if source_url.starts_with(DBIP_PREFIX) {
         Some(DBIP_ATTRIBUTION.to_string())
     } else {
         None
@@ -684,7 +796,7 @@ fn location_from(record: &Record<'_>) -> GeoLocation {
     let subdivision = record
         .subdivisions
         .first()
-        .and_then(|s| s.iso_code.or(s.names.en));
+        .and_then(|s| s.names.en.or(s.iso_code));
     GeoLocation {
         country: record.country.iso_code.map(str::to_string),
         subdivision: subdivision.map(str::to_string),
@@ -701,16 +813,54 @@ impl GeoLookup for GeoIp {
         let record = result.decode::<Record>().ok()??;
         Some(location_from(&record))
     }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
 }
 
-/// HTTP client for database downloads. Timeouts are generous: the MaxMind
-/// tarball is tens of megabytes and this runs on a background schedule.
-fn http_client() -> Result<reqwest::Client, TrafficError> {
+/// Longest silence tolerated from a download server. Bounds each read, not
+/// the whole download: a city database is 26-60 MB, which takes minutes on a
+/// slow link.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Delay before the first retry after a failed download.
+pub const RETRY_BASE: Duration = Duration::from_secs(15 * 60);
+
+/// Retries are never further apart than this.
+const RETRY_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Delay before the next download attempt after `failures` failures in a
+/// row: [`RETRY_BASE`], doubled per further failure, capped at
+/// `min(cap, 24 h)`.
+pub fn retry_delay(failures: u32, cap: Duration) -> Duration {
+    let doublings = failures.saturating_sub(1).min(31);
+    RETRY_BASE
+        .saturating_mul(1 << doublings)
+        .min(cap)
+        .min(RETRY_MAX)
+}
+
+/// Safety net for a server that trickles bytes just inside [`READ_TIMEOUT`].
+/// 60 MB in an hour needs only about 140 kbit/s.
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// HTTP client for database downloads (see [`READ_TIMEOUT`]).
+fn client_builder(read_timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(180))
-        .build()
-        .map_err(|e| TrafficError::Download(format!("client: {e}")))
+        .read_timeout(read_timeout)
+        .timeout(TOTAL_TIMEOUT)
+}
+
+/// `e` without its URL, which may hold the license key, saying so plainly
+/// when it was a timeout.
+fn describe(e: reqwest::Error) -> String {
+    if e.is_timeout() {
+        format!("timed out: {}", e.without_url())
+    } else {
+        e.without_url().to_string()
+    }
 }
 
 /// Create a path under `db_dir` that did not previously exist and let `fill`

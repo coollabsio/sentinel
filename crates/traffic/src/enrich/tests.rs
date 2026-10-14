@@ -511,3 +511,118 @@ fn coordinates_outside_the_map_range_are_dropped() {
         assert_eq!(enrich_with(location).city.unwrap().coords, Some((lat, lon)));
     }
 }
+
+/// A fake `GeoLookup` that counts lookups and whose answer and generation
+/// the test changes, as a database swap would.
+struct CountingGeo {
+    calls: std::sync::atomic::AtomicUsize,
+    generation: std::sync::atomic::AtomicU64,
+    location: Mutex<Option<GeoLocation>>,
+}
+
+impl CountingGeo {
+    fn new(generation: u64, location: Option<GeoLocation>) -> Arc<Self> {
+        Arc::new(Self {
+            calls: 0.into(),
+            generation: generation.into(),
+            location: Mutex::new(location),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn swap(&self, generation: u64, location: Option<GeoLocation>) {
+        *self.location.lock().unwrap() = location;
+        self.generation
+            .store(generation, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl GeoLookup for CountingGeo {
+    fn locate(&self, _ip: IpAddr) -> Option<GeoLocation> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.location.lock().unwrap().clone()
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn event_from(client_ip: &str) -> RequestEvent<'static> {
+    let mut ev = base_event();
+    ev.client_ip = Some(client_ip.to_string().into());
+    ev
+}
+
+#[test]
+fn a_repeated_ip_is_looked_up_once() {
+    let geo = CountingGeo::new(1, Some(berlin()));
+    let enricher = Enricher::new(geo.clone(), 8);
+
+    let first = enricher.enrich(&event_from("1.2.3.4"));
+    let second = enricher.enrich(&event_from("1.2.3.4"));
+    enricher.enrich(&event_from("5.6.7.8"));
+
+    assert_eq!(geo.calls(), 2);
+    assert_eq!(second.country, first.country);
+    assert_eq!(second.city, first.city);
+    assert_eq!(second.city.unwrap().key, "DE|BE|Berlin");
+}
+
+/// A database swap must not serve the old database's answer.
+#[test]
+fn a_new_generation_looks_the_ip_up_again() {
+    let geo = CountingGeo::new(1, Some(berlin()));
+    let enricher = Enricher::new(geo.clone(), 8);
+    enricher.enrich(&event_from("1.2.3.4"));
+
+    let mut paris = berlin();
+    paris.country = Some("FR".to_string());
+    paris.subdivision = None;
+    paris.city = Some("Paris".to_string());
+    geo.swap(2, Some(paris));
+    let result = enricher.enrich(&event_from("1.2.3.4"));
+
+    assert_eq!(geo.calls(), 2);
+    assert_eq!(result.country, Some("FR".to_string()));
+    assert_eq!(result.city.unwrap().key, "FR||Paris");
+}
+
+/// Misses from before the first database load are not kept.
+#[test]
+fn lookups_before_the_first_load_are_not_cached() {
+    let geo = CountingGeo::new(0, None);
+    let enricher = Enricher::new(geo.clone(), 8);
+    assert_eq!(enricher.enrich(&event_from("1.2.3.4")).country, None);
+    assert_eq!(enricher.enrich(&event_from("1.2.3.4")).country, None);
+    assert_eq!(geo.calls(), 2);
+
+    geo.swap(1, Some(berlin()));
+    let result = enricher.enrich(&event_from("1.2.3.4"));
+
+    assert_eq!(result.country, Some("DE".to_string()));
+    assert_eq!(result.city.unwrap().key, "DE|BE|Berlin");
+}
+
+/// A cached lookup still lets a trusted CF-IPCountry set the country, and
+/// still keys the city by the lookup's country.
+#[test]
+fn a_cached_lookup_keeps_the_cf_country_rules() {
+    let geo = CountingGeo::new(1, Some(berlin()));
+    let enricher = Enricher::new(geo.clone(), 8);
+    let mut ev = event_from("172.18.0.1");
+    enricher.enrich(&ev);
+
+    ev.cf_country = Some("US".into());
+    let with_cf = enricher.enrich(&ev);
+    ev.cf_country = None;
+    let without_cf = enricher.enrich(&ev);
+
+    assert_eq!(geo.calls(), 1);
+    assert_eq!(with_cf.country, Some("US".to_string()));
+    assert_eq!(with_cf.city.unwrap().key, "DE|BE|Berlin");
+    assert_eq!(without_cf.country, Some("DE".to_string()));
+}

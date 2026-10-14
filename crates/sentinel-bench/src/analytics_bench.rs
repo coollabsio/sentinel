@@ -1,5 +1,6 @@
 //! Traffic-analytics pipeline and query benchmark.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -435,7 +436,8 @@ pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>>
                     )?;
                 }
                 3 => {
-                    // What the API does for the city map: rows, then coordinates.
+                    // What the API does for the city map: rows merged by value,
+                    // the top `topn` by requests (ties on value), then coordinates.
                     let rows = store.breakdown_range(
                         Tier::D1,
                         app,
@@ -444,7 +446,15 @@ pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>>
                         now + 2 * 86_400_000,
                         1_000_000,
                     )?;
-                    let values: Vec<String> = rows.into_iter().map(|r| r.value).collect();
+                    let mut by_value: HashMap<String, i64> = HashMap::new();
+                    for r in rows {
+                        let acc = by_value.entry(r.value).or_insert(0);
+                        *acc = acc.saturating_add(r.requests);
+                    }
+                    let mut ranked: Vec<(String, i64)> = by_value.into_iter().collect();
+                    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    ranked.truncate(opts.topn);
+                    let values: Vec<String> = ranked.into_iter().map(|(v, _)| v).collect();
                     store.city_coords(&values)?;
                 }
                 _ => {

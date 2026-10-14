@@ -340,7 +340,7 @@ fn location_from_maps_a_city_record() {
         location_from(&record),
         GeoLocation {
             country: Some("DE".to_string()),
-            subdivision: Some("BE".to_string()),
+            subdivision: Some("Land Berlin".to_string()),
             city: Some("Berlin".to_string()),
             lat: Some(52.52),
             lon: Some(13.405),
@@ -348,16 +348,30 @@ fn location_from_maps_a_city_record() {
     );
 }
 
-/// DB-IP has no ISO subdivision code, only a name.
+/// GeoLite has a code and a name, DB-IP only the name. Preferring the name
+/// keeps one region under one key when the active source changes.
 #[test]
-fn location_from_uses_the_subdivision_name_when_there_is_no_code() {
-    let mut record = city_record();
-    record.subdivisions.push(place(None, Some("Land Berlin")));
+fn location_from_gives_one_subdivision_for_geolite_and_dbip() {
+    let mut geolite = city_record();
+    geolite
+        .subdivisions
+        .push(place(Some("BE"), Some("Land Berlin")));
+    let mut dbip = city_record();
+    dbip.subdivisions.push(place(None, Some("Land Berlin")));
 
     assert_eq!(
-        location_from(&record).subdivision,
-        Some("Land Berlin".to_string())
+        location_from(&geolite).subdivision,
+        location_from(&dbip).subdivision
     );
+}
+
+/// The code is the fallback when a record has no English name.
+#[test]
+fn location_from_uses_the_subdivision_code_when_there_is_no_name() {
+    let mut record = city_record();
+    record.subdivisions.push(place(Some("BE"), None));
+
+    assert_eq!(location_from(&record).subdivision, Some("BE".to_string()));
 }
 
 /// A country-only database decodes to a record with only the country set.
@@ -556,4 +570,399 @@ fn extract_raw_refuses_an_oversized_database() {
     let error = extract_mmdb(body, &Archive::Raw, &mut std::io::sink())
         .expect_err("raw databases must obey the same limit as gzip databases");
     assert!(matches!(error, TrafficError::Decompress(_)), "{error}");
+}
+
+/// A minimal valid `.mmdb`: one search-tree node whose records both mean
+/// "not found", plus the metadata `Reader` requires. Built here so the tests
+/// need no binary fixture. `kind` (under 29 bytes) is the `database_type`.
+fn tiny_mmdb_of(kind: &str) -> Vec<u8> {
+    fn key(db: &mut Vec<u8>, key: &str, value: &[u8]) {
+        db.push(0x40 | key.len() as u8); // utf8 string
+        db.extend_from_slice(key.as_bytes());
+        db.extend_from_slice(value);
+    }
+    // Node 0: both 24-bit records equal node_count, i.e. no data.
+    let mut db = vec![0, 0, 1, 0, 0, 1];
+    db.extend_from_slice(&[0; 16]); // data section separator
+    db.extend_from_slice(b"\xAB\xCD\xEFMaxMind.com");
+    db.push(0xE9); // map, 9 entries
+    key(&mut db, "binary_format_major_version", &[0xA1, 2]); // uint16
+    key(&mut db, "binary_format_minor_version", &[0xA0]);
+    key(&mut db, "build_epoch", &[0x00, 0x02]); // uint64 0
+    let mut kind_value = vec![0x40 | kind.len() as u8];
+    kind_value.extend_from_slice(kind.as_bytes());
+    key(&mut db, "database_type", &kind_value);
+    key(&mut db, "description", &[0xE0]); // empty map
+    key(&mut db, "ip_version", &[0xA1, 4]);
+    key(&mut db, "languages", &[0x00, 0x04]); // empty array
+    key(&mut db, "node_count", &[0xC1, 1]); // uint32
+    key(&mut db, "record_size", &[0xA1, 24]);
+    db
+}
+
+fn tiny_mmdb() -> Vec<u8> {
+    tiny_mmdb_of("Test")
+}
+
+/// Serves `body` as a `200` to every connection, `chunk` bytes at a time
+/// with `pause` after each write. Returns the base URL.
+fn serve_slowly(body: Vec<u8>, chunk: usize, pause: Duration) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let body = body.clone();
+            std::thread::spawn(move || {
+                // Read the request head; its contents do not matter.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                for part in body.chunks(chunk) {
+                    if stream
+                        .write_all(part)
+                        .and_then(|()| stream.flush())
+                        .is_err()
+                    {
+                        return;
+                    }
+                    std::thread::sleep(pause);
+                }
+            });
+        }
+    });
+    url
+}
+
+fn test_client(read_timeout: Duration) -> reqwest::Client {
+    client_builder(read_timeout).no_proxy().build().unwrap()
+}
+
+/// The timeout bounds each read, not the whole download: a city database
+/// takes minutes on a slow link, and that must still finish.
+#[tokio::test]
+async fn fetch_finishes_a_slow_but_steady_download() {
+    let body = b"0123456789".repeat(20);
+    // ~1 s in total, far longer than the timeout, but never silent for long.
+    let url = serve_slowly(body.clone(), 10, Duration::from_millis(50));
+    let source = Source {
+        url: format!("{url}/db.mmdb"),
+        archive: Archive::Raw,
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    let client = test_client(Duration::from_millis(400));
+    let fetched = GeoIp::fetch(&client, &source, dir.path(), None, None)
+        .await
+        .expect("a steady download must not time out");
+
+    let Fetched::Body { body: path, .. } = fetched else {
+        panic!("expected a body");
+    };
+    assert_eq!(std::fs::read(path).unwrap(), body);
+}
+
+/// A download that goes silent fails, says so, and keeps the key out.
+#[tokio::test]
+async fn fetch_reports_a_stalled_download_as_timed_out() {
+    let url = serve_slowly(vec![0; 64], 8, Duration::from_secs(30));
+    let source = Source {
+        url: format!("{url}/db?license_key=SECRETKEY"),
+        archive: Archive::Raw,
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    let client = test_client(Duration::from_millis(200));
+    let fetch = GeoIp::fetch(&client, &source, dir.path(), None, None);
+    let error = tokio::time::timeout(Duration::from_secs(5), fetch)
+        .await
+        .expect("the read timeout must end a stalled body")
+        .err()
+        .expect("a stalled download must fail");
+
+    let message = error.to_string();
+    assert!(message.contains("timed out"), "{message}");
+    assert!(!message.contains("SECRETKEY"), "{message}");
+    assert!(!dir.path().join(DOWNLOAD_FILE).exists());
+}
+
+/// The read timeout also covers waiting for the response head.
+#[tokio::test]
+async fn fetch_reports_a_server_that_never_answers_as_timed_out() {
+    // Keep the port open without answering.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let source = Source {
+        url: format!("http://{}/db.mmdb", listener.local_addr().unwrap()),
+        archive: Archive::Raw,
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    let client = test_client(Duration::from_millis(200));
+    let fetch = GeoIp::fetch(&client, &source, dir.path(), None, None);
+    let error = tokio::time::timeout(Duration::from_secs(5), fetch)
+        .await
+        .expect("the read timeout must end a silent server")
+        .err()
+        .expect("a silent server must fail");
+
+    let message = error.to_string();
+    assert!(message.contains("timed out"), "{message}");
+}
+
+#[test]
+fn retry_delay_doubles_up_to_the_cap() {
+    let minutes = |m: u64| Duration::from_secs(m * 60);
+    let day = minutes(24 * 60);
+    let period = 30 * day;
+
+    assert_eq!(retry_delay(1, period), minutes(15));
+    assert_eq!(retry_delay(2, period), minutes(30));
+    assert_eq!(retry_delay(3, period), minutes(60));
+    assert_eq!(retry_delay(7, period), minutes(960));
+    // Never more than a day apart...
+    assert_eq!(retry_delay(8, period), day);
+    assert_eq!(retry_delay(u32::MAX, period), day);
+    // ...and never longer than the refresh period itself.
+    assert_eq!(retry_delay(5, minutes(120)), minutes(120));
+}
+
+struct FullDisk;
+
+impl Write for FullDisk {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::StorageFull.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A failed write is a local problem, not a bad download.
+#[test]
+fn extract_reports_a_failed_write_as_an_io_error() {
+    let error =
+        extract_mmdb(&b"abc"[..], &Archive::Raw, &mut FullDisk).expect_err("the write must fail");
+    assert!(matches!(error, TrafficError::Io(_)), "{error}");
+}
+
+/// A full disk is not the source's fault: the next source would fail the
+/// same way, after another long download.
+#[tokio::test]
+async fn refresh_stops_the_source_chain_on_a_local_error() {
+    let dir = tempfile::tempdir().unwrap();
+    // The spool file cannot be created: a directory holds its name.
+    std::fs::create_dir(dir.path().join(DOWNLOAD_FILE)).unwrap();
+    let first = serve_slowly(tiny_mmdb(), 4096, Duration::ZERO);
+    let next = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    next.set_nonblocking(true).unwrap();
+    let sources = vec![
+        Source {
+            url: format!("{first}/a.mmdb"),
+            archive: Archive::Raw,
+        },
+        Source {
+            url: format!("http://{}/b.mmdb", next.local_addr().unwrap()),
+            archive: Archive::Raw,
+        },
+    ];
+
+    let geo = GeoIp::empty();
+    let client = test_client(Duration::from_secs(1));
+    let error = geo
+        .refresh_from(sources, dir.path(), &client)
+        .await
+        .expect_err("the spool file cannot be written");
+
+    assert!(matches!(error, TrafficError::Io(_)), "{error}");
+    assert!(
+        next.accept()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock),
+        "the next source must not be contacted"
+    );
+}
+
+fn leave_partial_files(dir: &Path) {
+    std::fs::write(dir.join(DOWNLOAD_FILE), b"partial").unwrap();
+    std::fs::write(dir.join(format!("{META_FILE}.tmp")), b"{").unwrap();
+}
+
+fn assert_no_partial_files(dir: &Path) {
+    assert!(!dir.join(DOWNLOAD_FILE).exists());
+    assert!(!dir.join(format!("{META_FILE}.tmp")).exists());
+}
+
+/// A download cut short by shutdown leaves its spool file behind.
+#[test]
+fn open_cached_removes_partial_files() {
+    let dir = tempfile::tempdir().unwrap();
+    leave_partial_files(dir.path());
+
+    assert!(GeoIp::open_cached(&default_settings(), dir.path()).is_none());
+    assert_no_partial_files(dir.path());
+}
+
+#[tokio::test]
+async fn refresh_removes_partial_files_before_it_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    leave_partial_files(dir.path());
+    // A closed port: the source fails at once.
+    let addr = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let sources = vec![Source {
+        url: format!("http://{addr}/db.mmdb"),
+        archive: Archive::Raw,
+    }];
+
+    let client = test_client(Duration::from_secs(1));
+    let result = GeoIp::empty()
+        .refresh_from(sources, dir.path(), &client)
+        .await;
+
+    assert!(result.is_err());
+    assert_no_partial_files(dir.path());
+}
+
+/// Refreshes share one spool file, so they must not overlap.
+#[tokio::test]
+async fn concurrent_refreshes_do_not_share_the_spool_file() {
+    // Different sizes, so interleaved writes to one file would show.
+    let short = serve_slowly(tiny_mmdb_of("A"), 16, Duration::from_millis(20));
+    let long = serve_slowly(tiny_mmdb_of(&"B".repeat(28)), 16, Duration::from_millis(20));
+    let source = |url: &str| {
+        vec![Source {
+            url: format!("{url}/db.mmdb"),
+            archive: Archive::Raw,
+        }]
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let geo = GeoIp::empty();
+    let client = test_client(Duration::from_secs(5));
+
+    let (a, b) = tokio::join!(
+        geo.refresh_from(source(&short), dir.path(), &client),
+        geo.refresh_from(source(&long), dir.path(), &client),
+    );
+
+    assert!(a.is_ok(), "{a:?}");
+    assert!(b.is_ok(), "{b:?}");
+    assert!(geo.is_loaded());
+}
+
+fn cache(dir: &Path, source_url: &str) {
+    let path = write_bytes(dir, &tiny_mmdb()).unwrap();
+    let file = path.file_name().unwrap().to_str().unwrap();
+    save_meta(dir, &meta(dir, file, source_url));
+}
+
+#[test]
+fn open_cached_reuses_a_database_from_the_same_source() {
+    let dir = tempfile::tempdir().unwrap();
+    cache(dir.path(), MIRROR_URL);
+
+    let geo = GeoIp::open_cached(&default_settings(), dir.path()).expect("database is reused");
+    assert!(geo.is_loaded());
+}
+
+/// The DB-IP URL names a month, so last month's file is no longer among the
+/// sources; it is still a DB-IP database and still worth serving.
+#[test]
+fn open_cached_reuses_a_dbip_database_from_an_earlier_month() {
+    let dir = tempfile::tempdir().unwrap();
+    let year = time::OffsetDateTime::now_utc().year() - 1;
+    let saved = dbip_url(year, 6);
+    cache(dir.path(), &saved);
+
+    let geo = GeoIp::open_cached(&default_settings(), dir.path())
+        .expect("an earlier DB-IP month is reused");
+    assert_eq!(geo.attribution(), Some(DBIP_ATTRIBUTION.to_string()));
+    let source_url = geo
+        .meta
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .source_url
+        .clone();
+    assert_eq!(source_url, saved);
+}
+
+/// ...but not once the configuration no longer uses DB-IP at all.
+#[test]
+fn open_cached_drops_a_dbip_database_when_dbip_is_not_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    cache(dir.path(), &dbip_url(2020, 6));
+    let mut cfg = default_settings();
+    cfg.geoip_db_url = Some("https://example.com/custom.mmdb".into());
+
+    assert!(GeoIp::open_cached(&cfg, dir.path()).is_none());
+}
+
+/// Shutdown drops a refresh mid-download; the partial body goes with it.
+#[tokio::test]
+async fn a_dropped_fetch_removes_its_partial_body() {
+    let url = serve_slowly(vec![0; 64], 8, Duration::from_secs(30));
+    let source = Source {
+        url: format!("{url}/db.mmdb"),
+        archive: Archive::Raw,
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    let client = test_client(Duration::from_secs(10));
+    let fetch = GeoIp::fetch(&client, &source, dir.path(), None, None);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), fetch)
+            .await
+            .is_err(),
+        "the fetch is still downloading"
+    );
+
+    assert!(!dir.path().join(DOWNLOAD_FILE).exists());
+}
+
+/// Enrichers cache lookups per generation: nothing loaded is `0`, and each
+/// database stored moves it on.
+#[tokio::test]
+async fn generation_moves_on_with_each_database_stored() {
+    let url = serve_slowly(tiny_mmdb(), 1024, Duration::ZERO);
+    let sources = || {
+        vec![Source {
+            url: format!("{url}/db.mmdb"),
+            archive: Archive::Raw,
+        }]
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let geo = GeoIp::empty();
+    let client = test_client(Duration::from_secs(5));
+    assert_eq!(geo.generation(), 0);
+
+    geo.refresh_from(sources(), dir.path(), &client)
+        .await
+        .unwrap();
+    assert_eq!(geo.generation(), 1);
+    geo.refresh_from(sources(), dir.path(), &client)
+        .await
+        .unwrap();
+    assert_eq!(geo.generation(), 2);
+
+    let cached = GeoIp::open_cached(&default_settings(), dir.path());
+    assert!(
+        cached.is_none(),
+        "the test server is not a configured source"
+    );
+    cache(dir.path(), MIRROR_URL);
+    let cached = GeoIp::open_cached(&default_settings(), dir.path()).unwrap();
+    assert_eq!(cached.generation(), 1);
 }

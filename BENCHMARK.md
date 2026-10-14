@@ -427,7 +427,7 @@ download. Live phase E polls
 
 Reported phases are: **[A]** parse+enrich+aggregate events/s plus CF/GeoIP country and city counts, **[B]**
 SQLite minute flush rows, city coordinate rows and latency, **[C]** minute→hour and hour→day compaction rows/latency,
-**[D]** populated store query p50/p95/p99 (stats, paths, country, city with coordinates, apps), and **[E]** live attribution wait, tail-to-visible
+**[D]** populated store query p50/p95/p99 (stats, paths, country, city top `--topn` with coordinates, as the API ranks them, apps), and **[E]** live attribution wait, tail-to-visible
 latency, plus HTTP query p50/p95/p99. Phase E exits non-zero if ingestion is not visible before
 `--timeout-secs` (with a 70-second floor so a minute bucket can flush), or if an analytics endpoint
 does not return success. With `--access-log`, **[F]** simultaneously appends Traefik records at

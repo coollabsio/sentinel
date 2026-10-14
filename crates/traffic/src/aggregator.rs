@@ -4,7 +4,7 @@
 //! one-minute counters and mergeable sketches, caps top-N groups, then drains
 //! the window into `store::traffic` rows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use config::IpMode;
@@ -68,6 +68,10 @@ pub struct Aggregator {
     breakdown: HashMap<String, DimMap, RandomState>,
     /// First `(lat, lon)` seen for each `city` breakdown value in the window.
     city_coords: HashMap<String, (f64, f64), RandomState>,
+    /// Size of `city_coords` after the last prune. The next prune waits
+    /// until the map has doubled from it, so each prune frees at least as
+    /// much as it keeps and its cost is spread over that many requests.
+    city_coords_kept: usize,
 }
 
 impl Aggregator {
@@ -84,6 +88,7 @@ impl Aggregator {
             path_other_errors: HashMap::default(),
             breakdown: HashMap::default(),
             city_coords: HashMap::default(),
+            city_coords_kept: 0,
         }
     }
 
@@ -175,7 +180,9 @@ impl Aggregator {
         if let Some(country) = &en.country {
             record_breakdown(dims, "country", country, bytes, topn, true);
         }
-        if let Some(city) = &en.city {
+        // `TRAFFIC_IP_MODE=off` records no city: a city can be as identifying
+        // as an IP network.
+        if let Some(city) = en.city.as_ref().filter(|_| self.ip_mode != IpMode::Off) {
             record_breakdown(dims, "city", &city.key, bytes, topn, true);
             if let Some(coords) = city.coords {
                 let key = truncate_key(&city.key);
@@ -245,16 +252,20 @@ impl Aggregator {
             .max(1)
             .saturating_mul(SOFT_CAP_TRIGGER)
             .saturating_mul(self.breakdown.len().max(1));
-        if self.city_coords.len() <= limit {
+        if self.city_coords.len() <= limit.max(self.city_coords_kept.saturating_mul(2)) {
             return;
         }
-        let breakdown = &self.breakdown;
-        self.city_coords.retain(|key, _| {
-            breakdown.values().any(|dims| {
-                dims.get("city")
-                    .is_some_and(|cities| cities.counts.contains_key(key))
-            })
-        });
+        // One set of every counted city, then one pass over the map: linear,
+        // not one scan of every app per coordinate.
+        let counted: HashSet<&str, RandomState> = self
+            .breakdown
+            .values()
+            .filter_map(|dims| dims.get("city"))
+            .flat_map(|cities| cities.counts.keys().map(String::as_str))
+            .collect();
+        self.city_coords
+            .retain(|key, _| counted.contains(key.as_str()));
+        self.city_coords_kept = self.city_coords.len();
     }
 
     /// Drains the current window into row types for `bucket`, capping
@@ -370,6 +381,7 @@ impl Aggregator {
         }
 
         self.city_coords.clear();
+        self.city_coords_kept = 0;
 
         WindowRollup {
             stats,

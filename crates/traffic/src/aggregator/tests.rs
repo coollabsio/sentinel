@@ -597,3 +597,53 @@ fn city_coordinates_stay_bounded_within_a_window() {
         a.city_coords.len()
     );
 }
+
+/// `TRAFFIC_IP_MODE=off` records no city and no coordinates. The other modes
+/// still record both.
+#[test]
+fn off_ip_mode_records_no_city() {
+    let berlin = city("DE|BE|Berlin", Some((52.52, 13.405)));
+    let mut a = Aggregator::new(50).with_ip_mode(IpMode::Off);
+    a.record(&base_event(), &berlin);
+
+    let rollup = a.take_rollup(60_000);
+
+    assert!(city_rows(&rollup).is_empty());
+    assert!(rollup.city_coords.is_empty());
+
+    for mode in [IpMode::Full, IpMode::Anonymized] {
+        let mut a = Aggregator::new(50).with_ip_mode(mode);
+        a.record(&base_event(), &berlin);
+
+        let rollup = a.take_rollup(60_000);
+
+        assert_eq!(city_rows(&rollup), vec![("DE|BE|Berlin".to_string(), 1)]);
+        assert_eq!(rollup.city_coords.len(), 1);
+    }
+}
+
+/// A flood of distinct cities over many apps must not prune the coordinate
+/// map on almost every request: each prune has to free room for at least
+/// half the limit, so the prune cost stays linear per request.
+#[test]
+fn city_coordinate_prunes_are_rare_in_a_flood_over_many_apps() {
+    let apps = 20;
+    let records = 20_000;
+    let mut a = Aggregator::new(1);
+    let mut prunes = 0;
+    for i in 0..records {
+        let mut ev = base_event();
+        ev.app = format!("app-{}", i % apps).into();
+        let before = a.city_coords.len();
+        a.record(&ev, &city(&format!("DE|BE|City{i}"), Some((52.0, 13.0))));
+        if a.city_coords.len() < before {
+            prunes += 1;
+        }
+    }
+
+    let limit = crate::sketches::SOFT_CAP_TRIGGER * apps;
+    assert!(
+        prunes <= records / (limit / 2),
+        "{prunes} prunes in {records} records"
+    );
+}

@@ -547,6 +547,60 @@ async fn build_deletes_stored_ips_that_the_ip_mode_does_not_allow() {
     assert!(ips(&store).is_empty());
 }
 
+/// `TRAFFIC_IP_MODE=off` records no city, so service start also deletes the
+/// stored `city` rows. The other modes keep them.
+#[tokio::test]
+async fn build_deletes_stored_cities_in_off_ip_mode() {
+    let store = AnalyticsStore::open_in_memory().expect("open store");
+    let city_row = store::traffic::BreakdownRow {
+        bucket: 60_000,
+        app: APP.into(),
+        dimension: "city".into(),
+        value: "DE|BE|Berlin".into(),
+        requests: 1,
+        bytes_out: 0,
+    };
+    store
+        .write_rows(Tier::H1, &[], &[], &[city_row])
+        .expect("seed city row");
+    let cities = |store: &AnalyticsStore| -> Vec<String> {
+        store
+            .breakdown_range(Tier::H1, APP, "city", 0, i64::MAX, 10)
+            .expect("breakdown_range")
+            .into_iter()
+            .map(|r| r.value)
+            .collect()
+    };
+
+    let mut cfg = test_config(PathBuf::from("/nonexistent/access.log"), 0);
+    let interval = Duration::from_millis(10);
+    for mode in [config::IpMode::Full, config::IpMode::Anonymized] {
+        cfg.traffic.ip_mode = mode;
+        TrafficService::build_with_intervals(
+            &cfg,
+            store.clone(),
+            Arc::new(NoGeo),
+            100,
+            interval,
+            interval,
+        )
+        .await;
+        assert_eq!(cities(&store), ["DE|BE|Berlin"]);
+    }
+
+    cfg.traffic.ip_mode = config::IpMode::Off;
+    TrafficService::build_with_intervals(
+        &cfg,
+        store.clone(),
+        Arc::new(NoGeo),
+        100,
+        interval,
+        interval,
+    )
+    .await;
+    assert!(cities(&store).is_empty());
+}
+
 struct BerlinGeo;
 
 impl crate::enrich::GeoLookup for BerlinGeo {
