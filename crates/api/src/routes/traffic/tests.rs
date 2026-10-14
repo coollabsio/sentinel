@@ -1571,3 +1571,147 @@ async fn city_breakdown_is_empty_when_there_are_no_city_rows() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(j.as_array().unwrap().len(), 0);
 }
+
+// --- Dashboard breakdowns vs. the single-dimension endpoints ----------------
+
+const DASHBOARD_DIMS: [&str; 12] = [
+    "country",
+    "city",
+    "referer",
+    "browser",
+    "os",
+    "device",
+    "protocol",
+    "cache",
+    "status",
+    "agent",
+    "ip",
+    "useragent",
+];
+
+/// 2023-11-01 .. 2023-11-15: covers the `1m`, `1h` and `1d` rows of
+/// [`seeded_all_dims`].
+const ALL_TIERS_RANGE: &str = "from=2023-11-01T00:00:00Z&to=2023-11-15T00:00:00Z";
+
+/// Every dashboard dimension plus `method` (not on the dashboard) in all
+/// three tiers. Resource `r_1` owns `r_1` and `r_1-web`; `rx1-web` (the `_`
+/// as a wildcard) and `r_1x` (no dash) do not belong to it. With a limit of
+/// 3, the resource ranks `top` 10, `__other__` 6, then a three-way tie at 5
+/// that the value order breaks (`a` before `b` and `c`).
+fn seeded_all_dims() -> AnalyticsStore {
+    const H1: i64 = 1_699_992_000_000; // 2023-11-14T20:00:00Z
+    const D1: i64 = 1_699_747_200_000; // 2023-11-12T00:00:00Z
+    let a = AnalyticsStore::open_in_memory().unwrap();
+    let row = |bucket: i64, app: &str, dim: &str, value: &str, requests: i64| BreakdownRow {
+        bucket,
+        app: app.into(),
+        dimension: dim.into(),
+        value: value.into(),
+        requests,
+        bytes_out: requests * 7,
+    };
+    let (mut m1, mut h1, mut d1) = (Vec::new(), Vec::new(), Vec::new());
+    for dim in DASHBOARD_DIMS.iter().copied().chain(["method"]) {
+        let top = if dim == "city" { "DE|BE|Berlin" } else { "top" };
+        m1.push(row(BUCKET, "r_1", dim, top, 10));
+        m1.push(row(BUCKET, "r_1", dim, "a", 3));
+        m1.push(row(BUCKET, "r_1", dim, "__other__", 6));
+        h1.push(row(H1, "r_1-web", dim, "a", 2));
+        h1.push(row(H1, "r_1-web", dim, "c", 5));
+        h1.push(row(H1, "r_1-web", dim, "b", 5));
+        d1.push(row(D1, "rx1-web", dim, "b", 100));
+        d1.push(row(D1, "r_1x", dim, "c", 100));
+        d1.push(row(D1, "r_1", dim, "z", 1));
+    }
+    a.flush_window(&[], &[], &m1).unwrap();
+    a.write_rows(Tier::H1, &[], &[], &h1).unwrap();
+    a.write_rows(Tier::D1, &[], &[], &d1).unwrap();
+    a.record_city_coords(&[
+        store::traffic::CityCoordRow {
+            value: "DE|BE|Berlin".into(),
+            lat: 52.52,
+            lon: 13.405,
+        },
+        store::traffic::CityCoordRow {
+            value: "b".into(),
+            lat: 1.5,
+            lon: -2.5,
+        },
+    ])
+    .unwrap();
+    a
+}
+
+/// For the server, one app and one resource, every dashboard breakdown is
+/// exactly what the single-dimension endpoint returns for the same range and
+/// limit: same top-N, tie order, `__other__` row and city coordinates.
+#[tokio::test]
+async fn dashboard_breakdowns_equal_the_single_dimension_endpoints() {
+    let state = state(Some(seeded_all_dims()));
+    for (dashboard, single) in [
+        ("/api/traffic/dashboard", "/api/traffic/breakdown"),
+        (
+            "/api/app/r_1/traffic/dashboard",
+            "/api/app/r_1/traffic/breakdown",
+        ),
+        (
+            "/api/resource/r_1/traffic/dashboard",
+            "/api/resource/r_1/traffic/breakdown",
+        ),
+    ] {
+        for limit in [3, 50] {
+            let (s, j) = get_with(
+                state.clone(),
+                &format!("{dashboard}?{ALL_TIERS_RANGE}&breakdown_limit={limit}"),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK);
+            let bds = j["breakdowns"].as_object().unwrap();
+            assert_eq!(bds.len(), DASHBOARD_DIMS.len(), "{dashboard}");
+            for dim in DASHBOARD_DIMS {
+                let (s, want) = get_with(
+                    state.clone(),
+                    &format!("{single}/{dim}?{ALL_TIERS_RANGE}&limit={limit}"),
+                )
+                .await;
+                assert_eq!(s, StatusCode::OK);
+                assert!(!want.as_array().unwrap().is_empty(), "{single}/{dim}");
+                assert_eq!(bds[dim], want, "{dashboard} {dim} limit={limit}");
+            }
+        }
+    }
+
+    // Hand-checked: the resource ranking with the tie, and the coordinates.
+    let (_, j) = get_with(
+        state.clone(),
+        &format!("/api/resource/r_1/traffic/dashboard?{ALL_TIERS_RANGE}&breakdown_limit=3"),
+    )
+    .await;
+    assert_eq!(
+        j["breakdowns"]["country"],
+        serde_json::json!([
+            { "value": "top", "requests": 10, "bytes_out": 70 },
+            { "value": "__other__", "requests": 6, "bytes_out": 42 },
+            { "value": "a", "requests": 5, "bytes_out": 35 },
+        ])
+    );
+    assert_eq!(
+        j["breakdowns"]["city"][0],
+        serde_json::json!({
+            "value": "DE|BE|Berlin", "requests": 10, "bytes_out": 70,
+            "lat": 52.52, "lon": 13.405,
+        })
+    );
+    let (_, j) = get_with(
+        state,
+        &format!("/api/traffic/dashboard?{ALL_TIERS_RANGE}&breakdown_limit=2"),
+    )
+    .await;
+    assert_eq!(
+        j["breakdowns"]["city"],
+        serde_json::json!([
+            { "value": "b", "requests": 105, "bytes_out": 735, "lat": 1.5, "lon": -2.5 },
+            { "value": "c", "requests": 105, "bytes_out": 735 },
+        ])
+    );
+}
