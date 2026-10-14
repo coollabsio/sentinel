@@ -7,10 +7,12 @@
 //! - [`Uniques`]: approximate distinct-IP counting (HyperLogLog++).
 //! - [`TopN`]: exact counts, capped to the top-N entries with an `__other__` bucket.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault};
 use std::net::IpAddr;
 
+use foldhash::fast::RandomState;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use siphasher::sip::SipHasher13;
@@ -21,6 +23,10 @@ use crate::TrafficError;
 /// Max centroids a [`LatencyDigest`] retains after compression, bounding its
 /// memory/serialized size independent of how many values were folded in.
 const MAX_CENTROIDS: usize = 100;
+
+/// Values [`LatencyDigest::add`] buffers before folding them into the
+/// t-digest with one merge and compress, instead of one per value.
+const ADD_BATCH: usize = 256;
 
 /// HyperLogLog++ precision (number of register-index bits). Must be identical
 /// across every [`Uniques`] instance that might ever be merged together.
@@ -59,9 +65,15 @@ impl<'de> Deserialize<'de> for HllHasherBuilder {
 type HllType = HyperLogLogPlus<[u8; 16], HllHasherBuilder>;
 
 /// Mergeable approximate-quantile sketch over non-negative, finite latencies.
-/// `None` means "no values added", avoiding the `tdigests` crate's
-/// `from_values`/`from_centroids`, which both panic on empty input.
-pub struct LatencyDigest(Option<TDigest>);
+#[derive(Default)]
+pub struct LatencyDigest {
+    /// `None` means "nothing folded yet", avoiding the `tdigests` crate's
+    /// `from_values`/`from_centroids`, which both panic on empty input.
+    digest: Option<TDigest>,
+    /// Sanitized values not yet folded into `digest`. Every reader goes
+    /// through [`Self::pool`] or [`Self::folded`], so none is ever skipped.
+    pending: Vec<f64>,
+}
 
 /// Local serializable mirror of `tdigests::Centroid`, which has no serde impl.
 #[derive(Serialize, Deserialize)]
@@ -73,62 +85,76 @@ struct CentroidData {
 impl LatencyDigest {
     /// Creates an empty digest.
     pub fn new() -> Self {
-        Self(None)
+        Self::default()
     }
 
-    /// Folds `values` into the digest, sanitizing away NaN/infinite/negative
-    /// entries first. A no-op if every value is filtered out.
+    /// Adds `values` to the digest, sanitizing away NaN/infinite/negative
+    /// entries first. Values are buffered and folded in batches of
+    /// [`ADD_BATCH`]: a merge and compress per value dominated ingest.
     pub fn add(&mut self, values: &[f64]) {
-        let clean: Vec<f64> = values
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .collect();
-
-        if clean.is_empty() {
-            return;
+        self.pending.extend(
+            values
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite() && *v >= 0.0),
+        );
+        if self.pending.len() >= ADD_BATCH {
+            self.digest = Self::pool(std::slice::from_ref(self));
+            self.pending.clear();
         }
-
-        let new_digest = TDigest::from_values(clean);
-        let mut combined = match self.0.take() {
-            Some(existing) => existing.merge(&new_digest),
-            None => new_digest,
-        };
-        combined.compress(MAX_CENTROIDS);
-        self.0 = Some(combined);
     }
 
-    /// Merges digests by pooling all centroids into one fresh digest (cheaper
-    /// and more accurate than repeated pairwise merges). Empty if all inputs are.
-    pub fn merge(sketches: &[LatencyDigest]) -> LatencyDigest {
+    /// Pools the centroids and buffered values of `sketches` into one fresh,
+    /// compressed digest (cheaper and more accurate than repeated pairwise
+    /// merges). `None` if all inputs are empty.
+    fn pool(sketches: &[LatencyDigest]) -> Option<TDigest> {
         let all_centroids: Vec<Centroid> = sketches
             .iter()
-            .filter_map(|s| s.0.as_ref())
-            .flat_map(|d| d.centroids().iter().cloned())
+            .flat_map(|s| {
+                let folded = s.digest.iter().flat_map(|d| d.centroids().iter().cloned());
+                folded.chain(s.pending.iter().map(|v| Centroid::new(*v, 1.0)))
+            })
             .collect();
 
         if all_centroids.is_empty() {
-            return LatencyDigest(None);
+            return None;
         }
 
         let mut digest = TDigest::from_centroids(all_centroids);
         digest.compress(MAX_CENTROIDS);
-        LatencyDigest(Some(digest))
+        Some(digest)
+    }
+
+    /// The digest with any buffered values folded in. Borrows when nothing
+    /// is buffered (every decoded digest), so reads stay copy-free.
+    fn folded(&self) -> Option<Cow<'_, TDigest>> {
+        if self.pending.is_empty() {
+            self.digest.as_ref().map(Cow::Borrowed)
+        } else {
+            Self::pool(std::slice::from_ref(self)).map(Cow::Owned)
+        }
+    }
+
+    /// Merges digests into one, including their buffered values. Empty if
+    /// all inputs are.
+    pub fn merge(sketches: &[LatencyDigest]) -> LatencyDigest {
+        LatencyDigest {
+            digest: Self::pool(sketches),
+            pending: Vec::new(),
+        }
     }
 
     /// Estimates the value at quantile `q` (0.0..=1.0). Returns `0.0` for an
     /// empty digest.
     pub fn quantile(&self, q: f64) -> f64 {
-        match &self.0 {
-            Some(digest) => digest.estimate_quantile(q),
-            None => 0.0,
-        }
+        self.folded()
+            .map_or(0.0, |digest| digest.estimate_quantile(q))
     }
 
     /// Postcard-encodes the digest's centroids. Returns an empty `Vec` for an
     /// empty digest.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let data: Vec<CentroidData> = match &self.0 {
+        let data: Vec<CentroidData> = match self.folded() {
             Some(digest) => digest
                 .centroids()
                 .iter()
@@ -163,16 +189,13 @@ impl LatencyDigest {
             .collect();
 
         if centroids.is_empty() {
-            return Ok(Self(None));
+            return Ok(Self::new());
         }
 
-        Ok(Self(Some(TDigest::from_centroids(centroids))))
-    }
-}
-
-impl Default for LatencyDigest {
-    fn default() -> Self {
-        Self::new()
+        Ok(Self {
+            digest: Some(TDigest::from_centroids(centroids)),
+            pending: Vec::new(),
+        })
     }
 }
 
@@ -286,8 +309,9 @@ pub fn truncate_key(key: &str) -> &str {
 /// count with everything else folded into `other`.
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct TopN {
-    /// key -> (requests, bytes_out).
-    pub counts: HashMap<String, (u64, u64)>,
+    /// key -> (requests, bytes_out). foldhash, not SipHash: this map takes
+    /// several lookups per event. The hasher is not serialized.
+    pub counts: HashMap<String, (u64, u64), RandomState>,
     /// Aggregate (requests, bytes_out) for keys evicted by [`Self::cap`].
     pub other: (u64, u64),
 }
