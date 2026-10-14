@@ -9,7 +9,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use store::traffic::{AnalyticsStore, AppFilter, BreakdownRow, PathRow, StatsRow, Tier};
+use store::traffic::{
+    AnalyticsStore, AppFilter, BreakdownRow, BreakdownTotal, PathRow, StatsRow, Tier,
+};
 use traffic::sketches::{LatencyDigest, Uniques};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
@@ -40,9 +42,10 @@ const MAX_LIMIT: usize = 1_000;
 /// Default cap on the dashboard's app leaderboard when `apps_limit` is absent.
 const DEFAULT_APPS_LIMIT: usize = 200;
 
-/// SQL `LIMIT` on `paths_range`/`breakdown_range`, purely a memory backstop
-/// against a pathological span. Real queries fall far below it; hitting it is
-/// logged, so any truncation is observable rather than silent.
+/// SQL `LIMIT` on `paths_range`/`breakdown_range`, and the cap on distinct
+/// values per dimension of the dashboard's `breakdown_totals`: purely a memory
+/// backstop against a pathological span. Real queries fall far below it;
+/// hitting it is logged, so any truncation is observable rather than silent.
 const MAX_SCAN_ROWS: usize = 1_000_000;
 
 /// Logs when a scan came back exactly at its budget, i.e. the SQL `LIMIT` may
@@ -821,7 +824,7 @@ async fn run_breakdown(
         for (tier, lo, hi) in tier_reads(from, to) {
             let r = target.breakdown(&analytics, tier, &dimension, lo, hi, budget)?;
             warn_if_truncated("breakdown", &label, r.len(), budget);
-            rows.extend(r);
+            rows.extend(r.into_iter().map(BreakdownTotal::from));
         }
         ranked_breakdown(&analytics, &dimension, rows, limit)
     })
@@ -990,7 +993,7 @@ async fn server_breakdown(
         for (tier, lo, hi) in tier_reads(from, to) {
             let r = analytics.breakdown_dim_rows_between(tier, &dimension, lo, hi, budget)?;
             warn_if_truncated("server_breakdown", "*", r.len(), budget);
-            rows.extend(r);
+            rows.extend(r.into_iter().map(BreakdownTotal::from));
         }
         ranked_breakdown(&analytics, &dimension, rows, limit)
     })
@@ -1144,9 +1147,13 @@ fn top_paths(rows: Vec<PathRow>, limit: usize) -> Vec<TrafficPath> {
     out
 }
 
-/// Groups per-bucket breakdown rows by value, summing counters, then returns
-/// the `limit` busiest values. No sketches on this table.
-fn top_breakdown(rows: Vec<BreakdownRow>, limit: usize) -> Vec<TrafficBreakdownEntry> {
+/// Groups breakdown totals (per-bucket rows, or one tier's sums) by value,
+/// summing counters, then returns the `limit` busiest values. No sketches on
+/// this table.
+fn top_breakdown(
+    rows: impl IntoIterator<Item = BreakdownTotal>,
+    limit: usize,
+) -> Vec<TrafficBreakdownEntry> {
     let mut by_value: HashMap<String, (i64, i64)> = HashMap::new();
     for r in rows {
         let acc = by_value.entry(r.value).or_insert((0, 0));
@@ -1172,7 +1179,7 @@ fn top_breakdown(rows: Vec<BreakdownRow>, limit: usize) -> Vec<TrafficBreakdownE
 fn ranked_breakdown(
     analytics: &AnalyticsStore,
     dimension: &str,
-    rows: Vec<BreakdownRow>,
+    rows: impl IntoIterator<Item = BreakdownTotal>,
     limit: usize,
 ) -> Result<Vec<TrafficBreakdownEntry>, store::StoreError> {
     let mut entries = top_breakdown(rows, limit);
@@ -1289,6 +1296,22 @@ impl Target {
     }
 }
 
+/// The dimensions of [`TrafficBreakdowns`], read by [`build_dashboard`].
+const DASHBOARD_DIMENSIONS: [&str; 12] = [
+    "country",
+    "city",
+    "referer",
+    "browser",
+    "os",
+    "device",
+    "protocol",
+    "cache",
+    "status",
+    "agent",
+    "ip",
+    "useragent",
+];
+
 /// The already-resolved windowing for one dashboard query. `from`/`to` bound
 /// the overview/paths/breakdowns; `series_width`/`series_count` come from
 /// `range` and drive only the series (whose window is derived from `now`).
@@ -1304,7 +1327,9 @@ struct DashboardParams {
 }
 
 /// Assembles the whole dashboard in one blocking pass, reusing the exact
-/// merge helpers the standalone endpoints use — nothing is re-summed. Returns
+/// merge and ranking helpers the standalone endpoints use. The breakdowns
+/// read every dimension in one query per tier instead of one per dimension;
+/// the result is the same as the single-dimension endpoints'. Returns
 /// `attribution: None`; the handler fills it in from `AppState` afterwards.
 fn build_dashboard(
     analytics: &AnalyticsStore,
@@ -1336,15 +1361,26 @@ fn build_dashboard(
     }
     let paths = top_paths(path_rows, p.paths_limit);
 
-    // Breakdowns — one ranked list per dimension. The dimension set is the
-    // struct's own fields, so it stays in lockstep with Coolify's list.
-    let dim = |name: &str| -> Result<Vec<TrafficBreakdownEntry>, store::StoreError> {
-        let mut rows = Vec::new();
-        for (tier, lo, hi) in tier_reads(p.from, p.to) {
-            let r = target.breakdown(analytics, tier, name, lo, hi, MAX_SCAN_ROWS)?;
-            warn_if_truncated("dashboard_breakdown", &label, r.len(), MAX_SCAN_ROWS);
-            rows.extend(r);
+    // Breakdowns — one read of every dimension per tier, then one ranked list
+    // per dimension, ranked like the single-dimension endpoint. The cap is per
+    // dimension, so a long-tailed `ip` cannot truncate `country`.
+    let mut by_dim: HashMap<String, Vec<BreakdownTotal>> = HashMap::new();
+    for (tier, lo, hi) in tier_reads(p.from, p.to) {
+        let totals = analytics.breakdown_totals(
+            tier,
+            target.filter(),
+            &DASHBOARD_DIMENSIONS,
+            lo,
+            hi,
+            MAX_SCAN_ROWS,
+        )?;
+        for (name, rows) in totals {
+            warn_if_truncated("dashboard_breakdown", &label, rows.len(), MAX_SCAN_ROWS);
+            by_dim.entry(name).or_default().extend(rows);
         }
+    }
+    let mut dim = |name: &str| {
+        let rows = by_dim.remove(name).unwrap_or_default();
         ranked_breakdown(analytics, name, rows, p.breakdown_limit)
     };
     let breakdowns = TrafficBreakdowns {

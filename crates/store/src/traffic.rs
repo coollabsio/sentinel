@@ -230,6 +230,27 @@ fn breakdown_for_sql(tier: Tier, filter: AppFilter<'_>) -> String {
     )
 }
 
+/// One read of several breakdown dimensions over a bucket range: the server
+/// (`filter == None`), one key or one resource. The predicate and parameters
+/// are those of [`AppFilter`]; the dimensions are `?6..`. The rows are not
+/// sorted, so the plan has no temp B-tree: the caller groups them.
+fn breakdown_totals_sql(tier: Tier, filter: Option<AppFilter<'_>>, dims: usize) -> String {
+    let sfx = suffix(tier);
+    let (indexed_by, app) = match filter {
+        Some(f) => (
+            f.indexed_by(&format!("idx_tb_{sfx}_app_dim_bucket")),
+            format!("{} AND ", f.predicate()),
+        ),
+        None => (String::new(), String::new()),
+    };
+    let dims: Vec<String> = (6..6 + dims).map(|i| format!("?{i}")).collect();
+    format!(
+        "SELECT dimension, value, requests, bytes_out FROM traffic_breakdown_{sfx}{indexed_by} \
+         WHERE {app}bucket >= ?4 AND bucket < ?5 AND dimension IN ({})",
+        dims.join(", ")
+    )
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatsRow {
     pub bucket: i64,
@@ -266,6 +287,24 @@ pub struct BreakdownRow {
     pub value: String,
     pub requests: i64,
     pub bytes_out: i64,
+}
+
+/// Requests and bytes of one breakdown value, summed over its rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BreakdownTotal {
+    pub value: String,
+    pub requests: i64,
+    pub bytes_out: i64,
+}
+
+impl From<BreakdownRow> for BreakdownTotal {
+    fn from(r: BreakdownRow) -> Self {
+        BreakdownTotal {
+            value: r.value,
+            requests: r.requests,
+            bytes_out: r.bytes_out,
+        }
+    }
 }
 
 /// Coordinates of one `city` breakdown value.
@@ -718,6 +757,66 @@ impl AnalyticsStore {
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
+        })
+    }
+
+    /// Totals per value of each of `dims` in `tier` over `[from, to)`, keyed
+    /// by dimension, for the app keys that `filter` selects (`None`: every
+    /// app). One read for all dimensions instead of one per dimension: the
+    /// rows are summed here while they are read, so only one entry for each
+    /// distinct value is held in memory.
+    ///
+    /// `limit` caps the distinct values of each dimension separately (a
+    /// memory backstop), so a dimension with many values cannot take the
+    /// budget of another. At the cap, rows of a new value are dropped; the
+    /// values already kept are still summed over all their rows. A dimension
+    /// with `limit` values may be truncated.
+    pub fn breakdown_totals(
+        &self,
+        tier: Tier,
+        filter: Option<AppFilter<'_>>,
+        dims: &[&str],
+        from: i64,
+        to: i64,
+        limit: usize,
+    ) -> Result<HashMap<String, Vec<BreakdownTotal>>, StoreError> {
+        self.with_reader(|c| {
+            let mut stmt = c.prepare_cached(&breakdown_totals_sql(tier, filter, dims.len()))?;
+            let (key, lo, hi) = filter.map(AppFilter::params).unwrap_or_default();
+            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&key, &lo, &hi, &from, &to];
+            params.extend(dims.iter().map(|d| d as &dyn rusqlite::ToSql));
+
+            let mut groups: HashMap<String, HashMap<String, (i64, i64)>> = HashMap::new();
+            let mut rows = stmt.query(params.as_slice())?;
+            while let Some(row) = rows.next()? {
+                let dim = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
+                let value = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
+                let (requests, bytes_out): (i64, i64) = (row.get(2)?, row.get(3)?);
+                let group = match groups.get_mut(dim) {
+                    Some(group) => group,
+                    None => groups.entry(dim.to_string()).or_default(),
+                };
+                if let Some(acc) = group.get_mut(value) {
+                    acc.0 = acc.0.saturating_add(requests);
+                    acc.1 = acc.1.saturating_add(bytes_out);
+                } else if group.len() < limit {
+                    group.insert(value.to_string(), (requests, bytes_out));
+                }
+            }
+            Ok(groups
+                .into_iter()
+                .map(|(dim, values)| {
+                    let totals = values
+                        .into_iter()
+                        .map(|(value, (requests, bytes_out))| BreakdownTotal {
+                            value,
+                            requests,
+                            bytes_out,
+                        })
+                        .collect();
+                    (dim, totals)
+                })
+                .collect())
         })
     }
 

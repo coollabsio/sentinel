@@ -1053,6 +1053,200 @@ fn exact_breakdown_query_seeks_app_dimension_and_bucket() {
     }
 }
 
+/// `(value, requests, bytes_out)` of every total of `dim`, sorted by value.
+fn totals_of(totals: &HashMap<String, Vec<BreakdownTotal>>, dim: &str) -> Vec<(String, i64, i64)> {
+    let mut out: Vec<_> = totals
+        .get(dim)
+        .into_iter()
+        .flatten()
+        .map(|t| (t.value.clone(), t.requests, t.bytes_out))
+        .collect();
+    out.sort();
+    out
+}
+
+/// `rows` summed by value, sorted by value: what the per-dimension reads
+/// give after the API groups them.
+fn summed(rows: Vec<BreakdownRow>) -> Vec<(String, i64, i64)> {
+    let mut by_value: HashMap<String, (i64, i64)> = HashMap::new();
+    for r in rows {
+        let acc = by_value.entry(r.value).or_default();
+        acc.0 += r.requests;
+        acc.1 += r.bytes_out;
+    }
+    let mut out: Vec<_> = by_value.into_iter().map(|(v, (r, b))| (v, r, b)).collect();
+    out.sort();
+    out
+}
+
+/// One `breakdown_totals` read gives, for every requested dimension, the
+/// same sums as one per-dimension read of each dimension, for the server,
+/// one exact key and one resource. Other dimensions, other keys and rows
+/// outside the window are not read.
+#[test]
+fn breakdown_totals_match_the_per_dimension_reads() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    let keys = ["u", "u-web", "ux", "u_-web", "v"];
+    for tier in [Tier::M1, Tier::H1, Tier::D1] {
+        let mut rows = Vec::new();
+        for (k, key) in keys.iter().enumerate() {
+            let k = k as i64;
+            for bucket in [0, 60_000, 120_000, 180_000] {
+                rows.push(breakdown_row(bucket, key, "country", "US", 1 + k));
+                rows.push(breakdown_row(
+                    bucket,
+                    key,
+                    "country",
+                    "DE",
+                    2 + bucket / 60_000,
+                ));
+                rows.push(breakdown_row(bucket, key, "ip", &format!("10.0.0.{k}"), 3));
+                rows.push(breakdown_row(bucket, key, "ip", "__other__", 5));
+                rows.push(breakdown_row(bucket, key, "method", "GET", 7));
+            }
+        }
+        s.write_rows(tier, &[], &[], &rows).unwrap();
+
+        for filter in [
+            None,
+            Some(AppFilter::Exact("u")),
+            Some(AppFilter::Resource("u")),
+        ] {
+            let got = s
+                .breakdown_totals(
+                    tier,
+                    filter,
+                    &["country", "ip", "city"],
+                    60_000,
+                    180_000,
+                    100,
+                )
+                .unwrap();
+            for dim in ["country", "ip", "city"] {
+                let want = summed(
+                    match filter {
+                        None => s.breakdown_dim_rows_between(tier, dim, 60_000, 180_000, 100),
+                        Some(f) => s.breakdown_for(tier, f, dim, 60_000, 180_000, 100),
+                    }
+                    .unwrap(),
+                );
+                assert_eq!(totals_of(&got, dim), want, "{tier:?} {filter:?} {dim}");
+            }
+            assert!(!got.contains_key("method"), "{tier:?} {filter:?}");
+        }
+        // Spot checks against hand-computed sums (two buckets in the window).
+        let got = s
+            .breakdown_totals(
+                tier,
+                Some(AppFilter::Resource("u")),
+                &["country"],
+                60_000,
+                180_000,
+                100,
+            )
+            .unwrap();
+        assert_eq!(
+            totals_of(&got, "country"),
+            vec![("DE".into(), 14, 80), ("US".into(), 6, 80)],
+            "u (1+1) + u-web (2+2); u_-web and ux are other resources"
+        );
+    }
+}
+
+/// The limit caps the distinct values of each dimension separately: a
+/// dimension with many values (`ip`) cannot take the budget of another
+/// (`country`). A value that is kept is summed over all its rows, also rows
+/// read after the cap was reached.
+#[test]
+fn breakdown_totals_cap_each_dimension_separately() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    let mut rows = Vec::new();
+    for ip in ["a", "b", "c"] {
+        rows.push(breakdown_row(0, "u", "ip", ip, 1));
+    }
+    for ip in ["a", "d", "e"] {
+        rows.push(breakdown_row(60_000, "u", "ip", ip, 10));
+    }
+    rows.push(breakdown_row(0, "u", "country", "US", 1));
+    rows.push(breakdown_row(60_000, "u", "country", "DE", 1));
+    s.write_rows(Tier::M1, &[], &[], &rows).unwrap();
+
+    for filter in [
+        None,
+        Some(AppFilter::Exact("u")),
+        Some(AppFilter::Resource("u")),
+    ] {
+        let got = s
+            .breakdown_totals(Tier::M1, filter, &["ip", "country"], 0, i64::MAX, 3)
+            .unwrap();
+        assert_eq!(
+            totals_of(&got, "ip"),
+            vec![
+                ("a".into(), 11, 40),
+                ("b".into(), 1, 20),
+                ("c".into(), 1, 20)
+            ],
+            "{filter:?}"
+        );
+        assert_eq!(totals_of(&got, "country").len(), 2, "{filter:?}");
+    }
+}
+
+/// The one-pass dashboard read keeps the plans of the per-dimension reads:
+/// an exact key seeks `(app, dimension, bucket)` for each dimension, a
+/// resource uses the app index for both key ranges, and the server-wide read
+/// takes the primary key's bucket range. No plan sorts.
+#[test]
+fn breakdown_totals_queries_use_the_expected_indexes() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    for tier in [Tier::M1, Tier::H1, Tier::D1] {
+        let sfx = suffix(tier);
+        let index = format!("idx_tb_{sfx}_app_dim_bucket");
+        let n = 5 + 12;
+
+        let plan = query_plan(
+            &s,
+            &breakdown_totals_sql(tier, Some(AppFilter::Exact("u")), 12),
+            n,
+        );
+        assert!(
+            plan.contains(&format!(
+                "USING INDEX {index} (app=? AND dimension=? AND bucket>? AND bucket<?)"
+            )),
+            "{tier:?}: {plan}"
+        );
+
+        let plan = query_plan(
+            &s,
+            &breakdown_totals_sql(tier, Some(AppFilter::Resource("u")), 12),
+            n,
+        );
+        assert!(
+            plan.contains("MULTI-INDEX OR")
+                && plan.contains(&format!("USING INDEX {index} (app=?"))
+                && plan.contains(&format!("USING INDEX {index} (app>? AND app<?)")),
+            "{tier:?}: {plan}"
+        );
+        assert!(!plan.contains("SCAN traffic_"), "{plan}");
+
+        let plan = query_plan(&s, &breakdown_totals_sql(tier, None, 12), n);
+        assert!(
+            plan.contains(&format!(
+                "USING INDEX sqlite_autoindex_traffic_breakdown_{sfx}_1 (bucket>? AND bucket<?)"
+            )),
+            "{tier:?}: {plan}"
+        );
+        for filter in [
+            None,
+            Some(AppFilter::Exact("u")),
+            Some(AppFilter::Resource("u")),
+        ] {
+            let plan = query_plan(&s, &breakdown_totals_sql(tier, filter, 12), n);
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+    }
+}
+
 /// Compaction and retention select and delete whole bucket windows. They use
 /// the primary key `(bucket, …)`, not an app index, so dropping the old
 /// `(app, bucket, dimension)` index does not turn them into scans.
