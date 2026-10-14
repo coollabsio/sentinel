@@ -647,3 +647,29 @@ fn city_coordinate_prunes_are_rare_in_a_flood_over_many_apps() {
         "{prunes} prunes in {records} records"
     );
 }
+
+/// Both latency digests a request feeds (per `(app, host)` and per
+/// `(app, path)`) keep every value through `take_rollup`, including a
+/// partial batch at the end of the window.
+#[test]
+fn rollup_digests_keep_every_latency() {
+    let mut a = Aggregator::new(50);
+    let en = base_enriched();
+    let mut ev = base_event();
+    ev.path = "/p".into();
+    for i in 0..1_001 {
+        ev.duration_ms = i as f64;
+        a.record(&ev, &en);
+    }
+
+    let rollup = a.take_rollup(60_000);
+    let path_row = rollup.paths.iter().find(|p| p.path == "/p").unwrap();
+    for blob in [&rollup.stats[0].latency_tdigest, &path_row.latency_tdigest] {
+        let centroids: Vec<(f64, f64)> = postcard::from_bytes(blob).unwrap();
+        assert_eq!(centroids.iter().map(|(_, w)| w).sum::<f64>(), 1_001.0);
+        let digest = LatencyDigest::from_bytes(blob).unwrap();
+        assert_eq!(digest.quantile(0.0), 0.0);
+        assert_eq!(digest.quantile(1.0), 1_000.0);
+        assert!((digest.quantile(0.5) - 500.0).abs() < 10.0);
+    }
+}
