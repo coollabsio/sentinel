@@ -330,7 +330,7 @@ fn traffic_defaults() {
     assert!(c.traffic.geoip_enabled);
     assert!(c.traffic.geoip_db_url.is_none());
     assert!(c.traffic.geoip_maxmind_key.is_none());
-    assert_eq!(c.traffic.geoip_maxmind_edition, "GeoLite2-Country");
+    assert_eq!(c.traffic.geoip_maxmind_edition, "GeoLite2-City");
     assert_eq!(
         c.traffic.analytics_file.to_str().unwrap(),
         "/app/db/analytics.sqlite"

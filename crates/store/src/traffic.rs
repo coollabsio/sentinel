@@ -6,6 +6,7 @@
 //! traffic` would be a cycle), driven via `compact_window`, which moves one bucket up atomically.
 
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +51,18 @@ CREATE TABLE IF NOT EXISTS traffic_paths_{sfx} (
 CREATE INDEX IF NOT EXISTS idx_tp_{sfx}_app_bucket ON traffic_paths_{sfx} (app, bucket);
 ";
 
+/// A breakdown query reads one dimension of one app over a bucket range, so
+/// the app index is `(app, dimension, bucket)`: the seek skips the other
+/// dimensions. Bucket-window reads and deletes (compaction, retention, the
+/// server-wide breakdown) use the primary key, which starts with `bucket`.
+///
+/// Databases created before this index had `idx_tb_{sfx}_app_bucket` on
+/// `(app, bucket, dimension)`. No query needs it, so the next open drops it
+/// and builds the new index (a one-time cost proportional to the table size,
+/// about 2.5 s for 3.3M rows). Dropping first lets the new index reuse the
+/// old index's pages, so the file does not grow. If the process stops between
+/// the two statements, the next open builds the index. Afterwards both
+/// statements are no-ops.
 const BREAKDOWN_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS traffic_breakdown_{sfx} (
     bucket    INTEGER NOT NULL,
@@ -60,7 +73,17 @@ CREATE TABLE IF NOT EXISTS traffic_breakdown_{sfx} (
     bytes_out INTEGER NOT NULL,
     PRIMARY KEY (bucket, app, dimension, value)
 ) STRICT;
-CREATE INDEX IF NOT EXISTS idx_tb_{sfx}_app_bucket ON traffic_breakdown_{sfx} (app, bucket, dimension);
+DROP INDEX IF EXISTS idx_tb_{sfx}_app_bucket;
+CREATE INDEX IF NOT EXISTS idx_tb_{sfx}_app_dim_bucket ON traffic_breakdown_{sfx} (app, dimension, bucket);
+";
+
+/// Coordinates of `city` breakdown values. Not tiered: one row for each city.
+const CITY_COORDS_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS traffic_city_coords (
+    value TEXT PRIMARY KEY,
+    lat   REAL NOT NULL,
+    lon   REAL NOT NULL
+) STRICT;
 ";
 
 pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
@@ -71,6 +94,7 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             ddl.push_str(&template.replace("{sfx}", sfx));
         }
     }
+    ddl.push_str(CITY_COORDS_SCHEMA);
     conn.execute_batch(&ddl)?;
     for tier in [Tier::M1, Tier::H1, Tier::D1] {
         let table = format!("traffic_paths_{}", suffix(tier));
@@ -151,12 +175,13 @@ impl AppFilter<'_> {
         }
     }
 
-    /// `INDEXED BY` for the `(app, bucket…)` index of a table. Without it,
-    /// SQLite (no `ANALYZE` statistics) prefers the primary key's `bucket`
-    /// range for the `OR`, which reads every app's rows in the window — and all
-    /// history for the default unbounded range. With it, the plan is a
-    /// `MULTI-INDEX OR`: `app = ? AND bucket` range for the exact key plus an
-    /// `app` range for the `uuid-` keys. `Exact` keeps today's plan untouched.
+    /// `INDEXED BY` for the app-leading index of a table (`(app, bucket)`, or
+    /// `(app, dimension, bucket)` for breakdowns). Without it, SQLite (no
+    /// `ANALYZE` statistics) prefers the primary key's `bucket` range for the
+    /// `OR`, which reads every app's rows in the window — and all history for
+    /// the default unbounded range. With it, the plan is a `MULTI-INDEX OR`:
+    /// `app = ?` (and `dimension = ?`) with the `bucket` range for the exact
+    /// key, plus an `app` range for the `uuid-` keys. `Exact` needs no hint.
     /// The index always exists: [`apply`] creates it for every tier.
     fn indexed_by(self, index: &str) -> String {
         match self {
@@ -200,7 +225,7 @@ fn breakdown_for_sql(tier: Tier, filter: AppFilter<'_>) -> String {
         "SELECT {BREAKDOWN_COLS} FROM traffic_breakdown_{sfx}{} \
          WHERE {} AND bucket >= ?4 AND bucket < ?5 AND dimension = ?6 \
          ORDER BY requests DESC LIMIT ?7",
-        filter.indexed_by(&format!("idx_tb_{sfx}_app_bucket")),
+        filter.indexed_by(&format!("idx_tb_{sfx}_app_dim_bucket")),
         filter.predicate(),
     )
 }
@@ -241,6 +266,14 @@ pub struct BreakdownRow {
     pub value: String,
     pub requests: i64,
     pub bytes_out: i64,
+}
+
+/// Coordinates of one `city` breakdown value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CityCoordRow {
+    pub value: String,
+    pub lat: f64,
+    pub lon: f64,
 }
 
 /// One bucket window's rows across all three tables of a single tier.
@@ -428,6 +461,24 @@ impl AnalyticsStore {
         self.write_rows(Tier::M1, stats, paths, breakdown)
     }
 
+    /// [`Self::flush_window`], plus the window's city coordinates in the same
+    /// transaction, so a reader never sees a city row before its coordinates.
+    pub fn flush_window_with_coords(
+        &self,
+        stats: &[StatsRow],
+        paths: &[PathRow],
+        breakdown: &[BreakdownRow],
+        city_coords: &[CityCoordRow],
+    ) -> Result<(), StoreError> {
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            insert_rows(&tx, Tier::M1, stats, paths, breakdown)?;
+            insert_city_coords(&tx, city_coords)?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Upserts a batch into `tier`'s three tables in one transaction. On
     /// conflict counters sum but sketch blobs replace (callers hand fully-merged
     /// sketches). Compaction clears its window first, so it relies on neither.
@@ -443,6 +494,46 @@ impl AnalyticsStore {
             insert_rows(&tx, tier, stats, paths, breakdown)?;
             tx.commit()?;
             Ok(())
+        })
+    }
+
+    /// Stores coordinates of `city` breakdown values. The latest coordinates
+    /// of a value replace older ones (a GeoIP database refresh can move a city).
+    pub fn record_city_coords(&self, rows: &[CityCoordRow]) -> Result<(), StoreError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.with_conn(|c| {
+            let tx = c.unchecked_transaction()?;
+            insert_city_coords(&tx, rows)?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// `(lat, lon)` of each of `values` that has coordinates. One query per
+    /// [`CITY_COORDS_CHUNK`] values; `__other__` never has coordinates.
+    pub fn city_coords(
+        &self,
+        values: &[String],
+    ) -> Result<HashMap<String, (f64, f64)>, StoreError> {
+        let values: Vec<&String> = values.iter().filter(|v| *v != "__other__").collect();
+        self.with_reader(|c| {
+            let mut out = HashMap::with_capacity(values.len());
+            for chunk in values.chunks(CITY_COORDS_CHUNK) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let mut stmt = c.prepare_cached(&format!(
+                    "SELECT value, lat, lon FROM traffic_city_coords WHERE value IN ({placeholders})"
+                ))?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |r| {
+                    Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
+                })?;
+                for row in rows {
+                    let (value, coords) = row?;
+                    out.insert(value, coords);
+                }
+            }
+            Ok(out)
         })
     }
 
@@ -735,7 +826,8 @@ impl AnalyticsStore {
     }
 
     /// Applies the per-tier retention windows (48h / 30d / 395d), deleting
-    /// everything older than `now - window` in each tier; returns rows removed.
+    /// everything older than `now - window` in each tier, then the city
+    /// coordinates no `city` row in any tier uses; returns rows removed.
     /// Pure SQL deletion — no sketch merging (that lives in `traffic::compaction`).
     pub fn retention(
         &self,
@@ -755,7 +847,23 @@ impl AnalyticsStore {
 
         Ok(self.delete_before(Tier::M1, m1_cutoff)?
             + self.delete_before(Tier::H1, h1_cutoff)?
-            + self.delete_before(Tier::D1, d1_cutoff)?)
+            + self.delete_before(Tier::D1, d1_cutoff)?
+            + self.prune_city_coords()?)
+    }
+
+    /// Deletes coordinates whose value has no `city` row in any tier; returns
+    /// rows removed.
+    fn prune_city_coords(&self) -> Result<usize, StoreError> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare_cached(
+                "DELETE FROM traffic_city_coords WHERE value NOT IN (
+                     SELECT value FROM traffic_breakdown_1m WHERE dimension = 'city'
+                     UNION SELECT value FROM traffic_breakdown_1h WHERE dimension = 'city'
+                     UNION SELECT value FROM traffic_breakdown_1d WHERE dimension = 'city'
+                 )",
+            )?;
+            Ok(stmt.execute([])?)
+        })
     }
 
     fn delete_table_before(
@@ -797,6 +905,22 @@ impl AnalyticsStore {
             Ok(rows)
         })
     }
+}
+
+/// Values per `city_coords` query: far below SQLite's bound-variable limit.
+const CITY_COORDS_CHUNK: usize = 500;
+
+/// Upserts city coordinates on an existing connection. The latest coordinates
+/// of a value replace older ones.
+fn insert_city_coords(conn: &Connection, rows: &[CityCoordRow]) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO traffic_city_coords (value, lat, lon) VALUES (?1, ?2, ?3)
+         ON CONFLICT(value) DO UPDATE SET lat = excluded.lat, lon = excluded.lon",
+    )?;
+    for row in rows {
+        stmt.execute((&row.value, row.lat, row.lon))?;
+    }
+    Ok(())
 }
 
 /// Upserts a batch into `tier`'s three tables on an existing connection. Shared

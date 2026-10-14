@@ -30,7 +30,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # Traffic analytics subsystem (feature-gated). Versions verified 2026-08 against
 # crates.io; all build on rust 1.97 / edition 2024. See
 # docs/superpowers/specs/2026-08-09-traffic-analytics-design.md §8.
-maxminddb = { version = "0.30", features = ["mmap"] }
+maxminddb = { version = "0.32", features = ["mmap"] }
 arc-swap = "1.9"
 foldhash = "0.2"
 postcard = { version = "1.1", features = ["use-std"] }

@@ -154,6 +154,42 @@ fn seeded() -> AnalyticsStore {
     a
 }
 
+fn city_bd(bucket: i64, app: &str, value: &str, requests: i64) -> BreakdownRow {
+    BreakdownRow {
+        dimension: "city".into(),
+        ..bd(bucket, app, value, requests)
+    }
+}
+
+/// `seeded()` plus city rows: Berlin on two apps and two buckets with
+/// coordinates, a city and an `__other__` row with none.
+fn seeded_cities() -> AnalyticsStore {
+    let a = seeded();
+    a.flush_window(
+        &[],
+        &[],
+        &[
+            city_bd(BUCKET, "app-a", "DE|BE|Berlin", 5),
+            city_bd(NEXT_BUCKET, "app-a", "DE|BE|Berlin", 4),
+            city_bd(BUCKET, "app-a", "SG||Singapore", 2),
+            city_bd(BUCKET, "app-a", "__other__", 1),
+            city_bd(BUCKET, "app-b", "DE|BE|Berlin", 6),
+        ],
+    )
+    .unwrap();
+    a.record_city_coords(&[store::traffic::CityCoordRow {
+        value: "DE|BE|Berlin".into(),
+        lat: 52.52,
+        lon: 13.405,
+    }])
+    .unwrap();
+    a
+}
+
+async fn get_cities(uri: &str) -> (StatusCode, serde_json::Value) {
+    get_with(state(Some(seeded_cities())), uri).await
+}
+
 fn state(analytics: Option<AnalyticsStore>) -> Arc<AppState> {
     let mut config = config::Config::load_for_test();
     config.token = "secret".into();
@@ -1049,10 +1085,11 @@ async fn server_dashboard_bundles_every_member() {
     assert_eq!(paths[0]["path"], "/b");
     assert_eq!(paths[0]["requests"], 22);
 
-    // Breakdowns: all eleven dimensions present; country merged across apps.
+    // Breakdowns: all twelve dimensions present; country merged across apps.
     let bds = &j["breakdowns"];
     for dim in [
         "country",
+        "city",
         "referer",
         "browser",
         "os",
@@ -1456,4 +1493,81 @@ async fn resource_routes_validate_like_the_app_routes() {
         assert_eq!(s, StatusCode::NOT_FOUND, "{uri}");
         assert_eq!(j["error"], "traffic analytics not enabled", "{uri}");
     }
+}
+
+#[tokio::test]
+async fn city_breakdown_has_coordinates_only_where_they_are_known() {
+    let (s, j) = get_cities(&format!("/api/app/app-a/traffic/breakdown/city?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+    let rows = j.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+
+    assert_eq!(rows[0]["value"], "DE|BE|Berlin");
+    assert_eq!(rows[0]["requests"], 9);
+    assert_eq!(rows[0]["lat"], 52.52);
+    assert_eq!(rows[0]["lon"], 13.405);
+
+    assert_eq!(rows[1]["value"], "SG||Singapore");
+    assert!(rows[1].get("lat").is_none());
+    assert!(rows[1].get("lon").is_none());
+
+    assert_eq!(rows[2]["value"], "__other__");
+    assert!(rows[2].get("lat").is_none());
+}
+
+#[tokio::test]
+async fn server_city_breakdown_merges_apps_and_has_coordinates() {
+    let (s, j) = get_cities(&format!("/api/traffic/breakdown/city?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+    let rows = j.as_array().unwrap();
+
+    assert_eq!(rows[0]["value"], "DE|BE|Berlin");
+    assert_eq!(rows[0]["requests"], 15);
+    assert_eq!(rows[0]["lat"], 52.52);
+}
+
+#[tokio::test]
+async fn resource_city_breakdown_has_coordinates() {
+    let (s, j) = get_cities(&format!(
+        "/api/resource/app-a/traffic/breakdown/city?{RANGE}"
+    ))
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j[0]["value"], "DE|BE|Berlin");
+    assert_eq!(j[0]["lat"], 52.52);
+}
+
+#[tokio::test]
+async fn dashboards_bundle_the_city_breakdown_with_coordinates() {
+    for uri in [
+        format!("/api/traffic/dashboard?{RANGE}"),
+        format!("/api/app/app-a/traffic/dashboard?{RANGE}"),
+        format!("/api/resource/app-a/traffic/dashboard?{RANGE}"),
+    ] {
+        let (s, j) = get_cities(&uri).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        let city = j["breakdowns"]["city"].as_array().unwrap();
+        assert_eq!(city[0]["value"], "DE|BE|Berlin", "{uri}");
+        assert_eq!(city[0]["lat"], 52.52, "{uri}");
+        assert_eq!(city[0]["lon"], 13.405, "{uri}");
+    }
+}
+
+/// Other dimensions must serialize exactly as before.
+#[tokio::test]
+async fn other_dimensions_have_no_coordinate_keys() {
+    let (s, j) = get_cities(&format!("/api/app/app-a/traffic/breakdown/country?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+    for row in j.as_array().unwrap() {
+        assert!(row.get("lat").is_none());
+        assert!(row.get("lon").is_none());
+    }
+}
+
+/// Data written before the upgrade has no city rows.
+#[tokio::test]
+async fn city_breakdown_is_empty_when_there_are_no_city_rows() {
+    let (s, j) = get(&format!("/api/app/app-a/traffic/breakdown/city?{RANGE}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j.as_array().unwrap().len(), 0);
 }

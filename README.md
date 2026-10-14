@@ -97,15 +97,15 @@ Inert unless Sentinel is built with the `traffic` Cargo feature. See [Traffic An
 | `TRAFFIC_ACCESS_LOG_PATH` | `/data/coolify/proxy/access.log` | Reverse-proxy JSON access log to tail |
 | `TRAFFIC_PROXY_TYPE` | `auto` | `traefik`, `caddy`, or `auto` (sniffs the format; Nginx is deferred) |
 | `TRAFFIC_TOPN` | `50` | Top-N cap per dimension (paths, countries, browsers, ...); overflow folds into a `__other__` row |
-| `TRAFFIC_IP_MODE` | `full` | How the `ip` dimension stores client IPs: `full`, `anonymized` (only the IPv4 /24 or IPv6 /48 network, as `1.2.3.0/24`), or `off` (no `ip` rows). At start, Sentinel deletes stored `ip` rows that the mode does not allow. Unique-visitor counts always use a HyperLogLog sketch, which stores no IPs |
+| `TRAFFIC_IP_MODE` | `full` | How the `ip` dimension stores client IPs: `full`, `anonymized` (only the IPv4 /24 or IPv6 /48 network, as `1.2.3.0/24`), or `off` (no `ip` rows, and no city either). At start, Sentinel deletes stored `ip` rows that the mode does not allow, and with `off` also the stored cities. Unique-visitor counts always use a HyperLogLog sketch, which stores no IPs |
 | `TRAFFIC_SAMPLE_THRESHOLD` | `0` (off) | Events/sec above which to start sampling under extreme load |
 | `TRAFFIC_RETENTION_1M_HOURS` | `48` | Safety net, **not** a queryable window — see note below |
 | `TRAFFIC_RETENTION_1H_DAYS` | `30` | How long hourly rollups are kept; this is your real fine-grained history |
 | `TRAFFIC_RETENTION_1D_DAYS` | `395` | How long daily rollups are kept before deletion (~13 months) |
-| `GEOIP_ENABLED` | `true` | Enable/disable country enrichment |
+| `GEOIP_ENABLED` | `true` | Enable/disable country and city enrichment. The database downloads in the background and is reused from disk on the next start |
 | `GEOIP_DB_URL` | *(unset)* | Explicit GeoIP database URL; when set, used with no fallback |
 | `GEOIP_MAXMIND_LICENSE_KEY` | *(unset)* | MaxMind license key; when set, GeoLite2 is downloaded directly from MaxMind, taking priority over `GEOIP_DB_URL` |
-| `GEOIP_MAXMIND_EDITION` | `GeoLite2-Country` | MaxMind edition ID used when `GEOIP_MAXMIND_LICENSE_KEY` is set |
+| `GEOIP_MAXMIND_EDITION` | `GeoLite2-City` | MaxMind edition ID used when `GEOIP_MAXMIND_LICENSE_KEY` is set. A country edition gives country data only |
 | `GEOIP_REFRESH_DAYS` | `30` | How often to re-check the GeoIP database for updates (a conditional request; cheap even when unchanged) |
 
 > **Note:** `TRAFFIC_RETENTION_1M_HOURS` is a backlog safety net, not a queryable window. Hourly compaction deletes per-minute rows as it folds them into the hourly tier, so the minute table normally holds only the last hour or two — this cap just bounds how far it can grow if compaction falls behind. Longer ranges are served from the hourly and daily tiers.

@@ -973,7 +973,7 @@ fn resource_queries_use_the_app_index() {
             ),
             (
                 breakdown_for_sql(tier, f),
-                format!("idx_tb_{sfx}_app_bucket"),
+                format!("idx_tb_{sfx}_app_dim_bucket"),
                 7,
             ),
         ] {
@@ -1021,6 +1021,154 @@ fn resource_queries_use_the_app_index() {
     }
 }
 
+fn query_plan(s: &AnalyticsStore, sql: &str, params: usize) -> String {
+    s.with_reader(|c| {
+        let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(vec![0i64; params]), |r| {
+                r.get::<_, String>(3)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.join(" | "))
+    })
+    .unwrap()
+}
+
+/// A dashboard reads one dimension of one app over a bucket range. The seek
+/// must include `dimension`, so SQLite reads only that dimension's rows
+/// instead of every dimension of every bucket in the range.
+#[test]
+fn exact_breakdown_query_seeks_app_dimension_and_bucket() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    for tier in [Tier::M1, Tier::H1, Tier::D1] {
+        let sfx = suffix(tier);
+        let plan = query_plan(&s, &breakdown_for_sql(tier, AppFilter::Exact("u")), 7);
+        assert!(
+            plan.contains(&format!(
+                "USING INDEX idx_tb_{sfx}_app_dim_bucket \
+                 (app=? AND dimension=? AND bucket>? AND bucket<?)"
+            )),
+            "{tier:?}: {plan}"
+        );
+    }
+}
+
+/// Compaction and retention select and delete whole bucket windows. They use
+/// the primary key `(bucket, …)`, not an app index, so dropping the old
+/// `(app, bucket, dimension)` index does not turn them into scans.
+#[test]
+fn bucket_window_queries_use_the_primary_key() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    for tier in [Tier::M1, Tier::H1, Tier::D1] {
+        let sfx = suffix(tier);
+        let pk = format!("sqlite_autoindex_traffic_breakdown_{sfx}_1");
+        for (sql, n) in [
+            (
+                format!(
+                    "SELECT {BREAKDOWN_COLS} FROM traffic_breakdown_{sfx} \
+                     WHERE bucket >= ?1 AND bucket < ?2 ORDER BY bucket"
+                ),
+                2,
+            ),
+            (
+                format!("DELETE FROM traffic_breakdown_{sfx} WHERE bucket >= ?1 AND bucket < ?2"),
+                2,
+            ),
+            (
+                format!("DELETE FROM traffic_breakdown_{sfx} WHERE bucket < ?1"),
+                1,
+            ),
+            (
+                format!(
+                    "SELECT {BREAKDOWN_COLS} FROM traffic_breakdown_{sfx} \
+                     WHERE bucket >= ?1 AND bucket < ?2 AND dimension = ?3 \
+                     ORDER BY requests DESC LIMIT ?4"
+                ),
+                4,
+            ),
+        ] {
+            let plan = query_plan(&s, &sql, n);
+            assert!(
+                plan.contains(&format!("USING INDEX {pk} (bucket")),
+                "{plan}"
+            );
+        }
+    }
+}
+
+/// `(index name, its columns)` of every breakdown-table index, including the
+/// primary key's automatic index.
+fn breakdown_indexes(conn: &Connection) -> Vec<(String, String)> {
+    conn.prepare(
+        "SELECT m.name, group_concat(i.name, ',') FROM sqlite_master m, \
+         pragma_index_info(m.name) i \
+         WHERE m.type = 'index' AND m.tbl_name LIKE 'traffic_breakdown_%' \
+         GROUP BY m.name ORDER BY m.name",
+    )
+    .unwrap()
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+/// A database from before the `(app, dimension, bucket)` index gets it on the
+/// next open, loses the old `(app, bucket, dimension)` index, keeps its rows,
+/// and ends with the same breakdown indexes as a new database.
+#[test]
+fn apply_replaces_the_old_breakdown_index() {
+    let conn = Connection::open_in_memory().unwrap();
+    for sfx in ["1m", "1h", "1d"] {
+        conn.execute_batch(&format!(
+            "CREATE TABLE traffic_breakdown_{sfx} (
+                bucket    INTEGER NOT NULL,
+                app       TEXT    NOT NULL,
+                dimension TEXT    NOT NULL,
+                value     TEXT    NOT NULL,
+                requests  INTEGER NOT NULL,
+                bytes_out INTEGER NOT NULL,
+                PRIMARY KEY (bucket, app, dimension, value)
+            ) STRICT;
+            CREATE INDEX idx_tb_{sfx}_app_bucket
+                ON traffic_breakdown_{sfx} (app, bucket, dimension);
+            INSERT INTO traffic_breakdown_{sfx} VALUES (60000, 'a', 'country', 'DE', 3, 30);"
+        ))
+        .unwrap();
+    }
+
+    apply(&conn).unwrap();
+    // A second open is a no-op.
+    apply(&conn).unwrap();
+
+    let fresh = Connection::open_in_memory().unwrap();
+    apply(&fresh).unwrap();
+    let migrated = breakdown_indexes(&conn);
+    assert_eq!(migrated, breakdown_indexes(&fresh));
+    for sfx in ["1m", "1h", "1d"] {
+        assert!(
+            migrated.contains(&(
+                format!("idx_tb_{sfx}_app_dim_bucket"),
+                "app,dimension,bucket".to_string()
+            )),
+            "{migrated:?}"
+        );
+        assert!(
+            !migrated
+                .iter()
+                .any(|(name, _)| name == &format!("idx_tb_{sfx}_app_bucket")),
+            "{migrated:?}"
+        );
+        let rows: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM traffic_breakdown_{sfx}"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "migration keeps the rows");
+    }
+}
+
 #[test]
 fn delete_breakdown_values_removes_rejected_values_in_every_tier() {
     let s = AnalyticsStore::open_in_memory().unwrap();
@@ -1052,4 +1200,149 @@ fn delete_breakdown_values_removes_rejected_values_in_every_tier() {
             .unwrap();
         assert_eq!(other.len(), 1, "other dimensions stay");
     }
+}
+
+fn coord(value: &str, lat: f64, lon: f64) -> CityCoordRow {
+    CityCoordRow {
+        value: value.into(),
+        lat,
+        lon,
+    }
+}
+
+/// A refreshed GeoIP database can move a city; the latest coordinates win.
+#[test]
+fn city_coords_take_the_latest_coordinates_of_a_value() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    s.record_city_coords(&[coord("DE|BE|Berlin", 52.52, 13.405)])
+        .unwrap();
+    s.record_city_coords(&[coord("DE|BE|Berlin", 1.0, 2.0)])
+        .unwrap();
+
+    let got = s.city_coords(&["DE|BE|Berlin".to_string()]).unwrap();
+
+    assert_eq!(got.get("DE|BE|Berlin"), Some(&(1.0, 2.0)));
+}
+
+/// Retention drops coordinates no `city` row in any tier refers to any more,
+/// and keeps those still used in any tier.
+#[test]
+fn retention_prunes_coordinates_of_cities_without_rows() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    let now = 1_000 * DAY_MS;
+    s.write_rows(
+        Tier::M1,
+        &[],
+        &[],
+        &[
+            breakdown_row(now - 49 * HOUR_MS, "a", "city", "XX||Gone", 1),
+            breakdown_row(now - HOUR_MS, "a", "city", "DE|BE|Berlin", 1),
+        ],
+    )
+    .unwrap();
+    s.write_rows(
+        Tier::H1,
+        &[],
+        &[],
+        &[breakdown_row(now - DAY_MS, "a", "city", "FR|IDF|Paris", 1)],
+    )
+    .unwrap();
+    s.write_rows(
+        Tier::D1,
+        &[],
+        &[],
+        &[
+            breakdown_row(now - DAY_MS, "a", "city", "IT|RM|Rome", 1),
+            // Same value in another dimension does not keep the coordinates.
+            breakdown_row(now - DAY_MS, "a", "country", "YY||Other", 1),
+        ],
+    )
+    .unwrap();
+    s.record_city_coords(&[
+        coord("XX||Gone", 1.0, 1.0),
+        coord("DE|BE|Berlin", 52.52, 13.405),
+        coord("FR|IDF|Paris", 48.85, 2.35),
+        coord("IT|RM|Rome", 41.9, 12.5),
+        coord("YY||Other", 3.0, 3.0),
+        coord("ZZ||Never", 4.0, 4.0),
+    ])
+    .unwrap();
+
+    let deleted = s.retention(now, 48, 30, 395).unwrap();
+
+    assert_eq!(
+        deleted,
+        1 + 3,
+        "1 expired breakdown row + 3 orphaned coordinates"
+    );
+    let all: Vec<String> = [
+        "XX||Gone",
+        "DE|BE|Berlin",
+        "FR|IDF|Paris",
+        "IT|RM|Rome",
+        "YY||Other",
+        "ZZ||Never",
+    ]
+    .iter()
+    .map(|v| v.to_string())
+    .collect();
+    let mut kept: Vec<String> = s.city_coords(&all).unwrap().into_keys().collect();
+    kept.sort();
+    assert_eq!(kept, ["DE|BE|Berlin", "FR|IDF|Paris", "IT|RM|Rome"]);
+}
+
+/// More values than one query chunk still resolve, and `__other__` is skipped.
+#[test]
+fn city_coords_resolves_more_values_than_one_chunk() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    let n = CITY_COORDS_CHUNK * 2 + 7;
+    let rows: Vec<CityCoordRow> = (0..n)
+        .map(|i| coord(&format!("C{i}"), i as f64, -(i as f64)))
+        .collect();
+    s.record_city_coords(&rows).unwrap();
+    let mut values: Vec<String> = (0..n).map(|i| format!("C{i}")).collect();
+    values.push("__other__".to_string());
+    values.push("unknown".to_string());
+
+    let got = s.city_coords(&values).unwrap();
+
+    assert_eq!(got.len(), n);
+    assert_eq!(got.get("C0"), Some(&(0.0, -0.0)));
+    let last = format!("C{}", n - 1);
+    assert_eq!(got.get(&last), Some(&((n - 1) as f64, -((n - 1) as f64))));
+    assert!(!got.contains_key("__other__"));
+}
+
+#[test]
+fn city_coords_returns_only_the_requested_known_values() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    s.record_city_coords(&[
+        coord("DE|BE|Berlin", 52.52, 13.405),
+        coord("FR|IDF|Paris", 48.85, 2.35),
+    ])
+    .unwrap();
+
+    let got = s
+        .city_coords(&["FR|IDF|Paris".to_string(), "DE||".to_string()])
+        .unwrap();
+
+    assert_eq!(got.len(), 1);
+    assert_eq!(got.get("FR|IDF|Paris"), Some(&(48.85, 2.35)));
+}
+
+/// A database file from before this table existed gets it on the next open.
+#[test]
+fn apply_adds_the_city_coords_table_to_an_existing_database() {
+    let s = AnalyticsStore::open_in_memory().unwrap();
+    s.execute_batch_for_test("DROP TABLE traffic_city_coords")
+        .unwrap();
+
+    s.with_conn(|c| Ok(apply(c)?)).unwrap();
+
+    s.record_city_coords(&[coord("DE|BE|Berlin", 52.52, 13.405)])
+        .unwrap();
+    assert_eq!(
+        s.city_coords(&["DE|BE|Berlin".to_string()]).unwrap().len(),
+        1
+    );
 }

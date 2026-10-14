@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use store::traffic::AnalyticsStore;
 
 use crate::aggregator::{Aggregator, WindowRollup, ip_value_allowed};
-use crate::enrich::{CountryLookup, Enricher};
+use crate::enrich::{Enricher, GeoLookup};
 use crate::parser::{ProxyType, detect, parse_line};
 use crate::tailer::Tailer;
 
@@ -127,7 +127,7 @@ impl TrafficService {
     pub async fn build(
         cfg: &config::Config,
         store: AnalyticsStore,
-        geo: Arc<dyn CountryLookup>,
+        geo: Arc<dyn GeoLookup>,
     ) -> Self {
         Self::build_with_intervals(
             cfg,
@@ -146,12 +146,13 @@ impl TrafficService {
     pub(crate) async fn build_with_intervals(
         cfg: &config::Config,
         store: AnalyticsStore,
-        geo: Arc<dyn CountryLookup>,
+        geo: Arc<dyn GeoLookup>,
         window_ms: i64,
         poll_interval: Duration,
         flush_check_interval: Duration,
     ) -> Self {
         Self::delete_disallowed_ips(&store, cfg.traffic.ip_mode).await;
+        Self::delete_disallowed_cities(&store, cfg.traffic.ip_mode).await;
 
         let path = &cfg.traffic.access_log_path;
         let (tailer, last_open_error) = match Tailer::open(path) {
@@ -466,6 +467,31 @@ impl TrafficService {
         }
     }
 
+    /// Deletes stored `city` breakdown rows when `ip_mode` is `off`, which
+    /// records no city. Their coordinates go on the next retention pass. A
+    /// failure is logged and dropped, like a flush failure.
+    async fn delete_disallowed_cities(store: &AnalyticsStore, ip_mode: config::IpMode) {
+        if ip_mode != config::IpMode::Off {
+            return;
+        }
+        let store = store.clone();
+        let result =
+            tokio::task::spawn_blocking(move || store.delete_breakdown_values("city", |_| false))
+                .await;
+        match result {
+            Ok(Ok(0)) => {}
+            Ok(Ok(deleted)) => {
+                tracing::info!(
+                    deleted,
+                    ?ip_mode,
+                    "deleted stored cities not allowed by TRAFFIC_IP_MODE"
+                )
+            }
+            Ok(Err(e)) => tracing::warn!(error = %e, "deleting stored cities failed"),
+            Err(e) => tracing::warn!(error = %e, "deleting stored cities task failed"),
+        }
+    }
+
     /// Writes one drained window on a blocking thread. A flush failure (or a
     /// panicking blocking task) is logged and dropped: losing a minute of
     /// analytics is vastly preferable to taking the agent down.
@@ -480,7 +506,12 @@ impl TrafficService {
         );
         let store = store.clone();
         let result = tokio::task::spawn_blocking(move || {
-            store.flush_window(&rollup.stats, &rollup.paths, &rollup.breakdown)
+            store.flush_window_with_coords(
+                &rollup.stats,
+                &rollup.paths,
+                &rollup.breakdown,
+                &rollup.city_coords,
+            )
         })
         .await;
         match result {

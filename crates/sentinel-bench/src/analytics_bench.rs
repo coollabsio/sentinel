@@ -1,7 +1,9 @@
 //! Traffic-analytics pipeline and query benchmark.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,24 +15,26 @@ use reqwest::Client;
 use store::traffic::{AnalyticsStore, Tier};
 use traffic::aggregator::Aggregator;
 use traffic::compaction::{compact_1h_to_1d, compact_1m_to_1h};
-use traffic::enrich::{CountryLookup, Enricher, NoGeo};
+use traffic::enrich::{Enricher, GeoLookup, NoGeo};
 use traffic::geoip::{self, GeoIp};
 use traffic::parser::{ProxyType, parse_line};
 
-/// Public resolvers / CDNs that GeoLite2/DB-IP usually map to a country.
-/// Documentation ranges (203.0.113.0/24) deliberately avoided — they miss.
-const GEOIP_IPS: &[&str] = &[
-    "8.8.8.8",         // Google DNS
-    "1.1.1.1",         // Cloudflare DNS
-    "9.9.9.9",         // Quad9
-    "208.67.222.222",  // OpenDNS
-    "94.140.14.14",    // AdGuard
-    "185.228.168.9",   // CleanBrowsing
-    "149.112.112.112", // Quad9 secondary
-    "64.6.64.6",       // Verisign
-    "142.250.190.14",  // Google edge
-    "104.16.1.1",      // Cloudflare edge
-];
+/// Number of distinct synthetic clients on the GeoIP path.
+const GEOIP_IP_POOL: usize = 2048;
+
+/// Deterministic public IPv4 address for line `i`. The pool is spread over
+/// the whole address space, so lookups reach many countries and cities as
+/// real traffic does. (Public DNS resolvers are anycast and have no city.)
+fn geoip_ip(i: usize) -> Ipv4Addr {
+    let hash = ((i % GEOIP_IP_POOL) as u32 + 1).wrapping_mul(2_654_435_761);
+    let [a, b, c, d] = hash.to_be_bytes();
+    // Keep out of reserved, private, documentation and multicast space.
+    let a = match a % 224 {
+        0 | 10 | 100 | 127 | 169 | 172 | 192 | 198 | 203 => 8,
+        a => a,
+    };
+    Ipv4Addr::new(a, b, c, d)
+}
 
 const CF_COUNTRIES: &[&str] = &["US", "DE", "FR", "JP", "BR", "IN", "GB", "AU", "CA", "NL"];
 
@@ -82,8 +86,9 @@ pub fn line_uses_cf_header(i: usize, cf_header_pct: u8) -> bool {
 
 /// Generate deterministic Traefik JSON lines with a mixed CF / GeoIP country path.
 ///
-/// * CF path (`line_uses_cf_header`): sets `request_Cf-Ipcountry` so enrichment
-///   never touches the database.
+/// * CF path (`line_uses_cf_header`): a local-proxy `ClientHost` with
+///   `request_Cf-Ipcountry` and a public `request_Cf-Connecting-Ip`, so the
+///   country comes from the trusted header and the city from GeoIP.
 /// * GeoIP path: omits CF country (and CF connecting IP) and uses a public
 ///   `ClientHost` that a real GeoIP DB can resolve.
 pub fn generate_lines(
@@ -106,13 +111,16 @@ pub fn generate_lines(
             let host_n = i % apps;
             let ua = "Mozilla/5.0 Chrome/120.0";
             if line_uses_cf_header(i, cf_header_pct) {
-                let ip = format!("203.0.113.{}", i % 250 + 1);
+                // As in production: the peer is the local proxy, so the
+                // enricher trusts the CF headers; the visitor is public.
+                let peer = format!("10.0.0.{}", i % 250 + 1);
+                let ip = geoip_ip(i);
                 let country = CF_COUNTRIES[i % CF_COUNTRIES.len()];
                 format!(
-                    r#"{{"ClientHost":"{ip}","DownstreamContentSize":{size},"DownstreamStatus":{status},"Duration":{duration},"RequestContentSize":{req_size},"RequestHost":"app{host_n}.example.test","RequestMethod":"GET","RequestPath":"{path}?n={i}","RequestProtocol":"HTTP/1.1","RequestScheme":"https","RouterName":"https-0-{app}@docker","StartUTC":"2026-08-10T00:00:00Z","TLSVersion":"1.3","request_Cf-Connecting-Ip":"{ip}","request_Cf-Ipcountry":"{country}","request_User-Agent":"{ua}","time":"2026-08-10T00:00:00Z","bench_ts_ms":{ts_ms}}}"#
+                    r#"{{"ClientHost":"{peer}","DownstreamContentSize":{size},"DownstreamStatus":{status},"Duration":{duration},"RequestContentSize":{req_size},"RequestHost":"app{host_n}.example.test","RequestMethod":"GET","RequestPath":"{path}?n={i}","RequestProtocol":"HTTP/1.1","RequestScheme":"https","RouterName":"https-0-{app}@docker","StartUTC":"2026-08-10T00:00:00Z","TLSVersion":"1.3","request_Cf-Connecting-Ip":"{ip}","request_Cf-Ipcountry":"{country}","request_User-Agent":"{ua}","time":"2026-08-10T00:00:00Z","bench_ts_ms":{ts_ms}}}"#
                 )
             } else {
-                let ip = GEOIP_IPS[i % GEOIP_IPS.len()];
+                let ip = geoip_ip(i);
                 format!(
                     r#"{{"ClientHost":"{ip}","DownstreamContentSize":{size},"DownstreamStatus":{status},"Duration":{duration},"RequestContentSize":{req_size},"RequestHost":"app{host_n}.example.test","RequestMethod":"GET","RequestPath":"{path}?n={i}","RequestProtocol":"HTTP/1.1","RequestScheme":"https","RouterName":"https-0-{app}@docker","StartUTC":"2026-08-10T00:00:00Z","TLSVersion":"1.3","request_User-Agent":"{ua}","time":"2026-08-10T00:00:00Z","bench_ts_ms":{ts_ms}}}"#
                 )
@@ -209,7 +217,7 @@ fn traffic_settings(opts: &AnalyticsOpts) -> TrafficSettings {
 
 async fn load_geoip(
     opts: &AnalyticsOpts,
-) -> Result<Arc<dyn CountryLookup>, Box<dyn std::error::Error>> {
+) -> Result<Arc<dyn GeoLookup>, Box<dyn std::error::Error>> {
     if opts.no_geoip {
         println!("[geoip] disabled (--no-geoip); CF-header lines only get country");
         return Ok(Arc::new(NoGeo));
@@ -217,14 +225,30 @@ async fn load_geoip(
 
     std::fs::create_dir_all(&opts.geoip_dir)?;
     let cfg = traffic_settings(opts);
+    // What a restart does: map the database a previous run left on disk.
+    let started = Instant::now();
+    if let Some(geo) = GeoIp::open_cached(&cfg, &opts.geoip_dir) {
+        println!(
+            "[geoip] reused from disk in {:.2}ms (delete {} to measure a download)",
+            started.elapsed().as_secs_f64() * 1000.0,
+            opts.geoip_dir.display()
+        );
+        return Ok(geo);
+    }
+
     let sources = geoip::resolve_sources(&cfg);
     println!(
         "[geoip] bootstrapping into {} (candidates={})",
         opts.geoip_dir.display(),
         sources.len()
     );
+    let started = Instant::now();
     match GeoIp::bootstrap(&cfg, &opts.geoip_dir).await {
         Ok(geo) => {
+            println!(
+                "[geoip] downloaded in {:.2}ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
             let attribution = geo
                 .attribution()
                 .unwrap_or_else(|| "(unrecognized source)".into());
@@ -312,6 +336,7 @@ pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>>
     let mut cf_country = 0u64;
     let mut geoip_country = 0u64;
     let mut unresolved = 0u64;
+    let mut city = 0u64;
     let started = Instant::now();
     for (i, line) in lines.iter().enumerate() {
         let event = parse_line(ProxyType::Traefik, line.as_bytes())
@@ -323,16 +348,18 @@ pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>>
             (Some(_), false) => geoip_country += 1,
             (None, _) => unresolved += 1,
         }
+        city += u64::from(enriched.city.as_ref().is_some_and(|c| c.coords.is_some()));
         aggregator.record(&event, &enriched);
     }
     let ingest_elapsed = started.elapsed();
     println!(
-        "[A] parse+enrich+aggregate: {:.2}ms ({:.0} events/s) cf_country={} geoip_country={} unresolved={}",
+        "[A] parse+enrich+aggregate: {:.2}ms ({:.0} events/s) cf_country={} geoip_country={} unresolved={} city={}",
         ingest_elapsed.as_secs_f64() * 1000.0,
         opts.events as f64 / ingest_elapsed.as_secs_f64().max(1e-9),
         cf_country,
         geoip_country,
-        unresolved
+        unresolved,
+        city
     );
     if opts.require_geoip && opts.cf_header_pct < 100 && geoip_country == 0 && opts.events > 0 {
         return Err(
@@ -344,10 +371,16 @@ pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>>
     let store = AnalyticsStore::open_in_memory()?;
     let rollup = aggregator.take_rollup(now - now % 60_000);
     let started = Instant::now();
-    store.flush_window(&rollup.stats, &rollup.paths, &rollup.breakdown)?;
+    store.flush_window_with_coords(
+        &rollup.stats,
+        &rollup.paths,
+        &rollup.breakdown,
+        &rollup.city_coords,
+    )?;
     println!(
-        "[B] flush: rows={} elapsed={:.2}ms",
+        "[B] flush: rows={} city_coords={} elapsed={:.2}ms",
         rollup.stats.len() + rollup.paths.len() + rollup.breakdown.len(),
+        rollup.city_coords.len(),
         started.elapsed().as_secs_f64() * 1000.0
     );
 
@@ -369,13 +402,15 @@ pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>>
             }
         }
         let r = a.take_rollup(bucket);
-        store.flush_window(&r.stats, &r.paths, &r.breakdown)?;
+        store.flush_window_with_coords(&r.stats, &r.paths, &r.breakdown, &r.city_coords)?;
     }
     let started = Instant::now();
     let h_rows = compact_1m_to_1h(&store, now, opts.topn)?;
     let h_elapsed = started.elapsed();
     let started = Instant::now();
-    let d_rows = compact_1h_to_1d(&store, now + 86_400_000, opts.topn)?;
+    // Daily compaction holds hour rows one full day past their day, so look
+    // two days ahead; otherwise nothing reaches the D1 tier that [D] queries.
+    let d_rows = compact_1h_to_1d(&store, now + 2 * 86_400_000, opts.topn)?;
     let d_elapsed = started.elapsed();
     println!(
         "[C] compaction: 1m->1h rows={h_rows} {:.2}ms; 1h->1d rows={d_rows} {:.2}ms",
@@ -384,10 +419,10 @@ pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>>
     );
 
     let app = "bench-app-0";
-    let mut samples = Vec::with_capacity(opts.query_iterations * 4);
+    let mut samples = Vec::with_capacity(opts.query_iterations * 5);
     let started = Instant::now();
     for _ in 0..opts.query_iterations {
-        for query in 0..4 {
+        for query in 0..5 {
             let t = Instant::now();
             match query {
                 0 => {
@@ -405,6 +440,28 @@ pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>>
                         now + 2 * 86_400_000,
                         1_000_000,
                     )?;
+                }
+                3 => {
+                    // What the API does for the city map: rows merged by value,
+                    // the top `topn` by requests (ties on value), then coordinates.
+                    let rows = store.breakdown_range(
+                        Tier::D1,
+                        app,
+                        "city",
+                        0,
+                        now + 2 * 86_400_000,
+                        1_000_000,
+                    )?;
+                    let mut by_value: HashMap<String, i64> = HashMap::new();
+                    for r in rows {
+                        let acc = by_value.entry(r.value).or_insert(0);
+                        *acc = acc.saturating_add(r.requests);
+                    }
+                    let mut ranked: Vec<(String, i64)> = by_value.into_iter().collect();
+                    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    ranked.truncate(opts.topn);
+                    let values: Vec<String> = ranked.into_iter().map(|(v, _)| v).collect();
+                    store.city_coords(&values)?;
                 }
                 _ => {
                     store.apps()?;
@@ -751,6 +808,18 @@ mod tests {
         }
         assert_eq!(with_cf, 50);
         assert_eq!(without_cf, 50);
+    }
+
+    /// The CF path must reach the enricher's trusted-header branch, or
+    /// `--cf-header-pct` measures GeoIP misses instead.
+    #[test]
+    fn cf_lines_are_trusted_by_the_enricher() {
+        let enricher = Enricher::new(Arc::new(NoGeo), 8);
+        for line in generate_lines(10, 1, 1, 1_700_000_000_000, 100) {
+            let event = parse_line(ProxyType::Traefik, line.as_bytes()).unwrap();
+            let enriched = enricher.enrich(&event);
+            assert_eq!(enriched.country.as_deref(), event.cf_country.as_deref());
+        }
     }
 
     #[test]

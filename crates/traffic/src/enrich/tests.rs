@@ -1,12 +1,40 @@
 use super::*;
 
-/// A fake `CountryLookup` that always resolves to "ZZ", for tests.
+/// A fake `GeoLookup` that always resolves to country "ZZ", for tests.
 struct FakeGeo;
 
-impl CountryLookup for FakeGeo {
-    fn country(&self, _ip: IpAddr) -> Option<String> {
-        Some("ZZ".to_string())
+impl GeoLookup for FakeGeo {
+    fn locate(&self, _ip: IpAddr) -> Option<GeoLocation> {
+        Some(GeoLocation {
+            country: Some("ZZ".to_string()),
+            ..GeoLocation::default()
+        })
     }
+}
+
+/// A fake `GeoLookup` that returns one fixed location.
+struct FixedGeo(GeoLocation);
+
+impl GeoLookup for FixedGeo {
+    fn locate(&self, _ip: IpAddr) -> Option<GeoLocation> {
+        Some(self.0.clone())
+    }
+}
+
+fn berlin() -> GeoLocation {
+    GeoLocation {
+        country: Some("DE".to_string()),
+        subdivision: Some("BE".to_string()),
+        city: Some("Berlin".to_string()),
+        lat: Some(52.52),
+        lon: Some(13.405),
+    }
+}
+
+fn enrich_with(location: GeoLocation) -> Enriched {
+    let mut ev = base_event();
+    ev.client_ip = Some("1.2.3.4".into());
+    Enricher::new(Arc::new(FixedGeo(location)), 8).enrich(&ev)
 }
 
 fn base_event() -> RequestEvent<'static> {
@@ -381,4 +409,220 @@ fn ua_cache_memoizes() {
 
     assert_eq!(first.ua.browser, second.ua.browser);
     assert!(!first.ua.browser.is_empty());
+}
+
+#[test]
+fn city_key_joins_the_parts_and_replaces_pipes() {
+    assert_eq!(city_key("DE", Some("BE"), "Berlin"), "DE|BE|Berlin");
+    assert_eq!(city_key("SG", None, "Singapore"), "SG||Singapore");
+    assert_eq!(city_key("US", Some("A|B"), "C|D"), "US|A B|C D");
+}
+
+#[test]
+fn city_comes_from_the_lookup_with_coordinates() {
+    let result = enrich_with(berlin());
+
+    assert_eq!(result.country, Some("DE".to_string()));
+    assert_eq!(
+        result.city,
+        Some(CityHit {
+            key: "DE|BE|Berlin".to_string(),
+            coords: Some((52.52, 13.405)),
+        })
+    );
+}
+
+/// A country-only database, or a network with no city, gives no city row.
+#[test]
+fn a_country_with_no_city_gives_no_city() {
+    let mut location = berlin();
+    location.city = None;
+
+    let result = enrich_with(location);
+
+    assert_eq!(result.country, Some("DE".to_string()));
+    assert_eq!(result.city, None);
+}
+
+#[test]
+fn no_country_gives_no_city() {
+    let mut location = berlin();
+    location.country = None;
+
+    assert_eq!(enrich_with(location).city, None);
+}
+
+#[test]
+fn coordinates_that_are_not_finite_are_dropped() {
+    let mut location = berlin();
+    location.lat = Some(f64::NAN);
+
+    let city = enrich_with(location).city.unwrap();
+
+    assert_eq!(city.key, "DE|BE|Berlin");
+    assert_eq!(city.coords, None);
+}
+
+#[test]
+fn one_missing_coordinate_drops_both() {
+    let mut location = berlin();
+    location.lon = None;
+
+    assert_eq!(enrich_with(location).city.unwrap().coords, None);
+}
+
+/// The Cloudflare header sets the country dimension only. The city key keeps
+/// the country of the lookup, so it agrees with the coordinates.
+#[test]
+fn the_cf_country_header_does_not_change_the_city_key() {
+    let enricher = Enricher::new(Arc::new(FixedGeo(berlin())), 8);
+    let mut ev = base_event();
+    ev.cf_country = Some("US".into());
+    ev.client_ip = Some("172.18.0.1".into());
+
+    let result = enricher.enrich(&ev);
+
+    assert_eq!(result.country, Some("US".to_string()));
+    assert_eq!(result.city.unwrap().key, "DE|BE|Berlin");
+}
+
+#[test]
+fn no_geo_gives_no_city() {
+    let mut ev = base_event();
+    ev.client_ip = Some("1.2.3.4".into());
+
+    let result = Enricher::new(Arc::new(NoGeo), 8).enrich(&ev);
+
+    assert_eq!(result.city, None);
+}
+
+#[test]
+fn coordinates_outside_the_map_range_are_dropped() {
+    for (lat, lon) in [(90.1, 0.0), (-90.1, 0.0), (0.0, 180.1), (0.0, -180.1)] {
+        let mut location = berlin();
+        location.lat = Some(lat);
+        location.lon = Some(lon);
+        assert_eq!(enrich_with(location).city.unwrap().coords, None);
+    }
+    for (lat, lon) in [(90.0, 180.0), (-90.0, -180.0)] {
+        let mut location = berlin();
+        location.lat = Some(lat);
+        location.lon = Some(lon);
+        assert_eq!(enrich_with(location).city.unwrap().coords, Some((lat, lon)));
+    }
+}
+
+/// A fake `GeoLookup` that counts lookups and whose answer and generation
+/// the test changes, as a database swap would.
+struct CountingGeo {
+    calls: std::sync::atomic::AtomicUsize,
+    generation: std::sync::atomic::AtomicU64,
+    location: Mutex<Option<GeoLocation>>,
+}
+
+impl CountingGeo {
+    fn new(generation: u64, location: Option<GeoLocation>) -> Arc<Self> {
+        Arc::new(Self {
+            calls: 0.into(),
+            generation: generation.into(),
+            location: Mutex::new(location),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn swap(&self, generation: u64, location: Option<GeoLocation>) {
+        *self.location.lock().unwrap() = location;
+        self.generation
+            .store(generation, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl GeoLookup for CountingGeo {
+    fn locate(&self, _ip: IpAddr) -> Option<GeoLocation> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.location.lock().unwrap().clone()
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn event_from(client_ip: &str) -> RequestEvent<'static> {
+    let mut ev = base_event();
+    ev.client_ip = Some(client_ip.to_string().into());
+    ev
+}
+
+#[test]
+fn a_repeated_ip_is_looked_up_once() {
+    let geo = CountingGeo::new(1, Some(berlin()));
+    let enricher = Enricher::new(geo.clone(), 8);
+
+    let first = enricher.enrich(&event_from("1.2.3.4"));
+    let second = enricher.enrich(&event_from("1.2.3.4"));
+    enricher.enrich(&event_from("5.6.7.8"));
+
+    assert_eq!(geo.calls(), 2);
+    assert_eq!(second.country, first.country);
+    assert_eq!(second.city, first.city);
+    assert_eq!(second.city.unwrap().key, "DE|BE|Berlin");
+}
+
+/// A database swap must not serve the old database's answer.
+#[test]
+fn a_new_generation_looks_the_ip_up_again() {
+    let geo = CountingGeo::new(1, Some(berlin()));
+    let enricher = Enricher::new(geo.clone(), 8);
+    enricher.enrich(&event_from("1.2.3.4"));
+
+    let mut paris = berlin();
+    paris.country = Some("FR".to_string());
+    paris.subdivision = None;
+    paris.city = Some("Paris".to_string());
+    geo.swap(2, Some(paris));
+    let result = enricher.enrich(&event_from("1.2.3.4"));
+
+    assert_eq!(geo.calls(), 2);
+    assert_eq!(result.country, Some("FR".to_string()));
+    assert_eq!(result.city.unwrap().key, "FR||Paris");
+}
+
+/// Misses from before the first database load are not kept.
+#[test]
+fn lookups_before_the_first_load_are_not_cached() {
+    let geo = CountingGeo::new(0, None);
+    let enricher = Enricher::new(geo.clone(), 8);
+    assert_eq!(enricher.enrich(&event_from("1.2.3.4")).country, None);
+    assert_eq!(enricher.enrich(&event_from("1.2.3.4")).country, None);
+    assert_eq!(geo.calls(), 2);
+
+    geo.swap(1, Some(berlin()));
+    let result = enricher.enrich(&event_from("1.2.3.4"));
+
+    assert_eq!(result.country, Some("DE".to_string()));
+    assert_eq!(result.city.unwrap().key, "DE|BE|Berlin");
+}
+
+/// A cached lookup still lets a trusted CF-IPCountry set the country, and
+/// still keys the city by the lookup's country.
+#[test]
+fn a_cached_lookup_keeps_the_cf_country_rules() {
+    let geo = CountingGeo::new(1, Some(berlin()));
+    let enricher = Enricher::new(geo.clone(), 8);
+    let mut ev = event_from("172.18.0.1");
+    enricher.enrich(&ev);
+
+    ev.cf_country = Some("US".into());
+    let with_cf = enricher.enrich(&ev);
+    ev.cf_country = None;
+    let without_cf = enricher.enrich(&ev);
+
+    assert_eq!(geo.calls(), 1);
+    assert_eq!(with_cf.country, Some("US".to_string()));
+    assert_eq!(with_cf.city.unwrap().key, "DE|BE|Berlin");
+    assert_eq!(without_cf.country, Some("DE".to_string()));
 }
