@@ -86,8 +86,9 @@ pub fn line_uses_cf_header(i: usize, cf_header_pct: u8) -> bool {
 
 /// Generate deterministic Traefik JSON lines with a mixed CF / GeoIP country path.
 ///
-/// * CF path (`line_uses_cf_header`): sets `request_Cf-Ipcountry` so enrichment
-///   never touches the database.
+/// * CF path (`line_uses_cf_header`): a local-proxy `ClientHost` with
+///   `request_Cf-Ipcountry` and a public `request_Cf-Connecting-Ip`, so the
+///   country comes from the trusted header and the city from GeoIP.
 /// * GeoIP path: omits CF country (and CF connecting IP) and uses a public
 ///   `ClientHost` that a real GeoIP DB can resolve.
 pub fn generate_lines(
@@ -110,10 +111,13 @@ pub fn generate_lines(
             let host_n = i % apps;
             let ua = "Mozilla/5.0 Chrome/120.0";
             if line_uses_cf_header(i, cf_header_pct) {
-                let ip = format!("203.0.113.{}", i % 250 + 1);
+                // As in production: the peer is the local proxy, so the
+                // enricher trusts the CF headers; the visitor is public.
+                let peer = format!("10.0.0.{}", i % 250 + 1);
+                let ip = geoip_ip(i);
                 let country = CF_COUNTRIES[i % CF_COUNTRIES.len()];
                 format!(
-                    r#"{{"ClientHost":"{ip}","DownstreamContentSize":{size},"DownstreamStatus":{status},"Duration":{duration},"RequestContentSize":{req_size},"RequestHost":"app{host_n}.example.test","RequestMethod":"GET","RequestPath":"{path}?n={i}","RequestProtocol":"HTTP/1.1","RequestScheme":"https","RouterName":"https-0-{app}@docker","StartUTC":"2026-08-10T00:00:00Z","TLSVersion":"1.3","request_Cf-Connecting-Ip":"{ip}","request_Cf-Ipcountry":"{country}","request_User-Agent":"{ua}","time":"2026-08-10T00:00:00Z","bench_ts_ms":{ts_ms}}}"#
+                    r#"{{"ClientHost":"{peer}","DownstreamContentSize":{size},"DownstreamStatus":{status},"Duration":{duration},"RequestContentSize":{req_size},"RequestHost":"app{host_n}.example.test","RequestMethod":"GET","RequestPath":"{path}?n={i}","RequestProtocol":"HTTP/1.1","RequestScheme":"https","RouterName":"https-0-{app}@docker","StartUTC":"2026-08-10T00:00:00Z","TLSVersion":"1.3","request_Cf-Connecting-Ip":"{ip}","request_Cf-Ipcountry":"{country}","request_User-Agent":"{ua}","time":"2026-08-10T00:00:00Z","bench_ts_ms":{ts_ms}}}"#
                 )
             } else {
                 let ip = geoip_ip(i);
@@ -404,7 +408,9 @@ pub async fn run(opts: &AnalyticsOpts) -> Result<(), Box<dyn std::error::Error>>
     let h_rows = compact_1m_to_1h(&store, now, opts.topn)?;
     let h_elapsed = started.elapsed();
     let started = Instant::now();
-    let d_rows = compact_1h_to_1d(&store, now + 86_400_000, opts.topn)?;
+    // Daily compaction holds hour rows one full day past their day, so look
+    // two days ahead; otherwise nothing reaches the D1 tier that [D] queries.
+    let d_rows = compact_1h_to_1d(&store, now + 2 * 86_400_000, opts.topn)?;
     let d_elapsed = started.elapsed();
     println!(
         "[C] compaction: 1m->1h rows={h_rows} {:.2}ms; 1h->1d rows={d_rows} {:.2}ms",
@@ -802,6 +808,18 @@ mod tests {
         }
         assert_eq!(with_cf, 50);
         assert_eq!(without_cf, 50);
+    }
+
+    /// The CF path must reach the enricher's trusted-header branch, or
+    /// `--cf-header-pct` measures GeoIP misses instead.
+    #[test]
+    fn cf_lines_are_trusted_by_the_enricher() {
+        let enricher = Enricher::new(Arc::new(NoGeo), 8);
+        for line in generate_lines(10, 1, 1, 1_700_000_000_000, 100) {
+            let event = parse_line(ProxyType::Traefik, line.as_bytes()).unwrap();
+            let enriched = enricher.enrich(&event);
+            assert_eq!(enriched.country.as_deref(), event.cf_country.as_deref());
+        }
     }
 
     #[test]

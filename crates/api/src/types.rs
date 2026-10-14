@@ -307,9 +307,12 @@ pub struct TrafficBreakdownEntry {
     pub value: String,
     pub requests: i64,
     pub bytes_out: i64,
+    // Left out when unknown, never `null`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub lat: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub lon: Option<f64>,
 }
 

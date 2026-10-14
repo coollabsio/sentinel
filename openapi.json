@@ -2829,17 +2829,11 @@
             "format": "int64"
           },
           "lat": {
-            "type": [
-              "number",
-              "null"
-            ],
+            "type": "number",
             "format": "double"
           },
           "lon": {
-            "type": [
-              "number",
-              "null"
-            ],
+            "type": "number",
             "format": "double"
           },
           "requests": {
