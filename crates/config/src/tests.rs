@@ -264,8 +264,8 @@ fn defaults_match_go_implementation() {
     );
     assert_eq!(c.command_retention_days, 7);
     assert_eq!(c.command_max_records, 100_000);
-    // Storage collection defaults on; the expensive volume walk too, but is
-    // inert until host paths are mounted (see HOST_MOUNT_PREFIX).
+    // Storage collection defaults on, volume sizing too. Bind mounts are
+    // sized only when host paths are mounted (see HOST_MOUNT_PREFIX).
     assert!(c.storage_enabled);
     assert_eq!(c.storage_refresh_rate_seconds, 300);
     assert!(c.storage_volumes_enabled);

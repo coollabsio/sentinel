@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use config::Config;
@@ -84,11 +85,23 @@ impl StorageCollector {
     }
 
     /// One `size: true` container list gives every container's writable-layer
-    /// size and mount sources; when volume walking is enabled, each mount's
-    /// host path is `du`-walked (sequentially, to bound I/O) and summed.
+    /// size and mount sources. When volume sizing is enabled, named volumes are
+    /// sized by the Docker daemon (`/system/df`), so Sentinel needs no host
+    /// mounts. Bind mounts are `du`-walked (sequentially, to bound I/O) only
+    /// when `HOST_MOUNT_PREFIX` says where the host paths are mounted.
     async fn collect_container_storage(&self, time: i64) {
-        let containers = match self.docker.list_container_sizes().await {
-            Ok(c) => c,
+        let volumes_enabled = self.config.storage_volumes_enabled;
+        let usage = if volumes_enabled {
+            self.docker.disk_usage().await
+        } else {
+            // Skip the daemon's volume walk when volume sizing is off.
+            self.docker
+                .list_container_sizes()
+                .await
+                .map(|c| (c, HashMap::new()))
+        };
+        let (containers, volume_sizes) = match usage {
+            Ok(u) => u,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to list container sizes");
                 return;
@@ -99,29 +112,29 @@ impl StorageCollector {
         }
 
         let store = self.store.clone();
-        let volumes_enabled = self.config.storage_volumes_enabled;
         let prefix = self.config.host_mount_prefix.clone();
 
         match tokio::task::spawn_blocking(move || {
-            // Cache measured sizes for the whole collection cycle: a host source
-            // shared across containers (or mounted at several targets within one
-            // container) is `du`-walked only once.
-            let mut measured: HashMap<PathBuf, u64> = HashMap::new();
+            // Cache walked bind mount sizes for the whole collection cycle: a
+            // host source shared across containers is `du`-walked only once.
+            let mut measured: HashMap<String, u64> = HashMap::new();
             let samples: Vec<ContainerDiskSample> = containers
                 .into_iter()
                 .map(|c| {
                     let volumes_total = if volumes_enabled {
                         c.mount_sources
                             .iter()
-                            .map(|src| resolve_host_path(&prefix, src))
                             // Dedupe per container so one source mounted at
                             // multiple targets is counted once, not summed twice.
                             .collect::<HashSet<_>>()
                             .into_iter()
-                            .map(|path| {
-                                *measured
-                                    .entry(path.clone())
-                                    .or_insert_with(|| dir_size(&path))
+                            .map(|src| match volume_sizes.get(src) {
+                                Some(size) => *size,
+                                // Without a prefix the host path is not visible.
+                                None if prefix.is_empty() => 0,
+                                None => *measured
+                                    .entry(src.clone())
+                                    .or_insert_with(|| dir_size(&resolve_host_path(&prefix, src))),
                             })
                             .sum()
                     } else {
@@ -163,6 +176,11 @@ fn resolve_host_path(prefix: &str, source: &str) -> PathBuf {
 /// volume; when hit, [`dir_size`] logs a warning and records the partial sum.
 const MAX_WALK_ENTRIES: u64 = 2_000_000;
 
+/// A missing bind mount source usually means its host path is not mounted
+/// under `HOST_MOUNT_PREFIX`, so it misses on every cycle. Warn once per
+/// process with the fix, then log further misses at debug.
+static MISSING_SOURCE_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Recursively sums on-disk block usage (like `du`) under `path`. Symlinks are
 /// never followed and any I/O error degrades to 0 with a warning — the walk
 /// must never crash a collection cycle.
@@ -171,8 +189,8 @@ const MAX_WALK_ENTRIES: u64 = 2_000_000;
 /// so a mount source that points at an arbitrarily large host tree (any bind
 /// mount, not just a Docker volume) is walked in full. To keep one pathological
 /// mount from stalling the collector, the walk is capped at [`MAX_WALK_ENTRIES`]
-/// entries; past that it logs a warning and returns the partial sum. Operators
-/// who don't want bind mounts walked can set `STORAGE_VOLUMES_ENABLED=false`.
+/// entries; past that it logs a warning and returns the partial sum. Bind mounts
+/// are walked only when `HOST_MOUNT_PREFIX` is set.
 ///
 /// `pub` so the host-only `sentinel-bench storage` harness can measure the real
 /// walk (see BENCHMARK.md §4.9); not part of any runtime API surface.
@@ -185,6 +203,19 @@ pub fn dir_size(path: &Path) -> u64 {
 fn dir_size_bounded(path: &Path, max_entries: u64) -> u64 {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if MISSING_SOURCE_WARNED.swap(true, Ordering::Relaxed) {
+                tracing::debug!(path = %path.display(), "storage: mount source not found");
+            } else {
+                tracing::warn!(
+                    path = %path.display(),
+                    "storage: bind mount source not found under HOST_MOUNT_PREFIX, its size \
+                     will be 0 (mount the host path read-only under the prefix); further \
+                     misses are logged at debug"
+                );
+            }
+            return 0;
+        }
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "storage: cannot stat mount source");
             return 0;
@@ -232,7 +263,7 @@ fn dir_size_bounded(path: &Path, max_entries: u64) -> u64 {
                     path = %path.display(),
                     entries = entries_seen,
                     "storage: mount source walk exceeded entry budget, recording partial size \
-                     (a large bind mount? disable with STORAGE_VOLUMES_ENABLED=false)"
+                     (a large bind mount? unset HOST_MOUNT_PREFIX to skip bind mounts)"
                 );
                 return total;
             }

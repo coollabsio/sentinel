@@ -1,4 +1,4 @@
-use super::container_disk_from_summary;
+use super::{container_disk_from_summary, volume_sizes_from_items};
 use bollard::models::{ContainerSummary, ContainerSummaryStateEnum, HealthStatusEnum, MountPoint};
 
 // A `size: true` list yields the raw Docker id, but the disk series must be
@@ -90,4 +90,24 @@ fn health_status_wire_strings_match_docker() {
     assert_eq!(HEALTHY.to_string(), "healthy");
     assert_eq!(UNHEALTHY.to_string(), "unhealthy");
     assert_eq!(EMPTY.to_string(), "");
+}
+
+#[test]
+fn volume_sizes_skip_unavailable_and_malformed_items() {
+    let items = vec![
+        serde_json::json!({
+            "Name": "db",
+            "Mountpoint": "/var/lib/docker/volumes/db/_data",
+            "UsageData": { "RefCount": 1, "Size": 4096 }
+        }),
+        serde_json::json!({
+            "Name": "remote",
+            "Mountpoint": "/mnt/remote",
+            "UsageData": { "RefCount": 1, "Size": -1 }
+        }),
+        serde_json::json!({ "Name": "no-usage", "Mountpoint": "/var/lib/docker/volumes/x/_data" }),
+    ];
+    let sizes = volume_sizes_from_items(&items);
+    assert_eq!(sizes.len(), 1);
+    assert_eq!(sizes["/var/lib/docker/volumes/db/_data"], 4096);
 }

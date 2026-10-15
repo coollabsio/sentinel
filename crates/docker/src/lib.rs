@@ -6,12 +6,14 @@ pub mod model;
 
 pub use model::{ContainerDisk, ContainerStats, ContainerSummary};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use bollard::Docker;
-use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions, StatsOptions};
+use bollard::query_parameters::{
+    DataUsageOptions, InspectContainerOptions, ListContainersOptions, StatsOptions,
+};
 use futures_util::StreamExt;
 use inspect_cache::InspectCache;
 
@@ -102,6 +104,32 @@ impl DockerClient {
         };
         let raw = self.inner.list_containers(Some(opts)).await?;
         Ok(raw.into_iter().map(container_disk_from_summary).collect())
+    }
+
+    /// Like [`Self::list_container_sizes`], plus the size of every named volume
+    /// keyed by host mountpoint (the same path a container lists as its mount
+    /// source), from one `/system/df` call. The daemon computes all sizes, so
+    /// Sentinel needs no access to host paths. bollard cannot encode the `type`
+    /// filter (a list), so the daemon also computes image and build cache usage.
+    pub async fn disk_usage(
+        &self,
+    ) -> Result<(Vec<ContainerDisk>, HashMap<String, u64>), DockerError> {
+        // API 1.52+ only returns the per-object `Items` with `verbose`.
+        let opts = DataUsageOptions {
+            verbose: true,
+            ..Default::default()
+        };
+        let df = self.inner.df(Some(opts)).await?;
+        let containers = df
+            .container_usage
+            .and_then(|c| c.items)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| serde_json::from_value::<bollard::models::ContainerSummary>(v).ok())
+            .map(container_disk_from_summary)
+            .collect();
+        let volumes = df.volume_usage.and_then(|v| v.items).unwrap_or_default();
+        Ok((containers, volume_sizes_from_items(&volumes)))
     }
 
     pub async fn stats(&self, id: &str) -> Result<ContainerStats, DockerError> {
@@ -250,6 +278,20 @@ fn container_disk_from_summary(c: bollard::models::ContainerSummary) -> Containe
         writable_layer: c.size_rw.filter(|v| *v >= 0).unwrap_or(0) as u64,
         mount_sources,
     }
+}
+
+/// Docker reports `UsageData.Size` as -1 when the size is not available
+/// (volume drivers other than `local`); those volumes are left out.
+fn volume_sizes_from_items(items: &[serde_json::Value]) -> HashMap<String, u64> {
+    items
+        .iter()
+        .filter_map(|v| {
+            let mountpoint = v.get("Mountpoint")?.as_str()?;
+            let size = v.get("UsageData")?.get("Size")?.as_i64()?;
+            let size = u64::try_from(size).ok()?;
+            Some((mountpoint.to_string(), size))
+        })
+        .collect()
 }
 
 #[cfg(test)]

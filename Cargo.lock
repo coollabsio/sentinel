@@ -687,6 +687,7 @@ version = "1.1.0"
 dependencies = [
  "bollard",
  "futures-util",
+ "serde_json",
  "thiserror",
  "tracing",
 ]

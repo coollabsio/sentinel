@@ -78,9 +78,9 @@ Sentinel is configured using environment variables:
 | `COLLECTOR_RETENTION_PERIOD_DAYS` | 7 | How long to keep metrics in database |
 | `STORAGE_ENABLED` | `true` | Enable/disable storage (disk + container storage) collection |
 | `STORAGE_REFRESH_RATE_SECONDS` | 300 | Interval for the cheap per-mount filesystem stats |
-| `STORAGE_VOLUMES_ENABLED` | `true` | Enable/disable the per-container volume `du`-walk |
+| `STORAGE_VOLUMES_ENABLED` | `true` | Enable/disable per-container volume and bind mount sizes |
 | `STORAGE_VOLUMES_REFRESH_RATE_SECONDS` | 900 | Interval for the expensive volume walk (kept separate so it can't hammer host I/O) |
-| `HOST_MOUNT_PREFIX` | *(empty)* | Path prefix under which host paths are mounted into Sentinel's container, used to resolve volume/bind sources |
+| `HOST_MOUNT_PREFIX` | *(empty)* | Path prefix under which host paths are mounted into Sentinel's container. When set, bind mount sources are `du`-walked under it; when empty, bind mounts are not sized |
 | `DOCKER_HOST` | `/var/run/docker.sock` | Docker Engine API socket; `unix://` URLs and bare paths only — e.g. `unix:///run/user/1000/podman/podman.sock` for rootless Podman |
 | `DEBUG` | `false` | Enable verbose logging, `human_friendly_time` fields, and the `/api/stats` route |
 | `PORT` | `8888` | HTTP server port |
@@ -112,7 +112,7 @@ Inert unless Sentinel is built with the `traffic` Cargo feature. See [Traffic An
 
 In development mode (`cargo run`/`cargo build` debug profile, or `SENTINEL_DEVELOPMENT=1`), `PUSH_ENDPOINT` defaults to `http://localhost:8000`.
 
-> **Storage collection & host paths.** Disk stats only cover filesystems Sentinel's container can see. To size **volumes/bind mounts**, mount the host paths (read-only is fine) — typically `/var/lib/docker/volumes` plus any bind-mount roots — and point `HOST_MOUNT_PREFIX` at them (e.g. `/host`). Inaccessible paths contribute `0` with a warning. Large trees (`/`, `/var`, home dirs) are walked every cycle and can be slow; the walk is capped, or set `STORAGE_VOLUMES_ENABLED=false` to skip it.
+> **Storage collection & host paths.** Disk stats only cover filesystems Sentinel's container can see. **Named volumes** are sized by the Docker daemon (`/system/df`), so they need no host mounts (volumes of drivers other than `local` count as `0`). **Bind mounts** count as `0` unless you mount their host paths (read-only is fine) and point `HOST_MOUNT_PREFIX` at them (e.g. `/host`); a missing path then logs one warning. Large trees (`/`, `/var`, home dirs) are walked every cycle and can be slow; the walk is capped, or set `STORAGE_VOLUMES_ENABLED=false` to skip all volume sizing.
 
 ### Example Configuration
 
