@@ -5,7 +5,7 @@ FROM rust:1.97.1-alpine3.24 AS builder
 # C toolchain. The runtime image is alpine:3.24, which ships musl's shared
 # libraries natively — the binary is dynamically linked against musl, not
 # static, and needs nothing beyond that to run in the runtime stage below.
-RUN apk add --no-cache musl-dev gcc
+RUN apk upgrade --no-cache && apk add --no-cache musl-dev gcc
 
 WORKDIR /app
 
@@ -38,7 +38,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Final stage
 FROM alpine:3.24
 
-RUN apk add --no-cache ca-certificates tzdata curl
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates tzdata curl
 
 ENV PORT=8888
 
