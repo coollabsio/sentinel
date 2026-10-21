@@ -1,6 +1,6 @@
 FROM rust:1.97.1-alpine3.24 AS builder
 
-RUN apk add --no-cache musl-dev gcc
+RUN apk upgrade --no-cache && apk add --no-cache musl-dev gcc
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -13,7 +13,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp /app/target/release/flux /flux
 
 FROM alpine:3.24
-RUN apk add --no-cache ca-certificates
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates
 COPY --from=builder /flux /usr/local/bin/flux
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/flux"]

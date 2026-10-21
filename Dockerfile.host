@@ -1,6 +1,6 @@
 FROM rust:1.97.1-alpine3.24 AS builder
 
-RUN apk add --no-cache musl-dev gcc file
+RUN apk upgrade --no-cache && apk add --no-cache musl-dev gcc file
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
