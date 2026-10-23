@@ -23,6 +23,56 @@ fn pseudo_filesystems_are_skipped() {
     assert!(!is_pseudo_fs("btrfs"));
 }
 
+/// Host mount table as Sentinel reads it through `--pid host` (`/proc/1/mountinfo`).
+const HOST_MOUNTINFO: &str = "\
+29 1 253:1 / / rw,relatime shared:1 - ext4 /dev/vda1 rw
+30 29 253:2 / /data rw,relatime shared:2 - xfs /dev/vdb1 rw
+31 29 0:25 / /run rw,nosuid shared:3 - tmpfs tmpfs rw
+90 29 0:42 / /var/lib/docker/rootfs/overlayfs/abc rw shared:40 - overlay overlay rw
+91 29 253:1 /var/lib/docker /mnt/docker\\040copy rw shared:1 - ext4 /dev/vda1 rw
+";
+
+/// The Sentinel container's own mount table (`/proc/self/mountinfo`).
+const CONTAINER_MOUNTINFO: &str = "\
+600 500 0:42 / / rw,relatime - overlay overlay rw,lowerdir=/x
+601 600 253:1 /data/coolify/sentinel /app/db rw,relatime - ext4 /dev/vda1 rw
+602 600 253:1 /var/lib/docker/containers/x/hosts /etc/hosts rw,relatime - ext4 /dev/vda1 rw
+603 600 253:2 /coolify/proxy /data/coolify/proxy ro,relatime - xfs /dev/vdb1 rw
+604 600 0:25 /docker.sock /run/docker.sock rw - tmpfs tmpfs rw
+";
+
+#[test]
+fn container_mounts_are_named_by_their_host_filesystem() {
+    let labels = host_mount_labels(CONTAINER_MOUNTINFO, HOST_MOUNTINFO).unwrap();
+
+    // /app/db is on the host root device, so it measures the host `/` exactly.
+    assert_eq!(labels.get("/app/db").map(String::as_str), Some("/"));
+    assert_eq!(labels.get("/etc/hosts").map(String::as_str), Some("/"));
+    assert_eq!(
+        labels.get("/data/coolify/proxy").map(String::as_str),
+        Some("/data")
+    );
+    // The container's own overlay root and tmpfs binds are no host disk.
+    assert_eq!(labels.get("/"), None);
+    assert_eq!(labels.get("/run/docker.sock"), None);
+}
+
+#[test]
+fn no_labels_when_sentinel_shares_the_host_mount_table() {
+    // Running on the host, or in a container without `--pid host`.
+    assert!(host_mount_labels(HOST_MOUNTINFO, HOST_MOUNTINFO).is_none());
+}
+
+#[test]
+fn mountinfo_paths_are_unescaped() {
+    let labels = host_mount_labels(
+        "1 0 253:1 / /mnt/a\\040b rw - ext4 /dev/vda1 rw\n",
+        HOST_MOUNTINFO,
+    )
+    .unwrap();
+    assert_eq!(labels.get("/mnt/a b").map(String::as_str), Some("/"));
+}
+
 #[test]
 fn dir_size_missing_path_is_zero() {
     assert_eq!(dir_size(Path::new("/nonexistent/sentinel/storage/path")), 0);

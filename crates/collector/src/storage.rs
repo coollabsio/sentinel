@@ -276,7 +276,18 @@ fn dir_size_bounded(path: &Path, max_entries: u64) -> u64 {
 /// Pseudo/virtual filesystems and zero-capacity devices are skipped.
 ///
 /// `pub` for the host-only `sentinel-bench storage` harness (BENCHMARK.md §4.9).
+///
+/// In a container, the samples are the host filesystems that Sentinel's own
+/// mounts are on (for example `/app/db` on the host root disk), named by their
+/// host mount point. See [`host_mount_labels`].
 pub fn sample_disks() -> Vec<DiskSample> {
+    let labels = match (
+        std::fs::read_to_string("/proc/self/mountinfo"),
+        std::fs::read_to_string("/proc/1/mountinfo"),
+    ) {
+        (Ok(own), Ok(host)) => host_mount_labels(&own, &host),
+        _ => None,
+    };
     let disks = Disks::new_with_refreshed_list();
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -290,6 +301,13 @@ pub fn sample_disks() -> Vec<DiskSample> {
             continue;
         }
         let mount = d.mount_point().to_string_lossy().to_string();
+        let mount = match &labels {
+            Some(labels) => match labels.get(&mount) {
+                Some(host_mount) => host_mount.clone(),
+                None => continue,
+            },
+            None => mount,
+        };
         if !seen.insert(mount.clone()) {
             continue;
         }
@@ -305,6 +323,76 @@ pub fn sample_disks() -> Vec<DiskSample> {
         });
     }
     out
+}
+
+/// Maps each of Sentinel's own mount points to the host mount point of the
+/// same filesystem, or `None` when Sentinel shares the host mount table (it
+/// runs on the host, or without `--pid host`).
+///
+/// In the container `/` is overlay and the host disks are not mounted. With
+/// `--pid host`, `/proc/1/mountinfo` is the host mount table, so a bind mount
+/// such as `/app/db` is matched by device to the host filesystem it is on, and
+/// its statvfs numbers are that host filesystem's. A device mounted at several
+/// host paths is named by the shortest one, so the root disk is `/`. Only the
+/// mount table is read; no host files are exposed.
+fn host_mount_labels(own: &str, host: &str) -> Option<HashMap<String, String>> {
+    if own == host {
+        return None;
+    }
+    let mut host_mounts: HashMap<&str, String> = HashMap::new();
+    for (device, mount_point, fs) in host.lines().filter_map(parse_mountinfo_line) {
+        if is_pseudo_fs(fs) {
+            continue;
+        }
+        let shortest = host_mounts
+            .entry(device)
+            .or_insert_with(|| mount_point.clone());
+        if mount_point.len() < shortest.len() {
+            *shortest = mount_point;
+        }
+    }
+    Some(
+        own.lines()
+            .filter_map(parse_mountinfo_line)
+            .filter_map(|(device, mount_point, _)| {
+                Some((mount_point, host_mounts.get(device)?.clone()))
+            })
+            .collect(),
+    )
+}
+
+/// `(major:minor, mount point, filesystem type)` of one `/proc/<pid>/mountinfo`
+/// line (proc(5)); the mount point has its octal escapes (`\040`) decoded.
+fn parse_mountinfo_line(line: &str) -> Option<(&str, String, &str)> {
+    let (left, right) = line.split_once(" - ")?;
+    let mut fields = left.split(' ');
+    let device = fields.nth(2)?;
+    let mount_point = unescape_mount_path(fields.nth(1)?);
+    let fs = right.split(' ').next()?;
+    Some((device, mount_point, fs))
+}
+
+fn unescape_mount_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes.get(i + 1..i + 4).and_then(|digits| {
+            let digits = std::str::from_utf8(digits).ok()?;
+            u8::from_str_radix(digits, 8).ok()
+        });
+        match (bytes[i], octal) {
+            (b'\\', Some(byte)) => {
+                out.push(byte);
+                i += 4;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Kernel/pseudo filesystems that carry no meaningful capacity for a server
