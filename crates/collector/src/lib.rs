@@ -57,12 +57,12 @@ impl Collector {
         );
 
         let mut sampler = HostSampler::new();
-        // Previous cumulative network counters per Docker container id, so each
-        // cycle can derive a bytes/sec rate from the delta. Keyed on the id, not
-        // the display name: a re-created container reuses the name but starts
-        // new counters. Kept in the run
-        // loop (not the store) because it is transient rate state, not history.
-        let mut net_prev: HashMap<String, (u64, u64, i64)> = HashMap::new();
+        // Previous cumulative counters per Docker container id, so each cycle can
+        // derive CPU percent and network rates from the delta. Keyed on the id,
+        // not the display name: a re-created container reuses the name but starts
+        // new counters. Kept in the run loop (not the store) because it is
+        // transient rate state, not history.
+        let mut prev: HashMap<String, Counters> = HashMap::new();
         // tokio::time::interval's first tick fires immediately, unlike Go's
         // time.NewTicker (which waits a full period before the first tick).
         // interval_at with an explicit first-tick deadline restores that
@@ -82,17 +82,13 @@ impl Collector {
                     // step inside `cycle` logs and continues, so there is no
                     // error to surface here. This replaces the Go
                     // implementation's panic/recover block.
-                    self.cycle(&mut sampler, &mut net_prev).await;
+                    self.cycle(&mut sampler, &mut prev).await;
                 }
             }
         }
     }
 
-    async fn cycle(
-        &self,
-        sampler: &mut HostSampler,
-        net_prev: &mut HashMap<String, (u64, u64, i64)>,
-    ) {
+    async fn cycle(&self, sampler: &mut HostSampler, prev: &mut HashMap<String, Counters>) {
         let time = now_millis();
 
         // Go stored host CPU with fmt.Sprintf("%.2f", ...) (collector.go), so
@@ -137,10 +133,10 @@ impl Collector {
             tracing::warn!(error = %e, "host metrics insert task panicked");
         }
 
-        self.collect_containers(time, net_prev).await;
+        self.collect_containers(time, prev).await;
     }
 
-    async fn collect_containers(&self, time: i64, net_prev: &mut HashMap<String, (u64, u64, i64)>) {
+    async fn collect_containers(&self, time: i64, prev: &mut HashMap<String, Counters>) {
         let containers = match self.docker.list_containers().await {
             Ok(c) => c,
             Err(e) => {
@@ -179,26 +175,44 @@ impl Collector {
         }
 
         // Split the fetched data into the three series, deriving each container's
-        // network rate from the previous cycle's counter for the same Docker id.
+        // CPU percent and network rate from the previous cycle's counters for the
+        // same Docker id.
         let live_ids: std::collections::HashSet<String> =
             fetched.iter().map(|f| f.docker_id.clone()).collect();
         let mut samples = Vec::with_capacity(fetched.len());
         let mut net_samples = Vec::with_capacity(fetched.len());
         let mut status_samples = Vec::with_capacity(fetched.len());
         for f in fetched {
-            let name = f.sample.container_id.clone();
-            // No network row without a usable baseline: a 0 there would be a
-            // made-up value, not a measured one.
-            if let Some((rx_rate, tx_rate)) =
-                net_rate(net_prev.get(&f.docker_id), f.net_rx, f.net_tx, time)
-            {
+            let name = f.name;
+            let stats = f.stats;
+            let last = prev.get(&f.docker_id);
+            // No cpu/mem or network row without a usable baseline: a 0 there
+            // would be a made-up value, not a measured one.
+            if let Some(cpu) = cpu_percent(last, &stats) {
+                samples.push(container_sample(name.clone(), cpu, &stats));
+            }
+            if let Some((rx_rate, tx_rate)) = net_rate(
+                last.map(|p| (p.net_rx, p.net_tx, p.time)).as_ref(),
+                stats.net_rx,
+                stats.net_tx,
+                time,
+            ) {
                 net_samples.push(ContainerNetworkSample {
                     container_id: name.clone(),
                     rx_bytes_per_sec: round2(rx_rate),
                     tx_bytes_per_sec: round2(tx_rate),
                 });
             }
-            net_prev.insert(f.docker_id, (f.net_rx, f.net_tx, time));
+            prev.insert(
+                f.docker_id,
+                Counters {
+                    cpu_total: stats.cpu_total,
+                    system_usage: stats.system_usage,
+                    net_rx: stats.net_rx,
+                    net_tx: stats.net_tx,
+                    time,
+                },
+            );
             // No status row on an inspect failure: the previous row stays rather
             // than being overwritten with made-up values.
             if let Some((health_status, restart_count)) = f.inspect {
@@ -209,11 +223,10 @@ impl Collector {
                     restart_count,
                 });
             }
-            samples.push(f.sample);
         }
         // Drop prev-counter state for containers that are gone, so the map does
         // not grow without bound across the process lifetime.
-        net_prev.retain(|k, _| live_ids.contains(k));
+        prev.retain(|k, _| live_ids.contains(k));
 
         let store = self.store.clone();
         // Each series is written on its own, so one failed insert does not drop
@@ -239,13 +252,21 @@ impl Collector {
     }
 }
 
-/// Everything one cycle needs from a single container: cpu/mem sample, the raw
-/// cumulative network counters (rate derived later), and inspect-derived status.
-struct FetchedContainer {
-    docker_id: String,
-    sample: ContainerSample,
+/// Cumulative counters from a container's previous sample.
+struct Counters {
+    cpu_total: u64,
+    system_usage: u64,
     net_rx: u64,
     net_tx: u64,
+    time: i64,
+}
+
+/// Everything one cycle needs from a single container: the raw one-shot stats
+/// (rates derived later from the previous sample) and inspect-derived status.
+struct FetchedContainer {
+    docker_id: String,
+    name: String,
+    stats: docker::ContainerStats,
     state: String,
     /// `(health_status, restart_count)`; `None` when inspect failed.
     inspect: Option<(String, u64)>,
@@ -267,6 +288,47 @@ fn net_rate(
             Some(((cur_rx - prx) as f64 / dt, (cur_tx - ptx) as f64 / dt))
         }
         _ => None,
+    }
+}
+
+/// CPU percent over the interval since the previous sample. One-shot stats carry
+/// no `precpu_stats`, so the previous cycle's counters are the baseline. `None`
+/// on the first sample and on a counter reset (a container restart).
+fn cpu_percent(prev: Option<&Counters>, stats: &docker::ContainerStats) -> Option<f64> {
+    let p = prev?;
+    if stats.cpu_total < p.cpu_total {
+        return None;
+    }
+    let windowed = docker::ContainerStats {
+        pre_cpu_total: p.cpu_total,
+        pre_system_usage: p.system_usage,
+        ..*stats
+    };
+    Some(round2(calc::cpu_percent(&windowed)))
+}
+
+fn container_sample(
+    name: String,
+    cpu_percent: f64,
+    stats: &docker::ContainerStats,
+) -> ContainerSample {
+    let mem_used = calc::memory_used(stats);
+    let mem_limit = stats.mem_limit;
+    // Matches the Go collector: `free` is derived, and `available` is set to the
+    // same derived value. Preserved deliberately for wire compatibility.
+    let free = mem_limit.saturating_sub(mem_used);
+    ContainerSample {
+        // Preserve the exact display name. Sanitizing punctuation is lossy:
+        // distinct names such as `app-a` and `appa` otherwise share history.
+        container_id: name,
+        cpu_percent,
+        mem_total: mem_limit,
+        mem_available: free,
+        mem_used,
+        // Go stored percentages with fmt.Sprintf("%.2f", ...) (collector.go), so
+        // round to keep stored and downsampled values at wire parity.
+        mem_used_percent: round2(calc::memory_percent(stats)),
+        mem_free: free,
     }
 }
 
@@ -298,34 +360,10 @@ async fn fetch(
         }
     };
 
-    let mem_used = calc::memory_used(&stats);
-    let mem_limit = stats.mem_limit;
-    // Matches the Go collector: `free` is derived, and `available` is set to the
-    // same derived value. Preserved deliberately for wire compatibility.
-    let free = mem_limit.saturating_sub(mem_used);
-    // Go stored both percentages with fmt.Sprintf("%.2f", ...) (collector.go)
-    // and re-parsed them on read, effectively rounding to 2 decimals. Round
-    // both here so the stored (and downsampled) values stay at wire parity with
-    // the Go agent; without it the raw f64 (e.g. 12.345678901234568) persists
-    // to storage even though a type-only check would pass.
-    let mem_used_percent = round2(calc::memory_percent(&stats));
-    let cpu_percent = round2(calc::cpu_percent(&stats));
-
     Some(FetchedContainer {
-        sample: ContainerSample {
-            // Preserve the exact display name. Sanitizing punctuation is lossy:
-            // distinct names such as `app-a` and `appa` otherwise share history.
-            container_id: name,
-            cpu_percent,
-            mem_total: mem_limit,
-            mem_available: free,
-            mem_used,
-            mem_used_percent,
-            mem_free: free,
-        },
         docker_id: container.id,
-        net_rx: stats.net_rx,
-        net_tx: stats.net_tx,
+        name,
+        stats,
         state: container.state,
         inspect,
     })
@@ -333,7 +371,51 @@ async fn fetch(
 
 #[cfg(test)]
 mod tests {
-    use super::net_rate;
+    use super::{Counters, cpu_percent, net_rate};
+
+    fn stats(cpu_total: u64, system_usage: u64) -> docker::ContainerStats {
+        docker::ContainerStats {
+            cpu_total,
+            system_usage,
+            online_cpus: 4,
+            ..Default::default()
+        }
+    }
+
+    fn counters(cpu_total: u64, system_usage: u64) -> Counters {
+        Counters {
+            cpu_total,
+            system_usage,
+            net_rx: 0,
+            net_tx: 0,
+            time: 0,
+        }
+    }
+
+    #[test]
+    fn first_sample_has_no_cpu() {
+        assert_eq!(cpu_percent(None, &stats(500, 10_000)), None);
+    }
+
+    #[test]
+    fn cpu_is_delta_against_previous_sample() {
+        // 250 of 10000 system ticks on 4 cpus → 10%.
+        let prev = counters(1_000, 40_000);
+        assert_eq!(cpu_percent(Some(&prev), &stats(1_250, 50_000)), Some(10.0));
+    }
+
+    #[test]
+    fn stopped_container_reports_zero_cpu() {
+        // Docker returns zeroed counters for a stopped container.
+        let prev = counters(0, 0);
+        assert_eq!(cpu_percent(Some(&prev), &stats(0, 0)), Some(0.0));
+    }
+
+    #[test]
+    fn cpu_counter_reset_has_no_cpu() {
+        let prev = counters(1_000, 40_000);
+        assert_eq!(cpu_percent(Some(&prev), &stats(10, 50_000)), None);
+    }
 
     #[test]
     fn first_sample_has_no_rate() {
