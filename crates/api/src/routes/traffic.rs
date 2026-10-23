@@ -286,12 +286,11 @@ fn aggregate_series(
         slot.s4xx = slot.s4xx.saturating_add(r.s4xx);
         slot.s5xx = slot.s5xx.saturating_add(r.s5xx);
 
-        match Uniques::from_bytes(&r.uniques_hll) {
-            Ok(u) => visitors[idx].merge_from(&u),
-            Err(e) => tracing::warn!(
+        if let Err(e) = visitors[idx].merge_bytes(&r.uniques_hll) {
+            tracing::warn!(
                 error = %e, app = %r.app, host = %r.host, bucket = r.bucket,
                 "skipping undecodable uniques sketch"
-            ),
+            );
         }
         match LatencyDigest::from_bytes(&r.latency_tdigest) {
             Ok(d) => digests[idx].push(d),
@@ -1044,12 +1043,11 @@ fn summarize_stats(rows: &[StatsRow]) -> TrafficOverview {
                 "skipping undecodable latency sketch"
             ),
         }
-        match Uniques::from_bytes(&r.uniques_hll) {
-            Ok(u) => visitors.merge_from(&u),
-            Err(e) => tracing::warn!(
+        if let Err(e) = visitors.merge_bytes(&r.uniques_hll) {
+            tracing::warn!(
                 error = %e, app = %r.app, host = %r.host, bucket = r.bucket,
                 "skipping undecodable uniques sketch"
-            ),
+            );
         }
     }
 
