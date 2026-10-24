@@ -45,6 +45,16 @@ configuration and return `404` otherwise (their descriptions say so too):
 
 All date/time query parameters use ISO 8601 in UTC: `YYYY-MM-DDTHH:MM:SSZ`.
 
+## History windows
+
+Metric history endpoints (`/api/{cpu,memory,disk,load,network}/history` and
+`/api/container/{id}/{cpu,memory,disk,network}/history`) return every stored row
+by default. Add `bucket_ms=<positive integer>` to average rows per
+epoch-aligned window of that width: each row's `time` is the window start,
+and disk keeps one row per mount per window. The row shape does not change.
+Use it for long ranges: a 7-day read with `bucket_ms=600000` returns about 1000
+rows per series instead of tens of thousands.
+
 ## Errors
 
 Error responses share one shape: `{"error": "<message>"}` with status `400`

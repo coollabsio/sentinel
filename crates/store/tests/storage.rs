@@ -19,7 +19,7 @@ fn round_trips_disk_and_reports_latest_per_mount() {
         .unwrap();
 
     // History returns every stored row, ordered by (time, mount).
-    let hist = s.disk_history(0, i64::MAX).unwrap();
+    let hist = s.disk_history(0, i64::MAX, None).unwrap();
     assert_eq!(hist.len(), 4);
     assert_eq!(hist[0].time, 1_000);
     assert_eq!(hist[0].mount, "/");
@@ -40,7 +40,7 @@ fn disk_insert_is_upsert_on_time_and_mount() {
     let s = Store::open_in_memory().unwrap();
     s.insert_disk_batch(1_000, &[disk("/", 10.0)]).unwrap();
     s.insert_disk_batch(1_000, &[disk("/", 99.0)]).unwrap();
-    let rows = s.disk_history(0, i64::MAX).unwrap();
+    let rows = s.disk_history(0, i64::MAX, None).unwrap();
     assert_eq!(rows.len(), 1);
     assert!((rows[0].used_percent - 99.0).abs() < f64::EPSILON);
 }
@@ -71,7 +71,7 @@ fn round_trips_container_disk_and_scopes_by_id() {
     )
     .unwrap();
 
-    let web = s.container_disk_history("web", 0, i64::MAX).unwrap();
+    let web = s.container_disk_history("web", 0, i64::MAX, None).unwrap();
     assert_eq!(web.len(), 2);
     assert_eq!(web[0].writable_layer, 1_000);
     assert_eq!(web[1].volumes_total, 6_000);
@@ -89,7 +89,7 @@ fn round_trips_container_disk_and_scopes_by_id() {
     // scoping must not leak across ids
     assert!(s.container_disk_latest_one("nope").unwrap().is_none());
     assert!(
-        s.container_disk_history("nope", 0, i64::MAX)
+        s.container_disk_history("nope", 0, i64::MAX, None)
             .unwrap()
             .is_empty()
     );
@@ -136,11 +136,11 @@ fn downsampling_collapses_aged_storage_rows_per_entity() {
 
     s.downsample(now).unwrap();
 
-    let disks = s.disk_history(0, i64::MAX).unwrap();
+    let disks = s.disk_history(0, i64::MAX, None).unwrap();
     assert_eq!(disks.len(), 1, "two aged disk rows collapse to one bucket");
     assert!((disks[0].used_percent - 15.0).abs() < 0.01, "averaged");
 
-    let cds = s.container_disk_history("web", 0, i64::MAX).unwrap();
+    let cds = s.container_disk_history("web", 0, i64::MAX, None).unwrap();
     assert_eq!(
         cds.len(),
         1,
@@ -148,4 +148,22 @@ fn downsampling_collapses_aged_storage_rows_per_entity() {
     );
     assert_eq!(cds[0].writable_layer, 200, "integer average of 100 and 300");
     assert_eq!(cds[0].volumes_total, 2_000);
+}
+
+#[test]
+fn disk_history_buckets_keep_one_row_per_mount() {
+    let s = Store::open_in_memory().unwrap();
+    s.insert_disk_batch(1_000, &[disk("/", 10.0), disk("/data", 20.0)])
+        .unwrap();
+    s.insert_disk_batch(1_500, &[disk("/", 30.0), disk("/data", 40.0)])
+        .unwrap();
+    let rows = s.disk_history(0, i64::MAX, Some(1_000)).unwrap();
+    let got: Vec<_> = rows
+        .iter()
+        .map(|r| (r.time, r.mount.as_str(), r.used_percent, r.used))
+        .collect();
+    assert_eq!(
+        got,
+        vec![(1_000, "/", 20.0, 60), (1_000, "/data", 30.0, 60)]
+    );
 }

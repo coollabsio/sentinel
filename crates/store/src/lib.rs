@@ -107,6 +107,8 @@ impl Store {
     fn from_writer(conn: rusqlite::Connection, path: Option<&Path>) -> Result<Self, StoreError> {
         Self::init_conn(&conn)?;
         schema::migrate_legacy(&conn)?;
+        // Before `apply`, so its `time` indexes are not built on old tables.
+        schema::cluster_container_tables(&conn)?;
         schema::apply(&conn)?;
         let writer = Arc::new(Mutex::new(conn));
 

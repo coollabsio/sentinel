@@ -443,6 +443,17 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "bucket_ms",
+            "in": "query",
+            "description": "Window width in milliseconds. Rows are averaged per epoch-aligned\nwindow and `time` is the window start. Omit for raw rows.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -562,6 +573,17 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "bucket_ms",
+            "in": "query",
+            "description": "Window width in milliseconds. Rows are averaged per epoch-aligned\nwindow and `time` is the window start. Omit for raw rows.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -630,6 +652,17 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "bucket_ms",
+            "in": "query",
+            "description": "Window width in milliseconds. Rows are averaged per epoch-aligned\nwindow and `time` is the window start. Omit for raw rows.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -697,6 +730,17 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "bucket_ms",
+            "in": "query",
+            "description": "Window width in milliseconds. Rows are averaged per epoch-aligned\nwindow and `time` is the window start. Omit for raw rows.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
             }
           }
         ],
@@ -826,6 +870,17 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "bucket_ms",
+            "in": "query",
+            "description": "Window width in milliseconds. Rows are averaged per epoch-aligned\nwindow and `time` is the window start. Omit for raw rows.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -920,6 +975,17 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "bucket_ms",
+            "in": "query",
+            "description": "Window width in milliseconds. Rows are averaged per epoch-aligned\nwindow and `time` is the window start. Omit for raw rows.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
             }
           }
         ],
@@ -1046,6 +1112,17 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "bucket_ms",
+            "in": "query",
+            "description": "Window width in milliseconds. Rows are averaged per epoch-aligned\nwindow and `time` is the window start. Omit for raw rows.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -1137,6 +1214,17 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "bucket_ms",
+            "in": "query",
+            "description": "Window width in milliseconds. Rows are averaged per epoch-aligned\nwindow and `time` is the window start. Omit for raw rows.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
             }
           }
         ],
@@ -1236,6 +1324,17 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "bucket_ms",
+            "in": "query",
+            "description": "Window width in milliseconds. Rows are averaged per epoch-aligned\nwindow and `time` is the window start. Omit for raw rows.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
             }
           }
         ],
