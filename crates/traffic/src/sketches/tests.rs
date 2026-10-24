@@ -226,6 +226,25 @@ fn uniques_from_bytes_rejects_incompatible_precision() {
     );
 }
 
+#[test]
+fn uniques_merge_bytes_unions_and_rejects_incompatible_precision() {
+    let mut other = Uniques::new();
+    for i in 0..3u32 {
+        other.add_ip(IpAddr::V4(Ipv4Addr::from(i)));
+    }
+    let mut a = Uniques::new();
+    a.add_ip(IpAddr::V4(Ipv4Addr::from(2u32)));
+    a.add_ip(IpAddr::V4(Ipv4Addr::from(9u32)));
+
+    a.merge_bytes(&other.to_bytes()).unwrap();
+    assert_eq!(a.count(), 4);
+
+    let bytes = postcard::to_stdvec(&other_precision_hll()).unwrap();
+    assert!(a.merge_bytes(&bytes).is_err());
+    assert!(a.merge_bytes(b"garbage").is_err());
+    assert_eq!(a.count(), 4, "a rejected sketch must not change the union");
+}
+
 /// Defense-in-depth: even if an incompatible sketch somehow reaches
 /// `merge_from` directly (bypassing `from_bytes`'s validation), it must
 /// degrade gracefully (skip the merge) rather than panic.

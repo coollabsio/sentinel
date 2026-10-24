@@ -321,3 +321,60 @@ fn downsample_keeps_container_series_separate() {
     assert!((web[0].percent - 10.0).abs() < 1e-9);
     assert!((db[0].percent - 20.0).abs() < 1e-9);
 }
+
+/// The cleanup guard keeps the 10 newest times of the whole table, also when
+/// they are spread over containers with different histories.
+#[test]
+fn cleanup_keeps_the_ten_newest_times_across_containers() {
+    let s = Store::open_in_memory().unwrap();
+    let now = 100 * DAY;
+    let old = now - 30 * DAY;
+    let sample = |id: &str| store::ContainerSample {
+        container_id: id.into(),
+        cpu_percent: 1.0,
+        mem_total: 1,
+        mem_available: 1,
+        mem_used: 1,
+        mem_used_percent: 1.0,
+        mem_free: 1,
+    };
+    for i in 0..5 {
+        s.insert_container_batch(old + i, &[sample("web")]).unwrap();
+    }
+    for i in 3..12 {
+        s.insert_container_batch(old + i, &[sample("db")]).unwrap();
+    }
+    s.cleanup(7, now).unwrap();
+    // Distinct times are old+0..=old+11, so old+2..=old+11 are kept.
+    let times = |id| {
+        s.container_cpu_history(id, 0, i64::MAX, None)
+            .unwrap()
+            .iter()
+            .map(|r| r.time - old)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(times("web"), vec![2, 3, 4]);
+    assert_eq!(times("db"), (3..12).collect::<Vec<_>>());
+}
+
+#[test]
+fn release_free_pages_shrinks_the_file_after_cleanup() {
+    let dir = std::env::temp_dir().join(format!("sentinel-release-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("m.sqlite");
+    let s = Store::open(&path).unwrap();
+    let now = 100 * DAY;
+    for i in 0..20_000 {
+        s.insert_cpu(now - 30 * DAY + i, 1.0).unwrap();
+    }
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let full = std::fs::metadata(&path).unwrap().len();
+
+    s.cleanup(7, now).unwrap();
+    assert!(s.release_free_pages().unwrap() > 0);
+    assert!(std::fs::metadata(&path).unwrap().len() < full / 2);
+    std::fs::remove_dir_all(&dir).ok();
+}

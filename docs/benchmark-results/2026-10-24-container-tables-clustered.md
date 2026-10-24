@@ -78,3 +78,46 @@ after, of which 354 MB are free pages that SQLite reuses for new rows: the live 
 - Reading the old table in rowid order is key: `ORDER BY container_id, time` made the copy 7× slower
   (one random lookup per row). Building the `time` index after the copy saved another ~20%.
 - Downsample and cleanup are ~6–9% slower (they now go through the `time` index); they run once a day.
+  The follow-up below removes that index.
+
+## Follow-up: no `time` index on the cpu, memory and network container tables
+
+The `time` index made each row live in two B-trees. Retention and downsampling read a time range
+over all containers, which a sequential scan of the clustered table does faster. Only
+`container_disk_usage` keeps its `time` index, for the "latest disk cycle" read. Cleanup keeps
+the 10 newest times of each table: it now reads them from each container's 10 newest rows (primary
+key), not from a sort of every row. Downsample groups by `(container_id, minute)`, so the insert
+goes in primary-key order, and it takes the row count from the `DELETE`, not from a `COUNT(*)` scan.
+
+Synthetic old-layout dataset (49 containers, 1.73M rows per table, 631 MB), tmpfs, `Store` API,
+4 interleaved runs each, same host as above:
+
+| Operation | Before | After |
+|---|---|---|
+| Startup rebuild (all 4 tables) | 5.3–5.8 s | 3.9–4.1 s |
+| Downsample one 12 h window (1.28M rows) | 2.6–3.1 s | 0.98–1.06 s |
+| Retention cleanup (226k rows deleted) | 348–425 ms | 151–162 ms |
+| One collector insert cycle (49 rows) | 0.24–0.33 ms | 0.24–0.27 ms |
+| Live data after rebuild | 291 MB | 192 MB |
+
+The table contents after rebuild, downsample and cleanup are identical before and after (SHA-1 of
+each container table in `(container_id, time)` order).
+
+
+## Follow-up: file compaction
+
+The metrics database now uses `auto_vacuum=INCREMENTAL`. A database created before this switches
+once at startup with one `VACUUM`, which also gives back the pages freed by the rebuild. After each
+daily retention pass, `PRAGMA incremental_vacuum` gives back the pages that cleanup and downsample
+freed. The `VACUUM` needs free disk for about two copies of the live data. If it fails, the
+database stays valid and the next start tries again.
+
+Same synthetic dataset, real `sentinel` binary, NVMe:
+
+| Step | Result |
+|---|---|
+| Rebuild (4 tables) | 4.7 s |
+| One-time `VACUUM` | 1.0 s |
+| File size | 631 MB → 189 MB |
+| `/api/health` during startup | 200 |
+| Second start | no rebuild, no `VACUUM` |

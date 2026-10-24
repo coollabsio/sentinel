@@ -237,6 +237,18 @@ impl Uniques {
         }
     }
 
+    /// Decodes a [`Self::to_bytes`] sketch and merges it into `self`. Cheaper
+    /// than [`Self::from_bytes`] plus [`Self::merge_from`]: the one merge
+    /// already rejects an incompatible precision before it changes `self`, so
+    /// no probe merge is needed.
+    pub fn merge_bytes(&mut self, b: &[u8]) -> Result<(), TrafficError> {
+        let hll: HllType =
+            postcard::from_bytes(b).map_err(|e| TrafficError::Codec(e.to_string()))?;
+        self.0
+            .merge(&hll)
+            .map_err(|e| TrafficError::Codec(format!("incompatible HLL precision: {e}")))
+    }
+
     /// Estimates the number of distinct IPs seen.
     pub fn count(&mut self) -> u64 {
         self.0.count().round() as u64

@@ -85,8 +85,8 @@ fn migration_is_idempotent() {
 }
 
 #[test]
-fn migration_leaves_free_pages_for_sqlite_to_reuse() {
-    let dir = tmpdir("no-vacuum");
+fn open_compacts_an_existing_database_once() {
+    let dir = tmpdir("compact");
     let path = dir.join("m.sqlite");
     let _ = std::fs::remove_file(&path);
     legacy_db(&path);
@@ -102,17 +102,20 @@ fn migration_leaves_free_pages_for_sqlite_to_reuse() {
         .unwrap();
         c.execute("DROP TABLE migration_padding", []).unwrap();
     }
+    let before = std::fs::metadata(&path).unwrap().len();
 
-    Store::open(&path).unwrap();
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 2);
+    drop(s);
 
     let c = rusqlite::Connection::open(&path).unwrap();
-    let free_pages: i64 = c
-        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
-        .unwrap();
-    assert!(
-        free_pages > 0,
-        "startup migration must not VACUUM reusable free pages"
-    );
+    let pragma = |name: &str| -> i64 {
+        c.query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(pragma("freelist_count"), 0);
+    assert_eq!(pragma("auto_vacuum"), 2, "INCREMENTAL");
+    assert!(std::fs::metadata(&path).unwrap().len() < before / 2);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -543,10 +546,11 @@ fn failed_container_rebuild_keeps_history_in_the_old_layout() {
         let c = rusqlite::Connection::open(&path).unwrap();
         c.execute_batch(
             r#"
-            CREATE TABLE container_cpu_usage (
-                time INTEGER NOT NULL, container_id TEXT NOT NULL, percent REAL NOT NULL,
+            CREATE TABLE container_disk_usage (
+                time INTEGER NOT NULL, container_id TEXT NOT NULL,
+                writable_layer INTEGER NOT NULL, volumes_total INTEGER NOT NULL,
                 PRIMARY KEY (time, container_id));
-            INSERT INTO container_cpu_usage VALUES (1000, 'web', 10.0), (2000, 'web', 'x');
+            INSERT INTO container_disk_usage VALUES (1000, 'web', 1, 2), (2000, 'web', 'x', 2);
             CREATE TABLE cpu_usage (time INTEGER PRIMARY KEY, percent REAL NOT NULL) STRICT;
             INSERT INTO cpu_usage VALUES (1000, 1.0);
             "#,
@@ -560,7 +564,7 @@ fn failed_container_rebuild_keeps_history_in_the_old_layout() {
         "the database must not be moved aside"
     );
     assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 1);
-    assert!(!without_rowid(&path, "container_cpu_usage"));
+    assert!(!without_rowid(&path, "container_disk_usage"));
     assert!(without_rowid(&path, "container_memory_usage"));
     drop(s);
 
@@ -568,7 +572,7 @@ fn failed_container_rebuild_keeps_history_in_the_old_layout() {
     let c = rusqlite::Connection::open(&path).unwrap();
     let time_index: bool = c
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_ccu_time')",
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_cdu_time')",
             [],
             |r| r.get(0),
         )

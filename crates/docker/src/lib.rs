@@ -133,11 +133,12 @@ impl DockerClient {
     }
 
     pub async fn stats(&self, id: &str) -> Result<ContainerStats, DockerError> {
-        // stream=false yields exactly one datapoint, matching the Go client's
-        // /containers/{id}/stats?stream=false request.
+        // one-shot returns at once instead of waiting a ~1 s collection cycle
+        // inside dockerd for a second sample, so `pre_*` fields are zero. The
+        // collector takes the CPU baseline from its previous sample instead.
         let opts = StatsOptions {
             stream: false,
-            one_shot: false,
+            one_shot: true,
         };
         let mut stream = self.inner.stats(id, Some(opts));
         let s = stream

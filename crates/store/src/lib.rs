@@ -114,6 +114,11 @@ impl Store {
             tracing::warn!(error = %e, "container table rebuild failed, keeping the old layout");
         }
         schema::apply(&conn)?;
+        // A failed VACUUM (e.g. no disk for the copy) leaves a valid database
+        // that is not compacted; the next start tries again.
+        if let Err(e) = schema::enable_incremental_vacuum(&conn) {
+            tracing::warn!(error = %e, "metrics database compaction failed");
+        }
         let writer = Arc::new(Mutex::new(conn));
 
         let reader = match path {
@@ -141,6 +146,9 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "cache_size", CACHE_SIZE_KIB)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Takes effect only before the first table exists. Older databases
+        // switch through the VACUUM in `schema::enable_incremental_vacuum`.
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         Ok(())
     }
 

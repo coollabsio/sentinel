@@ -87,7 +87,7 @@ struct StatsAcc {
     s4xx: i64,
     s5xx: i64,
     digests: Vec<LatencyDigest>,
-    uniques: Option<Uniques>,
+    uniques: Uniques,
 }
 
 /// Per-`(coarse bucket, app, path)` accumulator for the paths table.
@@ -161,11 +161,8 @@ fn merge_stats(rows: Vec<StatsRow>, existing: Vec<StatsRow>, bucket: i64) -> Vec
         if let Some(digest) = decode_digest(&row.latency_tdigest) {
             acc.digests.push(digest);
         }
-        if let Some(uniques) = decode_uniques(&row.uniques_hll) {
-            match &mut acc.uniques {
-                Some(existing) => existing.merge_from(&uniques),
-                None => acc.uniques = Some(uniques),
-            }
+        if let Err(err) = acc.uniques.merge_bytes(&row.uniques_hll) {
+            tracing::warn!(error = %err, "compaction: skipping undecodable uniques sketch");
         }
     }
 
@@ -185,7 +182,7 @@ fn merge_stats(rows: Vec<StatsRow>, existing: Vec<StatsRow>, bucket: i64) -> Vec
             latency_tdigest: LatencyDigest::merge(&acc.digests).to_bytes(),
             // NOT NULL: write an empty-but-valid sketch even if none decoded,
             // so the next tier up can still decode it.
-            uniques_hll: acc.uniques.unwrap_or_default().to_bytes(),
+            uniques_hll: acc.uniques.to_bytes(),
         })
         .collect()
 }
@@ -333,18 +330,6 @@ fn decode_digest(bytes: &[u8]) -> Option<LatencyDigest> {
         Ok(digest) => Some(digest),
         Err(err) => {
             tracing::warn!(error = %err, "compaction: skipping undecodable latency digest");
-            None
-        }
-    }
-}
-
-/// Decodes a persisted HLL sketch, degrading to "no contribution" on a
-/// corrupt BLOB. See [`decode_digest`].
-fn decode_uniques(bytes: &[u8]) -> Option<Uniques> {
-    match Uniques::from_bytes(bytes) {
-        Ok(uniques) => Some(uniques),
-        Err(err) => {
-            tracing::warn!(error = %err, "compaction: skipping undecodable uniques sketch");
             None
         }
     }
