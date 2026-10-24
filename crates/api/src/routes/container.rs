@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
-use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
+use crate::routes::cpu::{MetricsHistoryQuery, internal_error, resolve_history};
 use crate::routes::network::to_network_usage;
 use crate::time::format_millis;
 use crate::types::{
@@ -36,7 +36,7 @@ pub fn routes() -> OpenApiRouter<Arc<AppState>> {
     description = "Retrieve network throughput history (bytes/sec, summed across the container's interfaces) for a specific Docker container",
     params(
         ("containerId" = String, Path, description = "Exact container display name recorded by Sentinel"),
-        HistoryQuery
+        MetricsHistoryQuery
     ),
     responses(
         (status = 200, description = "Container network usage history", body = Vec<NetworkUsage>),
@@ -49,10 +49,10 @@ pub fn routes() -> OpenApiRouter<Arc<AppState>> {
 async fn network_history(
     Path(container_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Query(q): Query<HistoryQuery>,
+    Query(q): Query<MetricsHistoryQuery>,
 ) -> Response {
     let id = container_id;
-    let (from, to) = match resolve_range(&q, DEFAULT_FROM) {
+    let (from, to, bucket_ms) = match resolve_history(&q, DEFAULT_FROM) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -62,8 +62,10 @@ async fn network_history(
         Err(e) => return internal_error(e),
     };
     let store = state.store.clone();
-    let result =
-        tokio::task::spawn_blocking(move || store.container_network_history(&id, from, to)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        store.container_network_history(&id, from, to, bucket_ms)
+    })
+    .await;
     drop(permit);
     let rows = match result {
         Ok(Ok(rows)) => rows,
@@ -87,7 +89,7 @@ async fn network_history(
     description = "Retrieve CPU usage history for a specific Docker container",
     params(
         ("containerId" = String, Path, description = "Exact container display name recorded by Sentinel"),
-        HistoryQuery
+        MetricsHistoryQuery
     ),
     responses(
         (status = 200, description = "Container CPU usage history", body = Vec<CpuUsage>),
@@ -100,10 +102,10 @@ async fn network_history(
 async fn cpu_history(
     Path(container_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Query(q): Query<HistoryQuery>,
+    Query(q): Query<MetricsHistoryQuery>,
 ) -> Response {
     let id = container_id;
-    let (from, to) = match resolve_range(&q, DEFAULT_FROM) {
+    let (from, to, bucket_ms) = match resolve_history(&q, DEFAULT_FROM) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -114,7 +116,8 @@ async fn cpu_history(
     };
     let store = state.store.clone();
     let result =
-        tokio::task::spawn_blocking(move || store.container_cpu_history(&id, from, to)).await;
+        tokio::task::spawn_blocking(move || store.container_cpu_history(&id, from, to, bucket_ms))
+            .await;
     drop(permit);
     let rows = match result {
         Ok(Ok(rows)) => rows,
@@ -142,7 +145,7 @@ async fn cpu_history(
     description = "Retrieve memory usage history for a specific Docker container",
     params(
         ("containerId" = String, Path, description = "Exact container display name recorded by Sentinel"),
-        HistoryQuery
+        MetricsHistoryQuery
     ),
     responses(
         (status = 200, description = "Container memory usage history", body = Vec<MemUsage>),
@@ -155,10 +158,10 @@ async fn cpu_history(
 async fn memory_history(
     Path(container_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Query(q): Query<HistoryQuery>,
+    Query(q): Query<MetricsHistoryQuery>,
 ) -> Response {
     let id = container_id;
-    let (from, to) = match resolve_range(&q, DEFAULT_FROM) {
+    let (from, to, bucket_ms) = match resolve_history(&q, DEFAULT_FROM) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -168,8 +171,10 @@ async fn memory_history(
         Err(e) => return internal_error(e),
     };
     let store = state.store.clone();
-    let result =
-        tokio::task::spawn_blocking(move || store.container_memory_history(&id, from, to)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        store.container_memory_history(&id, from, to, bucket_ms)
+    })
+    .await;
     drop(permit);
     let rows = match result {
         Ok(Ok(rows)) => rows,
@@ -240,7 +245,7 @@ async fn disk_current(
     description = "Historical writable-layer and volume sizes for a specific container",
     params(
         ("containerId" = String, Path, description = "Exact container display name recorded by Sentinel"),
-        HistoryQuery
+        MetricsHistoryQuery
     ),
     responses(
         (status = 200, description = "Container storage history", body = Vec<ContainerDiskUsage>),
@@ -253,10 +258,10 @@ async fn disk_current(
 async fn disk_history(
     Path(container_id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Query(q): Query<HistoryQuery>,
+    Query(q): Query<MetricsHistoryQuery>,
 ) -> Response {
     let id = container_id;
-    let (from, to) = match resolve_range(&q, DEFAULT_FROM) {
+    let (from, to, bucket_ms) = match resolve_history(&q, DEFAULT_FROM) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -267,7 +272,8 @@ async fn disk_history(
     };
     let store = state.store.clone();
     let result =
-        tokio::task::spawn_blocking(move || store.container_disk_history(&id, from, to)).await;
+        tokio::task::spawn_blocking(move || store.container_disk_history(&id, from, to, bucket_ms))
+            .await;
     drop(permit);
     let rows = match result {
         Ok(Ok(rows)) => rows,

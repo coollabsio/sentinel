@@ -45,21 +45,23 @@ fn migrates_legacy_text_schema_preserving_data() {
 
     let s = Store::open(&path).unwrap();
 
-    let cpu = s.cpu_history(0, i64::MAX).unwrap();
+    let cpu = s.cpu_history(0, i64::MAX, None).unwrap();
     assert_eq!(cpu.len(), 2);
     assert_eq!(cpu[0].time, 1_700_000_000_000);
     assert!((cpu[0].percent - 42.50).abs() < 1e-9);
 
-    let mem = s.memory_history(0, i64::MAX).unwrap();
+    let mem = s.memory_history(0, i64::MAX, None).unwrap();
     assert_eq!(mem.len(), 1);
     assert_eq!(mem[0].total, 16_000_000_000);
     assert!((mem[0].used_percent - 43.75).abs() < 1e-9);
 
-    let ccpu = s.container_cpu_history("web", 0, i64::MAX).unwrap();
+    let ccpu = s.container_cpu_history("web", 0, i64::MAX, None).unwrap();
     assert_eq!(ccpu.len(), 1);
     assert!((ccpu[0].percent - 10.0).abs() < 1e-9);
 
-    let cmem = s.container_memory_history("web", 0, i64::MAX).unwrap();
+    let cmem = s
+        .container_memory_history("web", 0, i64::MAX, None)
+        .unwrap();
     assert_eq!(cmem.len(), 1);
     assert_eq!(cmem[0].used, 60);
 
@@ -77,7 +79,7 @@ fn migration_is_idempotent() {
         Store::open(&path).unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 2);
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 2);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -127,10 +129,12 @@ fn migrates_available_legacy_tables_when_one_is_missing() {
         .unwrap();
 
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 2);
-    assert!(s.memory_history(0, i64::MAX).unwrap().is_empty());
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 2);
+    assert!(s.memory_history(0, i64::MAX, None).unwrap().is_empty());
     assert_eq!(
-        s.container_cpu_history("web", 0, i64::MAX).unwrap().len(),
+        s.container_cpu_history("web", 0, i64::MAX, None)
+            .unwrap()
+            .len(),
         1
     );
 
@@ -149,10 +153,12 @@ fn detects_legacy_schema_when_cpu_table_is_missing() {
         .unwrap();
 
     let s = Store::open(&path).unwrap();
-    assert!(s.cpu_history(0, i64::MAX).unwrap().is_empty());
-    assert_eq!(s.memory_history(0, i64::MAX).unwrap().len(), 1);
+    assert!(s.cpu_history(0, i64::MAX, None).unwrap().is_empty());
+    assert_eq!(s.memory_history(0, i64::MAX, None).unwrap().len(), 1);
     assert_eq!(
-        s.container_cpu_history("web", 0, i64::MAX).unwrap().len(),
+        s.container_cpu_history("web", 0, i64::MAX, None)
+            .unwrap()
+            .len(),
         1
     );
 
@@ -218,7 +224,7 @@ fn skips_unparseable_rows_instead_of_failing() {
     let s = Store::open(&path).unwrap();
     // only the two originally-seeded good rows survive; all three malformed
     // rows above are dropped, none silently coerced to a fabricated 0/0.0
-    let rows = s.cpu_history(0, i64::MAX).unwrap();
+    let rows = s.cpu_history(0, i64::MAX, None).unwrap();
     assert_eq!(rows.len(), 2, "got {rows:?}");
     assert!(
         rows.iter()
@@ -254,7 +260,7 @@ fn skips_rows_with_a_genuine_sql_null_not_just_unparseable_text() {
     }
 
     let s = Store::open(&path).unwrap();
-    let rows = s.cpu_history(0, i64::MAX).unwrap();
+    let rows = s.cpu_history(0, i64::MAX, None).unwrap();
     assert_eq!(
         rows.len(),
         2,
@@ -325,13 +331,13 @@ fn migrates_a_large_legacy_database_row_for_row() {
 
     let s = Store::open(&path).unwrap();
 
-    let cpu = s.cpu_history(0, i64::MAX).unwrap();
+    let cpu = s.cpu_history(0, i64::MAX, None).unwrap();
     assert_eq!(cpu.len() as i64, N + 2, "2 seeded + {N} bulk cpu rows");
-    let mem = s.memory_history(0, i64::MAX).unwrap();
+    let mem = s.memory_history(0, i64::MAX, None).unwrap();
     assert_eq!(mem.len() as i64, N + 1);
     for name in ["web", "db"] {
-        let ccpu = s.container_cpu_history(name, 0, i64::MAX).unwrap();
-        let cmem = s.container_memory_history(name, 0, i64::MAX).unwrap();
+        let ccpu = s.container_cpu_history(name, 0, i64::MAX, None).unwrap();
+        let cmem = s.container_memory_history(name, 0, i64::MAX, None).unwrap();
         // "web" also has the single row legacy_db() seeded
         let seeded = i64::from(name == "web");
         assert_eq!(ccpu.len() as i64, N + seeded, "{name} cpu");
@@ -342,20 +348,20 @@ fn migrates_a_large_legacy_database_row_for_row() {
     for i in [0i64, N / 2, N - 1] {
         let t = 1_700_000_100_000 + i * 1_000;
         let expected = i as f64 / 100.0;
-        let cpu = s.cpu_history(t, t).unwrap();
+        let cpu = s.cpu_history(t, t, None).unwrap();
         assert_eq!(cpu.len(), 1, "cpu row at {t}");
         assert!((cpu[0].percent - expected).abs() < 1e-9, "cpu at {t}");
 
-        let mem = s.memory_history(t, t).unwrap();
+        let mem = s.memory_history(t, t, None).unwrap();
         assert_eq!(mem.len(), 1);
         assert_eq!(mem[0].used, 7_000_000_000 + i as u64);
         assert!((mem[0].used_percent - expected).abs() < 1e-9);
 
-        let ccpu = s.container_cpu_history("db", t, t).unwrap();
+        let ccpu = s.container_cpu_history("db", t, t, None).unwrap();
         assert_eq!(ccpu.len(), 1);
         assert!((ccpu[0].percent - expected).abs() < 1e-9);
 
-        let cmem = s.container_memory_history("db", t, t).unwrap();
+        let cmem = s.container_memory_history("db", t, t, None).unwrap();
         assert_eq!(cmem.len(), 1);
         assert_eq!(cmem[0].used, 60 + i as u64);
         assert_eq!(cmem[0].free, 40 + i as u64);
@@ -381,9 +387,9 @@ fn unreadable_database_is_moved_aside_instead_of_failing_startup() {
     let s = Store::open(&path).expect("open must recover, not error");
 
     // fresh, empty, typed database usable immediately
-    assert!(s.cpu_history(0, i64::MAX).unwrap().is_empty());
+    assert!(s.cpu_history(0, i64::MAX, None).unwrap().is_empty());
     s.insert_cpu(1_000, 1.0).unwrap();
-    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 1);
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 1);
 
     assert!(
         backup.exists(),
@@ -406,7 +412,7 @@ fn fresh_database_needs_no_migration() {
 
     let s = Store::open(&path).unwrap();
     s.insert_cpu(1_000, 1.0).unwrap();
-    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 1);
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 1);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -434,4 +440,139 @@ fn drops_unused_container_logs_table() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Typed schema of the container tables before they were clustered.
+fn rowid_container_db(path: &std::path::Path) {
+    let c = rusqlite::Connection::open(path).unwrap();
+    c.execute_batch(
+        r#"
+        CREATE TABLE container_cpu_usage (
+            time INTEGER NOT NULL, container_id TEXT NOT NULL, percent REAL NOT NULL,
+            PRIMARY KEY (time, container_id)) STRICT;
+        CREATE TABLE container_memory_usage (
+            time INTEGER NOT NULL, container_id TEXT NOT NULL, total INTEGER NOT NULL,
+            available INTEGER NOT NULL, used INTEGER NOT NULL, used_percent REAL NOT NULL,
+            free INTEGER NOT NULL, PRIMARY KEY (time, container_id)) STRICT;
+        CREATE INDEX idx_ccu_container_time ON container_cpu_usage (container_id, time);
+        CREATE INDEX idx_cmu_container_time ON container_memory_usage (container_id, time);
+
+        INSERT INTO container_cpu_usage VALUES (1000, 'web', 10.0), (1000, 'db', 20.0),
+                                               (2000, 'web', 30.0), (2000, 'db', 40.0);
+        INSERT INTO container_memory_usage VALUES (1000, 'web', 100, 40, 60, 60.0, 40);
+        "#,
+    )
+    .unwrap();
+}
+
+fn without_rowid(path: &std::path::Path, table: &str) -> bool {
+    let c = rusqlite::Connection::open(path).unwrap();
+    c.query_row(
+        "SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
+        (table,),
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn clusters_rowid_container_tables_preserving_rows() {
+    let dir = tmpdir("cluster");
+    let path = dir.join("metrics.sqlite");
+    rowid_container_db(&path);
+    assert!(!without_rowid(&path, "container_cpu_usage"));
+
+    let s = Store::open(&path).unwrap();
+    for table in [
+        "container_cpu_usage",
+        "container_memory_usage",
+        "container_disk_usage",
+        "container_network_usage",
+    ] {
+        assert!(without_rowid(&path, table), "{table}");
+    }
+    let web = s.container_cpu_history("web", 0, i64::MAX, None).unwrap();
+    assert_eq!(
+        web.iter().map(|r| (r.time, r.percent)).collect::<Vec<_>>(),
+        vec![(1000, 10.0), (2000, 30.0)]
+    );
+    assert_eq!(
+        s.container_cpu_history("db", 0, i64::MAX, None)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        s.container_memory_history("web", 0, i64::MAX, None)
+            .unwrap()[0]
+            .used,
+        60
+    );
+    drop(s);
+
+    // The old (container_id, time) index went with the old table.
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let old_index: bool = c
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_ccu_container_time')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!old_index);
+    drop(c);
+
+    // A second open finds nothing to rebuild and keeps the rows.
+    let s = Store::open(&path).unwrap();
+    assert_eq!(
+        s.container_cpu_history("web", 0, i64::MAX, None)
+            .unwrap()
+            .len(),
+        2
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn failed_container_rebuild_keeps_history_in_the_old_layout() {
+    let dir = tmpdir("cluster-fail");
+    let path = dir.join("metrics.sqlite");
+    {
+        // Not STRICT, so it can hold a value the STRICT copy rejects: the
+        // rebuild fails like it would on a full disk.
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            r#"
+            CREATE TABLE container_cpu_usage (
+                time INTEGER NOT NULL, container_id TEXT NOT NULL, percent REAL NOT NULL,
+                PRIMARY KEY (time, container_id));
+            INSERT INTO container_cpu_usage VALUES (1000, 'web', 10.0), (2000, 'web', 'x');
+            CREATE TABLE cpu_usage (time INTEGER PRIMARY KEY, percent REAL NOT NULL) STRICT;
+            INSERT INTO cpu_usage VALUES (1000, 1.0);
+            "#,
+        )
+        .unwrap();
+    }
+
+    let s = Store::open(&path).unwrap();
+    assert!(
+        !path.with_extension("legacy-backup.sqlite").exists(),
+        "the database must not be moved aside"
+    );
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 1);
+    assert!(!without_rowid(&path, "container_cpu_usage"));
+    assert!(without_rowid(&path, "container_memory_usage"));
+    drop(s);
+
+    // The old layout gets no redundant `time` index.
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let time_index: bool = c
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_ccu_time')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!time_index);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

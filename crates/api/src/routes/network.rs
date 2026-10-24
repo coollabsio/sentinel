@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
-use crate::routes::cpu::{HistoryQuery, internal_error, resolve_range};
+use crate::routes::cpu::{MetricsHistoryQuery, internal_error, resolve_history};
 use crate::time::format_millis;
 use crate::types::{BadRequestError, InternalServerError, NetworkUsage, UnauthorizedError};
 
@@ -53,7 +53,7 @@ async fn current(State(state): State<Arc<AppState>>) -> Response {
     tag = "System Metrics",
     summary = "Get network usage history",
     description = "Historical host network throughput (bytes/sec) with optional date range filtering",
-    params(HistoryQuery),
+    params(MetricsHistoryQuery),
     responses(
         (status = 200, description = "Network usage history", body = Vec<NetworkUsage>),
         (status = 400, response = BadRequestError),
@@ -62,8 +62,11 @@ async fn current(State(state): State<Arc<AppState>>) -> Response {
     ),
     security(("bearerAuth" = []))
 )]
-async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuery>) -> Response {
-    let (from, to) = match resolve_range(&q, "1970-01-01T00:00:00Z") {
+async fn history(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<MetricsHistoryQuery>,
+) -> Response {
+    let (from, to, bucket_ms) = match resolve_history(&q, "1970-01-01T00:00:00Z") {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -73,7 +76,8 @@ async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuer
         Err(e) => return internal_error(e),
     };
     let store = state.store.clone();
-    let result = tokio::task::spawn_blocking(move || store.network_history(from, to)).await;
+    let result =
+        tokio::task::spawn_blocking(move || store.network_history(from, to, bucket_ms)).await;
     drop(permit);
     let rows = match result {
         Ok(Ok(rows)) => rows,

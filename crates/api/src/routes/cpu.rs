@@ -24,6 +24,24 @@ pub struct HistoryQuery {
     pub to: Option<String>,
 }
 
+/// [`HistoryQuery`] plus an optional averaging window, for the metric history
+/// endpoints. A separate struct so the traffic endpoints that reuse
+/// `HistoryQuery` do not document a param they ignore.
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct MetricsHistoryQuery {
+    /// Start date in ISO 8601 format (UTC). Defaults to the Unix epoch
+    /// (all recorded history) when omitted.
+    pub from: Option<String>,
+    /// End date in ISO 8601 format (UTC). Defaults to now when omitted.
+    pub to: Option<String>,
+    /// Window width in milliseconds. Rows are averaged per epoch-aligned
+    /// window and `time` is the window start. Omit for raw rows.
+    // A `String` so `?bucket_ms=` (empty) means raw rows, like `from`/`to`.
+    #[param(value_type = Option<i64>, minimum = 1)]
+    pub bucket_ms: Option<String>,
+}
+
 /// Resolves `from`/`to` into a millisecond range, applying the Go defaults.
 /// The Response error type is necessary here for axum's flexibility in returning
 /// different response types (bad_request or other errors).
@@ -52,11 +70,42 @@ pub fn resolve_range(q: &HistoryQuery, default_from: &str) -> Result<(i64, i64),
     Ok((from_ms, to_ms))
 }
 
+/// [`resolve_range`] plus the optional `bucket_ms` window width.
+#[allow(clippy::result_large_err)]
+pub fn resolve_history(
+    q: &MetricsHistoryQuery,
+    default_from: &str,
+) -> Result<(i64, i64, Option<i64>), Response> {
+    let range = HistoryQuery {
+        from: q.from.clone(),
+        to: q.to.clone(),
+    };
+    let (from, to) = resolve_range(&range, default_from)?;
+    let bucket_ms = match q.bucket_ms.as_deref().filter(|s| !s.is_empty()) {
+        None => None,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(b) if b > 0 => Some(b),
+            _ => {
+                return Err(error_response(
+                    "Invalid 'bucket_ms'. Use a positive integer",
+                ));
+            }
+        },
+    };
+    Ok((from, to, bucket_ms))
+}
+
 fn bad_request(field: &str) -> Response {
+    error_response(&format!(
+        "Invalid '{field}' date format. Use YYYY-MM-DDTHH:MM:SSZ"
+    ))
+}
+
+fn error_response(error: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(ErrorBody {
-            error: format!("Invalid '{field}' date format. Use YYYY-MM-DDTHH:MM:SSZ"),
+            error: error.to_string(),
         }),
     )
         .into_response()
@@ -108,7 +157,7 @@ async fn current(State(state): State<Arc<AppState>>) -> Response {
     tag = "System Metrics",
     summary = "Get CPU usage history",
     description = "Retrieve historical CPU usage data with optional date range filtering",
-    params(HistoryQuery),
+    params(MetricsHistoryQuery),
     responses(
         (status = 200, description = "Historical CPU usage data", body = Vec<CpuUsage>),
         (status = 400, response = BadRequestError),
@@ -117,8 +166,11 @@ async fn current(State(state): State<Arc<AppState>>) -> Response {
     ),
     security(("bearerAuth" = []))
 )]
-async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuery>) -> Response {
-    let (from, to) = match resolve_range(&q, "1970-01-01T00:00:00Z") {
+async fn history(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<MetricsHistoryQuery>,
+) -> Response {
+    let (from, to, bucket_ms) = match resolve_history(&q, "1970-01-01T00:00:00Z") {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -128,7 +180,7 @@ async fn history(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuer
         Err(e) => return internal_error(e),
     };
     let store = state.store.clone();
-    let result = tokio::task::spawn_blocking(move || store.cpu_history(from, to)).await;
+    let result = tokio::task::spawn_blocking(move || store.cpu_history(from, to, bucket_ms)).await;
     drop(permit);
     let rows = match result {
         Ok(Ok(rows)) => rows,
