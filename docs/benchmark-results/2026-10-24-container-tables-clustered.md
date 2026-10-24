@@ -73,8 +73,8 @@ after, of which 354 MB are free pages that SQLite reuses for new rows: the live 
 
 ## Notes
 - The rebuild runs one transaction and one WAL checkpoint per table, so it needs free disk for about
-  one rebuilt table (~150 MB here). If it fails, the transaction rolls back; like any open failure,
-  the store then moves the file aside and starts fresh.
+  one rebuilt table (~150 MB here). If it fails, the transaction rolls back, the table keeps the old
+  layout and its history, and the rebuild runs again on the next start.
 - Reading the old table in rowid order is key: `ORDER BY container_id, time` made the copy 7× slower
   (one random lookup per row). Building the `time` index after the copy saved another ~20%.
 - Downsample and cleanup are ~6–9% slower (they now go through the `time` index); they run once a day.

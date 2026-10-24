@@ -1,3 +1,4 @@
+use crate::retention::REAL_COLS;
 use crate::{Store, StoreError};
 use rusqlite::OptionalExtension;
 
@@ -181,16 +182,6 @@ const CONTAINER_NETWORK_COLS: &str = "time, container_id, rx_bytes_per_sec, tx_b
 const HOST_STATUS_COLS: &str =
     "uptime_seconds, swap_total, swap_used, swap_free, swap_used_percent, time";
 
-/// Byte columns read back as `i64`, so their averages are cast to INTEGER.
-const INTEGER_COLS: [&str; 6] = [
-    "total",
-    "available",
-    "used",
-    "free",
-    "writable_layer",
-    "volumes_total",
-];
-
 /// History query over `cols`. With `bucket_ms`, rows are averaged per
 /// epoch-aligned window and `time` is the window start; `mount` and
 /// `container_id` stay grouping keys. Same columns either way, so the row
@@ -214,8 +205,9 @@ fn history_sql(
                 keys.push(col);
                 col.to_string()
             }
-            c if INTEGER_COLS.contains(&c) => format!("CAST(AVG({c}) AS INTEGER)"),
-            c => format!("AVG({c})"),
+            c if REAL_COLS.contains(&c) => format!("AVG({c})"),
+            // Rounded like downsampling, so both agree on the same window.
+            c => format!("CAST(ROUND(AVG({c})) AS INTEGER)"),
         })
         .collect::<Vec<_>>()
         .join(", ");

@@ -185,17 +185,17 @@ fn history_averages_per_epoch_aligned_bucket() {
     let got: Vec<_> = rows.iter().map(|r| (r.time, r.percent)).collect();
     assert_eq!(got, vec![(1_000, 15.0), (2_000, 30.0)]);
 
-    // Byte columns stay integers after averaging.
+    // Byte columns stay integers after averaging, rounded like downsampling.
     s.insert_memory(&mem(1_000)).unwrap();
     s.insert_memory(&MemRow {
-        used: 8_000_000_000,
+        used: 8_000_000_001,
         ..mem(1_999)
     })
     .unwrap();
     let rows = s.memory_history(0, i64::MAX, Some(1_000)).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].time, 1_000);
-    assert_eq!(rows[0].used, 7_500_000_000);
+    assert_eq!(rows[0].used, 7_500_000_001);
 }
 
 #[test]

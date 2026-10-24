@@ -532,3 +532,47 @@ fn clusters_rowid_container_tables_preserving_rows() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn failed_container_rebuild_keeps_history_in_the_old_layout() {
+    let dir = tmpdir("cluster-fail");
+    let path = dir.join("metrics.sqlite");
+    {
+        // Not STRICT, so it can hold a value the STRICT copy rejects: the
+        // rebuild fails like it would on a full disk.
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            r#"
+            CREATE TABLE container_cpu_usage (
+                time INTEGER NOT NULL, container_id TEXT NOT NULL, percent REAL NOT NULL,
+                PRIMARY KEY (time, container_id));
+            INSERT INTO container_cpu_usage VALUES (1000, 'web', 10.0), (2000, 'web', 'x');
+            CREATE TABLE cpu_usage (time INTEGER PRIMARY KEY, percent REAL NOT NULL) STRICT;
+            INSERT INTO cpu_usage VALUES (1000, 1.0);
+            "#,
+        )
+        .unwrap();
+    }
+
+    let s = Store::open(&path).unwrap();
+    assert!(
+        !path.with_extension("legacy-backup.sqlite").exists(),
+        "the database must not be moved aside"
+    );
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 1);
+    assert!(!without_rowid(&path, "container_cpu_usage"));
+    assert!(without_rowid(&path, "container_memory_usage"));
+    drop(s);
+
+    // The old layout gets no redundant `time` index.
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let time_index: bool = c
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_ccu_time')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!time_index);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

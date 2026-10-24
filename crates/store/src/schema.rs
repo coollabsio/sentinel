@@ -148,7 +148,11 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(DDL)?;
     for table in &CONTAINER_TABLES {
         conn.execute_batch(table.ddl)?;
-        conn.execute_batch(table.index)?;
+        // A table left in the old layout by a failed rebuild already has a
+        // `(time, container_id)` key, so a `time` index would only cost disk.
+        if is_without_rowid(conn, table.name)? {
+            conn.execute_batch(table.index)?;
+        }
     }
     Ok(())
 }

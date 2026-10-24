@@ -107,8 +107,12 @@ impl Store {
     fn from_writer(conn: rusqlite::Connection, path: Option<&Path>) -> Result<Self, StoreError> {
         Self::init_conn(&conn)?;
         schema::migrate_legacy(&conn)?;
-        // Before `apply`, so its `time` indexes are not built on old tables.
-        schema::cluster_container_tables(&conn)?;
+        // A failed rebuild (e.g. disk full) rolls back. The old layout still
+        // works, so keep the history and retry on the next start instead of
+        // failing the open, which would move the whole database aside.
+        if let Err(e) = schema::cluster_container_tables(&conn) {
+            tracing::warn!(error = %e, "container table rebuild failed, keeping the old layout");
+        }
         schema::apply(&conn)?;
         let writer = Arc::new(Mutex::new(conn));
 

@@ -106,6 +106,7 @@ than the rows it saves, except for disk, where the window is close to the sample
 ## Notes
 - The win is mostly on the client path, not in Sentinel: Coolify moves 13–14× fewer bytes per
   series over SSH and decodes ~1000 rows instead of 13k–28k (PHP decode of 7-day memory was 30 ms).
-- Container history stays the slowest read (20–27 ms): `idx_c*_container_time` is not covering,
-  so each row is a table lookup. A covering index needs a migration on large DBs; not in this change.
+- Container history stays the slowest read here (20–27 ms): `idx_c*_container_time` is not covering,
+  so each row is a table lookup. The clustered container tables fix this; see
+  [2026-10-24-container-tables-clustered.md](2026-10-24-container-tables-clustered.md).
 - `load` / `stress` modes were not run: their load grid does not include history endpoints.
