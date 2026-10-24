@@ -377,13 +377,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             let now = collector::now_millis();
                             let deleted = s.cleanup(days, now)?;
                             let collapsed = s.downsample(now)?;
+                            let pages_released = s.release_free_pages()?;
                             let commands_deleted = command_journal.cleanup(now)?;
-                            Ok::<_, store::StoreError>((deleted, collapsed, commands_deleted))
+                            Ok::<_, store::StoreError>((deleted, collapsed, pages_released, commands_deleted))
                         })
                         .await;
                         match result {
-                            Ok(Ok((deleted, collapsed, commands_deleted))) => tracing::info!(
-                                deleted, collapsed, commands_deleted, retention_days = days, "retention pass complete"
+                            Ok(Ok((deleted, collapsed, pages_released, commands_deleted))) => tracing::info!(
+                                deleted, collapsed, pages_released, commands_deleted, retention_days = days, "retention pass complete"
                             ),
                             Ok(Err(e)) => tracing::warn!(error = %e, "retention pass failed"),
                             Err(e) => tracing::warn!(error = %e, "retention task panicked"),

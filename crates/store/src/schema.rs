@@ -75,12 +75,14 @@ CREATE TABLE IF NOT EXISTS sentinel_meta (
 /// One per-container time series. Clustered on `(container_id, time)` (WITHOUT
 /// ROWID), so one container's history is a single range scan; a rowid table
 /// with a `(container_id, time)` index costs a random table lookup per row.
-/// The `time` index serves retention, downsampling and "latest cycle" reads.
+/// Only the disk table gets a `time` index, for its "latest cycle" read. The
+/// others do retention and downsampling as a sequential scan, which is faster
+/// than keeping each row in a second B-tree.
 struct ContainerTable {
     name: &'static str,
     columns: &'static str,
     ddl: &'static str,
-    index: &'static str,
+    index: Option<&'static str>,
 }
 
 const CONTAINER_TABLES: [ContainerTable; 4] = [
@@ -95,7 +97,7 @@ CREATE TABLE IF NOT EXISTS container_cpu_usage (
     PRIMARY KEY (container_id, time)
 ) STRICT, WITHOUT ROWID;
 "#,
-        index: "CREATE INDEX IF NOT EXISTS idx_ccu_time ON container_cpu_usage (time)",
+        index: None,
     },
     ContainerTable {
         name: "container_memory_usage",
@@ -112,7 +114,7 @@ CREATE TABLE IF NOT EXISTS container_memory_usage (
     PRIMARY KEY (container_id, time)
 ) STRICT, WITHOUT ROWID;
 "#,
-        index: "CREATE INDEX IF NOT EXISTS idx_cmu_time ON container_memory_usage (time)",
+        index: None,
     },
     ContainerTable {
         name: "container_disk_usage",
@@ -126,7 +128,7 @@ CREATE TABLE IF NOT EXISTS container_disk_usage (
     PRIMARY KEY (container_id, time)
 ) STRICT, WITHOUT ROWID;
 "#,
-        index: "CREATE INDEX IF NOT EXISTS idx_cdu_time ON container_disk_usage (time)",
+        index: Some("CREATE INDEX IF NOT EXISTS idx_cdu_time ON container_disk_usage (time)"),
     },
     ContainerTable {
         name: "container_network_usage",
@@ -140,7 +142,7 @@ CREATE TABLE IF NOT EXISTS container_network_usage (
     PRIMARY KEY (container_id, time)
 ) STRICT, WITHOUT ROWID;
 "#,
-        index: "CREATE INDEX IF NOT EXISTS idx_cnu_time ON container_network_usage (time)",
+        index: None,
     },
 ];
 
@@ -150,8 +152,10 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(table.ddl)?;
         // A table left in the old layout by a failed rebuild already has a
         // `(time, container_id)` key, so a `time` index would only cost disk.
-        if is_without_rowid(conn, table.name)? {
-            conn.execute_batch(table.index)?;
+        if let Some(index) = table.index
+            && is_without_rowid(conn, table.name)?
+        {
+            conn.execute_batch(index)?;
         }
     }
     Ok(())
@@ -174,7 +178,7 @@ pub fn cluster_container_tables(conn: &Connection) -> rusqlite::Result<bool> {
         tx.execute_batch(&format!("ALTER TABLE {name} RENAME TO {name}_old"))?;
         tx.execute_batch(table.ddl)?;
         // No ORDER BY: rowid (insert) order is a sequential read, while
-        // (container_id, time) order would be a random lookup per row. The
+        // (container_id, time) order would be a random lookup per row. A
         // `time` index is built after the copy, which is faster than keeping
         // it up to date row by row.
         let cols = table.columns;
@@ -182,7 +186,9 @@ pub fn cluster_container_tables(conn: &Connection) -> rusqlite::Result<bool> {
             "INSERT INTO {name} ({cols}) SELECT {cols} FROM {name}_old;
              DROP TABLE {name}_old;"
         ))?;
-        tx.execute_batch(table.index)?;
+        if let Some(index) = table.index {
+            tx.execute_batch(index)?;
+        }
         tx.commit()?;
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         tracing::info!(
@@ -193,6 +199,25 @@ pub fn cluster_container_tables(conn: &Connection) -> rusqlite::Result<bool> {
         rebuilt = true;
     }
     Ok(rebuilt)
+}
+
+/// Switches a database created without `auto_vacuum=INCREMENTAL` with one
+/// full VACUUM. That also gives back the pages freed by the legacy migration
+/// and the container table rebuild. The VACUUM needs free disk for about two
+/// copies of the live data. Returns true if it ran.
+pub fn enable_incremental_vacuum(conn: &Connection) -> rusqlite::Result<bool> {
+    let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+    if mode == 2 {
+        return Ok(false);
+    }
+    let started_at = std::time::Instant::now();
+    conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    tracing::info!(
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "metrics database compacted, auto_vacuum is now incremental"
+    );
+    Ok(true)
 }
 
 fn is_without_rowid(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
@@ -264,8 +289,6 @@ pub fn migrate_legacy(conn: &Connection) -> rusqlite::Result<bool> {
     tx.execute_batch("DROP TABLE IF EXISTS container_logs")?;
 
     tx.commit()?;
-    // Do not VACUUM during startup. SQLite will reuse pages freed by the legacy
-    // tables, while compacting here can delay health checks for large histories.
     tracing::info!(
         elapsed_ms = started_at.elapsed().as_millis(),
         "legacy schema migration complete"

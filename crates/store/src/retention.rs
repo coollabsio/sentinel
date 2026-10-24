@@ -6,15 +6,20 @@ pub const DOWNSAMPLE_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Downsampling bucket width.
 pub const BUCKET_MS: i64 = 60_000;
 
-const TABLES: [&str; 9] = [
+/// Tables with an index that starts with `time`.
+const TIME_INDEXED_TABLES: [&str; 6] = [
     "cpu_usage",
     "memory_usage",
-    "container_cpu_usage",
-    "container_memory_usage",
     "disk_usage",
     "container_disk_usage",
     "network_usage",
     "load_average",
+];
+
+/// Tables clustered on `(container_id, time)` with no `time` index.
+const PER_CONTAINER_TABLES: [&str; 3] = [
+    "container_cpu_usage",
+    "container_memory_usage",
     "container_network_usage",
 ];
 
@@ -25,12 +30,19 @@ impl Store {
         let cutoff = now_ms - (retention_days as i64) * 86_400_000;
         self.with_conn(|c| {
             let mut deleted = 0u64;
-            for table in TABLES {
+            for table in TIME_INDEXED_TABLES {
                 let sql = format!(
                     "DELETE FROM {table} WHERE time < ?1 AND time NOT IN
                      (SELECT DISTINCT time FROM {table} ORDER BY time DESC LIMIT 10)"
                 );
                 deleted += c.execute(&sql, (cutoff,))? as u64;
+            }
+            for table in PER_CONTAINER_TABLES {
+                // Fewer than 10 distinct times: every row is protected.
+                if let Some(tenth) = tenth_newest_time(c, table)? {
+                    let sql = format!("DELETE FROM {table} WHERE time < ?1");
+                    deleted += c.execute(&sql, (cutoff.min(tenth),))? as u64;
+                }
             }
             // container_status is a current-only snapshot keyed on the display
             // name; its `time` is a last-seen stamp. A container not seen since
@@ -38,6 +50,22 @@ impl Store {
             // last 10" — each container already has at most one row).
             deleted += c.execute("DELETE FROM container_status WHERE time < ?1", (cutoff,))? as u64;
             Ok(deleted)
+        })
+    }
+
+    /// Gives the pages freed by `cleanup` and `downsample` back to the file
+    /// system. Without this, the file stays at its largest size. Returns the
+    /// number of pages released.
+    pub fn release_free_pages(&self) -> Result<u64, StoreError> {
+        self.with_conn(|c| {
+            let free: i64 = c.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+            // Each step frees one page, so step until done (`execute_batch`
+            // steps once). The file shrinks at the checkpoint.
+            let mut stmt = c.prepare("PRAGMA incremental_vacuum")?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+            c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            Ok(free as u64)
         })
     }
 
@@ -145,6 +173,30 @@ impl Store {
     }
 }
 
+/// The 10th-newest distinct `time` in a per-container table. Without a `time`
+/// index, `SELECT DISTINCT time ... LIMIT 10` sorts every row. Each of the 10
+/// newest times is in some container's 10 newest rows, and the primary key
+/// reads those directly.
+fn tenth_newest_time(c: &rusqlite::Connection, table: &str) -> rusqlite::Result<Option<i64>> {
+    let sql = format!(
+        "WITH RECURSIVE ids(id) AS (
+             SELECT MIN(container_id) FROM {table}
+             UNION ALL
+             SELECT (SELECT MIN(container_id) FROM {table} WHERE container_id > ids.id)
+             FROM ids WHERE ids.id IS NOT NULL
+         ),
+         recent(id, since) AS MATERIALIZED (
+             SELECT id, (SELECT MIN(time) FROM (SELECT time FROM {table}
+                         WHERE container_id = ids.id ORDER BY time DESC LIMIT 10))
+             FROM ids WHERE id IS NOT NULL
+         )
+         SELECT DISTINCT time FROM recent JOIN {table}
+             ON container_id = recent.id AND time >= recent.since
+         ORDER BY time DESC LIMIT 1 OFFSET 9"
+    );
+    c.query_row(&sql, [], |r| r.get(0)).optional()
+}
+
 /// Rewrites `table` so every row older than `cutoff` becomes one row per
 /// minute bucket, each numeric column replaced by its bucket mean.
 /// Integer columns are rounded back to integers to satisfy STRICT typing.
@@ -155,40 +207,26 @@ fn bucket_host(
     lower_bound: Option<i64>,
     cutoff: i64,
 ) -> rusqlite::Result<u64> {
-    // execute_batch runs a multi-statement script and Connection::changes()
-    // afterward reflects only the LAST statement that touched row counts —
-    // here that's the INSERT OR REPLACE (the DROP TABLE that follows it is
-    // DDL and leaves changes() unchanged), not the DELETE. Since many raw
-    // rows always collapse into fewer bucket rows, that would systematically
-    // under-report "rows collapsed". Count the raw rows directly instead.
-    let raw_count: i64 = tx.query_row(
-        &format!("SELECT COUNT(*) FROM {table} WHERE (?1 IS NULL OR time >= ?1) AND time < ?2"),
-        (lower_bound, cutoff),
-        |r| r.get(0),
-    )?;
-
     let avg_list = avg_list(cols);
     let col_list = cols.join(", ");
     let lower_predicate = lower_bound
         .map(|value| format!("time >= {value}"))
         .unwrap_or_else(|| "1 = 1".to_string());
 
-    let sql = format!(
-        r#"
-        CREATE TEMP TABLE _ds AS
-        SELECT (time / {BUCKET_MS}) * {BUCKET_MS} AS time, {avg_list}
-        FROM {table} WHERE {lower_predicate} AND time < {cutoff}
-        GROUP BY time / {BUCKET_MS};
-
-        DELETE FROM {table} WHERE {lower_predicate} AND time < {cutoff};
-
-        INSERT OR REPLACE INTO {table} (time, {col_list})
-        SELECT time, {col_list} FROM _ds;
-
-        DROP TABLE _ds;
-        "#
-    );
-    tx.execute_batch(&sql)?;
+    tx.execute_batch(&format!(
+        "CREATE TEMP TABLE _ds AS
+         SELECT (time / {BUCKET_MS}) * {BUCKET_MS} AS time, {avg_list}
+         FROM {table} WHERE {lower_predicate} AND time < {cutoff}
+         GROUP BY time / {BUCKET_MS}"
+    ))?;
+    let raw_count = tx.execute(
+        &format!("DELETE FROM {table} WHERE {lower_predicate} AND time < {cutoff}"),
+        [],
+    )?;
+    tx.execute_batch(&format!(
+        "INSERT OR REPLACE INTO {table} (time, {col_list}) SELECT time, {col_list} FROM _ds;
+         DROP TABLE _ds;"
+    ))?;
     Ok(raw_count as u64)
 }
 
@@ -202,36 +240,29 @@ fn bucket_entity(
     lower_bound: Option<i64>,
     cutoff: i64,
 ) -> rusqlite::Result<u64> {
-    // See bucket_host: count raw rows directly rather than trusting
-    // Connection::changes() after a multi-statement execute_batch.
-    let raw_count: i64 = tx.query_row(
-        &format!("SELECT COUNT(*) FROM {table} WHERE (?1 IS NULL OR time >= ?1) AND time < ?2"),
-        (lower_bound, cutoff),
-        |r| r.get(0),
-    )?;
-
     let avg_list = avg_list(cols);
     let col_list = cols.join(", ");
     let lower_predicate = lower_bound
         .map(|value| format!("time >= {value}"))
         .unwrap_or_else(|| "1 = 1".to_string());
 
-    let sql = format!(
-        r#"
-        CREATE TEMP TABLE _ds AS
-        SELECT (time / {BUCKET_MS}) * {BUCKET_MS} AS time, {entity}, {avg_list}
-        FROM {table} WHERE {lower_predicate} AND time < {cutoff}
-        GROUP BY time / {BUCKET_MS}, {entity};
-
-        DELETE FROM {table} WHERE {lower_predicate} AND time < {cutoff};
-
-        INSERT OR REPLACE INTO {table} (time, {entity}, {col_list})
-        SELECT time, {entity}, {col_list} FROM _ds;
-
-        DROP TABLE _ds;
-        "#
-    );
-    tx.execute_batch(&sql)?;
+    // Entity first: the rows come out in the container tables' primary key
+    // order, so the insert appends instead of seeking.
+    tx.execute_batch(&format!(
+        "CREATE TEMP TABLE _ds AS
+         SELECT (time / {BUCKET_MS}) * {BUCKET_MS} AS time, {entity}, {avg_list}
+         FROM {table} WHERE {lower_predicate} AND time < {cutoff}
+         GROUP BY {entity}, time / {BUCKET_MS}"
+    ))?;
+    let raw_count = tx.execute(
+        &format!("DELETE FROM {table} WHERE {lower_predicate} AND time < {cutoff}"),
+        [],
+    )?;
+    tx.execute_batch(&format!(
+        "INSERT OR REPLACE INTO {table} (time, {entity}, {col_list})
+         SELECT time, {entity}, {col_list} FROM _ds;
+         DROP TABLE _ds;"
+    ))?;
     Ok(raw_count as u64)
 }
 
