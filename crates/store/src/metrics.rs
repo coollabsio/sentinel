@@ -1,3 +1,4 @@
+use crate::retention::REAL_COLS;
 use crate::{Store, StoreError};
 use rusqlite::OptionalExtension;
 
@@ -181,6 +182,39 @@ const CONTAINER_NETWORK_COLS: &str = "time, container_id, rx_bytes_per_sec, tx_b
 const HOST_STATUS_COLS: &str =
     "uptime_seconds, swap_total, swap_used, swap_free, swap_used_percent, time";
 
+/// History query over `cols`. With `bucket_ms`, rows are averaged per
+/// epoch-aligned window and `time` is the window start; `mount` and
+/// `container_id` stay grouping keys. Same columns either way, so the row
+/// mappers are shared.
+fn history_sql(
+    cols: &str,
+    table: &str,
+    filter: &str,
+    order: &str,
+    bucket_ms: Option<i64>,
+) -> String {
+    let Some(b) = bucket_ms else {
+        return format!("SELECT {cols} FROM {table} WHERE {filter} ORDER BY {order}");
+    };
+    let mut keys = vec!["1"];
+    let select = cols
+        .split(", ")
+        .map(|col| match col {
+            "time" => format!("(time / {b}) * {b}"),
+            "mount" | "container_id" => {
+                keys.push(col);
+                col.to_string()
+            }
+            c if REAL_COLS.contains(&c) => format!("AVG({c})"),
+            // Rounded like downsampling, so both agree on the same window.
+            c => format!("CAST(ROUND(AVG({c})) AS INTEGER)"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let keys = keys.join(", ");
+    format!("SELECT {select} FROM {table} WHERE {filter} GROUP BY {keys} ORDER BY {keys}")
+}
+
 impl Store {
     pub fn insert_cpu(&self, time: i64, percent: f64) -> Result<(), StoreError> {
         self.with_conn(|c| {
@@ -251,10 +285,19 @@ impl Store {
         })
     }
 
-    pub fn cpu_history(&self, from: i64, to: i64) -> Result<Vec<CpuRow>, StoreError> {
+    pub fn cpu_history(
+        &self,
+        from: i64,
+        to: i64,
+        bucket_ms: Option<i64>,
+    ) -> Result<Vec<CpuRow>, StoreError> {
         self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {CPU_COLS} FROM cpu_usage WHERE time >= ?1 AND time <= ?2 ORDER BY time ASC"
+            let sql = history_sql(
+                CPU_COLS,
+                "cpu_usage",
+                "time >= ?1 AND time <= ?2",
+                "time ASC",
+                bucket_ms,
             );
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
@@ -269,10 +312,19 @@ impl Store {
         })
     }
 
-    pub fn memory_history(&self, from: i64, to: i64) -> Result<Vec<MemRow>, StoreError> {
+    pub fn memory_history(
+        &self,
+        from: i64,
+        to: i64,
+        bucket_ms: Option<i64>,
+    ) -> Result<Vec<MemRow>, StoreError> {
         self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {MEM_COLS} FROM memory_usage WHERE time >= ?1 AND time <= ?2 ORDER BY time ASC"
+            let sql = history_sql(
+                MEM_COLS,
+                "memory_usage",
+                "time >= ?1 AND time <= ?2",
+                "time ASC",
+                bucket_ms,
             );
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
@@ -287,11 +339,15 @@ impl Store {
         id: &str,
         from: i64,
         to: i64,
+        bucket_ms: Option<i64>,
     ) -> Result<Vec<CpuRow>, StoreError> {
         self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {CPU_COLS} FROM container_cpu_usage
-                 WHERE container_id = ?1 AND time >= ?2 AND time <= ?3 ORDER BY time ASC"
+            let sql = history_sql(
+                CPU_COLS,
+                "container_cpu_usage",
+                "container_id = ?1 AND time >= ?2 AND time <= ?3",
+                "time ASC",
+                bucket_ms,
             );
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
@@ -311,11 +367,15 @@ impl Store {
         id: &str,
         from: i64,
         to: i64,
+        bucket_ms: Option<i64>,
     ) -> Result<Vec<MemRow>, StoreError> {
         self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {MEM_COLS} FROM container_memory_usage
-                 WHERE container_id = ?1 AND time >= ?2 AND time <= ?3 ORDER BY time ASC"
+            let sql = history_sql(
+                MEM_COLS,
+                "container_memory_usage",
+                "container_id = ?1 AND time >= ?2 AND time <= ?3",
+                "time ASC",
+                bucket_ms,
             );
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
@@ -536,11 +596,19 @@ impl Store {
         self.with_reader(|c| Ok(latest_network(c)?))
     }
 
-    pub fn network_history(&self, from: i64, to: i64) -> Result<Vec<NetworkRow>, StoreError> {
+    pub fn network_history(
+        &self,
+        from: i64,
+        to: i64,
+        bucket_ms: Option<i64>,
+    ) -> Result<Vec<NetworkRow>, StoreError> {
         self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {NETWORK_COLS} FROM network_usage
-                 WHERE time >= ?1 AND time <= ?2 ORDER BY time ASC"
+            let sql = history_sql(
+                NETWORK_COLS,
+                "network_usage",
+                "time >= ?1 AND time <= ?2",
+                "time ASC",
+                bucket_ms,
             );
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
@@ -555,11 +623,19 @@ impl Store {
         self.with_reader(|c| Ok(latest_load(c)?))
     }
 
-    pub fn load_history(&self, from: i64, to: i64) -> Result<Vec<LoadRow>, StoreError> {
+    pub fn load_history(
+        &self,
+        from: i64,
+        to: i64,
+        bucket_ms: Option<i64>,
+    ) -> Result<Vec<LoadRow>, StoreError> {
         self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {LOAD_COLS} FROM load_average
-                 WHERE time >= ?1 AND time <= ?2 ORDER BY time ASC"
+            let sql = history_sql(
+                LOAD_COLS,
+                "load_average",
+                "time >= ?1 AND time <= ?2",
+                "time ASC",
+                bucket_ms,
             );
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
@@ -574,11 +650,15 @@ impl Store {
         id: &str,
         from: i64,
         to: i64,
+        bucket_ms: Option<i64>,
     ) -> Result<Vec<ContainerNetworkRow>, StoreError> {
         self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {CONTAINER_NETWORK_COLS} FROM container_network_usage
-                 WHERE container_id = ?1 AND time >= ?2 AND time <= ?3 ORDER BY time ASC"
+            let sql = history_sql(
+                CONTAINER_NETWORK_COLS,
+                "container_network_usage",
+                "container_id = ?1 AND time >= ?2 AND time <= ?3",
+                "time ASC",
+                bucket_ms,
             );
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
@@ -588,11 +668,19 @@ impl Store {
         })
     }
 
-    pub fn disk_history(&self, from: i64, to: i64) -> Result<Vec<DiskRow>, StoreError> {
+    pub fn disk_history(
+        &self,
+        from: i64,
+        to: i64,
+        bucket_ms: Option<i64>,
+    ) -> Result<Vec<DiskRow>, StoreError> {
         self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {DISK_COLS} FROM disk_usage
-                 WHERE time >= ?1 AND time <= ?2 ORDER BY time ASC, mount ASC"
+            let sql = history_sql(
+                DISK_COLS,
+                "disk_usage",
+                "time >= ?1 AND time <= ?2",
+                "time ASC, mount ASC",
+                bucket_ms,
             );
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt
@@ -639,11 +727,15 @@ impl Store {
         id: &str,
         from: i64,
         to: i64,
+        bucket_ms: Option<i64>,
     ) -> Result<Vec<ContainerDiskRow>, StoreError> {
         self.with_reader(|c| {
-            let sql = format!(
-                "SELECT {CONTAINER_DISK_COLS} FROM container_disk_usage
-                 WHERE container_id = ?1 AND time >= ?2 AND time <= ?3 ORDER BY time ASC"
+            let sql = history_sql(
+                CONTAINER_DISK_COLS,
+                "container_disk_usage",
+                "container_id = ?1 AND time >= ?2 AND time <= ?3",
+                "time ASC",
+                bucket_ms,
             );
             let mut stmt = c.prepare_cached(&sql)?;
             let rows = stmt

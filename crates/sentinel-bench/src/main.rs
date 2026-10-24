@@ -320,6 +320,10 @@ fn base_endpoints() -> Vec<Endpoint> {
         Endpoint::new("/api/network/history", 2, 40, false),
         Endpoint::new("/api/load/current", 2, 80, false),
         Endpoint::new("/api/load/history", 1, 40, false),
+        // Coolify-shaped long-range reads: Sentinel averages rows per window.
+        Endpoint::new("/api/cpu/history?bucket_ms=600000", 1, 40, false),
+        Endpoint::new("/api/memory/history?bucket_ms=600000", 1, 40, false),
+        Endpoint::new("/api/disk/history?bucket_ms=600000", 1, 40, false),
         Endpoint::new("/api/summary", 3, 80, true),
         Endpoint::new("/api/containers/current", 3, 80, true),
     ]
@@ -334,6 +338,12 @@ fn container_endpoints(id: &str) -> Vec<Endpoint> {
         Endpoint::new(format!("/api/container/{id}/disk/current"), 1, 60, false),
         Endpoint::new(format!("/api/container/{id}/disk/history"), 1, 40, false),
         Endpoint::new(format!("/api/container/{id}/network/history"), 1, 40, false),
+        Endpoint::new(
+            format!("/api/container/{id}/memory/history?bucket_ms=600000"),
+            1,
+            40,
+            false,
+        ),
     ]
 }
 

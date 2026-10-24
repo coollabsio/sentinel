@@ -235,19 +235,21 @@ fn bucket_entity(
     Ok(raw_count as u64)
 }
 
+/// Metric columns stored as REAL. Every other averaged column is a byte/count
+/// value rounded back to an integer to satisfy STRICT typing. Integer-casting a
+/// REAL column (e.g. a `load1` of 0.75) would silently truncate it.
+pub(crate) const REAL_COLS: [&str; 7] = [
+    "percent",
+    "used_percent",
+    "rx_bytes_per_sec",
+    "tx_bytes_per_sec",
+    "load1",
+    "load5",
+    "load15",
+];
+
 fn avg_list(cols: &[&str]) -> String {
-    // REAL columns keep two decimals; every other column is a byte/count value
-    // rounded back to an integer to satisfy STRICT typing. Integer-casting a
-    // REAL column (e.g. a `load1` of 0.75) would silently truncate it.
-    const REAL_COLS: [&str; 7] = [
-        "percent",
-        "used_percent",
-        "rx_bytes_per_sec",
-        "tx_bytes_per_sec",
-        "load1",
-        "load5",
-        "load15",
-    ];
+    // REAL columns keep two decimals.
     cols.iter()
         .map(|c| {
             if REAL_COLS.contains(c) {

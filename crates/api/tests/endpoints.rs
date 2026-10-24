@@ -164,6 +164,46 @@ async fn cpu_history_rejects_bad_dates() {
 }
 
 #[tokio::test]
+async fn history_bucket_ms_averages_rows_per_window() {
+    let (s, j) = get(
+        router(state(false)),
+        "/api/cpu/history?bucket_ms=10000",
+        Some("secret"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let arr = j.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "both samples share one 10s window");
+    assert_eq!(arr[0]["time"], "1700000000000");
+
+    let (s, j) = get(
+        router(state(false)),
+        "/api/cpu/history?bucket_ms=",
+        Some("secret"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        j.as_array().unwrap().len(),
+        2,
+        "empty bucket_ms means raw rows"
+    );
+}
+
+#[tokio::test]
+async fn history_rejects_bad_bucket_ms() {
+    for uri in [
+        "/api/cpu/history?bucket_ms=0",
+        "/api/memory/history?bucket_ms=-5",
+        "/api/disk/history?bucket_ms=abc",
+    ] {
+        let (s, j) = get(router(state(false)), uri, Some("secret")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{uri}");
+        assert!(j["error"].as_str().unwrap().contains("bucket_ms"));
+    }
+}
+
+#[tokio::test]
 async fn cpu_history_returns_empty_array_not_null() {
     let store = store::Store::open_in_memory().unwrap();
     let mut config = config::Config::load_for_test();

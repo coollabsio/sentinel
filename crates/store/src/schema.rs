@@ -19,24 +19,6 @@ CREATE TABLE IF NOT EXISTS memory_usage (
     free         INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS container_cpu_usage (
-    time         INTEGER NOT NULL,
-    container_id TEXT    NOT NULL,
-    percent      REAL    NOT NULL,
-    PRIMARY KEY (time, container_id)
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS container_memory_usage (
-    time         INTEGER NOT NULL,
-    container_id TEXT    NOT NULL,
-    total        INTEGER NOT NULL,
-    available    INTEGER NOT NULL,
-    used         INTEGER NOT NULL,
-    used_percent REAL    NOT NULL,
-    free         INTEGER NOT NULL,
-    PRIMARY KEY (time, container_id)
-) STRICT;
-
 CREATE TABLE IF NOT EXISTS disk_usage (
     time         INTEGER NOT NULL,
     mount        TEXT    NOT NULL,
@@ -45,14 +27,6 @@ CREATE TABLE IF NOT EXISTS disk_usage (
     available    INTEGER NOT NULL,
     used_percent REAL    NOT NULL,
     PRIMARY KEY (time, mount)
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS container_disk_usage (
-    time           INTEGER NOT NULL,
-    container_id   TEXT    NOT NULL,
-    writable_layer INTEGER NOT NULL,
-    volumes_total  INTEGER NOT NULL,
-    PRIMARY KEY (time, container_id)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS network_usage (
@@ -66,14 +40,6 @@ CREATE TABLE IF NOT EXISTS load_average (
     load1  REAL NOT NULL,
     load5  REAL NOT NULL,
     load15 REAL NOT NULL
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS container_network_usage (
-    time             INTEGER NOT NULL,
-    container_id     TEXT    NOT NULL,
-    rx_bytes_per_sec REAL    NOT NULL,
-    tx_bytes_per_sec REAL    NOT NULL,
-    PRIMARY KEY (time, container_id)
 ) STRICT;
 
 -- Current status only (latest snapshot per container), keyed on the display
@@ -97,16 +63,8 @@ CREATE TABLE IF NOT EXISTS host_status (
     time              INTEGER NOT NULL
 ) STRICT;
 
-CREATE INDEX IF NOT EXISTS idx_ccu_container_time
-    ON container_cpu_usage (container_id, time);
-CREATE INDEX IF NOT EXISTS idx_cmu_container_time
-    ON container_memory_usage (container_id, time);
 CREATE INDEX IF NOT EXISTS idx_du_mount_time
     ON disk_usage (mount, time);
-CREATE INDEX IF NOT EXISTS idx_cdu_container_time
-    ON container_disk_usage (container_id, time);
-CREATE INDEX IF NOT EXISTS idx_cnu_container_time
-    ON container_network_usage (container_id, time);
 
 CREATE TABLE IF NOT EXISTS sentinel_meta (
     key   TEXT PRIMARY KEY,
@@ -114,8 +72,135 @@ CREATE TABLE IF NOT EXISTS sentinel_meta (
 ) STRICT;
 "#;
 
+/// One per-container time series. Clustered on `(container_id, time)` (WITHOUT
+/// ROWID), so one container's history is a single range scan; a rowid table
+/// with a `(container_id, time)` index costs a random table lookup per row.
+/// The `time` index serves retention, downsampling and "latest cycle" reads.
+struct ContainerTable {
+    name: &'static str,
+    columns: &'static str,
+    ddl: &'static str,
+    index: &'static str,
+}
+
+const CONTAINER_TABLES: [ContainerTable; 4] = [
+    ContainerTable {
+        name: "container_cpu_usage",
+        columns: "time, container_id, percent",
+        ddl: r#"
+CREATE TABLE IF NOT EXISTS container_cpu_usage (
+    time         INTEGER NOT NULL,
+    container_id TEXT    NOT NULL,
+    percent      REAL    NOT NULL,
+    PRIMARY KEY (container_id, time)
+) STRICT, WITHOUT ROWID;
+"#,
+        index: "CREATE INDEX IF NOT EXISTS idx_ccu_time ON container_cpu_usage (time)",
+    },
+    ContainerTable {
+        name: "container_memory_usage",
+        columns: "time, container_id, total, available, used, used_percent, free",
+        ddl: r#"
+CREATE TABLE IF NOT EXISTS container_memory_usage (
+    time         INTEGER NOT NULL,
+    container_id TEXT    NOT NULL,
+    total        INTEGER NOT NULL,
+    available    INTEGER NOT NULL,
+    used         INTEGER NOT NULL,
+    used_percent REAL    NOT NULL,
+    free         INTEGER NOT NULL,
+    PRIMARY KEY (container_id, time)
+) STRICT, WITHOUT ROWID;
+"#,
+        index: "CREATE INDEX IF NOT EXISTS idx_cmu_time ON container_memory_usage (time)",
+    },
+    ContainerTable {
+        name: "container_disk_usage",
+        columns: "time, container_id, writable_layer, volumes_total",
+        ddl: r#"
+CREATE TABLE IF NOT EXISTS container_disk_usage (
+    time           INTEGER NOT NULL,
+    container_id   TEXT    NOT NULL,
+    writable_layer INTEGER NOT NULL,
+    volumes_total  INTEGER NOT NULL,
+    PRIMARY KEY (container_id, time)
+) STRICT, WITHOUT ROWID;
+"#,
+        index: "CREATE INDEX IF NOT EXISTS idx_cdu_time ON container_disk_usage (time)",
+    },
+    ContainerTable {
+        name: "container_network_usage",
+        columns: "time, container_id, rx_bytes_per_sec, tx_bytes_per_sec",
+        ddl: r#"
+CREATE TABLE IF NOT EXISTS container_network_usage (
+    time             INTEGER NOT NULL,
+    container_id     TEXT    NOT NULL,
+    rx_bytes_per_sec REAL    NOT NULL,
+    tx_bytes_per_sec REAL    NOT NULL,
+    PRIMARY KEY (container_id, time)
+) STRICT, WITHOUT ROWID;
+"#,
+        index: "CREATE INDEX IF NOT EXISTS idx_cnu_time ON container_network_usage (time)",
+    },
+];
+
 pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(DDL)
+    conn.execute_batch(DDL)?;
+    for table in &CONTAINER_TABLES {
+        conn.execute_batch(table.ddl)?;
+        // A table left in the old layout by a failed rebuild already has a
+        // `(time, container_id)` key, so a `time` index would only cost disk.
+        if is_without_rowid(conn, table.name)? {
+            conn.execute_batch(table.index)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rebuilds container tables still in the old layout (rowid tables keyed on
+/// `(time, container_id)`) in the clustered one. One transaction and one
+/// WAL checkpoint per table, so the extra disk is about one table, not all
+/// four. An interrupted rebuild rolls back and runs again on the next start.
+/// Returns true if any table was rebuilt.
+pub fn cluster_container_tables(conn: &Connection) -> rusqlite::Result<bool> {
+    let mut rebuilt = false;
+    for table in &CONTAINER_TABLES {
+        let name = table.name;
+        if !table_exists(conn, name)? || is_without_rowid(conn, name)? {
+            continue;
+        }
+        let started_at = std::time::Instant::now();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(&format!("ALTER TABLE {name} RENAME TO {name}_old"))?;
+        tx.execute_batch(table.ddl)?;
+        // No ORDER BY: rowid (insert) order is a sequential read, while
+        // (container_id, time) order would be a random lookup per row. The
+        // `time` index is built after the copy, which is faster than keeping
+        // it up to date row by row.
+        let cols = table.columns;
+        tx.execute_batch(&format!(
+            "INSERT INTO {name} ({cols}) SELECT {cols} FROM {name}_old;
+             DROP TABLE {name}_old;"
+        ))?;
+        tx.execute_batch(table.index)?;
+        tx.commit()?;
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        tracing::info!(
+            table = name,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "container table clustered on (container_id, time)"
+        );
+        rebuilt = true;
+    }
+    Ok(rebuilt)
+}
+
+fn is_without_rowid(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
+        (table,),
+        |row| row.get(0),
+    )
 }
 
 fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
