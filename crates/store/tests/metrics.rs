@@ -16,7 +16,7 @@ fn round_trips_cpu() {
     let s = Store::open_in_memory().unwrap();
     s.insert_cpu(1_000, 12.34).unwrap();
     s.insert_cpu(2_000, 56.78).unwrap();
-    let rows = s.cpu_history(0, i64::MAX).unwrap();
+    let rows = s.cpu_history(0, i64::MAX, None).unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].time, 1_000);
     assert!((rows[0].percent - 12.34).abs() < f64::EPSILON);
@@ -28,7 +28,7 @@ fn cpu_history_is_ordered_ascending_and_range_filtered() {
     for t in [3_000, 1_000, 2_000] {
         s.insert_cpu(t, 1.0).unwrap();
     }
-    let rows = s.cpu_history(1_500, 3_000).unwrap();
+    let rows = s.cpu_history(1_500, 3_000, None).unwrap();
     assert_eq!(
         rows.iter().map(|r| r.time).collect::<Vec<_>>(),
         vec![2_000, 3_000]
@@ -40,7 +40,7 @@ fn cpu_insert_is_upsert_on_time() {
     let s = Store::open_in_memory().unwrap();
     s.insert_cpu(1_000, 1.0).unwrap();
     s.insert_cpu(1_000, 9.0).unwrap();
-    let rows = s.cpu_history(0, i64::MAX).unwrap();
+    let rows = s.cpu_history(0, i64::MAX, None).unwrap();
     assert_eq!(rows.len(), 1);
     assert!((rows[0].percent - 9.0).abs() < f64::EPSILON);
 }
@@ -49,7 +49,7 @@ fn cpu_insert_is_upsert_on_time() {
 fn round_trips_memory() {
     let s = Store::open_in_memory().unwrap();
     s.insert_memory(&mem(1_000)).unwrap();
-    let rows = s.memory_history(0, i64::MAX).unwrap();
+    let rows = s.memory_history(0, i64::MAX, None).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].total, 16_000_000_000);
     assert!((rows[0].used_percent - 43.75).abs() < f64::EPSILON);
@@ -80,17 +80,17 @@ fn container_batch_writes_cpu_and_memory() {
     ];
     s.insert_container_batch(5_000, &samples).unwrap();
 
-    let web = s.container_cpu_history("web", 0, i64::MAX).unwrap();
+    let web = s.container_cpu_history("web", 0, i64::MAX, None).unwrap();
     assert_eq!(web.len(), 1);
     assert!((web[0].percent - 10.0).abs() < f64::EPSILON);
 
-    let db = s.container_memory_history("db", 0, i64::MAX).unwrap();
+    let db = s.container_memory_history("db", 0, i64::MAX, None).unwrap();
     assert_eq!(db.len(), 1);
     assert_eq!(db[0].used, 100);
 
     // container scoping must not leak across ids
     assert!(
-        s.container_cpu_history("nope", 0, i64::MAX)
+        s.container_cpu_history("nope", 0, i64::MAX, None)
             .unwrap()
             .is_empty()
     );
@@ -101,7 +101,7 @@ fn empty_batch_is_a_noop() {
     let s = Store::open_in_memory().unwrap();
     s.insert_container_batch(1_000, &[]).unwrap();
     assert!(
-        s.container_cpu_history("x", 0, i64::MAX)
+        s.container_cpu_history("x", 0, i64::MAX, None)
             .unwrap()
             .is_empty()
     );
@@ -119,7 +119,7 @@ fn opening_twice_is_idempotent() {
     }
     {
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 1);
+        assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 1);
     }
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -173,4 +173,51 @@ fn prune_container_status_drops_unlisted_containers() {
     // An empty listing (no containers left) prunes everything.
     assert_eq!(s.prune_container_status(&[]).unwrap(), 1);
     assert!(s.latest_container_metrics().unwrap().is_empty());
+}
+
+#[test]
+fn history_averages_per_epoch_aligned_bucket() {
+    let s = Store::open_in_memory().unwrap();
+    for (t, p) in [(1_000, 10.0), (1_500, 20.0), (2_100, 30.0)] {
+        s.insert_cpu(t, p).unwrap();
+    }
+    let rows = s.cpu_history(0, i64::MAX, Some(1_000)).unwrap();
+    let got: Vec<_> = rows.iter().map(|r| (r.time, r.percent)).collect();
+    assert_eq!(got, vec![(1_000, 15.0), (2_000, 30.0)]);
+
+    // Byte columns stay integers after averaging.
+    s.insert_memory(&mem(1_000)).unwrap();
+    s.insert_memory(&MemRow {
+        used: 8_000_000_000,
+        ..mem(1_999)
+    })
+    .unwrap();
+    let rows = s.memory_history(0, i64::MAX, Some(1_000)).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].time, 1_000);
+    assert_eq!(rows[0].used, 7_500_000_000);
+}
+
+#[test]
+fn container_history_buckets_stay_scoped_to_one_container() {
+    let s = Store::open_in_memory().unwrap();
+    let sample = |id: &str, cpu: f64| ContainerSample {
+        container_id: id.into(),
+        cpu_percent: cpu,
+        mem_total: 100,
+        mem_available: 40,
+        mem_used: 60,
+        mem_used_percent: 60.0,
+        mem_free: 40,
+    };
+    s.insert_container_batch(5_000, &[sample("web", 10.0), sample("db", 90.0)])
+        .unwrap();
+    s.insert_container_batch(5_500, &[sample("web", 30.0), sample("db", 90.0)])
+        .unwrap();
+    let web = s
+        .container_cpu_history("web", 0, i64::MAX, Some(1_000))
+        .unwrap();
+    assert_eq!(web.len(), 1);
+    assert_eq!(web[0].time, 5_000);
+    assert!((web[0].percent - 20.0).abs() < f64::EPSILON);
 }

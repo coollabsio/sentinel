@@ -11,9 +11,9 @@ fn deletes_rows_older_than_retention() {
     for d in 0..20 {
         s.insert_cpu(now - d * DAY, d as f64).unwrap();
     }
-    let before = s.cpu_history(0, i64::MAX).unwrap().len();
+    let before = s.cpu_history(0, i64::MAX, None).unwrap().len();
     s.cleanup(7, now).unwrap();
-    let after = s.cpu_history(0, i64::MAX).unwrap();
+    let after = s.cpu_history(0, i64::MAX, None).unwrap();
     assert_eq!(before, 20, "should have 20 rows before cleanup");
     assert_eq!(
         after.len(),
@@ -37,7 +37,7 @@ fn always_preserves_the_ten_most_recent_rows() {
         s.insert_cpu(1_000 + i, i as f64).unwrap(); // all far older than cutoff
     }
     s.cleanup(7, now).unwrap();
-    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 10);
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 10);
 }
 
 #[test]
@@ -71,14 +71,16 @@ fn cleanup_covers_every_table() {
         .unwrap();
     }
     s.cleanup(7, now).unwrap();
-    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 10);
-    assert_eq!(s.memory_history(0, i64::MAX).unwrap().len(), 10);
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 10);
+    assert_eq!(s.memory_history(0, i64::MAX, None).unwrap().len(), 10);
     assert_eq!(
-        s.container_cpu_history("web", 0, i64::MAX).unwrap().len(),
+        s.container_cpu_history("web", 0, i64::MAX, None)
+            .unwrap()
+            .len(),
         10
     );
     assert_eq!(
-        s.container_memory_history("web", 0, i64::MAX)
+        s.container_memory_history("web", 0, i64::MAX, None)
             .unwrap()
             .len(),
         10
@@ -102,7 +104,7 @@ fn downsample_collapses_old_samples_into_one_minute_averages() {
     assert_eq!(collapsed, 12);
 
     let rows = s
-        .cpu_history(bucket, bucket + retention::BUCKET_MS - 1)
+        .cpu_history(bucket, bucket + retention::BUCKET_MS - 1, None)
         .unwrap();
     assert_eq!(
         rows.len(),
@@ -127,7 +129,7 @@ fn downsample_rounds_percentages_to_two_decimals() {
         s.insert_cpu(bucket + offset as i64 * 5_000, value).unwrap();
     }
     s.downsample(now).unwrap();
-    let rows = s.cpu_history(bucket, bucket).unwrap();
+    let rows = s.cpu_history(bucket, bucket, None).unwrap();
     assert_eq!(rows[0].percent, 10.02);
 }
 
@@ -148,12 +150,12 @@ fn downsample_preserves_real_network_and_load_decimals() {
     }
     s.downsample(now).unwrap();
 
-    let net = s.network_history(bucket, bucket).unwrap();
+    let net = s.network_history(bucket, bucket, None).unwrap();
     assert_eq!(net.len(), 1, "three raw rows collapse to one bucket");
     assert_eq!(net[0].rx_bytes_per_sec, 12.5);
     assert_eq!(net[0].tx_bytes_per_sec, 6.25);
 
-    let load = s.load_history(bucket, bucket).unwrap();
+    let load = s.load_history(bucket, bucket, None).unwrap();
     assert_eq!(load[0].load1, 0.75, "0.75 must not round to 1");
     assert_eq!(load[0].load5, 1.5);
     assert_eq!(load[0].load15, 2.25);
@@ -194,10 +196,12 @@ fn cleanup_covers_new_series_and_container_status() {
 
     s.cleanup(7, now).unwrap();
 
-    assert_eq!(s.network_history(0, i64::MAX).unwrap().len(), 10);
-    assert_eq!(s.load_history(0, i64::MAX).unwrap().len(), 10);
+    assert_eq!(s.network_history(0, i64::MAX, None).unwrap().len(), 10);
+    assert_eq!(s.load_history(0, i64::MAX, None).unwrap().len(), 10);
     assert_eq!(
-        s.container_network_history("c", 0, i64::MAX).unwrap().len(),
+        s.container_network_history("c", 0, i64::MAX, None)
+            .unwrap()
+            .len(),
         10
     );
     // Stale container is gone from the current view.
@@ -242,7 +246,7 @@ fn downsample_preserves_a_bucket_that_straddles_the_cutoff() {
     s.downsample(bucket + retention::BUCKET_MS + retention::DOWNSAMPLE_AFTER_MS)
         .unwrap();
 
-    let rows = s.cpu_history(bucket, bucket).unwrap();
+    let rows = s.cpu_history(bucket, bucket, None).unwrap();
     assert_eq!(rows.len(), 1, "the straddling bucket collapses to one row");
     assert_eq!(
         rows[0].percent, 15.0,
@@ -259,7 +263,7 @@ fn downsample_leaves_recent_samples_at_full_resolution() {
         s.insert_cpu(recent + i * 5_000, 1.0).unwrap();
     }
     s.downsample(now).unwrap();
-    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 12);
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 12);
 }
 
 #[test]
@@ -272,9 +276,9 @@ fn downsample_is_idempotent() {
         s.insert_cpu(bucket + i * 5_000, 5.0).unwrap();
     }
     s.downsample(now).unwrap();
-    let first = s.cpu_history(0, i64::MAX).unwrap();
+    let first = s.cpu_history(0, i64::MAX, None).unwrap();
     s.downsample(now).unwrap();
-    assert_eq!(first, s.cpu_history(0, i64::MAX).unwrap());
+    assert_eq!(first, s.cpu_history(0, i64::MAX, None).unwrap());
 }
 
 #[test]
@@ -310,8 +314,8 @@ fn downsample_keeps_container_series_separate() {
         .unwrap();
     }
     s.downsample(now).unwrap();
-    let web = s.container_cpu_history("web", 0, i64::MAX).unwrap();
-    let db = s.container_cpu_history("db", 0, i64::MAX).unwrap();
+    let web = s.container_cpu_history("web", 0, i64::MAX, None).unwrap();
+    let db = s.container_cpu_history("db", 0, i64::MAX, None).unwrap();
     assert_eq!(web.len(), 1);
     assert_eq!(db.len(), 1);
     assert!((web[0].percent - 10.0).abs() < 1e-9);

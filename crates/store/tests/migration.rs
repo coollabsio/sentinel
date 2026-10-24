@@ -45,21 +45,23 @@ fn migrates_legacy_text_schema_preserving_data() {
 
     let s = Store::open(&path).unwrap();
 
-    let cpu = s.cpu_history(0, i64::MAX).unwrap();
+    let cpu = s.cpu_history(0, i64::MAX, None).unwrap();
     assert_eq!(cpu.len(), 2);
     assert_eq!(cpu[0].time, 1_700_000_000_000);
     assert!((cpu[0].percent - 42.50).abs() < 1e-9);
 
-    let mem = s.memory_history(0, i64::MAX).unwrap();
+    let mem = s.memory_history(0, i64::MAX, None).unwrap();
     assert_eq!(mem.len(), 1);
     assert_eq!(mem[0].total, 16_000_000_000);
     assert!((mem[0].used_percent - 43.75).abs() < 1e-9);
 
-    let ccpu = s.container_cpu_history("web", 0, i64::MAX).unwrap();
+    let ccpu = s.container_cpu_history("web", 0, i64::MAX, None).unwrap();
     assert_eq!(ccpu.len(), 1);
     assert!((ccpu[0].percent - 10.0).abs() < 1e-9);
 
-    let cmem = s.container_memory_history("web", 0, i64::MAX).unwrap();
+    let cmem = s
+        .container_memory_history("web", 0, i64::MAX, None)
+        .unwrap();
     assert_eq!(cmem.len(), 1);
     assert_eq!(cmem[0].used, 60);
 
@@ -77,7 +79,7 @@ fn migration_is_idempotent() {
         Store::open(&path).unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 2);
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 2);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -127,10 +129,12 @@ fn migrates_available_legacy_tables_when_one_is_missing() {
         .unwrap();
 
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 2);
-    assert!(s.memory_history(0, i64::MAX).unwrap().is_empty());
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 2);
+    assert!(s.memory_history(0, i64::MAX, None).unwrap().is_empty());
     assert_eq!(
-        s.container_cpu_history("web", 0, i64::MAX).unwrap().len(),
+        s.container_cpu_history("web", 0, i64::MAX, None)
+            .unwrap()
+            .len(),
         1
     );
 
@@ -149,10 +153,12 @@ fn detects_legacy_schema_when_cpu_table_is_missing() {
         .unwrap();
 
     let s = Store::open(&path).unwrap();
-    assert!(s.cpu_history(0, i64::MAX).unwrap().is_empty());
-    assert_eq!(s.memory_history(0, i64::MAX).unwrap().len(), 1);
+    assert!(s.cpu_history(0, i64::MAX, None).unwrap().is_empty());
+    assert_eq!(s.memory_history(0, i64::MAX, None).unwrap().len(), 1);
     assert_eq!(
-        s.container_cpu_history("web", 0, i64::MAX).unwrap().len(),
+        s.container_cpu_history("web", 0, i64::MAX, None)
+            .unwrap()
+            .len(),
         1
     );
 
@@ -218,7 +224,7 @@ fn skips_unparseable_rows_instead_of_failing() {
     let s = Store::open(&path).unwrap();
     // only the two originally-seeded good rows survive; all three malformed
     // rows above are dropped, none silently coerced to a fabricated 0/0.0
-    let rows = s.cpu_history(0, i64::MAX).unwrap();
+    let rows = s.cpu_history(0, i64::MAX, None).unwrap();
     assert_eq!(rows.len(), 2, "got {rows:?}");
     assert!(
         rows.iter()
@@ -254,7 +260,7 @@ fn skips_rows_with_a_genuine_sql_null_not_just_unparseable_text() {
     }
 
     let s = Store::open(&path).unwrap();
-    let rows = s.cpu_history(0, i64::MAX).unwrap();
+    let rows = s.cpu_history(0, i64::MAX, None).unwrap();
     assert_eq!(
         rows.len(),
         2,
@@ -325,13 +331,13 @@ fn migrates_a_large_legacy_database_row_for_row() {
 
     let s = Store::open(&path).unwrap();
 
-    let cpu = s.cpu_history(0, i64::MAX).unwrap();
+    let cpu = s.cpu_history(0, i64::MAX, None).unwrap();
     assert_eq!(cpu.len() as i64, N + 2, "2 seeded + {N} bulk cpu rows");
-    let mem = s.memory_history(0, i64::MAX).unwrap();
+    let mem = s.memory_history(0, i64::MAX, None).unwrap();
     assert_eq!(mem.len() as i64, N + 1);
     for name in ["web", "db"] {
-        let ccpu = s.container_cpu_history(name, 0, i64::MAX).unwrap();
-        let cmem = s.container_memory_history(name, 0, i64::MAX).unwrap();
+        let ccpu = s.container_cpu_history(name, 0, i64::MAX, None).unwrap();
+        let cmem = s.container_memory_history(name, 0, i64::MAX, None).unwrap();
         // "web" also has the single row legacy_db() seeded
         let seeded = i64::from(name == "web");
         assert_eq!(ccpu.len() as i64, N + seeded, "{name} cpu");
@@ -342,20 +348,20 @@ fn migrates_a_large_legacy_database_row_for_row() {
     for i in [0i64, N / 2, N - 1] {
         let t = 1_700_000_100_000 + i * 1_000;
         let expected = i as f64 / 100.0;
-        let cpu = s.cpu_history(t, t).unwrap();
+        let cpu = s.cpu_history(t, t, None).unwrap();
         assert_eq!(cpu.len(), 1, "cpu row at {t}");
         assert!((cpu[0].percent - expected).abs() < 1e-9, "cpu at {t}");
 
-        let mem = s.memory_history(t, t).unwrap();
+        let mem = s.memory_history(t, t, None).unwrap();
         assert_eq!(mem.len(), 1);
         assert_eq!(mem[0].used, 7_000_000_000 + i as u64);
         assert!((mem[0].used_percent - expected).abs() < 1e-9);
 
-        let ccpu = s.container_cpu_history("db", t, t).unwrap();
+        let ccpu = s.container_cpu_history("db", t, t, None).unwrap();
         assert_eq!(ccpu.len(), 1);
         assert!((ccpu[0].percent - expected).abs() < 1e-9);
 
-        let cmem = s.container_memory_history("db", t, t).unwrap();
+        let cmem = s.container_memory_history("db", t, t, None).unwrap();
         assert_eq!(cmem.len(), 1);
         assert_eq!(cmem[0].used, 60 + i as u64);
         assert_eq!(cmem[0].free, 40 + i as u64);
@@ -381,9 +387,9 @@ fn unreadable_database_is_moved_aside_instead_of_failing_startup() {
     let s = Store::open(&path).expect("open must recover, not error");
 
     // fresh, empty, typed database usable immediately
-    assert!(s.cpu_history(0, i64::MAX).unwrap().is_empty());
+    assert!(s.cpu_history(0, i64::MAX, None).unwrap().is_empty());
     s.insert_cpu(1_000, 1.0).unwrap();
-    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 1);
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 1);
 
     assert!(
         backup.exists(),
@@ -406,7 +412,7 @@ fn fresh_database_needs_no_migration() {
 
     let s = Store::open(&path).unwrap();
     s.insert_cpu(1_000, 1.0).unwrap();
-    assert_eq!(s.cpu_history(0, i64::MAX).unwrap().len(), 1);
+    assert_eq!(s.cpu_history(0, i64::MAX, None).unwrap().len(), 1);
 
     std::fs::remove_dir_all(&dir).ok();
 }
