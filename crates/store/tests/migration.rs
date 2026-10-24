@@ -435,3 +435,85 @@ fn drops_unused_container_logs_table() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Typed schema of the container tables before they were clustered.
+fn rowid_container_db(path: &std::path::Path) {
+    let c = rusqlite::Connection::open(path).unwrap();
+    c.execute_batch(
+        r#"
+        CREATE TABLE container_cpu_usage (
+            time INTEGER NOT NULL, container_id TEXT NOT NULL, percent REAL NOT NULL,
+            PRIMARY KEY (time, container_id)) STRICT;
+        CREATE TABLE container_memory_usage (
+            time INTEGER NOT NULL, container_id TEXT NOT NULL, total INTEGER NOT NULL,
+            available INTEGER NOT NULL, used INTEGER NOT NULL, used_percent REAL NOT NULL,
+            free INTEGER NOT NULL, PRIMARY KEY (time, container_id)) STRICT;
+        CREATE INDEX idx_ccu_container_time ON container_cpu_usage (container_id, time);
+        CREATE INDEX idx_cmu_container_time ON container_memory_usage (container_id, time);
+
+        INSERT INTO container_cpu_usage VALUES (1000, 'web', 10.0), (1000, 'db', 20.0),
+                                               (2000, 'web', 30.0), (2000, 'db', 40.0);
+        INSERT INTO container_memory_usage VALUES (1000, 'web', 100, 40, 60, 60.0, 40);
+        "#,
+    )
+    .unwrap();
+}
+
+fn without_rowid(path: &std::path::Path, table: &str) -> bool {
+    let c = rusqlite::Connection::open(path).unwrap();
+    c.query_row(
+        "SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
+        (table,),
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn clusters_rowid_container_tables_preserving_rows() {
+    let dir = tmpdir("cluster");
+    let path = dir.join("metrics.sqlite");
+    rowid_container_db(&path);
+    assert!(!without_rowid(&path, "container_cpu_usage"));
+
+    let s = Store::open(&path).unwrap();
+    for table in [
+        "container_cpu_usage",
+        "container_memory_usage",
+        "container_disk_usage",
+        "container_network_usage",
+    ] {
+        assert!(without_rowid(&path, table), "{table}");
+    }
+    let web = s.container_cpu_history("web", 0, i64::MAX).unwrap();
+    assert_eq!(
+        web.iter().map(|r| (r.time, r.percent)).collect::<Vec<_>>(),
+        vec![(1000, 10.0), (2000, 30.0)]
+    );
+    assert_eq!(s.container_cpu_history("db", 0, i64::MAX).unwrap().len(), 2);
+    assert_eq!(
+        s.container_memory_history("web", 0, i64::MAX).unwrap()[0].used,
+        60
+    );
+    drop(s);
+
+    // The old (container_id, time) index went with the old table.
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let old_index: bool = c
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_ccu_container_time')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!old_index);
+    drop(c);
+
+    // A second open finds nothing to rebuild and keeps the rows.
+    let s = Store::open(&path).unwrap();
+    assert_eq!(
+        s.container_cpu_history("web", 0, i64::MAX).unwrap().len(),
+        2
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
