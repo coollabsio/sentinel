@@ -1483,6 +1483,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "logarchive"
+version = "1.1.3"
+dependencies = [
+ "bollard",
+ "config",
+ "docker",
+ "futures-util",
+ "tempfile",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lru"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2440,6 +2454,7 @@ dependencies = [
  "docker",
  "dotenvy",
  "http-body-util",
+ "logarchive",
  "push",
  "rusqlite",
  "serde_json",

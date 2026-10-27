@@ -470,3 +470,83 @@ fn traffic_ip_mode_reads_env_and_rejects_unknown_values() {
         Err(ConfigError::InvalidIpMode)
     ));
 }
+
+#[test]
+fn log_archive_defaults_next_to_the_metrics_db() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "https://example.com"),
+        ("LOG_ARCHIVE_ENABLED", ""),
+        ("LOG_ARCHIVE_DIR", ""),
+        ("LOG_ARCHIVE_MAX_FILE_MB", ""),
+        ("LOG_ARCHIVE_MAX_TOTAL_MB", ""),
+        ("LOG_ARCHIVE_RETENTION_DAYS", ""),
+    ]);
+    let a = Config::load(false).unwrap().log_archive;
+    assert!(a.enabled);
+    assert_eq!(a.dir.to_str().unwrap(), "/app/db/container-logs");
+    assert_eq!(a.max_file_mb, 10);
+    assert_eq!(a.max_total_mb, 1024);
+    assert_eq!(a.retention_days, 7);
+    assert_eq!(
+        Config::load(true)
+            .unwrap()
+            .log_archive
+            .dir
+            .to_str()
+            .unwrap(),
+        "./db/container-logs"
+    );
+}
+
+#[test]
+fn log_archive_reads_overrides() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "https://example.com"),
+        ("LOG_ARCHIVE_ENABLED", "false"),
+        ("LOG_ARCHIVE_DIR", "/tmp/archive"),
+        ("LOG_ARCHIVE_MAX_FILE_MB", "5"),
+        ("LOG_ARCHIVE_MAX_TOTAL_MB", "200"),
+        ("LOG_ARCHIVE_RETENTION_DAYS", "3"),
+    ]);
+    let a = Config::load(false).unwrap().log_archive;
+    assert!(!a.enabled);
+    assert_eq!(a.dir.to_str().unwrap(), "/tmp/archive");
+    assert_eq!(a.max_file_mb, 5);
+    assert_eq!(a.max_total_mb, 200);
+    assert_eq!(a.retention_days, 3);
+}
+
+#[test]
+fn log_archive_rejects_invalid_values() {
+    for (var, value) in [
+        ("LOG_ARCHIVE_MAX_FILE_MB", "0"),
+        ("LOG_ARCHIVE_MAX_TOTAL_MB", "-1"),
+        ("LOG_ARCHIVE_RETENTION_DAYS", "0"),
+        ("LOG_ARCHIVE_RETENTION_DAYS", "4294967296"),
+    ] {
+        let _l = env_lock().lock().unwrap();
+        let _g = EnvGuard::set(&[
+            ("TOKEN", "t"),
+            ("PUSH_ENDPOINT", "https://example.com"),
+            (var, value),
+        ]);
+        assert!(
+            matches!(Config::load(false), Err(ConfigError::NotPositive(v)) if v == var),
+            "{var}={value} must be rejected"
+        );
+    }
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "https://example.com"),
+        ("LOG_ARCHIVE_ENABLED", "maybe"),
+    ]);
+    assert!(matches!(
+        Config::load(false),
+        Err(ConfigError::InvalidBool("LOG_ARCHIVE_ENABLED"))
+    ));
+}

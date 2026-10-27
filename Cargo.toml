@@ -58,6 +58,7 @@ collector = { path = "crates/collector" }
 config = { path = "crates/config" }
 control = { path = "crates/control" }
 docker = { path = "crates/docker" }
+logarchive = { path = "crates/logarchive" }
 push = { path = "crates/push" }
 store = { path = "crates/store" }
 traffic = { workspace = true, optional = true }
