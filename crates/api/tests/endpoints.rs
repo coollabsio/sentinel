@@ -230,6 +230,8 @@ async fn disk_history_filters_by_mount() {
     for uri in [
         "/api/disk/history?mount=%2F,%2Fdata",
         "/api/disk/history?mount=%2F,,%2Fdata&bucket_ms=60000",
+        // Coolify encodes the commas.
+        "/api/disk/history?bucket_ms=60000&mount=%2F%2C%2Fapp%2Fdb%2C%2Fdata%2Fcoolify%2C%2Fdata",
     ] {
         let (s, j) = get(router(st.clone()), uri, Some("secret")).await;
         assert_eq!(s, StatusCode::OK, "{uri}");
