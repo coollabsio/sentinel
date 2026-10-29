@@ -987,6 +987,15 @@
               "format": "int64",
               "minimum": 1
             }
+          },
+          {
+            "name": "mount",
+            "in": "query",
+            "description": "Comma-separated exact mount points, e.g. `/,/data`. Omit or leave\nempty for every mount.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {

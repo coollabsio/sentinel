@@ -55,6 +55,10 @@ and disk keeps one row per mount per window. The row shape does not change.
 Use it for long ranges: a 7-day read with `bucket_ms=600000` returns about 1000
 rows per series instead of tens of thousands.
 
+`/api/disk/history` also takes `mount=<comma-separated mount points>` (for
+example `mount=%2F,%2Fdata`) to return rows only for those exact mounts. Empty
+items are ignored; an absent or empty `mount` returns every mount.
+
 ## Errors
 
 Error responses share one shape: `{"error": "<message>"}` with status `400`

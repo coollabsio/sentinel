@@ -204,6 +204,46 @@ async fn history_rejects_bad_bucket_ms() {
 }
 
 #[tokio::test]
+async fn disk_history_filters_by_mount() {
+    let st = state(false);
+    let disk = |mount: &str| store::DiskSample {
+        mount: mount.into(),
+        total: 100,
+        used: 60,
+        available: 40,
+        used_percent: 60.0,
+    };
+    st.store
+        .insert_disk_batch(
+            1_700_000_000_000,
+            &[disk("/"), disk("/data"), disk("/boot")],
+        )
+        .unwrap();
+    let mounts = |j: serde_json::Value| -> Vec<String> {
+        j.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["mount"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    for uri in [
+        "/api/disk/history?mount=%2F,%2Fdata",
+        "/api/disk/history?mount=%2F,,%2Fdata&bucket_ms=60000",
+    ] {
+        let (s, j) = get(router(st.clone()), uri, Some("secret")).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        assert_eq!(mounts(j), vec!["/", "/data"], "{uri}");
+    }
+
+    for uri in ["/api/disk/history", "/api/disk/history?mount="] {
+        let (s, j) = get(router(st.clone()), uri, Some("secret")).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        assert_eq!(mounts(j), vec!["/", "/boot", "/data"], "{uri}");
+    }
+}
+
+#[tokio::test]
 async fn cpu_history_returns_empty_array_not_null() {
     let store = store::Store::open_in_memory().unwrap();
     let mut config = config::Config::load_for_test();
