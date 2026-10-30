@@ -19,7 +19,7 @@ fn round_trips_disk_and_reports_latest_per_mount() {
         .unwrap();
 
     // History returns every stored row, ordered by (time, mount).
-    let hist = s.disk_history(0, i64::MAX, None).unwrap();
+    let hist = s.disk_history(0, i64::MAX, None, &[]).unwrap();
     assert_eq!(hist.len(), 4);
     assert_eq!(hist[0].time, 1_000);
     assert_eq!(hist[0].mount, "/");
@@ -40,7 +40,7 @@ fn disk_insert_is_upsert_on_time_and_mount() {
     let s = Store::open_in_memory().unwrap();
     s.insert_disk_batch(1_000, &[disk("/", 10.0)]).unwrap();
     s.insert_disk_batch(1_000, &[disk("/", 99.0)]).unwrap();
-    let rows = s.disk_history(0, i64::MAX, None).unwrap();
+    let rows = s.disk_history(0, i64::MAX, None, &[]).unwrap();
     assert_eq!(rows.len(), 1);
     assert!((rows[0].used_percent - 99.0).abs() < f64::EPSILON);
 }
@@ -136,7 +136,7 @@ fn downsampling_collapses_aged_storage_rows_per_entity() {
 
     s.downsample(now).unwrap();
 
-    let disks = s.disk_history(0, i64::MAX, None).unwrap();
+    let disks = s.disk_history(0, i64::MAX, None, &[]).unwrap();
     assert_eq!(disks.len(), 1, "two aged disk rows collapse to one bucket");
     assert!((disks[0].used_percent - 15.0).abs() < 0.01, "averaged");
 
@@ -157,7 +157,7 @@ fn disk_history_buckets_keep_one_row_per_mount() {
         .unwrap();
     s.insert_disk_batch(1_500, &[disk("/", 30.0), disk("/data", 40.0)])
         .unwrap();
-    let rows = s.disk_history(0, i64::MAX, Some(1_000)).unwrap();
+    let rows = s.disk_history(0, i64::MAX, Some(1_000), &[]).unwrap();
     let got: Vec<_> = rows
         .iter()
         .map(|r| (r.time, r.mount.as_str(), r.used_percent, r.used))
@@ -166,4 +166,39 @@ fn disk_history_buckets_keep_one_row_per_mount() {
         got,
         vec![(1_000, "/", 20.0, 60), (1_000, "/data", 30.0, 60)]
     );
+}
+
+#[test]
+fn disk_history_filters_by_mount() {
+    let s = Store::open_in_memory().unwrap();
+    let all = [disk("/", 10.0), disk("/data", 20.0), disk("/boot", 30.0)];
+    s.insert_disk_batch(1_000, &all).unwrap();
+    s.insert_disk_batch(1_500, &all).unwrap();
+    let mounts = ["/".to_string(), "/data".to_string()];
+    let pairs = |rows: Vec<store::DiskRow>| {
+        rows.into_iter()
+            .map(|r| (r.time, r.mount))
+            .collect::<Vec<_>>()
+    };
+
+    let rows = pairs(s.disk_history(0, i64::MAX, None, &mounts).unwrap());
+    assert_eq!(
+        rows,
+        vec![
+            (1_000, "/".into()),
+            (1_000, "/data".into()),
+            (1_500, "/".into()),
+            (1_500, "/data".into()),
+        ]
+    );
+
+    assert_eq!(s.disk_history(0, i64::MAX, None, &[]).unwrap().len(), 6);
+
+    let rows = pairs(s.disk_history(0, i64::MAX, Some(1_000), &mounts).unwrap());
+    assert_eq!(rows, vec![(1_000, "/".into()), (1_000, "/data".into())]);
+
+    let rows = s
+        .disk_history(0, i64::MAX, None, &["/missing".to_string()])
+        .unwrap();
+    assert!(rows.is_empty());
 }

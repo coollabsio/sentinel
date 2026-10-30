@@ -668,23 +668,36 @@ impl Store {
         })
     }
 
+    /// Disk history for `mounts` (exact mount points); empty means every mount.
     pub fn disk_history(
         &self,
         from: i64,
         to: i64,
         bucket_ms: Option<i64>,
+        mounts: &[String],
     ) -> Result<Vec<DiskRow>, StoreError> {
         self.with_reader(|c| {
+            let mut filter = String::from("time >= ?1 AND time <= ?2");
+            if !mounts.is_empty() {
+                let placeholders = (3..3 + mounts.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                filter.push_str(&format!(" AND mount IN ({placeholders})"));
+            }
             let sql = history_sql(
                 DISK_COLS,
                 "disk_usage",
-                "time >= ?1 AND time <= ?2",
+                &filter,
                 "time ASC, mount ASC",
                 bucket_ms,
             );
             let mut stmt = c.prepare_cached(&sql)?;
+            let params = [&from as &dyn rusqlite::ToSql, &to]
+                .into_iter()
+                .chain(mounts.iter().map(|m| m as &dyn rusqlite::ToSql));
             let rows = stmt
-                .query_map((from, to), map_disk_row)?
+                .query_map(rusqlite::params_from_iter(params), map_disk_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
