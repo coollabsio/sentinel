@@ -3,10 +3,12 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
+use utoipa::IntoParams;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
-use crate::routes::cpu::{MetricsHistoryQuery, internal_error, resolve_history};
+use crate::routes::cpu::{MetricsHistoryQuery, error_response, internal_error, resolve_history};
 use crate::time::format_millis;
 use crate::types::{BadRequestError, DiskUsage, InternalServerError, UnauthorizedError};
 
@@ -49,13 +51,25 @@ async fn current(State(state): State<Arc<AppState>>) -> Response {
     Json(out).into_response()
 }
 
+/// Each mount is one SQL parameter; stays far below SQLite's variable limit.
+const MAX_MOUNTS: usize = 1000;
+
+/// Disk-only filter, kept out of [`MetricsHistoryQuery`] which other endpoints share.
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct DiskHistoryQuery {
+    /// Comma-separated exact mount points, e.g. `/,/data` (at most 1000).
+    /// Omit or leave empty for every mount.
+    pub mount: Option<String>,
+}
+
 #[utoipa::path(
     get,
     path = "/api/disk/history",
     tag = "System Metrics",
     summary = "Get disk usage history",
     description = "Historical filesystem usage across mountpoints with optional date range filtering",
-    params(MetricsHistoryQuery),
+    params(MetricsHistoryQuery, DiskHistoryQuery),
     responses(
         (status = 200, description = "Historical disk usage data", body = Vec<DiskUsage>),
         (status = 400, response = BadRequestError),
@@ -67,18 +81,35 @@ async fn current(State(state): State<Arc<AppState>>) -> Response {
 async fn history(
     State(state): State<Arc<AppState>>,
     Query(q): Query<MetricsHistoryQuery>,
+    Query(dq): Query<DiskHistoryQuery>,
 ) -> Response {
     let (from, to, bucket_ms) = match resolve_history(&q, "1970-01-01T00:00:00Z") {
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    let mut mounts: Vec<String> = dq
+        .mount
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned)
+        .collect();
+    mounts.sort_unstable();
+    mounts.dedup();
+    if mounts.len() > MAX_MOUNTS {
+        return error_response(&format!(
+            "Too many 'mount' values. Use at most {MAX_MOUNTS}"
+        ));
+    }
 
     let permit = match state.history_queries.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(e) => return internal_error(e),
     };
     let store = state.store.clone();
-    let result = tokio::task::spawn_blocking(move || store.disk_history(from, to, bucket_ms)).await;
+    let result =
+        tokio::task::spawn_blocking(move || store.disk_history(from, to, bucket_ms, &mounts)).await;
     drop(permit);
     let rows = match result {
         Ok(Ok(rows)) => rows,

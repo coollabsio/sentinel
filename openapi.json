@@ -987,6 +987,15 @@
               "format": "int64",
               "minimum": 1
             }
+          },
+          {
+            "name": "mount",
+            "in": "query",
+            "description": "Comma-separated exact mount points, e.g. `/,/data` (at most 1000).\nOmit or leave empty for every mount.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
