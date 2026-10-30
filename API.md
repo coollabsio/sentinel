@@ -57,7 +57,8 @@ rows per series instead of tens of thousands.
 
 `/api/disk/history` also takes `mount=<comma-separated mount points>` (for
 example `mount=%2F,%2Fdata`) to return rows only for those exact mounts. Empty
-items are ignored; an absent or empty `mount` returns every mount.
+items are ignored; an absent or empty `mount` returns every mount. More than
+1000 distinct mounts returns `400`.
 
 ## Errors
 

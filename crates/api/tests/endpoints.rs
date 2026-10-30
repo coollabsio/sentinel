@@ -246,6 +246,43 @@ async fn disk_history_filters_by_mount() {
 }
 
 #[tokio::test]
+async fn disk_history_limits_mount_count() {
+    let list = |n: usize| {
+        (0..n)
+            .map(|i| format!("%2Fm{i}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    // Duplicates collapse, so they never count against the limit.
+    let dupes = vec!["%2F"; 5000].join(",");
+    let (s, _) = get(
+        router(state(false)),
+        &format!("/api/disk/history?mount={dupes}"),
+        Some("secret"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, _) = get(
+        router(state(false)),
+        &format!("/api/disk/history?mount={}", list(1000)),
+        Some("secret"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let (s, j) = get(
+        router(state(false)),
+        &format!("/api/disk/history?mount={}", list(1001)),
+        Some("secret"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(j["error"].as_str().unwrap().contains("mount"));
+}
+
+#[tokio::test]
 async fn cpu_history_returns_empty_array_not_null() {
     let store = store::Store::open_in_memory().unwrap();
     let mut config = config::Config::load_for_test();

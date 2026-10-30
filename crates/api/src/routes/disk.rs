@@ -8,7 +8,7 @@ use utoipa::IntoParams;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
-use crate::routes::cpu::{MetricsHistoryQuery, internal_error, resolve_history};
+use crate::routes::cpu::{MetricsHistoryQuery, error_response, internal_error, resolve_history};
 use crate::time::format_millis;
 use crate::types::{BadRequestError, DiskUsage, InternalServerError, UnauthorizedError};
 
@@ -51,12 +51,15 @@ async fn current(State(state): State<Arc<AppState>>) -> Response {
     Json(out).into_response()
 }
 
+/// Each mount is one SQL parameter; stays far below SQLite's variable limit.
+const MAX_MOUNTS: usize = 1000;
+
 /// Disk-only filter, kept out of [`MetricsHistoryQuery`] which other endpoints share.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct DiskHistoryQuery {
-    /// Comma-separated exact mount points, e.g. `/,/data`. Omit or leave
-    /// empty for every mount.
+    /// Comma-separated exact mount points, e.g. `/,/data` (at most 1000).
+    /// Omit or leave empty for every mount.
     pub mount: Option<String>,
 }
 
@@ -84,7 +87,7 @@ async fn history(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    let mounts: Vec<String> = dq
+    let mut mounts: Vec<String> = dq
         .mount
         .as_deref()
         .unwrap_or_default()
@@ -92,6 +95,13 @@ async fn history(
         .filter(|m| !m.is_empty())
         .map(str::to_owned)
         .collect();
+    mounts.sort_unstable();
+    mounts.dedup();
+    if mounts.len() > MAX_MOUNTS {
+        return error_response(&format!(
+            "Too many 'mount' values. Use at most {MAX_MOUNTS}"
+        ));
+    }
 
     let permit = match state.history_queries.clone().acquire_owned().await {
         Ok(permit) => permit,

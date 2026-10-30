@@ -991,7 +991,7 @@
           {
             "name": "mount",
             "in": "query",
-            "description": "Comma-separated exact mount points, e.g. `/,/data`. Omit or leave\nempty for every mount.",
+            "description": "Comma-separated exact mount points, e.g. `/,/data` (at most 1000).\nOmit or leave empty for every mount.",
             "required": false,
             "schema": {
               "type": "string"
