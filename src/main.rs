@@ -83,7 +83,7 @@ fn assignment_client(
 async fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => Ok(listener),
-        Err(e) if addr.is_ipv6() => {
+        Err(e) if addr.is_ipv6() && addr.ip().is_unspecified() => {
             let v4 = SocketAddr::from(([0, 0, 0, 0], addr.port()));
             tracing::warn!(error = %e, %v4, "IPv6 bind failed, falling back to IPv4");
             tokio::net::TcpListener::bind(v4).await

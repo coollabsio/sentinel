@@ -32,6 +32,7 @@ docker run -d \
   -p 8888:8888 \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v sentinel-data:/app/db \
+  -e BIND_ADDRESS=:: \
   -e TOKEN=your-secret-token \
   -e PUSH_ENDPOINT=https://coolify.example.com \
   -e COLLECTOR_ENABLED=true \
@@ -92,6 +93,7 @@ Sentinel is configured using environment variables:
 | `DOCKER_HOST` | `/var/run/docker.sock` | Docker Engine API socket; `unix://` URLs and bare paths only — e.g. `unix:///run/user/1000/podman/podman.sock` for rootless Podman |
 | `DEBUG` | `false` | Enable verbose logging, `human_friendly_time` fields, and the `/api/stats` route |
 | `PORT` | `8888` | HTTP server port |
+| `BIND_ADDRESS` | `127.0.0.1` | IP address the HTTP server listens on. The default accepts only connections from inside the container. Set `::` (all interfaces, IPv4 and IPv6) when you publish the port or call the API from another container |
 
 #### Traffic Analytics Variables
 
@@ -329,6 +331,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - sentinel-data:/app/db
     environment:
+      BIND_ADDRESS: "::"
       TOKEN: ${SENTINEL_TOKEN}
       PUSH_ENDPOINT: ${PUSH_ENDPOINT}
       COLLECTOR_ENABLED: "true"

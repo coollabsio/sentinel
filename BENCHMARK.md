@@ -121,6 +121,7 @@ Example start:
 ```bash
 docker run -d --name sentinel-bench-a \
   -p 127.0.0.1:18888:8888 \
+  -e BIND_ADDRESS=:: \
   -e TOKEN -e PUSH_ENDPOINT \
   -e COLLECTOR_ENABLED -e COLLECTOR_REFRESH_RATE_SECONDS \
   -e PUSH_INTERVAL_SECONDS -e DEBUG \
