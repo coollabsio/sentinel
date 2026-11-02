@@ -517,7 +517,9 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "volume.delete.v1",
             "volume.serve.v1",
             "volume.receive.v1",
-            "volume.transfer.v1"
+            "volume.transfer.v1",
+            "volume.verify.v1",
+            "workload.stop_timeout.v1"
         ])
     );
 }
@@ -1382,6 +1384,7 @@ fn builds_shell_free_podman_lifecycle_arguments() {
     let request = |action| WorkloadLifecycleRequest {
         name: "coolify-test-web".into(),
         action,
+        stop_timeout_seconds: None,
     };
 
     assert_eq!(
@@ -1413,14 +1416,16 @@ fn rejects_unsafe_workload_lifecycle_requests() {
     assert!(
         crate::commands::podman_lifecycle_args(&WorkloadLifecycleRequest {
             name: "bad name".into(),
-            action: 1
+            action: 1,
+            stop_timeout_seconds: None,
         })
         .is_err()
     );
     assert!(
         crate::commands::podman_lifecycle_args(&WorkloadLifecycleRequest {
             name: "coolify-safe".into(),
-            action: 0
+            action: 0,
+            stop_timeout_seconds: None,
         })
         .is_err()
     );
@@ -1761,6 +1766,7 @@ fn workload_lifecycle_command(
                 sentinel_protocol::control::v1::WorkloadLifecycleRequest {
                     name: name.into(),
                     action: action.into(),
+                    stop_timeout_seconds: None,
                 },
             ),
         ),

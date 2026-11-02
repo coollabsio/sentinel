@@ -49,6 +49,8 @@ const NFT_TIMEOUT: Duration = Duration::from_secs(30);
 const RECEIVE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECEIVE_MAX_ENTRIES: usize = 256;
 const ERROR_MAX_CHARS: usize = 2_000;
+/// The longest checksum check of one volume. It reads all data on both Nodes.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 
 fn valid_transfer_id(value: &str) -> bool {
     (1..=64).contains(&value.len())
@@ -797,7 +799,7 @@ pub(crate) fn validate_receive(request: &VolumeReceiveRequest) -> Result<(), Str
     if !valid_transfer_id(&request.transfer_id) {
         return Err("The transfer ID is invalid.".into());
     }
-    if !matches!(request.pass.as_str(), "warm" | "final") {
+    if !matches!(request.pass.as_str(), "warm" | "final" | "verify") {
         return Err("The transfer pass is invalid.".into());
     }
     if request.source_address.parse::<Ipv4Addr>().is_err() {
@@ -942,10 +944,15 @@ pub(crate) fn receive(
 
     let worker_progress = progress.clone();
     let warm = request.pass == "warm";
+    let verify = request.pass == "verify";
     let password = request.secret.clone();
     let transfer_id = request.transfer_id.clone();
     std::thread::spawn(move || {
-        let outcome = copy_volumes(source, &password, &mountpoints, warm, &worker_progress);
+        let outcome = if verify {
+            verify_volumes(source, &password, &mountpoints)
+        } else {
+            copy_volumes(source, &password, &mountpoints, warm, &worker_progress)
+        };
         if host {
             revoke_source(source_address, source_port);
         }
@@ -967,6 +974,67 @@ pub(crate) fn receive(
         }
     });
     Ok(snapshot(&progress))
+}
+
+/// Compares every file of each volume with the source by checksum, without
+/// changing anything. It fails when rsync would copy, change, or delete any
+/// file, so a move switches only to an exact copy.
+fn verify_volumes(
+    (address, port): (Ipv4Addr, u32),
+    password: &str,
+    mountpoints: &[(String, String)],
+) -> Result<(), String> {
+    for (name, path) in mountpoints {
+        let output = output_with_timeout(
+            Command::new("rsync")
+                .args([
+                    "-aHAX",
+                    "--numeric-ids",
+                    "--checksum",
+                    "--dry-run",
+                    "--delete",
+                    "--itemize-changes",
+                    "--no-inc-recursive",
+                    "--contimeout=30",
+                    "--timeout=600",
+                ])
+                .arg(format!("rsync://{RSYNC_USER}@{address}:{port}/{name}/"))
+                .arg(format!("{path}/"))
+                .env_clear()
+                .env(
+                    "PATH",
+                    std::env::var_os("PATH")
+                        .unwrap_or_else(|| "/usr/sbin:/usr/bin:/sbin:/bin".into()),
+                )
+                .env("LC_ALL", "C")
+                .env("RSYNC_PASSWORD", password)
+                .stdin(Stdio::null()),
+            VERIFY_TIMEOUT,
+        )
+        .map_err(|_| format!("The check of the volume {name} did not finish."))?;
+        if !output.status.success() {
+            return Err(tail(
+                &String::from_utf8_lossy(&output.stderr),
+                &format!("rsync could not check the volume {name}."),
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let differences: Vec<&str> = stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        if !differences.is_empty() {
+            return Err(format!(
+                "The copy of the volume {name} differs from the source in {} entries, for example: {}",
+                differences.len(),
+                differences.iter().take(5).copied().collect::<Vec<_>>().join("; ")
+            )
+            .chars()
+            .take(ERROR_MAX_CHARS)
+            .collect());
+        }
+    }
+    Ok(())
 }
 
 /// Copies the volumes one after another. `bytes_done` and `bytes_total` add up

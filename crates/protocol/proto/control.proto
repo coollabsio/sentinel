@@ -292,6 +292,9 @@ enum WorkloadLifecycleAction {
 message WorkloadLifecycleRequest {
   string name = 1;
   WorkloadLifecycleAction action = 2;
+  // Seconds that STOP and RESTART wait before they kill the container, 1 to
+  // 600. Unset is 10. Needs `workload.stop_timeout.v1`.
+  optional uint32 stop_timeout_seconds = 3;
 }
 
 message WorkloadLifecycleResult {

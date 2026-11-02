@@ -706,11 +706,12 @@ fn workload_lifecycle(
     } else {
         None
     };
-    let output = output_with_timeout(
-        std::process::Command::new(podman).args(arguments),
-        PODMAN_LIFECYCLE_TIMEOUT,
-    )
-    .map_err(podman_error);
+    // Podman needs the stop timeout plus the time to remove the container.
+    let timeout = PODMAN_LIFECYCLE_TIMEOUT.max(Duration::from_secs(
+        u64::from(stop_timeout_seconds(request)?) + 60,
+    ));
+    let output = output_with_timeout(std::process::Command::new(podman).args(arguments), timeout)
+        .map_err(podman_error);
     let failure = match output {
         Ok(output) if output.status.success() => None,
         Ok(output) => {
@@ -741,6 +742,17 @@ fn workload_lifecycle(
     })
 }
 
+const DEFAULT_STOP_TIMEOUT_SECONDS: u32 = 10;
+const MAX_STOP_TIMEOUT_SECONDS: u32 = 600;
+
+fn stop_timeout_seconds(request: &WorkloadLifecycleRequest) -> Result<u32, String> {
+    match request.stop_timeout_seconds {
+        None => Ok(DEFAULT_STOP_TIMEOUT_SECONDS),
+        Some(seconds) if (1..=MAX_STOP_TIMEOUT_SECONDS).contains(&seconds) => Ok(seconds),
+        Some(_) => Err("The stop timeout must be 1 to 600 seconds.".into()),
+    }
+}
+
 pub(crate) fn podman_lifecycle_args(
     request: &WorkloadLifecycleRequest,
 ) -> Result<Vec<String>, String> {
@@ -749,13 +761,14 @@ pub(crate) fn podman_lifecycle_args(
     }
 
     let name = request.name.clone();
+    let stop_timeout = stop_timeout_seconds(request)?.to_string();
     match WorkloadLifecycleAction::try_from(request.action).ok() {
         Some(WorkloadLifecycleAction::Start) => Ok(vec!["start".into(), name]),
         Some(WorkloadLifecycleAction::Stop) => {
-            Ok(vec!["stop".into(), "--time".into(), "10".into(), name])
+            Ok(vec!["stop".into(), "--time".into(), stop_timeout, name])
         }
         Some(WorkloadLifecycleAction::Restart) => {
-            Ok(vec!["restart".into(), "--time".into(), "10".into(), name])
+            Ok(vec!["restart".into(), "--time".into(), stop_timeout, name])
         }
         Some(WorkloadLifecycleAction::Remove) => Ok(vec!["rm".into(), "--force".into(), name]),
         _ => Err("The workload lifecycle action is invalid.".into()),

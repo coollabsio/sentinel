@@ -44,12 +44,19 @@ pub const CAPABILITY_VOLUME_RECEIVE: &str = "volume.receive.v1";
 /// This Sentinel serves and receives volumes for a move (decision 0007). Not a
 /// command.
 pub const CAPABILITY_VOLUME_TRANSFER: &str = "volume.transfer.v1";
-pub const VOLUME_CAPABILITIES: [&str; 5] = [
+/// `volume.receive.v1` accepts the `verify` pass. Not a command.
+pub const CAPABILITY_VOLUME_VERIFY: &str = "volume.verify.v1";
+/// `workload.lifecycle.v1` accepts `stop_timeout_seconds`, so a move can give
+/// the source time for a clean shutdown. Not a command.
+pub const CAPABILITY_WORKLOAD_STOP_TIMEOUT: &str = "workload.stop_timeout.v1";
+pub const VOLUME_CAPABILITIES: [&str; 7] = [
     CAPABILITY_VOLUME_MOUNTS,
     CAPABILITY_VOLUME_DELETE,
     CAPABILITY_VOLUME_SERVE,
     CAPABILITY_VOLUME_RECEIVE,
     CAPABILITY_VOLUME_TRANSFER,
+    CAPABILITY_VOLUME_VERIFY,
+    CAPABILITY_WORKLOAD_STOP_TIMEOUT,
 ];
 /// The cluster registry. Sentinel discovery DNS resolves it to the Node that
 /// runs the registry.

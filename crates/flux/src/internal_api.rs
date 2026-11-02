@@ -169,6 +169,8 @@ struct WorkloadLifecycleApiRequest {
     command_id: String,
     name: String,
     action: WorkloadLifecycleApiAction,
+    #[serde(default)]
+    stop_timeout_seconds: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -969,8 +971,18 @@ async fn workload_lifecycle(
     {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request").into());
     }
+    if request
+        .stop_timeout_seconds
+        .is_some_and(|seconds| !(1..=600).contains(&seconds))
+    {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid stop timeout").into());
+    }
     let now = now_millis();
     let action = request.action;
+    // The command waits for the stop timeout, so the wait for its result grows with it.
+    let timeout = LIFECYCLE_TIMEOUT.max(Duration::from_secs(
+        u64::from(request.stop_timeout_seconds.unwrap_or(0)) + 60,
+    ));
     let result = state
         .registry
         .dispatch(
@@ -983,10 +995,11 @@ async fn workload_lifecycle(
                 payload: Some(Payload::WorkloadLifecycle(WorkloadLifecycleRequest {
                     name: request.name,
                     action: action.protocol().into(),
+                    stop_timeout_seconds: request.stop_timeout_seconds,
                 })),
-                expires_at_unix_ms: now + LIFECYCLE_TIMEOUT.as_millis() as i64,
+                expires_at_unix_ms: now + timeout.as_millis() as i64,
             },
-            LIFECYCLE_TIMEOUT,
+            timeout,
         )
         .await
         .map_err(dispatch_error)?;
