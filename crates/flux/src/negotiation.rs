@@ -8,6 +8,9 @@ use sentinel_protocol::{
 
 use crate::CredentialClaims;
 
+const MAX_HELLO_FIELD_BYTES: usize = 128;
+const MAX_HELLO_CAPABILITIES: usize = 256;
+
 pub struct Negotiated {
     pub protocol_version: u32,
     pub capabilities: Vec<String>,
@@ -17,7 +20,10 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
     if hello.server_id.is_empty()
         || hello.server_id != claims.subject
         || hello.sentinel_version.is_empty()
+        || hello.sentinel_version.len() > MAX_HELLO_FIELD_BYTES
         || hello.boot_id.is_empty()
+        || hello.boot_id.len() > MAX_HELLO_FIELD_BYTES
+        || hello.capabilities.len() > MAX_HELLO_CAPABILITIES
     {
         return Err("invalid identity");
     }

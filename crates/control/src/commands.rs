@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use prost::Message;
 use sentinel_protocol::control::v1::command::Payload;
@@ -22,6 +23,14 @@ use sentinel_protocol::{
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 use tokio::sync::Notify;
+
+use crate::network::output_with_timeout;
+
+/// Pulls of large images can take long; this only stops a stalled pull or
+/// runtime from holding the command executor forever.
+const PODMAN_DEPLOY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const PODMAN_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+pub(crate) const PODMAN_QUERY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 pub(crate) const CONTAINER_RUNTIMES: [&str; 2] = ["podman", "docker"];
 
@@ -592,10 +601,11 @@ fn workload_lifecycle(
     } else {
         None
     };
-    let output = std::process::Command::new(podman)
-        .args(arguments)
-        .output()
-        .map_err(|_| "Podman is unavailable.".to_string());
+    let output = output_with_timeout(
+        std::process::Command::new(podman).args(arguments),
+        PODMAN_LIFECYCLE_TIMEOUT,
+    )
+    .map_err(podman_error);
     let failure = match output {
         Ok(output) if output.status.success() => None,
         Ok(output) => {
@@ -665,14 +675,20 @@ fn workload_deploy(
     podman: &Path,
     request: &WorkloadDeployRequest,
 ) -> Result<WorkloadDeployResult, String> {
-    let arguments = podman_deploy_args(request)?;
+    let deploy = podman_deploy_args(request)?;
     if !request.network_name.is_empty() {
         ensure_workload_network(podman, &request.network_name, &request.network_subnet)?;
     }
-    let output = std::process::Command::new(podman)
-        .args(arguments)
-        .output()
-        .map_err(|_| "Podman is unavailable.".to_string())?;
+    let mut command = std::process::Command::new(podman);
+    command
+        .args(deploy.arguments)
+        .env_clear()
+        .envs(std::env::vars_os().filter(|(name, _)| {
+            name.to_str()
+                .is_some_and(|name| podman_runtime_variable(name) && name != "NOTIFY_SOCKET")
+        }))
+        .envs(deploy.environment);
+    let output = output_with_timeout(&mut command, PODMAN_DEPLOY_TIMEOUT).map_err(podman_error)?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if message.is_empty() {
@@ -695,25 +711,28 @@ fn workload_deploy(
 }
 
 fn ensure_workload_network(podman: &Path, name: &str, subnet: &str) -> Result<(), String> {
-    let inspected = std::process::Command::new(podman)
-        .args(["network", "inspect", name])
-        .output()
-        .map_err(|_| "Podman is unavailable.".to_string())?;
+    let inspected = output_with_timeout(
+        std::process::Command::new(podman).args(["network", "inspect", name]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .map_err(podman_error)?;
     if inspected.status.success() {
         return network_inspect_has_subnet(&inspected.stdout, subnet)
             .then_some(())
             .ok_or_else(|| "The existing workload network uses a different subnet.".to_string());
     }
-    let created = std::process::Command::new(podman)
-        .args(["network", "create", "--subnet", subnet, name])
-        .output()
-        .map_err(|_| "Podman is unavailable.".to_string())?;
+    let created = output_with_timeout(
+        std::process::Command::new(podman).args(["network", "create", "--subnet", subnet, name]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .map_err(podman_error)?;
     if created.status.success() {
         return Ok(());
     }
-    let raced = std::process::Command::new(podman)
-        .args(["network", "inspect", name])
-        .output();
+    let raced = output_with_timeout(
+        std::process::Command::new(podman).args(["network", "inspect", name]),
+        PODMAN_QUERY_TIMEOUT,
+    );
     if raced.is_ok_and(|output| {
         output.status.success() && network_inspect_has_subnet(&output.stdout, subnet)
     }) {
@@ -789,11 +808,66 @@ pub(crate) fn container_mac_address(address: std::net::Ipv4Addr) -> String {
     format!("02:42:{a:02x}:{b:02x}:{c:02x}:{d:02x}")
 }
 
-pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<String>, String> {
+/// A `podman run` invocation. Workload environment values travel in the
+/// child's process environment, not in its argument list, because
+/// `/proc/<pid>/cmdline` is readable by every local user.
+#[derive(Debug)]
+pub(crate) struct PodmanDeploy {
+    pub(crate) arguments: Vec<String>,
+    pub(crate) environment: Vec<(String, String)>,
+}
+
+/// Environment variables that Podman or its helpers read themselves. Sentinel
+/// passes these from its own environment to Podman. A workload variable with
+/// such a name stays in the argument list, so it cannot change how Podman runs.
+pub(crate) fn podman_runtime_variable(name: &str) -> bool {
+    const NAMES: [&str; 18] = [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TZ",
+        "TMPDIR",
+        "NOTIFY_SOCKET",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "REGISTRY_AUTH_FILE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "STORAGE_DRIVER",
+        "STORAGE_OPTS",
+        "GODEBUG",
+        "GOMAXPROCS",
+        "GOMEMLIMIT",
+    ];
+    const PREFIXES: [&str; 10] = [
+        "LC_",
+        "XDG_",
+        "CONTAINERS_",
+        "CONTAINER_",
+        "PODMAN_",
+        "BUILDAH_",
+        "DOCKER_",
+        "NETAVARK_",
+        "AARDVARK_",
+        "_",
+    ];
+    let upper = name.to_ascii_uppercase();
+    NAMES.contains(&name)
+        || PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        || matches!(
+            upper.as_str(),
+            "HTTP_PROXY" | "HTTPS_PROXY" | "NO_PROXY" | "ALL_PROXY" | "FTP_PROXY"
+        )
+}
+
+pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<PodmanDeploy, String> {
     if !valid_container_name(&request.name) {
         return Err("The container name is invalid.".into());
     }
     if request.image.is_empty()
+        || request.image.starts_with('-')
         || request.image.len() > 2_048
         || !request
             .image
@@ -881,14 +955,22 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
             format!("{memory_reservation_bytes}b"),
         ]);
     }
+    let mut environment = Vec::new();
     for variable in &request.environment {
         let key = &variable.key;
         let value = &variable.value;
-        // Podman accepts any name and value; only `=` in a name and null bytes cannot be passed as `--env KEY=VALUE`.
+        // Podman accepts any name and value; only `=` in a name and null bytes can be passed neither as `--env KEY=VALUE` nor in a process environment.
         if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
             return Err("An environment variable is invalid.".into());
         }
-        args.extend(["--env".into(), format!("{key}={value}")]);
+        // `--env KEY` reads the value from Podman's environment. A `*` in the
+        // name is a Podman wildcard import, so such names stay inline.
+        if key.contains('*') || podman_runtime_variable(key) {
+            args.extend(["--env".into(), format!("{key}={value}")]);
+        } else {
+            args.extend(["--env".into(), key.clone()]);
+            environment.push((key.clone(), value.clone()));
+        }
     }
     for label in &request.labels {
         let key = &label.key;
@@ -936,14 +1018,24 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
     }
     args.push(request.image.clone());
     args.extend(request.command.clone());
-    Ok(args)
+    Ok(PodmanDeploy {
+        arguments: args,
+        environment,
+    })
 }
 
 fn container_list() -> Result<Vec<ContainerObservation>, &'static str> {
-    let output = std::process::Command::new("podman")
-        .args(["ps", "--all", "--no-trunc", "--format", "json"])
-        .output()
-        .map_err(|_| "Podman is unavailable.")?;
+    let output = output_with_timeout(
+        std::process::Command::new("podman").args([
+            "ps",
+            "--all",
+            "--no-trunc",
+            "--format",
+            "json",
+        ]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .map_err(|_| "Podman is unavailable or did not answer.")?;
     if !output.status.success() {
         return Err("Podman could not list containers.");
     }
@@ -1101,9 +1193,14 @@ fn system_info(sentinel_version: &str, system: &mut System) -> SystemInfoResult 
 
 fn container_runtime() -> (Option<String>, Option<String>) {
     for runtime in CONTAINER_RUNTIMES {
-        let output = std::process::Command::new(runtime)
-            .args(["version", "--format", "{{.Server.Version}}"])
-            .output();
+        let output = output_with_timeout(
+            std::process::Command::new(runtime).args([
+                "version",
+                "--format",
+                "{{.Server.Version}}",
+            ]),
+            Duration::from_secs(30),
+        );
         if let Ok(output) = output
             && output.status.success()
         {
@@ -1115,6 +1212,14 @@ fn container_runtime() -> (Option<String>, Option<String>) {
     }
 
     (None, None)
+}
+
+fn podman_error(error: std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        "Podman did not finish in time.".into()
+    } else {
+        "Podman is unavailable.".into()
+    }
 }
 
 fn failed(command_id: &str, code: &str, message: &str) -> CommandResult {

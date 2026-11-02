@@ -15,7 +15,10 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
 
-use crate::network::{self, RestoreStep};
+use crate::commands::PODMAN_QUERY_TIMEOUT;
+use crate::network::{self, RestoreStep, output_with_timeout};
+
+const PODMAN_START_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 const BOOT_ID_FILE: &str = "boot-restore.boot-id";
 const STOPPED_MARKER_DIR: &str = "var/lib/coolify/workloads/stopped";
@@ -251,10 +254,10 @@ fn restore_containers(root: &Path) -> Result<(usize, usize), String> {
     }
     // Read the markers first: if they are unreadable, start nothing.
     let stopped = stopped_markers(root)?;
-    let listed = match Command::new("podman")
-        .args(["ps", "--all", "--no-trunc", "--format", "json"])
-        .output()
-    {
+    let listed = match output_with_timeout(
+        Command::new("podman").args(["ps", "--all", "--no-trunc", "--format", "json"]),
+        PODMAN_QUERY_TIMEOUT,
+    ) {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
         Err(_) => return Err("Podman is unavailable.".into()),
@@ -275,11 +278,13 @@ fn restore_containers(root: &Path) -> Result<(usize, usize), String> {
     if candidates.is_empty() {
         return Ok((0, 0));
     }
-    let inspected = Command::new("podman")
-        .args(["inspect", "--format", "json"])
-        .args(&candidates)
-        .output()
-        .map_err(|_| "Podman is unavailable.".to_string())?;
+    let inspected = output_with_timeout(
+        Command::new("podman")
+            .args(["inspect", "--format", "json"])
+            .args(&candidates),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .map_err(|_| "Podman is unavailable or did not answer.".to_string())?;
     // A container removed after `ps` makes inspect exit non-zero while still
     // printing the others, so use any parseable output.
     let restartable = match restartable_containers(&inspected.stdout, &stopped) {
@@ -292,7 +297,10 @@ fn restore_containers(root: &Path) -> Result<(usize, usize), String> {
 
     let (mut started, mut failed) = (0, 0);
     for id in restartable {
-        match Command::new("podman").args(["start", &id]).output() {
+        match output_with_timeout(
+            Command::new("podman").args(["start", &id]),
+            PODMAN_START_TIMEOUT,
+        ) {
             Ok(output) if output.status.success() => {
                 tracing::info!(container = %id, "restarted a managed workload after boot");
                 started += 1;

@@ -137,14 +137,11 @@ impl Agent for AgentService {
                     Some(agent_message::Message::Heartbeat(heartbeat))
                         if heartbeat.connection_id == task_connection_id =>
                     {
-                        if !registry
-                            .heartbeat(&server_id, &task_connection_id, heartbeat.sent_at_unix_ms)
-                            .await
-                        {
+                        if !registry.heartbeat(&server_id, &task_connection_id).await {
                             break;
                         }
                         reporter
-                            .heartbeat(&server_id, &task_connection_id, heartbeat.sent_at_unix_ms)
+                            .heartbeat(&server_id, &task_connection_id, now_millis())
                             .await;
                     }
                     Some(agent_message::Message::CommandAccepted(_)) => {}
@@ -172,7 +169,12 @@ impl Agent for AgentService {
                             break;
                         }
                     }
-                    _ => break,
+                    // A message type that a newer Sentinel sends and this Flux
+                    // does not know decodes as `None`; skip it instead of
+                    // dropping the connection.
+                    None => {}
+                    Some(agent_message::Message::Hello(_))
+                    | Some(agent_message::Message::Heartbeat(_)) => break,
                 }
             }
             registry.remove(&server_id, &task_connection_id).await;

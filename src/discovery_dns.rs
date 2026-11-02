@@ -7,6 +7,44 @@ use std::time::Duration;
 const MAX_DNS_PACKET: usize = 1232;
 const DNS_TTL_SECONDS: u32 = 30;
 const SYSTEMD_RESOLVED_STUB: &str = "127.0.0.53:53";
+/// A hung Corrosion query must not stall the single DNS request loop.
+const CORROSION_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bounds the threads that slow TCP DNS clients can hold.
+const MAX_TCP_CONNECTIONS: usize = 32;
+
+trait OutputWithTimeout {
+    fn output_with_timeout(&mut self) -> Result<std::process::Output, String>;
+}
+
+impl OutputWithTimeout for Command {
+    /// Runs the command and kills it after `CORROSION_QUERY_TIMEOUT`. Query
+    /// output is small, so it fits in the pipe buffer until the child exits.
+    fn output_with_timeout(&mut self) -> Result<std::process::Output, String> {
+        let mut child = self
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|_| "Corrosion is unavailable.".to_string())?;
+        let deadline = std::time::Instant::now() + CORROSION_QUERY_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("Corrosion did not answer in time.".into());
+                }
+            }
+        }
+        child
+            .wait_with_output()
+            .map_err(|_| "Corrosion is unavailable.".to_string())
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Question {
@@ -223,8 +261,7 @@ fn lookup_endpoints(
             namespace,
             endpoint_lookup_sql(namespace),
         ])
-        .output()
-        .map_err(|_| "Corrosion is unavailable.".to_string())?;
+        .output_with_timeout()?;
     if !output.status.success() {
         return Err("Corrosion could not query discovery endpoints.".into());
     }
@@ -260,8 +297,7 @@ fn lookup_names(
             &address.to_string(),
             reverse_lookup_sql(),
         ])
-        .output()
-        .map_err(|_| "Corrosion is unavailable.".to_string())?;
+        .output_with_timeout()?;
     if !output.status.success() {
         return Err("Corrosion could not query reverse discovery endpoints.".into());
     }
@@ -347,30 +383,50 @@ fn forward_tcp(request: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn serve_tcp(listener: TcpListener, zone: String, corrosion_config: PathBuf) {
-    for mut stream in listener.incoming().flatten() {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        let mut length = [0_u8; 2];
-        if stream.read_exact(&mut length).is_err() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let zone = Arc::new(zone);
+    let corrosion_config = Arc::new(corrosion_config);
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming().flatten() {
+        if active.fetch_add(1, Ordering::AcqRel) >= MAX_TCP_CONNECTIONS {
+            active.fetch_sub(1, Ordering::AcqRel);
             continue;
         }
-        let length = u16::from_be_bytes(length) as usize;
-        if length == 0 || length > MAX_DNS_PACKET {
-            continue;
-        }
-        let mut request = vec![0_u8; length];
-        if stream.read_exact(&mut request).is_err() {
-            continue;
-        }
-        let Some(response) = answer_request(&request, &zone, &corrosion_config, u16::MAX as usize)
-            .or_else(|| forward_tcp(&request))
-        else {
-            continue;
-        };
-        let response_length = (response.len() as u16).to_be_bytes();
-        let _ = stream.write_all(&response_length);
-        let _ = stream.write_all(&response);
+        let zone = zone.clone();
+        let corrosion_config = corrosion_config.clone();
+        let active = active.clone();
+        std::thread::spawn(move || {
+            serve_tcp_connection(stream, &zone, &corrosion_config);
+            active.fetch_sub(1, Ordering::AcqRel);
+        });
     }
+}
+
+fn serve_tcp_connection(mut stream: TcpStream, zone: &str, corrosion_config: &Path) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let mut length = [0_u8; 2];
+    if stream.read_exact(&mut length).is_err() {
+        return;
+    }
+    let length = u16::from_be_bytes(length) as usize;
+    if length == 0 || length > MAX_DNS_PACKET {
+        return;
+    }
+    let mut request = vec![0_u8; length];
+    if stream.read_exact(&mut request).is_err() {
+        return;
+    }
+    let Some(response) = answer_request(&request, zone, corrosion_config, u16::MAX as usize)
+        .or_else(|| forward_tcp(&request))
+    else {
+        return;
+    };
+    let response_length = (response.len() as u16).to_be_bytes();
+    let _ = stream.write_all(&response_length);
+    let _ = stream.write_all(&response);
 }
 
 pub(crate) fn run(bind: SocketAddr, zone: &str, corrosion_config: &Path) -> Result<(), String> {
@@ -403,9 +459,8 @@ pub(crate) fn run(bind: SocketAddr, zone: &str, corrosion_config: &Path) -> Resu
         else {
             continue;
         };
-        socket
-            .send_to(&response, source)
-            .map_err(|error| format!("Discovery DNS response failed: {error}"))?;
+        // A failed reply to one client must not stop the resolver.
+        let _ = socket.send_to(&response, source);
     }
 }
 

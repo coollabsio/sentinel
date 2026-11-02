@@ -25,6 +25,10 @@ const DEFAULT_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(60);
 const AUTHENTICATION_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
 const UNSUPPORTED_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
 const MAX_TEMPORARY_RETRY_SECONDS: u64 = 60;
+/// A Flux connection that ends sooner without an error (for example a
+/// credential that expires at once because the Node clock is ahead) counts as
+/// a failed attempt, so reconnects back off instead of running every second.
+const MIN_STABLE_CONNECTION: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignmentErrorKind {
@@ -364,6 +368,7 @@ impl AssignmentClient {
                 Ok(AssignmentOutcome::Enabled(assignment)) => {
                     temporary_attempt = 0;
                     let status = PollStatus::Enabled;
+                    let connected_at = std::time::Instant::now();
                     let retry_after = match crate::connection::connect(
                         &assignment,
                         &self.sentinel_version,
@@ -373,9 +378,24 @@ impl AssignmentClient {
                     )
                     .await
                     {
-                        Ok(()) => {
+                        Ok(()) if connected_at.elapsed() >= MIN_STABLE_CONNECTION => {
                             connection_attempt = 0;
                             Duration::from_secs(1)
+                        }
+                        Ok(()) => {
+                            let retry_after = retry_delay(
+                                &AssignmentError::Temporary,
+                                connection_attempt,
+                                jitter_seed(),
+                            );
+                            if !*shutdown.borrow() {
+                                tracing::warn!(
+                                    retry_after_seconds = retry_after.as_secs(),
+                                    "Sentinel Flux connection ended soon after it started; check the Node clock if this repeats"
+                                );
+                            }
+                            connection_attempt = connection_attempt.saturating_add(1);
+                            retry_after
                         }
                         Err(error) => {
                             let retry_after = retry_delay(

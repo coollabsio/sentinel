@@ -18,7 +18,10 @@ use sentinel_protocol::control::v1::ContainerObservation;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, watch};
 
-use crate::network::{CORROSION_NODE_NAME_FILE, CORROSION_OWNER_FILE, valid_discovery_label};
+use crate::commands::PODMAN_QUERY_TIMEOUT;
+use crate::network::{
+    CORROSION_NODE_NAME_FILE, CORROSION_OWNER_FILE, output_with_timeout, valid_discovery_label,
+};
 
 pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_secs(15);
 pub(crate) const ENDPOINT_TTL_SECONDS: i64 = 120;
@@ -127,16 +130,17 @@ fn drained_wait(root: &Path, name: &str) -> Result<Duration, String> {
     let Some(identity) = read_identity(root)? else {
         return Ok(Duration::ZERO);
     };
-    let output = Command::new("podman")
-        .args([
+    let output = output_with_timeout(
+        Command::new("podman").args([
             "container",
             "inspect",
             "--format",
             &format!("{{{{ index .Config.Labels \"{WORKLOAD_LABEL}\" }}}}"),
             name,
-        ])
-        .output()
-        .map_err(|_| "Podman is unavailable.".to_string())?;
+        ]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .map_err(|_| "Podman is unavailable or did not answer.".to_string())?;
     let workload_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || !valid_discovery_label(&workload_id) {
         return Ok(Duration::ZERO);
@@ -526,10 +530,10 @@ pub(crate) fn publish_once(root: &Path) -> Result<PublishOutcome, String> {
         ));
     }
 
-    let listed = match Command::new("podman")
-        .args(["ps", "--all", "--no-trunc", "--format", "json"])
-        .output()
-    {
+    let listed = match output_with_timeout(
+        Command::new("podman").args(["ps", "--all", "--no-trunc", "--format", "json"]),
+        PODMAN_QUERY_TIMEOUT,
+    ) {
         Ok(output) => output,
         Err(_) => return Ok(PublishOutcome::Skipped("Podman is unavailable")),
     };
@@ -547,11 +551,13 @@ pub(crate) fn publish_once(root: &Path) -> Result<PublishOutcome, String> {
     let inspected = if ids.is_empty() {
         HashMap::new()
     } else {
-        let output = Command::new("podman")
-            .args(["inspect", "--format", "json"])
-            .args(&ids)
-            .output()
-            .map_err(|_| "Podman is unavailable.".to_string())?;
+        let output = output_with_timeout(
+            Command::new("podman")
+                .args(["inspect", "--format", "json"])
+                .args(&ids),
+            PODMAN_QUERY_TIMEOUT,
+        )
+        .map_err(|_| "Podman is unavailable or did not answer.".to_string())?;
         // A container removed after `ps` makes inspect exit non-zero while
         // still printing the others, so use any parseable output.
         match parse_podman_inspect(&output.stdout) {

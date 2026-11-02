@@ -44,6 +44,8 @@ pub enum CommandDispatchError {
     QueueFull,
     #[error("command timed out")]
     Timeout,
+    #[error("a command with this ID is already running")]
+    Duplicate,
 }
 
 impl ConnectionRegistry {
@@ -81,7 +83,9 @@ impl ConnectionRegistry {
         }
     }
 
-    pub async fn heartbeat(&self, server_id: &str, connection_id: &str, sent_at: i64) -> bool {
+    /// Records a heartbeat at Flux's own clock; the timestamp that Sentinel
+    /// sends is not trusted for liveness.
+    pub async fn heartbeat(&self, server_id: &str, connection_id: &str) -> bool {
         let mut connections = self.connections.write().await;
         let Some(connection) = connections.get_mut(server_id) else {
             return false;
@@ -89,7 +93,7 @@ impl ConnectionRegistry {
         if connection.info.connection_id != connection_id {
             return false;
         }
-        connection.info.last_heartbeat_unix_ms = sent_at.max(now_millis());
+        connection.info.last_heartbeat_unix_ms = now_millis();
         true
     }
 
@@ -100,6 +104,19 @@ impl ConnectionRegistry {
             .is_some_and(|connection| connection.info.connection_id == connection_id)
         {
             connections.remove(server_id);
+        }
+    }
+
+    /// Asks every connected Sentinel to close its stream, so a graceful
+    /// shutdown does not wait for long-lived streams.
+    pub async fn shutdown_all(&self, reconnect_after_seconds: u32) {
+        for connection in self.connections.read().await.values() {
+            let _ = connection.sender.try_send(ControlMessage {
+                message: Some(control_message::Message::ShutdownHint(ShutdownHint {
+                    reason: "shutdown".into(),
+                    reconnect_after_seconds,
+                })),
+            });
         }
     }
 
@@ -119,13 +136,19 @@ impl ConnectionRegistry {
     ) -> Result<CommandResult, CommandDispatchError> {
         let command_id = command.command_id.clone();
         let (result_sender, result_receiver) = oneshot::channel();
-        self.pending.lock().await.insert(
-            command_id.clone(),
-            PendingCommand {
-                server_id: server_id.into(),
-                result: result_sender,
-            },
-        );
+        {
+            let mut pending = self.pending.lock().await;
+            if pending.contains_key(&command_id) {
+                return Err(CommandDispatchError::Duplicate);
+            }
+            pending.insert(
+                command_id.clone(),
+                PendingCommand {
+                    server_id: server_id.into(),
+                    result: result_sender,
+                },
+            );
+        }
         let send_result = {
             let connections = self.connections.read().await;
             let Some(connection) = connections.get(server_id) else {

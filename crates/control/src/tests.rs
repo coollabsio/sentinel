@@ -1219,7 +1219,8 @@ fn builds_shell_free_podman_deploy_arguments() {
         pull_policy: "newer".into(),
     };
 
-    let arguments = crate::commands::podman_deploy_args(&request).unwrap();
+    let deploy = crate::commands::podman_deploy_args(&request).unwrap();
+    let arguments = deploy.arguments;
 
     assert_eq!(arguments[0], "run");
     assert!(
@@ -1253,10 +1254,11 @@ fn builds_shell_free_podman_deploy_arguments() {
             .windows(2)
             .any(|v| v == ["--memory-reservation", "536870912b"])
     );
-    assert!(
-        arguments
-            .windows(2)
-            .any(|v| v == ["--env", "APP_ENV=production"])
+    assert!(arguments.windows(2).any(|v| v == ["--env", "APP_ENV"]));
+    assert!(!arguments.iter().any(|v| v.contains("production")));
+    assert_eq!(
+        deploy.environment,
+        [("APP_ENV".to_string(), "production".to_string())]
     );
     assert!(
         arguments
@@ -1317,7 +1319,9 @@ fn uses_the_requested_image_pull_policy() {
         ..Default::default()
     };
     let pull = |pull_policy: &str| {
-        let arguments = crate::commands::podman_deploy_args(&request(pull_policy)).unwrap();
+        let arguments = crate::commands::podman_deploy_args(&request(pull_policy))
+            .unwrap()
+            .arguments;
         let index = arguments.iter().position(|v| v == "--pull").unwrap();
         assert_eq!(arguments.iter().filter(|v| *v == "--pull").count(), 1);
         arguments[index + 1].clone()
@@ -2784,20 +2788,45 @@ fn passes_any_podman_environment_variable_and_rejects_unpassable_ones() {
         ..Default::default()
     };
     let long_value = "x".repeat(10_000);
-    let mut environment = vec![variable("app.name", "demo"), variable("1BAD", &long_value)];
+    let mut environment = vec![
+        variable("app.name", "demo"),
+        variable("1BAD", &long_value),
+        variable("PATH", "/app/bin"),
+        variable("http_proxy", "http://proxy:3128"),
+        variable("SECRET*", "literal"),
+    ];
     environment.extend((0..300).map(|index| variable(&format!("VAR_{index}"), "value")));
 
-    let arguments = crate::commands::podman_deploy_args(&request(environment)).unwrap();
+    let deploy = crate::commands::podman_deploy_args(&request(environment)).unwrap();
+    let arguments = deploy.arguments;
 
+    // Values go to Podman's process environment, not to its world-readable argument list.
+    assert!(arguments.windows(2).any(|v| v == ["--env", "app.name"]));
+    assert!(arguments.windows(2).any(|v| v == ["--env", "1BAD"]));
+    assert!(!arguments.iter().any(|v| v.contains(&long_value)));
     assert!(
-        arguments
-            .windows(2)
-            .any(|v| v == ["--env", "app.name=demo"])
+        deploy
+            .environment
+            .contains(&("app.name".to_string(), "demo".to_string()))
     );
     assert!(
-        arguments
-            .windows(2)
-            .any(|v| v[0] == "--env" && v[1] == format!("1BAD={long_value}"))
+        deploy
+            .environment
+            .contains(&("1BAD".to_string(), long_value.clone()))
+    );
+    // Names that Podman reads itself, and wildcard names, stay inline.
+    for inline in [
+        "PATH=/app/bin",
+        "http_proxy=http://proxy:3128",
+        "SECRET*=literal",
+    ] {
+        assert!(arguments.windows(2).any(|v| v == ["--env", inline]));
+    }
+    assert!(
+        !deploy
+            .environment
+            .iter()
+            .any(|(key, _)| ["PATH", "http_proxy", "SECRET*"].contains(&key.as_str()))
     );
     for invalid in [
         variable("", "x"),

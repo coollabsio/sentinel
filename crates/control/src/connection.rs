@@ -6,7 +6,7 @@ use config::ControlTlsConfig;
 use sentinel_protocol::control::v1::agent_message;
 use sentinel_protocol::control::v1::control_message;
 use sentinel_protocol::control::v1::{
-    AgentMessage, CommandAccepted, Heartbeat, Hello, RuntimeChanged,
+    AgentMessage, Command, CommandAccepted, Heartbeat, Hello, RuntimeChanged,
 };
 use sentinel_protocol::{
     CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
@@ -28,6 +28,8 @@ use crate::commands::CommandExecutor;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MESSAGE_LIMIT: usize = 16 * 1024 * 1024;
+/// Commands received but not started yet. The executor runs one at a time.
+const COMMAND_QUEUE: usize = 64;
 static RUNTIME_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct RuntimeWatcherGuard(watch::Sender<bool>);
@@ -168,6 +170,15 @@ pub async fn connect(
         sender.clone(),
         runtime_shutdown_receiver,
     ));
+    // Commands run on a blocking thread, in arrival order, so this loop keeps
+    // sending heartbeats while a long command (an image pull, a network
+    // reconcile) runs. Flux drops a connection that stays silent.
+    let (command_sender, command_receiver) = mpsc::channel(COMMAND_QUEUE);
+    tokio::spawn(run_commands(
+        command_receiver,
+        command_executor,
+        sender.clone(),
+    ));
     ticker.tick().await;
     loop {
         tokio::select! {
@@ -184,26 +195,62 @@ pub async fn connect(
                     match message.message {
                         Some(control_message::Message::ShutdownHint(_)) => return Ok(()),
                         Some(control_message::Message::Command(command)) => {
-                            let command_id = command.command_id.clone();
                             let command_capability_accepted = capability_accepted(&command.command_type);
-                            let execution = command_executor.lock().await.execute(command, command_capability_accepted);
-                            if execution.accepted {
-                                sender.send(AgentMessage {
-                                    message: Some(agent_message::Message::CommandAccepted(CommandAccepted {
-                                        command_id,
-                                        accepted_at_unix_ms: now_millis(),
-                                    })),
-                                }).await.map_err(|_| FluxConnectionError::Connection)?;
-                            }
-                            sender.send(AgentMessage {
-                                message: Some(agent_message::Message::CommandResult(execution.result)),
-                            }).await.map_err(|_| FluxConnectionError::Connection)?;
+                            command_sender.send((command, command_capability_accepted)).await.map_err(|_| FluxConnectionError::Connection)?;
                         }
                         _ => {}
                     }
                 }
                 _ => return Err(FluxConnectionError::Connection),
             }
+        }
+    }
+}
+
+/// Executes the commands of one connection in order and sends their results.
+/// It stops when the connection closes; a command that already started still
+/// finishes and is journaled, so a redelivery returns its stored result.
+async fn run_commands(
+    mut commands: mpsc::Receiver<(Command, bool)>,
+    command_executor: Arc<tokio::sync::Mutex<CommandExecutor>>,
+    sender: mpsc::Sender<AgentMessage>,
+) {
+    while let Some((command, capability_accepted)) = commands.recv().await {
+        let command_id = command.command_id.clone();
+        let executor = command_executor.clone().lock_owned().await;
+        let execution = match tokio::task::spawn_blocking(move || {
+            let mut executor = executor;
+            executor.execute(command, capability_accepted)
+        })
+        .await
+        {
+            Ok(execution) => execution,
+            Err(_) => {
+                tracing::warn!(%command_id, "the command execution task failed");
+                continue;
+            }
+        };
+        if execution.accepted
+            && sender
+                .send(AgentMessage {
+                    message: Some(agent_message::Message::CommandAccepted(CommandAccepted {
+                        command_id,
+                        accepted_at_unix_ms: now_millis(),
+                    })),
+                })
+                .await
+                .is_err()
+        {
+            return;
+        }
+        if sender
+            .send(AgentMessage {
+                message: Some(agent_message::Message::CommandResult(execution.result)),
+            })
+            .await
+            .is_err()
+        {
+            return;
         }
     }
 }

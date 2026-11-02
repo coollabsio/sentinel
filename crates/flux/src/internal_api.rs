@@ -520,12 +520,7 @@ async fn trust_bundle_update(
         || request.bundle_pem.trim().is_empty()
         || request.bundle_pem.len() > MAX_TRUST_BUNDLE_BYTES
     {
-        let authorization = headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok());
-        if authorization != Some(&format!("Bearer {}", state.token)) {
-            return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-        }
+        authorize(&state.token, &headers)?;
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid trust bundle").into());
     }
     let result = dispatch_network(
@@ -562,12 +557,7 @@ async fn dispatch_network(
     command_type: &str,
     payload: Payload,
 ) -> Result<sentinel_protocol::control::v1::CommandResult, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, headers)?;
     if server_id.is_empty()
         || server_id.len() > 255
         || command_id.is_empty()
@@ -886,12 +876,7 @@ async fn workload_lifecycle(
     headers: HeaderMap,
     Json(request): Json<WorkloadLifecycleApiRequest>,
 ) -> Result<Json<WorkloadLifecycleResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty()
         || request.server_id.len() > 255
         || request.command_id.is_empty()
@@ -947,12 +932,7 @@ async fn workload_deploy(
     headers: HeaderMap,
     Json(request): Json<WorkloadDeployApiRequest>,
 ) -> Result<Json<WorkloadDeployResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty()
         || request.server_id.len() > 255
         || request.command_id.is_empty()
@@ -1041,12 +1021,7 @@ async fn container_list(
     headers: HeaderMap,
     Json(request): Json<ContainerListApiRequest>,
 ) -> Result<Json<ContainerListResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty() || request.server_id.len() > 255 {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID").into());
     }
@@ -1113,12 +1088,7 @@ async fn system_info(
     headers: HeaderMap,
     Json(request): Json<SystemInfoApiRequest>,
 ) -> Result<Json<SystemInfoResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty() || request.server_id.len() > 255 {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID").into());
     }
@@ -1179,12 +1149,7 @@ async fn logs_read(
     headers: HeaderMap,
     Json(request): Json<LogsReadApiRequest>,
 ) -> Result<Json<LogsReadResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty() || request.server_id.len() > 255 {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID").into());
     }
@@ -1250,12 +1215,7 @@ async fn container_logs(
     headers: HeaderMap,
     Json(request): Json<ContainerLogsApiRequest>,
 ) -> Result<Json<ContainerLogsResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty()
         || request.server_id.len() > 255
         || request.command_id.is_empty()
@@ -1322,12 +1282,7 @@ async fn ping(
     headers: HeaderMap,
     Json(request): Json<PingRequest>,
 ) -> Result<Json<PingResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty() || request.server_id.len() > 255 {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID").into());
     }
@@ -1371,6 +1326,25 @@ async fn ping(
     }))
 }
 
+/// Checks the internal API bearer token in constant time.
+fn authorize(token: &str, headers: &HeaderMap) -> Result<(), ApiError> {
+    let presented = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default()
+        .as_bytes();
+    let expected = token.as_bytes();
+    let difference = presented.iter().zip(expected).fold(
+        presented.len() ^ expected.len(),
+        |difference, (left, right)| difference | usize::from(left ^ right),
+    );
+    if difference != 0 || expected.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
+    }
+    Ok(())
+}
+
 /// An internal API error. A failed Sentinel command keeps the message that Sentinel reported.
 pub(crate) struct ApiError(StatusCode, String);
 
@@ -1402,5 +1376,6 @@ fn dispatch_error(error: CommandDispatchError) -> (StatusCode, &'static str) {
         CommandDispatchError::Send => (StatusCode::SERVICE_UNAVAILABLE, "connection closed"),
         CommandDispatchError::QueueFull => (StatusCode::SERVICE_UNAVAILABLE, "connection is busy"),
         CommandDispatchError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "command timed out"),
+        CommandDispatchError::Duplicate => (StatusCode::CONFLICT, "command is already running"),
     }
 }

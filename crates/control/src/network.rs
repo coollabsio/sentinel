@@ -1,8 +1,9 @@
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use sentinel_protocol::control::v1::{
     ClusterLeaveRequest, ClusterLeaveResult, CorrosionInspectResult, CorrosionReconcileRequest,
@@ -16,6 +17,9 @@ const COOLIFY_NFT_TABLE: &str = "coolify_cluster";
 const COOLIFY_NFT_BRIDGE_TABLE: &str = "coolify_cluster_bridge";
 const BRIDGE_SYSCTL_FILE: &str = "etc/sysctl.d/90-coolify-workload-firewall.conf";
 pub(crate) const CORROSION_VERSION: &str = "v1.0.0";
+/// SHA-512 of the Corrosion v1.0.0 release archives. Change them together with `CORROSION_VERSION`.
+const CORROSION_SHA512_X86_64: &str = "d8303bd383683f990162956d69fdb89d85bcbe39df5f6d3e3b74d21237d691a764782448d19b3196db97a45b0b0ac7b2ab87fc460aa0de206cc7c7954dd074c5";
+const CORROSION_SHA512_AARCH64: &str = "23f55e40f71c3fc884f6f58eb8ebc22b5fc00511f370ce0611cec69bc3578edc5009f754b19ee96a2e68fe88fb38a062837e01a366ec0bb32dceb3076e7df6c6";
 /// The Node WireGuard IP that owns this Node's discovery rows and serves its Corrosion API.
 pub(crate) const CORROSION_OWNER_FILE: &str = "etc/corrosion/coolify-owner";
 /// The Node DNS label published as `<name>.nodes.coolify.internal`.
@@ -24,6 +28,7 @@ pub(crate) const CORROSION_NODE_NAME_FILE: &str = "etc/corrosion/coolify-node-na
 pub(crate) fn validate_interface(value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 15
+        || value.starts_with(['-', '.'])
         || !value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
@@ -74,28 +79,24 @@ pub(crate) fn leave_cluster(
                 tracing::warn!(error = %message, "could not withdraw this Node's discovery endpoints before leaving the cluster");
             }
         }
-        let _ = Command::new("resolvectl")
-            .args(["revert", &request.interface])
-            .status();
+        run_best_effort(Command::new("resolvectl").args(["revert", &request.interface]));
         for unit in ["coolify-discovery-dns.service", "corrosion.service"] {
-            let _ = Command::new("systemctl")
-                .args(["disable", "--now", unit])
-                .status();
+            run_best_effort(Command::new("systemctl").args(["disable", "--now", unit]));
         }
-        let _ = Command::new("wg-quick")
-            .args(["down", &request.interface])
-            .status();
-        let _ = Command::new("nft")
-            .args(["delete", "table", "inet", COOLIFY_NFT_TABLE])
-            .status();
-        let _ = Command::new("nft")
-            .args(["delete", "table", "bridge", COOLIFY_NFT_BRIDGE_TABLE])
-            .status();
+        run_best_effort(Command::new("wg-quick").args(["down", &request.interface]));
+        run_best_effort(Command::new("nft").args(["delete", "table", "inet", COOLIFY_NFT_TABLE]));
+        run_best_effort(Command::new("nft").args([
+            "delete",
+            "table",
+            "bridge",
+            COOLIFY_NFT_BRIDGE_TABLE,
+        ]));
         for cidr in &request.workload_cidrs {
-            let _ = Command::new("iptables")
-                .args(["-t", "nat", "-D", "POSTROUTING"])
-                .args(mesh_nat_rule_arguments(&request.interface, cidr))
-                .status();
+            run_best_effort(
+                Command::new("iptables")
+                    .args(["-t", "nat", "-D", "POSTROUTING"])
+                    .args(mesh_nat_rule_arguments(&request.interface, cidr)),
+            );
         }
     }
 
@@ -188,15 +189,20 @@ fn ipv4_in_cidr(address: &str, cidr: &str) -> bool {
 pub(crate) fn validate_wireguard(request: &WireguardReconcileRequest) -> Result<(), String> {
     validate_interface(&request.interface)?;
     if request.listen_port == 0
+        || request.listen_port > 65_535
         || request.revision == 0
         || !request.address.ends_with("/32")
+        || !valid_ipv4_cidr(&request.address)
         || request.peers.len() > 99
+        || (!request.flux_probe_host.is_empty()
+            && (!safe_config_value(&request.flux_probe_host)
+                || request.flux_probe_host.starts_with('-')))
     {
         return Err("The WireGuard configuration is invalid.".into());
     }
     for peer in &request.peers {
-        if peer.public_key.is_empty()
-            || peer.endpoint.is_empty()
+        if !safe_config_value(&peer.public_key)
+            || !safe_config_value(&peer.endpoint)
             || peer.allowed_ips.is_empty()
             || peer.allowed_ips.len() > 128
             || peer
@@ -209,6 +215,16 @@ pub(crate) fn validate_wireguard(request: &WireguardReconcileRequest) -> Result<
         }
     }
     Ok(())
+}
+
+/// A single-line `wg-quick` value: no whitespace or control characters, so a
+/// value can never start another configuration line.
+fn safe_config_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
 }
 
 pub(crate) fn render_wireguard(
@@ -535,7 +551,12 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()
         .map_err(|_| "The staged file could not be written.")?;
     fs::set_permissions(&staged, fs::Permissions::from_mode(mode))
         .map_err(|_| "The staged file permissions could not be set.")?;
-    fs::rename(staged, path).map_err(|_| "The staged file could not be activated.".to_string())
+    fs::rename(staged, path).map_err(|_| "The staged file could not be activated.".to_string())?;
+    // Persist the rename itself, so a crash cannot bring back the old file.
+    if let Ok(directory) = fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
 }
 
 pub(crate) fn hash(contents: &[u8]) -> String {
@@ -804,6 +825,30 @@ fn rollback_start_arguments(unit: &str) -> [&str; 3] {
     ["start", "--wait", unit]
 }
 
+/// Arms a transient rollback that runs `script` after 60 seconds unless its
+/// timer is stopped. A unit with the same name left by an earlier attempt (a
+/// failed rollback, or a crash before the timer was stopped) would make
+/// `systemd-run` fail on every later attempt, so it is cleared first, and
+/// `--collect` keeps a failed rollback from staying loaded.
+fn arm_rollback(unit: &str, script: &str, error: &str) -> Result<(), String> {
+    let service = format!("{unit}.service");
+    let timer = format!("{unit}.timer");
+    run_best_effort(Command::new("systemctl").args(["stop", &timer]));
+    run_best_effort(Command::new("systemctl").args(["reset-failed", &service, &timer]));
+    run(
+        Command::new("systemd-run").args([
+            "--unit",
+            unit,
+            "--collect",
+            "--on-active=60s",
+            "/bin/sh",
+            "-c",
+            script,
+        ]),
+        error,
+    )
+}
+
 fn activate_wireguard(
     request: &WireguardReconcileRequest,
     staged_path: &Path,
@@ -831,22 +876,14 @@ fn activate_wireguard(
             config_path.display()
         )
     };
-    run(
-        Command::new("systemd-run").args([
-            "--unit",
-            &rollback_unit,
-            "--on-active=60s",
-            "/bin/sh",
-            "-c",
-            &rollback_command,
-        ]),
+    arm_rollback(
+        &rollback_unit,
+        &rollback_command,
         "The WireGuard rollback could not be armed.",
     )?;
     fs::rename(staged_path, config_path)
         .map_err(|_| "The staged WireGuard configuration could not be activated.")?;
-    let _ = Command::new("wg-quick")
-        .args(["down", &request.interface])
-        .status();
+    run_best_effort(Command::new("wg-quick").args(["down", &request.interface]));
     let healthy = run(
         Command::new("wg-quick").args(["up", &request.interface]),
         "WireGuard activation failed.",
@@ -906,9 +943,13 @@ pub(crate) fn reconcile_firewall(
     let configuration_hash = hash(snapshot.as_bytes());
     let state_file = state_path(root, "firewall.state");
     let prior = read_state_file(&state_file);
+    // The tables can disappear without Sentinel (a firewall service reload,
+    // `nft flush ruleset`), so an unchanged revision is only a no-op while
+    // they are still loaded.
     if prior
         .as_ref()
         .is_some_and(|state| state.0 == request.revision && state.1 == configuration_hash)
+        && firewall_tables_active(root)
     {
         return Ok(FirewallReconcileResult {
             state: Some(firewall_state(request.revision, configuration_hash, false)),
@@ -992,15 +1033,9 @@ fn activate_firewall(
     } else {
         delete_tables
     };
-    run(
-        Command::new("systemd-run").args([
-            "--unit",
-            "coolify-firewall-rollback",
-            "--on-active=60s",
-            "/bin/sh",
-            "-c",
-            &rollback,
-        ]),
+    arm_rollback(
+        "coolify-firewall-rollback",
+        &rollback,
         "The firewall rollback could not be armed.",
     )?;
     let activated = run(
@@ -1330,6 +1365,21 @@ pub(crate) fn reconcile_corrosion(
     request: &CorrosionReconcileRequest,
 ) -> Result<CorrosionReconcileResult, String> {
     let changes = write_corrosion_files(root, request)?;
+    let result = apply_corrosion(root, request, changes);
+    if result.is_err() && root == Path::new("/") {
+        // The files are already written, so a retry would see no change and
+        // skip the restart and the cluster ID. Dropping the cluster ID marker
+        // makes the next attempt apply both again.
+        let _ = fs::remove_file(root.join("etc/corrosion/coolify-cluster-id"));
+    }
+    result
+}
+
+fn apply_corrosion(
+    root: &Path,
+    request: &CorrosionReconcileRequest,
+    changes: CorrosionChanges,
+) -> Result<CorrosionReconcileResult, String> {
     let host = root == Path::new("/");
     let steps = if host {
         install_corrosion(request.version.as_str())?;
@@ -1711,6 +1761,14 @@ fn corrosion_download(version: &str, architecture: &str) -> Result<String, Strin
     ))
 }
 
+fn corrosion_checksum(architecture: &str) -> Result<&'static str, String> {
+    match architecture.trim() {
+        "x86_64" => Ok(CORROSION_SHA512_X86_64),
+        "aarch64" => Ok(CORROSION_SHA512_AARCH64),
+        _ => Err("The host architecture is not supported by Corrosion.".into()),
+    }
+}
+
 fn install_corrosion(version: &str) -> Result<(), String> {
     if fs::read_to_string("/usr/local/bin/corrosion.version")
         .ok()
@@ -1723,27 +1781,45 @@ fn install_corrosion(version: &str) -> Result<(), String> {
         .arg("-m")
         .output()
         .map_err(|_| "The host architecture could not be detected.")?;
-    let url = corrosion_download(version, &String::from_utf8_lossy(&architecture.stdout))?;
+    let architecture = String::from_utf8_lossy(&architecture.stdout);
+    let url = corrosion_download(version, &architecture)?;
+    let checksum = corrosion_checksum(&architecture)?;
     let directory = PathBuf::from(format!(
         "/var/lib/coolify/downloads/corrosion-{}",
         std::process::id()
     ));
+    let _ = fs::remove_dir_all(&directory);
     fs::create_dir_all(&directory)
         .map_err(|_| "The Corrosion download directory could not be created.")?;
+    let installed = download_corrosion(&directory, &url, checksum, version);
+    let _ = fs::remove_dir_all(&directory);
+    installed?;
+    ensure_corrosion_user()
+}
+
+fn download_corrosion(
+    directory: &Path,
+    url: &str,
+    checksum: &str,
+    version: &str,
+) -> Result<(), String> {
     let archive = directory.join("corrosion.tar.gz");
     run(
         Command::new("curl")
             .args(["-fsSL", "--retry", "3", "--max-time", "120", "-o"])
             .arg(&archive)
-            .arg(&url),
+            .arg(url),
         "Corrosion could not be downloaded.",
     )?;
+    if crate::ingress::sha512_file(&archive)? != checksum {
+        return Err("The Corrosion download checksum does not match.".into());
+    }
     run(
         Command::new("tar")
             .arg("-xzf")
             .arg(&archive)
             .arg("-C")
-            .arg(&directory),
+            .arg(directory),
         "Corrosion could not be extracted.",
     )?;
     run(
@@ -1757,7 +1833,10 @@ fn install_corrosion(version: &str) -> Result<(), String> {
         Path::new("/usr/local/bin/corrosion.version"),
         format!("{version}\n").as_bytes(),
         0o644,
-    )?;
+    )
+}
+
+fn ensure_corrosion_user() -> Result<(), String> {
     if !Command::new("id")
         .args(["-u", "corrosion"])
         .status()
@@ -1775,7 +1854,6 @@ fn install_corrosion(version: &str) -> Result<(), String> {
             "The Corrosion service user could not be created.",
         )?;
     }
-    let _ = fs::remove_dir_all(directory);
     Ok(())
 }
 
@@ -1799,8 +1877,68 @@ fn ensure_discovery_dns_user() -> Result<(), String> {
     )
 }
 
+/// Upper bound for one host command run through [`run`]. It only stops a hung
+/// tool from blocking the command executor forever; the slowest legitimate
+/// command is a retried download with its own `--max-time`.
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Like [`Command::output`], but kills the process when it runs longer than
+/// `timeout` and returns a `TimedOut` error.
+pub(crate) fn output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Output> {
+    fn drain(stream: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut output);
+            }
+            output
+        })
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the command timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// Runs a best-effort cleanup command whose result does not matter.
+fn run_best_effort(command: &mut Command) {
+    let _ = output_with_timeout(command, COMMAND_TIMEOUT);
+}
+
 pub(crate) fn run(command: &mut Command, fallback: &str) -> Result<(), String> {
-    let output = command.output().map_err(|_| fallback.to_string())?;
+    let output = output_with_timeout(command, COMMAND_TIMEOUT).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            format!("{fallback} The command timed out.")
+        } else {
+            fallback.to_string()
+        }
+    })?;
     if output.status.success() {
         return Ok(());
     }
