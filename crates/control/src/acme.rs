@@ -276,15 +276,22 @@ async fn account(
     Ok(account)
 }
 
-/// Fails unless `host` resolves to a public address of an ingress Node.
-async fn check_dns(host: &str, ingress: &[IpAddr]) -> Result<(), IssueError> {
+/// The public addresses of ingress Nodes that `host` resolves to: the ones
+/// the CA validates through. Fails when there is none.
+async fn check_dns(host: &str, ingress: &[IpAddr]) -> Result<Vec<IpAddr>, IssueError> {
     let found = tokio::net::lookup_host((host, 80))
         .await
         .map(|addresses| addresses.map(|address| address.ip()).collect::<Vec<_>>())
         .unwrap_or_default();
-    let points_to_ingress = found.iter().any(|address| ingress.contains(address));
-    if points_to_ingress {
-        return Ok(());
+    let mut targets = found
+        .iter()
+        .filter(|address| ingress.contains(address))
+        .copied()
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    if !targets.is_empty() {
+        return Ok(targets);
     }
     let found = if found.is_empty() {
         "no address".to_string()
@@ -300,9 +307,11 @@ async fn check_dns(host: &str, ingress: &[IpAddr]) -> Result<(), IssueError> {
     )))
 }
 
-/// Waits until every ingress Node serves the challenge answer on its public
-/// address, the path the CA uses. The cluster firewall drops port 80 over
-/// WireGuard, so the check does not use it.
+/// Waits until every ingress Node that the host resolves to serves the
+/// challenge answer on its public address, the path the CA uses. An ingress
+/// Node that DNS does not point to cannot fail a validation, so an offline one
+/// does not block orders. The cluster firewall drops port 80 over WireGuard,
+/// so the check does not use it.
 async fn self_check(
     host: &str,
     token: &str,
@@ -348,7 +357,7 @@ async fn issue(
     host: &str,
     ingress: &[IpAddr],
 ) -> Result<(String, String), IssueError> {
-    check_dns(host, ingress).await?;
+    let targets = check_dns(host, ingress).await?;
     let identifiers = [Identifier::Dns(host.to_string())];
     let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
     let mut authorizations = order.authorizations();
@@ -376,7 +385,7 @@ async fn issue(
             ])],
         )
         .await?;
-        self_check(host, &token, &key_authorization, ingress).await?;
+        self_check(host, &token, &key_authorization, &targets).await?;
         challenge.set_ready().await?;
     }
     let retries = RetryPolicy::new().timeout(Duration::from_secs(120));
