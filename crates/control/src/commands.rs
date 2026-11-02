@@ -9,8 +9,8 @@ use sentinel_protocol::control::v1::{
     ClusterLeaveResult, Command, CommandError, CommandResult, CommandStatus, ContainerListResult,
     ContainerObservation, ContainerPort, LogSource, LogsReadResult, SystemInfoResult,
     SystemPingResult, TrustBundleUpdateResult, WireguardInspectResult, WireguardKeyEnsureResult,
-    WorkloadDeployRequest, WorkloadDeployResult, WorkloadLifecycleAction, WorkloadLifecycleRequest,
-    WorkloadLifecycleResult,
+    WorkloadDeployRequest, WorkloadDeployResult, WorkloadHealthCheck, WorkloadLifecycleAction,
+    WorkloadLifecycleRequest, WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
     CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_REGISTRY_INSPECT,
@@ -994,6 +994,39 @@ pub(crate) fn podman_runtime_variable(name: &str) -> bool {
         )
 }
 
+/// The `podman run` flags of a health check. Podman runs a command that is not
+/// a JSON array with `/bin/sh -c`, like the `CMD-SHELL` form of `HEALTHCHECK`.
+pub(crate) fn podman_health_args(check: &WorkloadHealthCheck) -> Result<Vec<String>, String> {
+    let command = check.command.trim();
+    if command.is_empty()
+        || command.len() > 4_096
+        || command.starts_with('[')
+        || command.contains(['\0', '\n', '\r'])
+    {
+        return Err("The health check command is invalid.".into());
+    }
+    let seconds = |value: u32, minimum: u32| (minimum..=3_600).contains(&value);
+    if !seconds(check.interval_seconds, 1)
+        || !seconds(check.timeout_seconds, 1)
+        || !seconds(check.start_period_seconds, 0)
+        || !(1..=100).contains(&check.retries)
+    {
+        return Err("The health check timing is invalid.".into());
+    }
+    Ok(vec![
+        "--health-cmd".into(),
+        command.into(),
+        "--health-interval".into(),
+        format!("{}s", check.interval_seconds),
+        "--health-timeout".into(),
+        format!("{}s", check.timeout_seconds),
+        "--health-retries".into(),
+        check.retries.to_string(),
+        "--health-start-period".into(),
+        format!("{}s", check.start_period_seconds),
+    ])
+}
+
 pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<PodmanDeploy, String> {
     if !valid_container_name(&request.name) {
         return Err("The container name is invalid.".into());
@@ -1086,6 +1119,9 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Podm
             "--memory-reservation".into(),
             format!("{memory_reservation_bytes}b"),
         ]);
+    }
+    if let Some(check) = &request.health_check {
+        args.extend(podman_health_args(check)?);
     }
     let mut environment = Vec::new();
     for variable in &request.environment {
@@ -1228,7 +1264,7 @@ pub(crate) fn parse_podman_containers(
                 name: name.into(),
                 image: image.into(),
                 state: state.into(),
-                health_status: string_field(value, &["Health", "HealthStatus"]).map(str::to_string),
+                health_status: container_health(value),
                 restart_count: value
                     .get("Restarts")
                     .and_then(serde_json::Value::as_u64)
@@ -1240,6 +1276,15 @@ pub(crate) fn parse_podman_containers(
             })
         })
         .collect()
+}
+
+/// `podman ps --format json` puts the health check state in `Status`: empty
+/// without a check, else `starting`, `healthy`, or `unhealthy`. Podman builds
+/// the "Up 5 seconds (healthy)" text of the table output from it.
+fn container_health(value: &serde_json::Value) -> Option<String> {
+    string_field(value, &["Health", "HealthStatus", "Status"])
+        .map(|health| health.trim().to_ascii_lowercase())
+        .filter(|health| matches!(health.as_str(), "starting" | "healthy" | "unhealthy"))
 }
 
 fn string_field<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {

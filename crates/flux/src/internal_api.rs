@@ -16,8 +16,8 @@ use sentinel_protocol::control::v1::{
     IngressReconcileRequest, IngressRoute, LogSource, LogsReadRequest, SystemInfoRequest,
     SystemPingRequest, TrustBundleUpdateRequest, WireguardInspectRequest,
     WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest,
-    WorkloadEnvironmentVariable, WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
-    WorkloadName,
+    WorkloadEnvironmentVariable, WorkloadHealthCheck, WorkloadLabel, WorkloadLifecycleAction,
+    WorkloadLifecycleRequest, WorkloadName,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -150,6 +150,17 @@ struct WorkloadDeployApiRequest {
     pull_policy: String,
     #[serde(default)]
     mounts: Vec<volume::DeployMount>,
+    #[serde(default)]
+    health_check: Option<DeployHealthCheck>,
+}
+
+#[derive(Deserialize)]
+struct DeployHealthCheck {
+    command: String,
+    interval_seconds: u32,
+    timeout_seconds: u32,
+    retries: u32,
+    start_period_seconds: u32,
 }
 
 /// Validates a workload image pull policy. The default (`missing`) is
@@ -1086,6 +1097,13 @@ async fn workload_deploy(
                         .into_iter()
                         .map(volume::DeployMount::protocol)
                         .collect(),
+                    health_check: request.health_check.map(|check| WorkloadHealthCheck {
+                        command: check.command,
+                        interval_seconds: check.interval_seconds,
+                        timeout_seconds: check.timeout_seconds,
+                        retries: check.retries,
+                        start_period_seconds: check.start_period_seconds,
+                    }),
                 })),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },

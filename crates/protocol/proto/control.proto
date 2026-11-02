@@ -255,6 +255,18 @@ message WorkloadDeployRequest {
   // with the labels `coolify.managed=true` and `coolify.volume=<uuid>` before
   // it creates the container. At most 32.
   repeated WorkloadVolumeMount mounts = 17;
+  // A health check that replaces the HEALTHCHECK of the image. Absent means
+  // the container keeps the HEALTHCHECK of the image, if it has one.
+  optional WorkloadHealthCheck health_check = 18;
+}
+
+// `podman run --health-*`. The command runs in the container with `/bin/sh -c`.
+message WorkloadHealthCheck {
+  string command = 1;
+  uint32 interval_seconds = 2;
+  uint32 timeout_seconds = 3;
+  uint32 retries = 4;
+  uint32 start_period_seconds = 5;
 }
 
 message WorkloadVolumeMount {

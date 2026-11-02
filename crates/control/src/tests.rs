@@ -1230,6 +1230,7 @@ fn builds_shell_free_podman_deploy_arguments() {
         memory_reservation_bytes: Some(536_870_912),
         pull_policy: "newer".into(),
         mounts: Vec::new(),
+        health_check: None,
     };
 
     let deploy = crate::commands::podman_deploy_args(&request).unwrap();

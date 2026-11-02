@@ -13,6 +13,9 @@ pub const CAPABILITY_TRUST_BUNDLE_UPDATE: &str = "trust.bundle.update.v1";
 pub const CAPABILITY_WORKLOAD_DEPLOY: &str = "workload.deploy.v1";
 pub const CAPABILITY_WORKLOAD_RESOURCES: &str = "workload.resources.v1";
 pub const CAPABILITY_WORKLOAD_LIFECYCLE: &str = "workload.lifecycle.v1";
+/// `workload.deploy.v1` accepts `health_check`. Not a command: an older
+/// Sentinel ignores the field and would run the container without the check.
+pub const CAPABILITY_WORKLOAD_HEALTHCHECK: &str = "workload.healthcheck.v1";
 pub const CAPABILITY_CLUSTER_LEAVE: &str = "network.cluster.leave.v1";
 pub const CAPABILITY_WIREGUARD_KEY_ENSURE: &str = "network.wireguard.key.ensure.v1";
 pub const CAPABILITY_WIREGUARD_INSPECT: &str = "network.wireguard.inspect.v1";
