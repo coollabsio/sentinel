@@ -1203,6 +1203,7 @@ async fn ingress_reconcile_route_forwards_routes_and_names_and_returns_the_ingre
                 workload_id: "web".into(),
                 namespace: "default".into(),
             }],
+            ..Default::default()
         }))
     );
     registry
@@ -1221,6 +1222,7 @@ async fn ingress_reconcile_route_forwards_routes_and_names_and_returns_the_ingre
                         revision: 7,
                         route_count: 2,
                         name_count: 1,
+                        tls_enabled: false,
                     },
                 )),
             },

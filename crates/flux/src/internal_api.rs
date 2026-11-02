@@ -1,3 +1,4 @@
+use base64::Engine;
 use std::time::Duration;
 
 use axum::Json;
@@ -274,6 +275,17 @@ struct IngressReconcileApiRequest {
     routes: Vec<IngressRouteApiRequest>,
     #[serde(default)]
     names: Vec<WorkloadNameApiRequest>,
+    #[serde(default)]
+    tls_enabled: bool,
+    /// Base64 of the 32-byte cluster TLS key; empty without HTTPS.
+    #[serde(default)]
+    tls_key: String,
+    #[serde(default)]
+    tls_issuer: bool,
+    #[serde(default)]
+    acme_directory_url: String,
+    #[serde(default)]
+    ingress_public_ips: Vec<String>,
 }
 #[derive(Deserialize)]
 struct WorkloadNameApiRequest {
@@ -350,6 +362,16 @@ pub struct SystemInfoResponse {
     load_average_one: Option<f64>,
     load_average_five: Option<f64>,
     load_average_fifteen: Option<f64>,
+    ingress_certificates: Vec<IngressCertificateStatusResponse>,
+}
+
+#[derive(Serialize)]
+pub struct IngressCertificateStatusResponse {
+    host: String,
+    status: String,
+    not_after: i64,
+    error: String,
+    next_attempt_at: i64,
 }
 
 #[derive(Serialize)]
@@ -824,6 +846,10 @@ async fn ingress_reconcile(
     headers: HeaderMap,
     Json(request): Json<IngressReconcileApiRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state.token, &headers)?;
+    let tls_key = base64::engine::general_purpose::STANDARD
+        .decode(&request.tls_key)
+        .map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, "invalid TLS key"))?;
     let result = dispatch_network(
         &state,
         &headers,
@@ -853,6 +879,11 @@ async fn ingress_reconcile(
                     namespace: name.namespace,
                 })
                 .collect(),
+            tls_enabled: request.tls_enabled,
+            tls_key,
+            tls_issuer: request.tls_issuer,
+            acme_directory_url: request.acme_directory_url,
+            ingress_public_ips: request.ingress_public_ips,
         }),
     )
     .await?;
@@ -868,6 +899,7 @@ async fn ingress_reconcile(
         "revision": value.revision,
         "route_count": value.route_count,
         "name_count": value.name_count,
+        "tls_enabled": value.tls_enabled,
     })))
 }
 
@@ -1141,6 +1173,17 @@ async fn system_info(
         load_average_one: info.load_average_one,
         load_average_five: info.load_average_five,
         load_average_fifteen: info.load_average_fifteen,
+        ingress_certificates: info
+            .ingress_certificates
+            .into_iter()
+            .map(|certificate| IngressCertificateStatusResponse {
+                host: certificate.host,
+                status: certificate.status,
+                not_after: certificate.not_after,
+                error: certificate.error,
+                next_attempt_at: certificate.next_attempt_at,
+            })
+            .collect(),
     }))
 }
 

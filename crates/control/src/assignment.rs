@@ -341,6 +341,12 @@ impl AssignmentClient {
             ingress_trigger,
             shutdown.clone(),
         ));
+        // Orders and renews ingress certificates on the issuer Node, also
+        // while Coolify is unavailable.
+        let certificate_issuer = tokio::spawn(crate::acme::run(
+            std::path::PathBuf::from("/"),
+            shutdown.clone(),
+        ));
 
         loop {
             if *shutdown.borrow() {
@@ -441,6 +447,7 @@ impl AssignmentClient {
         boot_restore.abort();
         discovery_publisher.abort();
         ingress_renderer.abort();
+        certificate_issuer.abort();
         tracing::info!("Sentinel control assignment polling stopped");
     }
 }

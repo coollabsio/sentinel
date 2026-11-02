@@ -7,9 +7,11 @@ use super::*;
 #[test]
 fn network_capabilities_are_typed_and_versioned() {
     let capabilities = NETWORK_CAPABILITIES;
-    assert_eq!(capabilities.len(), 9);
+    assert_eq!(capabilities.len(), 10);
     assert!(capabilities.contains(&CAPABILITY_INGRESS_RECONCILE));
     assert_eq!(CAPABILITY_INGRESS_RECONCILE, "ingress.reconcile.v1");
+    assert!(capabilities.contains(&CAPABILITY_INGRESS_TLS));
+    assert_eq!(CAPABILITY_INGRESS_TLS, "ingress.tls.v1");
     assert!(!capabilities.contains(&"discovery.corrosion.endpoints.reconcile.v1"));
     assert!(
         capabilities
@@ -330,6 +332,7 @@ fn ingress_reconcile_command_and_result_round_trip() {
                     workload_id: "uuid-web".into(),
                     namespace: "default".into(),
                 }],
+                ..Default::default()
             },
         )),
         expires_at_unix_ms: 2,
@@ -351,6 +354,7 @@ fn ingress_reconcile_command_and_result_round_trip() {
                 revision: 4,
                 route_count: 1,
                 name_count: 1,
+                tls_enabled: false,
             },
         )),
     };

@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
+mod acme;
 mod assignment;
 mod commands;
 mod connection;
 mod container_logs;
 mod discovery;
 mod ingress;
+mod ingress_tls;
 mod logs;
 mod network;
 mod restore;

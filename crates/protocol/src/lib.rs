@@ -22,7 +22,10 @@ pub const CAPABILITY_FIREWALL_RECONCILE: &str = "network.firewall.reconcile.v1";
 pub const CAPABILITY_CORROSION_INSPECT: &str = "discovery.corrosion.inspect.v1";
 pub const CAPABILITY_CORROSION_RECONCILE: &str = "discovery.corrosion.reconcile.v1";
 pub const CAPABILITY_INGRESS_RECONCILE: &str = "ingress.reconcile.v1";
-pub const NETWORK_CAPABILITIES: [&str; 9] = [
+/// `ingress.reconcile.v1` accepts `tls_enabled` and `tls_key`. Not a command:
+/// it only tells Coolify that this Sentinel can serve HTTPS.
+pub const CAPABILITY_INGRESS_TLS: &str = "ingress.tls.v1";
+pub const NETWORK_CAPABILITIES: [&str; 10] = [
     CAPABILITY_CLUSTER_LEAVE,
     CAPABILITY_WIREGUARD_KEY_ENSURE,
     CAPABILITY_WIREGUARD_INSPECT,
@@ -32,6 +35,7 @@ pub const NETWORK_CAPABILITIES: [&str; 9] = [
     CAPABILITY_CORROSION_INSPECT,
     CAPABILITY_CORROSION_RECONCILE,
     CAPABILITY_INGRESS_RECONCILE,
+    CAPABILITY_INGRESS_TLS,
 ];
 
 pub mod control {

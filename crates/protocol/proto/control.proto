@@ -169,6 +169,20 @@ message SystemInfoResult {
   optional double load_average_one = 18;
   optional double load_average_five = 19;
   optional double load_average_fifteen = 20;
+  // The certificate state of every host, reported only by the cluster's
+  // certificate issuer.
+  repeated IngressCertificateStatus ingress_certificates = 21;
+}
+
+message IngressCertificateStatus {
+  string host = 1;
+  // "issued", "failed", "dns_mismatch", "orphaned" or "pending".
+  string status = 2;
+  // Unix seconds; 0 without a certificate.
+  int64 not_after = 3;
+  string error = 4;
+  // Unix seconds of the next order attempt; 0 when none is scheduled.
+  int64 next_attempt_at = 5;
 }
 
 message ContainerListRequest {}
@@ -344,10 +358,11 @@ message TrustBundleUpdateResult {
   bool changed = 2;
 }
 
-// Converges this Node's HTTP ingress (Caddy on :80) and the cluster-wide route
-// and internal name tables in Corrosion. Every cluster Node receives the same
-// routes and names; `enabled` only controls Caddy on this Node. The table write
-// is idempotent for the same revision and rejects older revisions.
+// Converges this Node's HTTP ingress (Caddy on :80, and :443 for hosts with a
+// certificate) and the cluster-wide route and internal name tables in
+// Corrosion. Every cluster Node receives the same routes and names; `enabled`
+// only controls Caddy on this Node. The table write is idempotent for the same
+// revision and rejects older revisions.
 message IngressReconcileRequest {
   bool enabled = 1;
   // Must equal the Caddy version this Sentinel pins, for example "v2.11.7".
@@ -355,6 +370,21 @@ message IngressReconcileRequest {
   uint64 revision = 3;
   repeated IngressRoute routes = 4;
   repeated WorkloadName names = 5;
+  // Serve the certificates in Corrosion over HTTPS. Requires `enabled`.
+  bool tls_enabled = 6;
+  // The 32-byte cluster key that decrypts the certificate private keys in
+  // Corrosion. Set exactly when `tls_enabled` is set.
+  bytes tls_key = 7;
+  // This Node orders and renews the certificates of the cluster. Coolify sets
+  // it on one ingress Node. Requires `tls_enabled`.
+  bool tls_issuer = 8;
+  // The ACME directory, for example Let's Encrypt. Set exactly when `tls_issuer` is set.
+  string acme_directory_url = 9;
+  // The public IPv4 or IPv6 address of every ingress Node, the issuer
+  // included: what DNS records point to. The issuer orders only hosts that
+  // resolve to one of them, and checks on each of them that the challenge is
+  // served before the CA validates it. Set exactly when `tls_issuer` is set.
+  repeated string ingress_public_ips = 10;
 }
 
 // An internal DNS name, `<name>.<namespace>.coolify.internal`, of a workload.
@@ -383,6 +413,7 @@ message IngressReconcileResult {
   uint64 revision = 4;
   uint64 route_count = 5;
   uint64 name_count = 6;
+  bool tls_enabled = 7;
 }
 
 message CommandError {

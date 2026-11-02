@@ -1188,6 +1188,7 @@ fn system_info(sentinel_version: &str, system: &mut System) -> SystemInfoResult 
         load_average_one: Some(load.one),
         load_average_five: Some(load.five),
         load_average_fifteen: Some(load.fifteen),
+        ingress_certificates: crate::ingress_tls::issuer_statuses(std::path::Path::new("/")),
     }
 }
 

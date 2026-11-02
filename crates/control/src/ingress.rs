@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha512};
 use tokio::sync::{Notify, watch};
 
+use crate::ingress_tls::{Challenge, LoadedCertificate};
 use crate::network::{
     atomic_write, run as run_command, state_path, valid_discovery_label, write_if_changed,
 };
@@ -50,7 +51,7 @@ const INGRESS_STATE_FILE: &str = "ingress.state";
 const ADMIN_SOCKET: &str = "/run/coolify-ingress/admin.sock";
 const CADDY_BINARY: &str = "/usr/local/bin/caddy";
 const CADDY_VERSION_FILE: &str = "/usr/local/bin/caddy.version";
-const INGRESS_USER: &str = "coolify-ingress";
+pub(crate) const INGRESS_USER: &str = "coolify-ingress";
 const INGRESS_HOME: &str = "/var/lib/coolify-ingress";
 /// Endpoints in this namespace are Node WireGuard addresses, never workloads.
 const NODE_NAMESPACE: &str = "nodes";
@@ -155,6 +156,7 @@ pub(crate) fn validate_routes(request: &IngressReconcileRequest) -> Result<(), S
 
 pub(crate) fn validate_request(request: &IngressReconcileRequest) -> Result<(), String> {
     validate_routes(request)?;
+    crate::ingress_tls::validate_request(request)?;
     // Disabling must keep working after a Sentinel upgrade changed the pin.
     let version_accepted = request.caddy_version == CADDY_VERSION
         || (!request.enabled && request.caddy_version.is_empty());
@@ -496,11 +498,15 @@ fn static_response(status: u16, body: &str) -> Value {
 /// routes are sorted by host, and upstreams list this Node's endpoints first,
 /// then the others, each by address.
 ///
+/// Port 80 answers ACME challenges first. A host with a loaded certificate is
+/// served on 443 and redirected there from 80; other hosts stay on 80.
 /// `reverse_proxy` passes the client's Host header through unchanged.
 pub(crate) fn render_caddy_config(
     routes: &[StoredRoute],
     endpoints: &[LiveEndpoint],
     local_node_ip: &str,
+    challenges: &[Challenge],
+    certificates: &[LoadedCertificate],
 ) -> Vec<u8> {
     let mut upstreams = BTreeMap::<(&str, &str), Vec<(bool, Ipv4Addr)>>::new();
     for endpoint in endpoints {
@@ -520,7 +526,11 @@ pub(crate) fn render_caddy_config(
     let mut sorted = routes.iter().collect::<Vec<_>>();
     sorted.sort_by(|left, right| left.host.cmp(&right.host));
     sorted.dedup_by(|right, left| right.host == left.host);
-    let mut rendered = sorted
+    let secure = certificates
+        .iter()
+        .map(|certificate| certificate.host.as_str())
+        .collect::<HashSet<_>>();
+    let proxied = sorted
         .into_iter()
         .map(|route| {
             let dials = upstreams
@@ -548,34 +558,94 @@ pub(crate) fn render_caddy_config(
                     },
                 })
             };
+            (route.host.as_str(), handler)
+        })
+        .collect::<Vec<_>>();
+    let host_route = |host: &str, handler: &Value| {
+        json!({
+            "match": [{"host": [host]}],
+            "handle": [handler],
+            "terminal": true,
+        })
+    };
+    let not_found = json!({
+        "handle": [static_response(404, NOT_FOUND_BODY)],
+        "terminal": true,
+    });
+    let redirect = json!({
+        "handler": "static_response",
+        "status_code": 308,
+        "headers": {"Location": ["https://{http.request.host}{http.request.uri}"]},
+    });
+
+    let mut challenges = challenges.iter().collect::<Vec<_>>();
+    challenges.sort();
+    let mut plain = challenges
+        .into_iter()
+        .map(|challenge| {
             json!({
-                "match": [{"host": [route.host]}],
-                "handle": [handler],
+                "match": [{
+                    "host": [challenge.host],
+                    "path": [format!("/.well-known/acme-challenge/{}", challenge.token)],
+                }],
+                "handle": [static_response(200, &challenge.key_authorization)],
                 "terminal": true,
             })
         })
         .collect::<Vec<_>>();
-    rendered.push(json!({
-        "handle": [static_response(404, NOT_FOUND_BODY)],
-        "terminal": true,
+    plain.extend(proxied.iter().map(|(host, handler)| {
+        if secure.contains(host) {
+            host_route(host, &redirect)
+        } else {
+            host_route(host, handler)
+        }
     }));
+    plain.push(not_found.clone());
+    let mut servers = json!({
+        "ingress": {
+            "listen": [":80"],
+            "automatic_https": {"disable": true},
+            "routes": plain,
+        },
+    });
+    let mut apps = json!({});
+    if !certificates.is_empty() {
+        let mut encrypted = proxied
+            .iter()
+            .filter(|(host, _)| secure.contains(host))
+            .map(|(host, handler)| host_route(host, handler))
+            .collect::<Vec<_>>();
+        encrypted.push(not_found);
+        servers["ingress_tls"] = json!({
+            "listen": [":443"],
+            "protocols": ["h1", "h2"],
+            "automatic_https": {"disable": true},
+            "tls_connection_policies": [{}],
+            "routes": encrypted,
+        });
+        let mut loaded = certificates.iter().collect::<Vec<_>>();
+        loaded.sort();
+        apps["tls"] = json!({
+            "certificates": {
+                "load_files": loaded
+                    .into_iter()
+                    .map(|certificate| json!({
+                        "certificate": certificate.certificate_file,
+                        "key": certificate.key_file,
+                        "tags": [certificate.fingerprint],
+                    }))
+                    .collect::<Vec<_>>(),
+            },
+        });
+    }
+    apps["http"] = json!({"servers": servers});
 
     let config = json!({
         "admin": {
             "listen": format!("unix/{ADMIN_SOCKET}"),
             "config": {"persist": false},
         },
-        "apps": {
-            "http": {
-                "servers": {
-                    "ingress": {
-                        "listen": [":80"],
-                        "automatic_https": {"disable": true},
-                        "routes": rendered,
-                    },
-                },
-            },
-        },
+        "apps": apps,
     });
     let mut output = serde_json::to_vec_pretty(&config).unwrap_or_default();
     output.push(b'\n');
@@ -584,7 +654,7 @@ pub(crate) fn render_caddy_config(
 
 /// The configuration Caddy starts with before the first render: no routes.
 pub(crate) fn bootstrap_config() -> Vec<u8> {
-    render_caddy_config(&[], &[], "")
+    render_caddy_config(&[], &[], "", &[], &[])
 }
 
 pub(crate) fn ingress_unit() -> String {
@@ -755,7 +825,7 @@ fn ensure_config_dir(root: &Path) -> Result<(), String> {
         .map_err(|_| "The ingress configuration directory could not be created.".to_string())
 }
 
-fn read_stored_routes(owner_node_ip: &str) -> Result<StoredRoutes, String> {
+pub(crate) fn read_stored_routes(owner_node_ip: &str) -> Result<StoredRoutes, String> {
     let query = |sql: &str| {
         crate::discovery::corrosion_api(
             owner_node_ip,
@@ -804,6 +874,7 @@ pub(crate) fn reconcile(
             revision: request.revision,
             route_count: request.routes.len() as u64,
             name_count: request.names.len() as u64,
+            tls_enabled: false,
         });
     }
 
@@ -840,6 +911,7 @@ pub(crate) fn reconcile(
         }
         wait_until_caddy_answers()?;
     }
+    crate::ingress_tls::apply(root, request)?;
     atomic_write(
         &state_file(root),
         format!("enabled {CADDY_VERSION}\n").as_bytes(),
@@ -853,6 +925,7 @@ pub(crate) fn reconcile(
         revision: request.revision,
         route_count: request.routes.len() as u64,
         name_count: request.names.len() as u64,
+        tls_enabled: request.tls_enabled,
     })
 }
 
@@ -883,6 +956,7 @@ pub(crate) fn remove(root: &Path) -> Result<(), String> {
         }
     }
     let _ = fs::remove_dir(root.join(INGRESS_CONFIG_DIR));
+    crate::ingress_tls::remove(root)?;
     if host {
         run_command(
             Command::new("systemctl").arg("daemon-reload"),
@@ -1034,16 +1108,50 @@ pub(crate) fn render_once(root: &Path, state: &mut RenderState) -> Result<Render
         ));
     }
     let owner = identity.owner_node_ip.as_str();
+    let query = |sql: &str| {
+        crate::discovery::corrosion_api(
+            owner,
+            "queries",
+            &serde_json::to_vec(sql).unwrap_or_default(),
+        )
+        .and_then(|output| parse_query_events(&output))
+    };
     let routes = read_stored_routes(owner)?;
-    let endpoints = crate::discovery::corrosion_api(
+    let endpoints = parse_live_endpoints(&query(endpoints_query_sql())?);
+    let (challenges, certificates) = match crate::ingress_tls::read_key(root) {
+        Some(key) => {
+            let challenges = crate::ingress_tls::parse_challenges(&query(
+                crate::ingress_tls::challenges_query_sql(),
+            )?);
+            let stored = crate::ingress_tls::parse_certificates(&query(
+                crate::ingress_tls::certificates_query_sql(),
+            )?);
+            let hosts = routes
+                .routes
+                .iter()
+                .map(|route| route.host.as_str())
+                .collect::<HashSet<_>>();
+            let certificates = crate::ingress_tls::write_certificates(
+                root,
+                &key,
+                &stored,
+                &hosts,
+                crate::network::unix_seconds(),
+            )?;
+            (challenges, certificates)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    let config = render_caddy_config(
+        &routes.routes,
+        &endpoints,
         owner,
-        "queries",
-        &serde_json::to_vec(endpoints_query_sql()).unwrap_or_default(),
-    )
-    .and_then(|output| parse_query_events(&output))
-    .map(|rows| parse_live_endpoints(&rows))?;
-    let config = render_caddy_config(&routes.routes, &endpoints, owner);
-    apply_config(root, &config, state, load_into_caddy)
+        &challenges,
+        &certificates,
+    );
+    let outcome = apply_config(root, &config, state, load_into_caddy)?;
+    crate::ingress_tls::remove_stale(root, &certificates)?;
+    Ok(outcome)
 }
 
 /// Renders whenever `trigger` fires and every `RENDER_INTERVAL`, until shutdown.
@@ -1119,6 +1227,7 @@ mod tests {
             revision,
             routes,
             names: vec![],
+            ..Default::default()
         }
     }
 
@@ -1151,7 +1260,14 @@ mod tests {
     }
 
     fn config(routes: &[StoredRoute], endpoints: &[LiveEndpoint]) -> Value {
-        serde_json::from_slice(&render_caddy_config(routes, endpoints, "10.240.0.2")).unwrap()
+        serde_json::from_slice(&render_caddy_config(
+            routes,
+            endpoints,
+            "10.240.0.2",
+            &[],
+            &[],
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -1615,7 +1731,7 @@ mod tests {
         // The client Host header is passed through: no header rewrite.
         assert!(proxy.get("headers").is_none());
         assert!(
-            !String::from_utf8(render_caddy_config(&[], &[], ""))
+            !String::from_utf8(render_caddy_config(&[], &[], "", &[], &[]))
                 .unwrap()
                 .contains("Host")
         );
@@ -1662,10 +1778,16 @@ mod tests {
         let mut shuffled_endpoints = endpoints.clone();
         shuffled_endpoints.rotate_left(1);
 
-        let first = render_caddy_config(&routes, &endpoints, "10.240.0.2");
+        let first = render_caddy_config(&routes, &endpoints, "10.240.0.2", &[], &[]);
         assert_eq!(
             first,
-            render_caddy_config(&shuffled_routes, &shuffled_endpoints, "10.240.0.2")
+            render_caddy_config(
+                &shuffled_routes,
+                &shuffled_endpoints,
+                "10.240.0.2",
+                &[],
+                &[]
+            )
         );
         let rendered: Value = serde_json::from_slice(&first).unwrap();
         let hosts = rendered["apps"]["http"]["servers"]["ingress"]["routes"]
@@ -1696,7 +1818,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(INGRESS_CONFIG_FILE);
         let mut state = RenderState::default();
-        let first = render_caddy_config(&[stored("a.example.com", "web", 80)], &[], "");
+        let first = render_caddy_config(&[stored("a.example.com", "web", 80)], &[], "", &[], &[]);
 
         // Caddy is down: the file is written and the load stays pending.
         assert_eq!(
@@ -1739,7 +1861,7 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
 
         // A changed configuration is written and loaded.
-        let second = render_caddy_config(&[stored("b.example.com", "web", 80)], &[], "");
+        let second = render_caddy_config(&[stored("b.example.com", "web", 80)], &[], "", &[], &[]);
         assert_eq!(
             apply_config(temp.path(), &second, &mut state, |_| Ok(
                 LoadOutcome::Loaded
@@ -1864,6 +1986,7 @@ mod tests {
                 revision: 3,
                 route_count: 1,
                 name_count: 0,
+                tls_enabled: false,
             }
         );
         assert!(enabled(root));
@@ -1913,6 +2036,7 @@ mod tests {
                     revision: 3,
                     route_count: 1,
                     name_count: 1,
+                    tls_enabled: false,
                 }
             );
             assert!(!enabled(root));

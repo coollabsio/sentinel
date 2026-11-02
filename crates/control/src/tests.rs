@@ -2254,6 +2254,7 @@ fn ingress_request(
             workload_id: "web".into(),
             namespace: "default".into(),
         }],
+        ..Default::default()
     }
 }
 
@@ -2334,6 +2335,7 @@ fn executes_capability_gated_ingress_reconciles_and_wakes_the_renderer() {
                 revision: 2,
                 route_count: 1,
                 name_count: 1,
+                tls_enabled: false,
             }
         ))
     );
