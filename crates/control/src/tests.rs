@@ -511,7 +511,12 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "ingress.tls.v1",
             "image.build.v1",
             "builder.reconcile.v1",
-            "registry.reconcile.v1"
+            "registry.reconcile.v1",
+            "volume.mounts.v1",
+            "volume.delete.v1",
+            "volume.serve.v1",
+            "volume.receive.v1",
+            "volume.transfer.v1"
         ])
     );
 }
