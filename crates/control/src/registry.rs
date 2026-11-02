@@ -271,8 +271,21 @@ fn ensure_server(root: &Path, podman: &Path, server: &RegistryServer) -> Result<
     Ok(())
 }
 
+/// Stops zot on a Node that no longer runs the registry. The image data stays
+/// in its volume: a short outage can move the role and back, and a returning
+/// role must not start with an empty registry.
 fn remove_server(root: &Path, podman: &Path) -> Result<(), String> {
-    remove_container_and_volume(podman, REGISTRY_CONTAINER, REGISTRY_VOLUME)?;
+    let output = output_with_timeout(
+        Command::new(podman).args(["rm", "--force", "--ignore", REGISTRY_CONTAINER]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .map_err(|error| podman_failure(&error))?;
+    if !output.status.success() {
+        return Err(stderr_or(
+            &output.stderr,
+            "Podman could not stop the registry.",
+        ));
+    }
     match std::fs::remove_dir_all(server_dir(root)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

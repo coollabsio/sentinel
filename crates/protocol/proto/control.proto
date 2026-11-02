@@ -511,7 +511,8 @@ message BuilderReconcileResult {
 
 // Converges the cluster registry on this Node. Every Node gets the trust (CA
 // and pull credential for Podman). Only the registry Node gets `server`; on
-// every other Node Sentinel removes the registry container and its data.
+// every other Node Sentinel removes the registry container and keeps its
+// data volume, so a role that returns finds its images again.
 message RegistryReconcileRequest {
   // PEM of the registry CA. Never a private key.
   string ca_pem = 1;
