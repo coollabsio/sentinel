@@ -249,6 +249,8 @@ struct FirewallReconcileApiRequest {
     workload_cidrs: Vec<String>,
     #[serde(default)]
     ingress_rules: Vec<FirewallIngressRuleApiRequest>,
+    #[serde(default)]
+    registry_ip: String,
 }
 #[derive(Deserialize)]
 struct CorrosionInspectApiRequest {
@@ -813,6 +815,7 @@ async fn firewall_reconcile(
             flux_probe_host: request.flux_probe_host,
             workload_cidrs: request.workload_cidrs,
             ingress_rules,
+            registry_ip: request.registry_ip,
         }),
     )
     .await?;

@@ -259,6 +259,9 @@ fn render_peer(peer: &WireguardPeer) -> String {
     )
 }
 
+/// The cluster registry port (`sentinel_protocol::REGISTRY_HOST`).
+const REGISTRY_PORT: u16 = 5443;
+
 pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<String, String> {
     if request.revision == 0
         || request.wireguard_port == 0
@@ -271,6 +274,8 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
             .workload_cidrs
             .iter()
             .any(|cidr| !valid_ipv4_cidr(cidr))
+        || (!request.registry_ip.is_empty()
+            && !ipv4_in_cidr(&request.registry_ip, &request.cluster_cidr))
         || request.rules.len() > 100_000
         || request.ingress_rules.len() > 100_000
         || request.rules.iter().any(|rule| {
@@ -409,13 +414,29 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
         .join(" ");
 
     let local_node_ip = &request.local_node_ip;
+    // Node hosts reach the cluster registry over the mesh. The input rule
+    // matches only on the registry Node; the source must be a Node address.
+    let (input_registry_rule, output_registry_rule) = if request.registry_ip.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (
+            format!(
+                "ip saddr {} ip daddr {} tcp dport {REGISTRY_PORT} accept; ",
+                request.cluster_cidr, request.registry_ip
+            ),
+            format!(
+                "ip daddr {} tcp dport {REGISTRY_PORT} accept; ",
+                request.registry_ip
+            ),
+        )
+    };
 
     Ok(format!(
         "table inet {COOLIFY_NFT_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
- chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; ip saddr {} udp dport 8787 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} udp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 8080 accept; ip saddr {} drop; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
+ chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; ip saddr {} udp dport 8787 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} udp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 8080 accept; {input_registry_rule}ip saddr {} drop; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
  chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} {forward_ingress_rules} ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; ip saddr != @workload_networks ip daddr @workload_networks drop; }}
- chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; ip daddr {local_node_ip} udp dport 53 accept; ip daddr {local_node_ip} tcp dport 53 accept; ip daddr {local_node_ip} tcp dport 8080 accept; {output_allow_rules} {output_ingress_rules} ip daddr {} drop; ip daddr @workload_networks drop; }}
+ chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; ip daddr {local_node_ip} udp dport 53 accept; ip daddr {local_node_ip} tcp dport 53 accept; ip daddr {local_node_ip} tcp dport 8080 accept; {output_allow_rules} {output_ingress_rules} {output_registry_rule}ip daddr {} drop; ip daddr @workload_networks drop; }}
 }}
 table bridge {COOLIFY_NFT_BRIDGE_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
@@ -2526,6 +2547,7 @@ mod tests {
             wireguard_interface: "coolify0".into(),
             workload_cidrs: vec!["100.64.0.0/24".into(), "100.64.1.0/24".into()],
             flux_probe_host: "10.240.0.1".into(),
+            registry_ip: String::new(),
         })
         .unwrap();
         assert!(rendered.contains("table inet coolify_cluster"));
@@ -3024,6 +3046,7 @@ mod tests {
             flux_probe_host: String::new(),
             workload_cidrs: vec!["100.64.0.0/24".into()],
             ingress_rules: vec![],
+            registry_ip: String::new(),
         };
         let first = reconcile_firewall(temp.path(), &request).unwrap();
         let second = reconcile_firewall(temp.path(), &request).unwrap();
@@ -3439,6 +3462,7 @@ mod tests {
             flux_probe_host: String::new(),
             workload_cidrs: vec!["100.64.1.0/24".into(), "100.64.0.0/24".into()],
             ingress_rules: vec![],
+            registry_ip: String::new(),
         }
     }
 
