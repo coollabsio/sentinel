@@ -57,21 +57,27 @@ pub(crate) fn podman_logs_args(container: &str, lines: u32, since: Option<i64>) 
     args
 }
 
-/// Returns the full ID of the inspected container when it carries the label
-/// `coolify.managed=true`. Logs are then read by ID, so a container that is
-/// replaced under the same name in between is never read.
+/// Returns the full ID of the inspected container when Coolify owns it: it
+/// carries `coolify.managed=true` (a workload) or `coolify.build` (a build
+/// container from `image.build.v1`). Logs are then read by ID, so a container
+/// that is replaced under the same name in between is never read.
 pub(crate) fn managed_container_id(inspect_output: &[u8]) -> Result<String, String> {
     let containers: Vec<serde_json::Value> = serde_json::from_slice(inspect_output)
         .map_err(|_| "Podman returned invalid container data.".to_string())?;
     let container = containers
         .first()
         .ok_or_else(|| "The container does not exist.".to_string())?;
-    let managed = container
+    let labels = container
         .get("Config")
-        .and_then(|config| config.get("Labels"))
+        .and_then(|config| config.get("Labels"));
+    let managed = labels
         .and_then(|labels| labels.get(MANAGED_LABEL))
         .and_then(serde_json::Value::as_str)
-        == Some("true");
+        == Some("true")
+        || labels
+            .and_then(|labels| labels.get(crate::builder::BUILD_LABEL))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|build_id| !build_id.is_empty());
     if !managed {
         return Err("The container is not managed by Coolify.".into());
     }
