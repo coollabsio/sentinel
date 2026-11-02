@@ -97,7 +97,7 @@ pub(crate) fn mark_draining(containers: &mut [ContainerObservation]) {
 
 /// Counts the other serving endpoints of a workload that has an ingress route.
 pub(crate) fn serving_elsewhere_sql() -> &'static str {
-    "SELECT COUNT(*) FROM workload_endpoints WHERE namespace = 'default' AND workload_id = ? AND state = 'running' AND health NOT IN ('unhealthy', 'starting') AND expires_at > unixepoch() AND EXISTS (SELECT 1 FROM ingress_routes WHERE ingress_routes.workload_id = workload_endpoints.workload_id AND ingress_routes.namespace = workload_endpoints.namespace)"
+    "SELECT COUNT(*) FROM workload_endpoints WHERE namespace = 'default' AND workload_id = ? AND state = 'running' AND health NOT IN ('unhealthy', 'starting') AND expires_at > unixepoch() AND EXISTS (SELECT 1 FROM ingress_http_routes WHERE ingress_http_routes.workload_id = workload_endpoints.workload_id AND ingress_http_routes.namespace = workload_endpoints.namespace)"
 }
 
 /// How long to wait before the container stops: only a routed workload with
@@ -825,7 +825,7 @@ mod tests {
         assert!(sql.contains("workload_id = ?") && sql.contains("state = 'running'"));
         assert!(sql.contains("health NOT IN ('unhealthy', 'starting')"));
         assert!(sql.contains("expires_at > unixepoch()"));
-        assert!(sql.contains("FROM ingress_routes"));
+        assert!(sql.contains("FROM ingress_http_routes"));
         assert_eq!(drain_wait(0), Duration::ZERO);
         assert_eq!(drain_wait(1), DRAIN_DURATION);
         assert!(DRAIN_DURATION > crate::ingress::RENDER_INTERVAL);

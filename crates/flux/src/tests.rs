@@ -1190,12 +1190,14 @@ async fn ingress_reconcile_route_forwards_routes_and_names_and_returns_the_ingre
                     workload_id: "web".into(),
                     namespace: "default".into(),
                     port: 3000,
+                    ..Default::default()
                 },
                 IngressRoute {
                     host: "api.example.com".into(),
                     workload_id: "api".into(),
                     namespace: "default".into(),
                     port: 8080,
+                    ..Default::default()
                 },
             ],
             names: vec![WorkloadName {

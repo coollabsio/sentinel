@@ -464,6 +464,7 @@ async fn tick(root: &Path, state: &mut IssuerState) -> Result<(), String> {
     let hosts = routes
         .routes
         .into_iter()
+        .filter(|route| !route.http_only)
         .map(|route| route.host)
         .collect::<BTreeSet<_>>();
     let states = parse_states(&query(&owner, states_query_sql()).await?);

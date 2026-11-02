@@ -320,9 +320,26 @@ struct WorkloadNameApiRequest {
 #[derive(Deserialize)]
 struct IngressRouteApiRequest {
     host: String,
+    #[serde(default)]
     workload_id: String,
+    #[serde(default)]
     namespace: String,
+    #[serde(default)]
     port: u32,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    redirect_host: String,
+    #[serde(default)]
+    http_only: bool,
+    #[serde(default)]
+    allow_http: bool,
+    #[serde(default)]
+    temporary_redirect: bool,
+    #[serde(default)]
+    noindex: bool,
+    #[serde(default)]
+    strip_path: bool,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -931,6 +948,13 @@ async fn ingress_reconcile(
                     workload_id: route.workload_id,
                     namespace: route.namespace,
                     port: route.port,
+                    path: route.path,
+                    redirect_host: route.redirect_host,
+                    http_only: route.http_only,
+                    allow_http: route.allow_http,
+                    temporary_redirect: route.temporary_redirect,
+                    noindex: route.noindex,
+                    strip_path: route.strip_path,
                 })
                 .collect(),
             names: request

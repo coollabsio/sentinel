@@ -511,6 +511,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "discovery.corrosion.reconcile.v1",
             "ingress.reconcile.v1",
             "ingress.tls.v1",
+            "ingress.routes.v2",
             "image.build.v1",
             "builder.reconcile.v1",
             "registry.reconcile.v1",
@@ -2273,6 +2274,7 @@ fn ingress_request(
             workload_id: "web".into(),
             namespace: "default".into(),
             port: 3000,
+            ..Default::default()
         }],
         names: vec![sentinel_protocol::control::v1::WorkloadName {
             name: "frontend".into(),

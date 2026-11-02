@@ -7,16 +7,18 @@ use super::*;
 #[test]
 fn network_capabilities_are_typed_and_versioned() {
     let capabilities = NETWORK_CAPABILITIES;
-    assert_eq!(capabilities.len(), 10);
+    assert_eq!(capabilities.len(), 11);
     assert!(capabilities.contains(&CAPABILITY_INGRESS_RECONCILE));
     assert_eq!(CAPABILITY_INGRESS_RECONCILE, "ingress.reconcile.v1");
     assert!(capabilities.contains(&CAPABILITY_INGRESS_TLS));
     assert_eq!(CAPABILITY_INGRESS_TLS, "ingress.tls.v1");
+    assert!(capabilities.contains(&CAPABILITY_INGRESS_ROUTES_V2));
+    assert_eq!(CAPABILITY_INGRESS_ROUTES_V2, "ingress.routes.v2");
     assert!(!capabilities.contains(&"discovery.corrosion.endpoints.reconcile.v1"));
     assert!(
         capabilities
             .iter()
-            .all(|capability| capability.ends_with(".v1"))
+            .all(|capability| capability.ends_with(".v1") || capability.ends_with(".v2"))
     );
 
     let command = control::v1::Command {
@@ -327,6 +329,7 @@ fn ingress_reconcile_command_and_result_round_trip() {
                     workload_id: "web".into(),
                     namespace: "default".into(),
                     port: 3000,
+                    ..Default::default()
                 }],
                 names: vec![control::v1::WorkloadName {
                     name: "web".into(),

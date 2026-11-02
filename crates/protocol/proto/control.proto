@@ -472,6 +472,25 @@ message IngressRoute {
   string namespace = 3;
   // Workload container port.
   uint32 port = 4;
+  // Path prefix: empty for all paths, or `/segment...` without a trailing
+  // slash, `?` or `#`. At most 255 characters. Needs `ingress.routes.v2`, like
+  // every field below.
+  string path = 5;
+  // Redirects every request to this host and keeps the request URI. Then
+  // `workload_id`, `namespace` and `path` are empty and `port` is 0, and the
+  // route is the only route of its host.
+  string redirect_host = 6;
+  // No certificate for this host: serve on port 80 only.
+  bool http_only = 7;
+  // The host has a certificate, but port 80 serves the routes instead of
+  // redirecting to HTTPS.
+  bool allow_http = 8;
+  // Redirects use 307 instead of 308.
+  bool temporary_redirect = 9;
+  // Adds the response header `X-Robots-Tag: noindex, nofollow`.
+  bool noindex = 10;
+  // Removes the `path` prefix before proxying.
+  bool strip_path = 11;
 }
 
 message IngressReconcileResult {
