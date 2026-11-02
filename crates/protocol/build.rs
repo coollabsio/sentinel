@@ -15,6 +15,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ".coolify.sentinel.control.v1.CommandResult.payload",
         "#[allow(clippy::large_enum_variant)]",
     );
+    prost.enum_attribute(
+        ".coolify.sentinel.control.v1.Command.payload",
+        "#[allow(clippy::large_enum_variant)]",
+    );
 
     tonic_prost_build::configure()
         .build_client(true)
