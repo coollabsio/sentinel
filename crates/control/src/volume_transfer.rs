@@ -902,7 +902,8 @@ pub(crate) fn receive(
     ensure_rsync()?;
     let mesh = Mesh::read(root)?;
     mesh.peer_node(&request.source_address)?;
-    let source_port = u16::try_from(request.source_port).map_err(|_| "The source port is invalid.")?;
+    let source_port =
+        u16::try_from(request.source_port).map_err(|_| "The source port is invalid.")?;
     let host = root == Path::new("/");
     ensure_volumes(podman, names.iter().map(String::as_str))?;
     let mountpoints = names
