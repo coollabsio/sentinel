@@ -513,6 +513,10 @@ pub async fn serve(
             "/v1/commands/registry.reconcile",
             post(build::registry_reconcile),
         )
+        .route(
+            "/v1/commands/registry.inspect",
+            post(build::registry_inspect),
+        )
         .route("/v1/commands/volume.delete", post(volume::volume_delete))
         .route("/v1/commands/volume.serve", post(volume::volume_serve))
         .route("/v1/commands/volume.receive", post(volume::volume_receive))

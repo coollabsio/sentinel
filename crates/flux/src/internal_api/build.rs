@@ -7,14 +7,16 @@ use axum::http::{HeaderMap, StatusCode};
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    BuilderReconcileRequest, ImageBuildRequest, RegistryReconcileRequest, RegistryServer,
+    BuilderReconcileRequest, ImageBuildRequest, RegistryInspectRequest, RegistryReconcileRequest,
+    RegistryServer,
 };
 use sentinel_protocol::{
-    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_REGISTRY_RECONCILE,
+    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_REGISTRY_INSPECT,
+    CAPABILITY_REGISTRY_RECONCILE,
 };
 use serde::Deserialize;
 
-use super::{ApiError, ApiState, DEPLOY_TIMEOUT, dispatch_with_timeout};
+use super::{ApiError, ApiState, DEPLOY_TIMEOUT, LIFECYCLE_TIMEOUT, dispatch_with_timeout};
 
 #[derive(Deserialize)]
 pub(super) struct ImageBuildApiRequest {
@@ -173,5 +175,50 @@ pub(super) async fn registry_reconcile(
         "trust_installed": value.trust_installed,
         "server_running": value.server_running,
         "registry_host": value.registry_host,
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct RegistryInspectApiRequest {
+    server_id: String,
+    command_id: String,
+}
+
+/// A read-only report of the registry and build cache on one Node.
+pub(super) async fn registry_inspect(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<RegistryInspectApiRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = dispatch_with_timeout(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_REGISTRY_INSPECT,
+        Payload::RegistryInspect(RegistryInspectRequest {}),
+        LIFECYCLE_TIMEOUT,
+    )
+    .await?;
+    let Some(command_result::Payload::RegistryInspect(value)) = result.payload else {
+        return Err(invalid_response());
+    };
+    Ok(Json(serde_json::json!({
+        "command_id": request.command_id,
+        "observed_at_unix_ms": result.observed_at_unix_ms,
+        "registry_running": value.registry_running,
+        "healthy": value.healthy,
+        "error": value.error,
+        "repositories": value.repositories.iter().map(|repository| serde_json::json!({
+            "name": repository.name,
+            "tags": repository.tags.iter().map(|tag| serde_json::json!({
+                "tag": tag.tag,
+                "digest": tag.digest,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "repositories_truncated": value.repositories_truncated,
+        "registry_bytes": value.registry_bytes,
+        "build_cache_bytes": value.build_cache_bytes,
+        "builder_running": value.builder_running,
     })))
 }

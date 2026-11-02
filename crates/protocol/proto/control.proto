@@ -86,6 +86,7 @@ message Command {
     VolumeDeleteRequest volume_delete = 32;
     VolumeServeRequest volume_serve = 33;
     VolumeReceiveRequest volume_receive = 34;
+    RegistryInspectRequest registry_inspect = 35;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -134,6 +135,7 @@ message CommandResult {
     VolumeDeleteResult volume_delete = 32;
     VolumeServeResult volume_serve = 33;
     VolumeReceiveResult volume_receive = 34;
+    RegistryInspectResult registry_inspect = 35;
     CommandError error = 20;
   }
 }
@@ -528,6 +530,38 @@ message RegistryServer {
   string push_username = 4;
   // Tags to keep in each repository, 1 to 100.
   uint32 keep_tags = 5;
+}
+
+// A read-only report of the cluster registry and the build cache on this
+// Node. Every Node reports its disk use; the registry Node also reports
+// whether zot answers, and its repositories and tags.
+message RegistryInspectRequest {}
+
+message RegistryInspectResult {
+  // zot runs on this Node.
+  bool registry_running = 1;
+  // zot answered over TLS with the pull credential. Only on the registry Node.
+  bool healthy = 2;
+  // Why zot did not answer, when it runs but is not healthy.
+  string error = 3;
+  // At most 100 repositories with at most 50 tags each.
+  repeated RegistryRepository repositories = 4;
+  bool repositories_truncated = 5;
+  // Disk use of the registry volume and the BuildKit cache on this Node.
+  uint64 registry_bytes = 6;
+  uint64 build_cache_bytes = 7;
+  bool builder_running = 8;
+}
+
+message RegistryRepository {
+  string name = 1;
+  repeated RegistryTag tags = 2;
+}
+
+message RegistryTag {
+  string tag = 1;
+  // `sha256:...`, or empty when it was not looked up.
+  string digest = 2;
 }
 
 message RegistryReconcileResult {

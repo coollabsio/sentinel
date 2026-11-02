@@ -12,6 +12,7 @@ mod ingress_tls;
 mod logs;
 mod network;
 mod registry;
+mod registry_inspect;
 mod restore;
 mod trust;
 mod volume_transfer;

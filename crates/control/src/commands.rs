@@ -13,8 +13,8 @@ use sentinel_protocol::control::v1::{
     WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
-    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_REGISTRY_RECONCILE,
-    REGISTRY_HOST,
+    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_REGISTRY_INSPECT,
+    CAPABILITY_REGISTRY_RECONCILE, REGISTRY_HOST,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -145,13 +145,14 @@ impl CommandExecutor {
         // commands. Their results are never replayed, so they are not
         // journaled; a repeated ID reads again. volume.serve and
         // volume.receive are idempotent per transfer and carry the transfer
-        // secret, which must not be stored.
+        // secret, which must not be stored. registry.inspect is a read-only report.
         let journaled = !matches!(
             command.command_type.as_str(),
             CAPABILITY_LOGS_READ
                 | CAPABILITY_CONTAINER_LOGS
                 | CAPABILITY_VOLUME_SERVE
                 | CAPABILITY_VOLUME_RECEIVE
+                | CAPABILITY_REGISTRY_INSPECT
         );
         let lookup = if journaled {
             self.journal.lookup(&command.command_id, &request)
@@ -264,6 +265,7 @@ impl CommandExecutor {
             (CAPABILITY_REGISTRY_RECONCILE, Some(Payload::RegistryReconcile(request))) => {
                 crate::registry::validate(request).is_ok()
             }
+            (CAPABILITY_REGISTRY_INSPECT, Some(Payload::RegistryInspect(_))) => true,
             (CAPABILITY_VOLUME_DELETE, Some(Payload::VolumeDelete(request))) => {
                 crate::volumes::validate_delete(request).is_ok()
             }
@@ -298,6 +300,7 @@ impl CommandExecutor {
                     | CAPABILITY_IMAGE_BUILD
                     | CAPABILITY_BUILDER_RECONCILE
                     | CAPABILITY_REGISTRY_RECONCILE
+                    | CAPABILITY_REGISTRY_INSPECT
                     | CAPABILITY_VOLUME_DELETE
                     | CAPABILITY_VOLUME_SERVE
                     | CAPABILITY_VOLUME_RECEIVE
@@ -579,6 +582,14 @@ impl CommandExecutor {
                 ),
                 Err(message) => failed(&command.command_id, "builder_reconcile_failed", &message),
             }
+        } else if let Some(Payload::RegistryInspect(_)) = command.payload {
+            succeeded(
+                &command.command_id,
+                command_result::Payload::RegistryInspect(crate::registry_inspect::inspect(
+                    &self.network_root,
+                    &self.podman,
+                )),
+            )
         } else if let Some(Payload::RegistryReconcile(request)) = command.payload {
             let result = crate::registry::reconcile(&self.network_root, &self.podman, &request);
             // The registry Node publishes `registry.cluster.coolify.internal`.

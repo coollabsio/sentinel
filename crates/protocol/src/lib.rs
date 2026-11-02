@@ -28,10 +28,12 @@ pub const CAPABILITY_INGRESS_TLS: &str = "ingress.tls.v1";
 pub const CAPABILITY_IMAGE_BUILD: &str = "image.build.v1";
 pub const CAPABILITY_BUILDER_RECONCILE: &str = "builder.reconcile.v1";
 pub const CAPABILITY_REGISTRY_RECONCILE: &str = "registry.reconcile.v1";
-pub const BUILD_CAPABILITIES: [&str; 3] = [
+pub const CAPABILITY_REGISTRY_INSPECT: &str = "registry.inspect.v1";
+pub const BUILD_CAPABILITIES: [&str; 4] = [
     CAPABILITY_IMAGE_BUILD,
     CAPABILITY_BUILDER_RECONCILE,
     CAPABILITY_REGISTRY_RECONCILE,
+    CAPABILITY_REGISTRY_INSPECT,
 ];
 /// `workload.deploy.v1` accepts `mounts`. Not a command: an older Sentinel
 /// ignores the field and would run the container without its data.
