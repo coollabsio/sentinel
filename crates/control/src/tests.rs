@@ -507,7 +507,8 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "network.firewall.reconcile.v1",
             "discovery.corrosion.inspect.v1",
             "discovery.corrosion.reconcile.v1",
-            "ingress.reconcile.v1"
+            "ingress.reconcile.v1",
+            "ingress.tls.v1"
         ])
     );
 }
