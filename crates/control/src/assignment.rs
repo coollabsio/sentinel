@@ -8,7 +8,7 @@ use sentinel_protocol::{
     BUILD_CAPABILITIES, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
     CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RESOURCES,
-    NETWORK_CAPABILITIES, PROTOCOL_MAX, PROTOCOL_MIN, select_protocol,
+    NETWORK_CAPABILITIES, PROTOCOL_MAX, PROTOCOL_MIN, VOLUME_CAPABILITIES, select_protocol,
 };
 use serde::{Deserialize, Serialize};
 use store::CommandJournal;
@@ -247,6 +247,7 @@ impl AssignmentClient {
             .into_iter()
             .chain(NETWORK_CAPABILITIES)
             .chain(BUILD_CAPABILITIES)
+            .chain(VOLUME_CAPABILITIES)
             .collect(),
             trust_bundle_version: crate::trust::installed_version(&self.control_tls),
         };
@@ -318,6 +319,12 @@ impl AssignmentClient {
             .with_ingress_trigger(ingress_trigger.clone())
             .with_control_tls(self.control_tls.clone()),
         ));
+        // Volume transfers keep their state in memory; daemons and firewall
+        // elements of an earlier Sentinel process have no owner any more.
+        let _ = tokio::task::spawn_blocking(|| {
+            crate::volume_transfer::remove_leftovers(std::path::Path::new("/"))
+        })
+        .await;
         // Restores the approved cluster network and stopped workloads once per
         // boot. It needs neither Coolify nor Flux; commands that arrive while it
         // runs wait for the command executor it holds.

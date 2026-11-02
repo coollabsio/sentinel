@@ -3,7 +3,8 @@ use sentinel_protocol::{
     BUILD_CAPABILITIES, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
     CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RESOURCES,
-    NETWORK_CAPABILITIES, PROTOCOL_MAX, PROTOCOL_MIN, intersect_capabilities, select_protocol,
+    NETWORK_CAPABILITIES, PROTOCOL_MAX, PROTOCOL_MIN, VOLUME_CAPABILITIES, intersect_capabilities,
+    select_protocol,
 };
 
 use crate::CredentialClaims;
@@ -55,6 +56,7 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
     .into_iter()
     .chain(NETWORK_CAPABILITIES)
     .chain(BUILD_CAPABILITIES)
+    .chain(VOLUME_CAPABILITIES)
     .collect::<Vec<_>>();
     let capabilities =
         intersect_capabilities(&claims.capabilities, &hello.capabilities, &supported);

@@ -13,7 +13,7 @@ use sentinel_protocol::control::v1::{
 };
 use sha2::{Digest, Sha256};
 
-const COOLIFY_NFT_TABLE: &str = "coolify_cluster";
+pub(crate) const COOLIFY_NFT_TABLE: &str = "coolify_cluster";
 const COOLIFY_NFT_BRIDGE_TABLE: &str = "coolify_cluster_bridge";
 const BRIDGE_SYSCTL_FILE: &str = "etc/sysctl.d/90-coolify-workload-firewall.conf";
 pub(crate) const CORROSION_VERSION: &str = "v1.0.0";
@@ -162,7 +162,7 @@ fn valid_ipv4_cidr(value: &str) -> bool {
         && prefix.parse::<u8>().is_ok_and(|prefix| prefix <= 32)
 }
 
-fn ipv4_in_cidr(address: &str, cidr: &str) -> bool {
+pub(crate) fn ipv4_in_cidr(address: &str, cidr: &str) -> bool {
     let Ok(address) = address.parse::<std::net::Ipv4Addr>() else {
         return false;
     };
@@ -961,6 +961,8 @@ pub(crate) fn reconcile_firewall(
     atomic_write(&snapshot_path, snapshot.as_bytes(), 0o600)?;
     if root == Path::new("/") {
         activate_firewall(root, &snapshot, request)?;
+        // The new table has no volume transfer rules.
+        crate::volume_transfer::restore_firewall();
     }
     atomic_write(
         &state_file,
@@ -2306,7 +2308,8 @@ pub(crate) fn apply_restore_step(root: &Path, step: &RestoreStep) -> Result<(), 
         RestoreStep::LoadFirewall {
             inet_table_exists,
             bridge_table_exists,
-        } => restore_firewall_tables(root, *inet_table_exists, *bridge_table_exists),
+        } => restore_firewall_tables(root, *inet_table_exists, *bridge_table_exists)
+            .inspect(|()| crate::volume_transfer::restore_firewall()),
         RestoreStep::WireguardUp { interface, address } => {
             restore_wireguard_link(interface, address)
         }

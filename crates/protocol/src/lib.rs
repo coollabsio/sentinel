@@ -33,6 +33,22 @@ pub const BUILD_CAPABILITIES: [&str; 3] = [
     CAPABILITY_BUILDER_RECONCILE,
     CAPABILITY_REGISTRY_RECONCILE,
 ];
+/// `workload.deploy.v1` accepts `mounts`. Not a command: an older Sentinel
+/// ignores the field and would run the container without its data.
+pub const CAPABILITY_VOLUME_MOUNTS: &str = "volume.mounts.v1";
+pub const CAPABILITY_VOLUME_DELETE: &str = "volume.delete.v1";
+pub const CAPABILITY_VOLUME_SERVE: &str = "volume.serve.v1";
+pub const CAPABILITY_VOLUME_RECEIVE: &str = "volume.receive.v1";
+/// This Sentinel serves and receives volumes for a move (decision 0007). Not a
+/// command.
+pub const CAPABILITY_VOLUME_TRANSFER: &str = "volume.transfer.v1";
+pub const VOLUME_CAPABILITIES: [&str; 5] = [
+    CAPABILITY_VOLUME_MOUNTS,
+    CAPABILITY_VOLUME_DELETE,
+    CAPABILITY_VOLUME_SERVE,
+    CAPABILITY_VOLUME_RECEIVE,
+    CAPABILITY_VOLUME_TRANSFER,
+];
 /// The cluster registry. Sentinel discovery DNS resolves it to the Node that
 /// runs the registry.
 pub const REGISTRY_HOST: &str = "registry.cluster.coolify.internal:5443";

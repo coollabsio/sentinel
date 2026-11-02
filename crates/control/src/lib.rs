@@ -14,6 +14,8 @@ mod network;
 mod registry;
 mod restore;
 mod trust;
+mod volume_transfer;
+mod volumes;
 
 pub use assignment::{
     Assignment, AssignmentClient, AssignmentError, AssignmentErrorKind, AssignmentOutcome,

@@ -33,6 +33,7 @@ use uuid::Uuid;
 use crate::{CommandDispatchError, ConnectionRegistry, now_millis};
 
 mod build;
+mod volume;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -147,6 +148,8 @@ struct WorkloadDeployApiRequest {
     memory_reservation_bytes: Option<u64>,
     #[serde(default)]
     pull_policy: String,
+    #[serde(default)]
+    mounts: Vec<volume::DeployMount>,
 }
 
 /// Validates a workload image pull policy. The default (`missing`) is
@@ -410,6 +413,7 @@ pub struct ContainerListResponse {
     command_id: String,
     observed_at_unix_ms: i64,
     containers: Vec<ContainerResponse>,
+    volumes: Vec<volume::VolumeResponse>,
 }
 
 #[derive(Serialize)]
@@ -507,6 +511,9 @@ pub async fn serve(
             "/v1/commands/registry.reconcile",
             post(build::registry_reconcile),
         )
+        .route("/v1/commands/volume.delete", post(volume::volume_delete))
+        .route("/v1/commands/volume.serve", post(volume::volume_serve))
+        .route("/v1/commands/volume.receive", post(volume::volume_receive))
         .with_state(ApiState { registry, token });
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "Flux internal command API is listening");
@@ -1054,6 +1061,11 @@ async fn workload_deploy(
                     memory_limit_bytes: request.memory_limit_bytes,
                     memory_reservation_bytes: request.memory_reservation_bytes,
                     pull_policy,
+                    mounts: request
+                        .mounts
+                        .into_iter()
+                        .map(volume::DeployMount::protocol)
+                        .collect(),
                 })),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },
@@ -1147,6 +1159,11 @@ async fn container_list(
         command_id,
         observed_at_unix_ms,
         containers,
+        volumes: list
+            .volumes
+            .into_iter()
+            .map(volume::VolumeResponse::from)
+            .collect(),
     }))
 }
 

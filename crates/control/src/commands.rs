@@ -24,6 +24,9 @@ use sentinel_protocol::{
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
     CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
+use sentinel_protocol::{
+    CAPABILITY_VOLUME_DELETE, CAPABILITY_VOLUME_RECEIVE, CAPABILITY_VOLUME_SERVE,
+};
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 use tokio::sync::Notify;
@@ -140,10 +143,15 @@ impl CommandExecutor {
         let request = journal_request(&command);
         // logs.read and container.logs are read-only, frequently polled
         // commands. Their results are never replayed, so they are not
-        // journaled; a repeated ID reads again.
+        // journaled; a repeated ID reads again. volume.serve and
+        // volume.receive are idempotent per transfer and carry the transfer
+        // secret, which must not be stored.
         let journaled = !matches!(
             command.command_type.as_str(),
-            CAPABILITY_LOGS_READ | CAPABILITY_CONTAINER_LOGS
+            CAPABILITY_LOGS_READ
+                | CAPABILITY_CONTAINER_LOGS
+                | CAPABILITY_VOLUME_SERVE
+                | CAPABILITY_VOLUME_RECEIVE
         );
         let lookup = if journaled {
             self.journal.lookup(&command.command_id, &request)
@@ -256,6 +264,15 @@ impl CommandExecutor {
             (CAPABILITY_REGISTRY_RECONCILE, Some(Payload::RegistryReconcile(request))) => {
                 crate::registry::validate(request).is_ok()
             }
+            (CAPABILITY_VOLUME_DELETE, Some(Payload::VolumeDelete(request))) => {
+                crate::volumes::validate_delete(request).is_ok()
+            }
+            (CAPABILITY_VOLUME_SERVE, Some(Payload::VolumeServe(request))) => {
+                crate::volume_transfer::validate_serve(request).is_ok()
+            }
+            (CAPABILITY_VOLUME_RECEIVE, Some(Payload::VolumeReceive(request))) => {
+                crate::volume_transfer::validate_receive(request).is_ok()
+            }
             _ => false,
         };
         let accepted = !(command.command_id.is_empty()
@@ -281,6 +298,9 @@ impl CommandExecutor {
                     | CAPABILITY_IMAGE_BUILD
                     | CAPABILITY_BUILDER_RECONCILE
                     | CAPABILITY_REGISTRY_RECONCILE
+                    | CAPABILITY_VOLUME_DELETE
+                    | CAPABILITY_VOLUME_SERVE
+                    | CAPABILITY_VOLUME_RECEIVE
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
@@ -378,14 +398,19 @@ impl CommandExecutor {
                 ))),
             }
         } else if let Some(Payload::ContainerList(_)) = command.payload {
-            match container_list() {
-                Ok(containers) => CommandResult {
+            match container_list().and_then(|containers| {
+                crate::volumes::list(&self.podman).map(|volumes| (containers, volumes))
+            }) {
+                Ok((containers, volumes)) => CommandResult {
                     event_id: format!("{}:result", command.command_id),
                     command_id: command.command_id.clone(),
                     status: CommandStatus::Succeeded.into(),
                     observed_at_unix_ms: now_millis(),
                     payload: Some(command_result::Payload::ContainerList(
-                        ContainerListResult { containers },
+                        ContainerListResult {
+                            containers,
+                            volumes,
+                        },
                     )),
                 },
                 Err(message) => failed(&command.command_id, "container_list_failed", message),
@@ -567,6 +592,30 @@ impl CommandExecutor {
                 ),
                 Err(message) => failed(&command.command_id, "registry_reconcile_failed", &message),
             }
+        } else if let Some(Payload::VolumeDelete(request)) = command.payload {
+            match crate::volumes::delete(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::VolumeDelete(result),
+                ),
+                Err(message) => failed(&command.command_id, "volume_delete_failed", &message),
+            }
+        } else if let Some(Payload::VolumeServe(request)) = command.payload {
+            match crate::volume_transfer::serve(&self.network_root, &self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::VolumeServe(result),
+                ),
+                Err(message) => failed(&command.command_id, "volume_serve_failed", &message),
+            }
+        } else if let Some(Payload::VolumeReceive(request)) = command.payload {
+            match crate::volume_transfer::receive(&self.network_root, &self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::VolumeReceive(result),
+                ),
+                Err(message) => failed(&command.command_id, "volume_receive_failed", &message),
+            }
         } else {
             failed(
                 &command.command_id,
@@ -730,6 +779,14 @@ fn workload_deploy(
     if !request.network_name.is_empty() {
         ensure_workload_network(podman, &request.network_name, &request.network_subnet)?;
     }
+    // `podman run` would create a missing volume itself, without the Coolify labels.
+    crate::volumes::ensure_volumes(
+        podman,
+        request
+            .mounts
+            .iter()
+            .map(|mount| mount.volume_name.as_str()),
+    )?;
     let mut command = std::process::Command::new(podman);
     command
         .args(deploy.arguments)
@@ -1067,6 +1124,7 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Podm
     {
         return Err("A command argument is invalid.".into());
     }
+    args.extend(crate::volumes::mount_args(&request.mounts)?);
     args.push(request.image.clone());
     args.extend(request.command.clone());
     Ok(PodmanDeploy {

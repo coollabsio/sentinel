@@ -83,6 +83,9 @@ message Command {
     ImageBuildRequest image_build = 29;
     BuilderReconcileRequest builder_reconcile = 30;
     RegistryReconcileRequest registry_reconcile = 31;
+    VolumeDeleteRequest volume_delete = 32;
+    VolumeServeRequest volume_serve = 33;
+    VolumeReceiveRequest volume_receive = 34;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -128,6 +131,9 @@ message CommandResult {
     ImageBuildResult image_build = 29;
     BuilderReconcileResult builder_reconcile = 30;
     RegistryReconcileResult registry_reconcile = 31;
+    VolumeDeleteResult volume_delete = 32;
+    VolumeServeResult volume_serve = 33;
+    VolumeReceiveResult volume_receive = 34;
     CommandError error = 20;
   }
 }
@@ -195,6 +201,14 @@ message ContainerListRequest {}
 
 message ContainerListResult {
   repeated ContainerObservation containers = 1;
+  // Only volumes with the label `coolify.managed=true`.
+  repeated VolumeObservation volumes = 2;
+}
+
+message VolumeObservation {
+  string name = 1;
+  map<string, string> labels = 2;
+  optional int64 created_at_unix_ms = 3;
 }
 
 message ContainerObservation {
@@ -235,6 +249,18 @@ message WorkloadDeployRequest {
   optional uint64 memory_reservation_bytes = 15;
   // One of "missing", "newer", or "always". Empty means "missing".
   string pull_policy = 16;
+  // Named Podman volumes (decision 0007). Sentinel creates a missing volume
+  // with the labels `coolify.managed=true` and `coolify.volume=<uuid>` before
+  // it creates the container. At most 32.
+  repeated WorkloadVolumeMount mounts = 17;
+}
+
+message WorkloadVolumeMount {
+  // `coolify-vol-<uuid>`.
+  string volume_name = 1;
+  // Absolute and normalized, not `/`, without `,`. Unique in a request.
+  string container_path = 2;
+  bool read_only = 3;
 }
 
 message WorkloadEnvironmentVariable {
@@ -506,6 +532,73 @@ message RegistryReconcileResult {
   bool server_running = 2;
   // "registry.cluster.coolify.internal:5443".
   string registry_host = 3;
+}
+
+// Deletes Coolify volumes. Sentinel rejects the request when a container
+// uses one of them. A volume that does not exist is reported as missing.
+message VolumeDeleteRequest {
+  // 1 to 32 `coolify-vol-<uuid>` names.
+  repeated string names = 1;
+}
+
+message VolumeDeleteResult {
+  repeated string deleted = 1;
+  repeated string missing = 2;
+}
+
+// Serves volumes read-only to one peer Node with a temporary `rsync --daemon`
+// on this Node's WireGuard address. Idempotent per `transfer_id`. Never
+// journaled: the request holds the transfer secret.
+message VolumeServeRequest {
+  // 1 to 64 ASCII letters, digits or `-`.
+  string transfer_id = 1;
+  // 1 to 32 `coolify-vol-<uuid>` names. Not needed with `stop`.
+  repeated string names = 2;
+  // The WireGuard address of the receiving Node.
+  string peer_ip = 3;
+  // 32 to 128 ASCII letters or digits.
+  string secret = 4;
+  // Sentinel stops serving at this time.
+  int64 expires_at_unix_ms = 5;
+  // Stops serving and removes the firewall rule. Succeeds when nothing runs.
+  bool stop = 6;
+}
+
+message VolumeServeResult {
+  // Empty after `stop`.
+  string address = 1;
+  uint32 port = 2;
+  repeated VolumeUsage volumes = 3;
+}
+
+message VolumeUsage {
+  string name = 1;
+  // The apparent size of the files in the volume.
+  uint64 used_bytes = 2;
+}
+
+// Copies volumes from a serving Node into local volumes. The first call for a
+// `transfer_id` and `pass` creates the missing volumes and starts the copy in
+// the background; every call returns the current state. Never journaled: the
+// request holds the transfer secret.
+message VolumeReceiveRequest {
+  string transfer_id = 1;
+  // "warm" or "final".
+  string pass = 2;
+  string source_address = 3;
+  uint32 source_port = 4;
+  string secret = 5;
+  repeated string names = 6;
+}
+
+message VolumeReceiveResult {
+  // "running", "succeeded" or "failed".
+  string state = 1;
+  // 0 while unknown.
+  uint64 bytes_total = 2;
+  uint64 bytes_done = 3;
+  // The end of the rsync error output when the pass failed.
+  string error = 4;
 }
 
 message CommandError {
