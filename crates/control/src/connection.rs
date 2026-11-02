@@ -9,7 +9,7 @@ use sentinel_protocol::control::v1::{
     AgentMessage, Command, CommandAccepted, Heartbeat, Hello, RuntimeChanged,
 };
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
+    BUILD_CAPABILITIES, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
     CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RESOURCES,
     NETWORK_CAPABILITIES,
@@ -118,6 +118,7 @@ pub async fn connect(
                 ]
                 .into_iter()
                 .chain(NETWORK_CAPABILITIES.map(str::to_string))
+                .chain(BUILD_CAPABILITIES.map(str::to_string))
                 .collect(),
                 boot_id: boot_id(),
                 trust_bundle_version,

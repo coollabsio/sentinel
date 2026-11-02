@@ -25,6 +25,17 @@ pub const CAPABILITY_INGRESS_RECONCILE: &str = "ingress.reconcile.v1";
 /// `ingress.reconcile.v1` accepts `tls_enabled` and `tls_key`. Not a command:
 /// it only tells Coolify that this Sentinel can serve HTTPS.
 pub const CAPABILITY_INGRESS_TLS: &str = "ingress.tls.v1";
+pub const CAPABILITY_IMAGE_BUILD: &str = "image.build.v1";
+pub const CAPABILITY_BUILDER_RECONCILE: &str = "builder.reconcile.v1";
+pub const CAPABILITY_REGISTRY_RECONCILE: &str = "registry.reconcile.v1";
+pub const BUILD_CAPABILITIES: [&str; 3] = [
+    CAPABILITY_IMAGE_BUILD,
+    CAPABILITY_BUILDER_RECONCILE,
+    CAPABILITY_REGISTRY_RECONCILE,
+];
+/// The cluster registry. Sentinel discovery DNS resolves it to the Node that
+/// runs the registry.
+pub const REGISTRY_HOST: &str = "registry.cluster.coolify.internal:5443";
 pub const NETWORK_CAPABILITIES: [&str; 10] = [
     CAPABILITY_CLUSTER_LEAVE,
     CAPABILITY_WIREGUARD_KEY_ENSURE,

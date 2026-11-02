@@ -13,6 +13,10 @@ use sentinel_protocol::control::v1::{
     WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
+    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_REGISTRY_RECONCILE,
+    REGISTRY_HOST,
+};
+use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
     CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT,
     CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ,
@@ -28,7 +32,7 @@ use crate::network::output_with_timeout;
 
 /// Pulls of large images can take long; this only stops a stalled pull or
 /// runtime from holding the command executor forever.
-const PODMAN_DEPLOY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub(crate) const PODMAN_DEPLOY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PODMAN_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub(crate) const PODMAN_QUERY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
@@ -243,6 +247,15 @@ impl CommandExecutor {
             (CAPABILITY_INGRESS_RECONCILE, Some(Payload::IngressReconcile(request))) => {
                 crate::ingress::validate_routes(request).is_ok()
             }
+            (CAPABILITY_IMAGE_BUILD, Some(Payload::ImageBuild(request))) => {
+                crate::builder::validate_build(request).is_ok()
+            }
+            (CAPABILITY_BUILDER_RECONCILE, Some(Payload::BuilderReconcile(request))) => {
+                crate::builder::validate_reconcile(request).is_ok()
+            }
+            (CAPABILITY_REGISTRY_RECONCILE, Some(Payload::RegistryReconcile(request))) => {
+                crate::registry::validate(request).is_ok()
+            }
             _ => false,
         };
         let accepted = !(command.command_id.is_empty()
@@ -265,6 +278,9 @@ impl CommandExecutor {
                     | CAPABILITY_CORROSION_INSPECT
                     | CAPABILITY_CORROSION_RECONCILE
                     | CAPABILITY_INGRESS_RECONCILE
+                    | CAPABILITY_IMAGE_BUILD
+                    | CAPABILITY_BUILDER_RECONCILE
+                    | CAPABILITY_REGISTRY_RECONCILE
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
@@ -522,6 +538,35 @@ impl CommandExecutor {
                 ),
                 Err(message) => failed(&command.command_id, "ingress_reconcile_failed", &message),
             }
+        } else if let Some(Payload::ImageBuild(request)) = command.payload {
+            match crate::builder::start(&self.network_root, &self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::ImageBuild(result),
+                ),
+                Err(message) => failed(&command.command_id, "image_build_failed", &message),
+            }
+        } else if let Some(Payload::BuilderReconcile(request)) = command.payload {
+            match crate::builder::reconcile(&self.network_root, &self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::BuilderReconcile(result),
+                ),
+                Err(message) => failed(&command.command_id, "builder_reconcile_failed", &message),
+            }
+        } else if let Some(Payload::RegistryReconcile(request)) = command.payload {
+            let result = crate::registry::reconcile(&self.network_root, &self.podman, &request);
+            // The registry Node publishes `registry.cluster.coolify.internal`.
+            if let Some(trigger) = &self.discovery_trigger {
+                trigger.notify_one();
+            }
+            match result {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::RegistryReconcile(result),
+                ),
+                Err(message) => failed(&command.command_id, "registry_reconcile_failed", &message),
+            }
         } else {
             failed(
                 &command.command_id,
@@ -675,7 +720,13 @@ fn workload_deploy(
     podman: &Path,
     request: &WorkloadDeployRequest,
 ) -> Result<WorkloadDeployResult, String> {
-    let deploy = podman_deploy_args(request)?;
+    let mut deploy = podman_deploy_args(request)?;
+    let auth = crate::registry::pull_auth_path(root);
+    if request.image.starts_with(&format!("{REGISTRY_HOST}/")) && auth.exists() {
+        deploy
+            .arguments
+            .splice(1..1, ["--authfile".to_string(), auth.display().to_string()]);
+    }
     if !request.network_name.is_empty() {
         ensure_workload_network(podman, &request.network_name, &request.network_subnet)?;
     }
@@ -1216,6 +1267,10 @@ fn container_runtime() -> (Option<String>, Option<String>) {
 }
 
 fn podman_error(error: std::io::Error) -> String {
+    podman_failure(&error)
+}
+
+pub(crate) fn podman_failure(error: &std::io::Error) -> String {
     if error.kind() == std::io::ErrorKind::TimedOut {
         "Podman did not finish in time.".into()
     } else {

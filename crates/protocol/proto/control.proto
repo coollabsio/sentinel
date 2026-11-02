@@ -80,6 +80,9 @@ message Command {
     TrustBundleUpdateRequest trust_bundle_update = 26;
     IngressReconcileRequest ingress_reconcile = 27;
     ContainerLogsRequest container_logs = 28;
+    ImageBuildRequest image_build = 29;
+    BuilderReconcileRequest builder_reconcile = 30;
+    RegistryReconcileRequest registry_reconcile = 31;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -122,6 +125,9 @@ message CommandResult {
     TrustBundleUpdateResult trust_bundle_update = 26;
     IngressReconcileResult ingress_reconcile = 27;
     ContainerLogsResult container_logs = 28;
+    ImageBuildResult image_build = 29;
+    BuilderReconcileResult builder_reconcile = 30;
+    RegistryReconcileResult registry_reconcile = 31;
     CommandError error = 20;
   }
 }
@@ -417,6 +423,89 @@ message IngressReconcileResult {
   uint64 route_count = 5;
   uint64 name_count = 6;
   bool tls_enabled = 7;
+}
+
+// Starts a one-shot build container `coolify-build-<build_id>` and returns
+// when it runs; it does not wait for the build. The container has the label
+// `coolify.build=<build_id>`. Coolify reads its state with `container.list`,
+// its output with `container.logs`, stops it with `workload.lifecycle`, and
+// removes it with `workload.lifecycle` when it no longer needs the log. The
+// last log line of a successful build is
+// `COOLIFY_BUILD_RESULT {"digest":"sha256:..."}`.
+message ImageBuildRequest {
+  // 1 to 64 ASCII letters, digits or `-`.
+  string build_id = 1;
+  // The coolify-builder image, for example
+  // "ghcr.io/coollabsio/coolify-builder:1.0.0@sha256:...".
+  string builder_image = 2;
+  // A public `https://` Git URL without credentials.
+  string repository_url = 3;
+  // The full commit SHA (40 or 64 lowercase hex characters).
+  string commit_sha = 4;
+  // "dockerfile" or "railpack".
+  string source_type = 5;
+  // Relative to the repository root; empty is the root.
+  string base_directory = 6;
+  // Relative to `base_directory`; empty is "Dockerfile". Only for "dockerfile".
+  string dockerfile_path = 7;
+  // The target in the cluster registry:
+  // "registry.cluster.coolify.internal:5443/<repository>:<tag>".
+  string image = 8;
+}
+
+message ImageBuildResult {
+  string runtime_id = 1;
+  string name = 2;
+}
+
+// Converges BuildKit on this Node: the `coolify-buildkitd` container (rootless
+// BuildKit with a private uid range) and its cache limit. A disabled builder
+// removes the container and its cache. Needs the registry trust from
+// `registry.reconcile.v1`.
+message BuilderReconcileRequest {
+  bool enabled = 1;
+  // The BuildKit cache limit. 0 uses 20% of the root disk.
+  uint64 max_used_space_bytes = 2;
+  // The registry user that may push. Set exactly when `enabled` is set.
+  string push_username = 3;
+  string push_password = 4;
+}
+
+message BuilderReconcileResult {
+  bool enabled = 1;
+  bool running = 2;
+  // A user-namespace AppArmor profile was needed and is loaded.
+  bool apparmor_profile = 3;
+}
+
+// Converges the cluster registry on this Node. Every Node gets the trust (CA
+// and pull credential for Podman). Only the registry Node gets `server`; on
+// every other Node Sentinel removes the registry container and its data.
+message RegistryReconcileRequest {
+  // PEM of the registry CA. Never a private key.
+  string ca_pem = 1;
+  string pull_username = 2;
+  string pull_password = 3;
+  RegistryServer server = 4;
+}
+
+message RegistryServer {
+  // Server certificate for `registry.cluster.coolify.internal` and its key.
+  string certificate_pem = 1;
+  string private_key_pem = 2;
+  // bcrypt htpasswd lines of the push and pull users.
+  string htpasswd = 3;
+  // The user with push access. Every other user can only pull.
+  string push_username = 4;
+  // Tags to keep in each repository, 1 to 100.
+  uint32 keep_tags = 5;
+}
+
+message RegistryReconcileResult {
+  bool trust_installed = 1;
+  bool server_running = 2;
+  // "registry.cluster.coolify.internal:5443".
+  string registry_host = 3;
 }
 
 message CommandError {

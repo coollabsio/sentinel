@@ -228,13 +228,15 @@ fn build_ptr_response(
     response
 }
 
-/// Node names are endpoint rows of their own. Workload names map to a
+/// Node and cluster service names are endpoint rows of their own. Workload names map to a
 /// workload ID through `workload_names`, which Coolify writes, so a rename
 /// applies without touching the containers.
 const NODE_NAMESPACE: &str = "nodes";
+/// Cluster services, for example `registry.cluster`. Endpoint rows of their own.
+const CLUSTER_NAMESPACE: &str = "cluster";
 
 fn endpoint_lookup_sql(namespace: &str) -> &'static str {
-    if namespace == NODE_NAMESPACE {
+    if namespace == NODE_NAMESPACE || namespace == CLUSTER_NAMESPACE {
         "SELECT container_ip FROM workload_endpoints WHERE workload_id = ? AND namespace = ? AND state = 'running' AND health IN ('healthy', 'unknown') AND expires_at > unixepoch() ORDER BY container_ip"
     } else {
         "SELECT e.container_ip FROM workload_names n JOIN workload_endpoints e ON e.namespace = n.namespace AND e.workload_id = n.workload_id WHERE n.name = ? AND n.namespace = ? AND n.revision = (SELECT MAX(revision) FROM workload_names) AND e.state = 'running' AND e.health IN ('healthy', 'unknown') AND e.expires_at > unixepoch() ORDER BY e.container_ip"

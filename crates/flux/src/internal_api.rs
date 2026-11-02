@@ -32,6 +32,8 @@ use uuid::Uuid;
 
 use crate::{CommandDispatchError, ConnectionRegistry, now_millis};
 
+mod build;
+
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
@@ -496,6 +498,15 @@ pub async fn serve(
             post(corrosion_reconcile),
         )
         .route("/v1/commands/ingress.reconcile", post(ingress_reconcile))
+        .route("/v1/commands/image.build", post(build::image_build))
+        .route(
+            "/v1/commands/builder.reconcile",
+            post(build::builder_reconcile),
+        )
+        .route(
+            "/v1/commands/registry.reconcile",
+            post(build::registry_reconcile),
+        )
         .with_state(ApiState { registry, token });
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "Flux internal command API is listening");
@@ -581,6 +592,27 @@ async fn dispatch_network(
     command_type: &str,
     payload: Payload,
 ) -> Result<sentinel_protocol::control::v1::CommandResult, ApiError> {
+    dispatch_with_timeout(
+        state,
+        headers,
+        server_id,
+        command_id,
+        command_type,
+        payload,
+        LIFECYCLE_TIMEOUT,
+    )
+    .await
+}
+
+async fn dispatch_with_timeout(
+    state: &ApiState,
+    headers: &HeaderMap,
+    server_id: &str,
+    command_id: &str,
+    command_type: &str,
+    payload: Payload,
+    timeout: Duration,
+) -> Result<sentinel_protocol::control::v1::CommandResult, ApiError> {
     authorize(&state.token, headers)?;
     if server_id.is_empty()
         || server_id.len() > 255
@@ -603,9 +635,9 @@ async fn dispatch_network(
                 payload_version: 1,
                 created_at_unix_ms: now,
                 payload: Some(payload),
-                expires_at_unix_ms: now + LIFECYCLE_TIMEOUT.as_millis() as i64,
+                expires_at_unix_ms: now + timeout.as_millis() as i64,
             },
-            LIFECYCLE_TIMEOUT,
+            timeout,
         )
         .await
         .map_err(dispatch_error)?;
