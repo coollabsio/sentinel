@@ -48,6 +48,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The image, host, and Flux steps are targets of one Dockerfile and share
+      # its builder stage, so only the first step compiles. They stay in one
+      # job for this reason. No VERSION build arg: the image and the host
+      # artifact share one binary, and a non-numeric version such as "main"
+      # makes Coolify's version_compare() restart Sentinel in a loop.
       - name: Build and Push Image (${{ matrix.arch }})
         uses: docker/build-push-action@v7
         with:
@@ -55,6 +60,8 @@ jobs:
           file: Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
+          cache-from: type=gha,scope=sentinel-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=sentinel-${{ matrix.arch }}
           tags: |
             ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ matrix.arch }}
           labels: |
@@ -64,11 +71,10 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile.host
+          file: Dockerfile
+          target: host
           platforms: ${{ matrix.platform }}
           push: true
-          build-args: |
-            VERSION=main
           tags: |
             ${{ env.GITHUB_REGISTRY }}/${{ env.HOST_IMAGE_NAME }}:main-${{ matrix.arch }}
           labels: |
@@ -79,7 +85,8 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile.flux
+          file: Dockerfile
+          target: flux
           platforms: ${{ matrix.platform }}
           push: true
           tags: |

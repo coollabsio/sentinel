@@ -38,9 +38,6 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      - name: Build
-        run: cargo build --release --locked
-
       # The default-feature steps above do build the `traffic` *crate* (it is a
       # workspace member), but `crates/api/src/routes/traffic.rs` and the whole
       # traffic-wiring block in `src/main.rs` sit behind the `api`/binary
@@ -53,8 +50,9 @@ jobs:
       - name: Test (traffic feature)
         run: cargo test --workspace --features traffic
 
-      - name: Build (traffic feature)
-        run: cargo build --release --locked --features traffic
+      # No `cargo build --release` steps: clippy and test above already compile
+      # both feature sets, and the `docker` job below does the release build
+      # that ships. Two fat-LTO builds here only doubled the CI time.
 
       # Prebuilt-binary install (not `cargo install`) so this doesn't compile
       # cargo-audit from source on every run. Checks Cargo.lock against the
@@ -85,3 +83,5 @@ jobs:
           context: .
           push: false
           tags: sentinel:ci
+          cache-from: type=gha,scope=sentinel-amd64
+          cache-to: type=gha,mode=max,scope=sentinel-amd64

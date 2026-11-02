@@ -626,4 +626,4 @@ Copy into `docs/benchmark-results/YYYY-MM-DD-<label>.md`:
 | `crates/sentinel-bench/src/storage_bench.rs` | Storage-feature micro-bench (§4.9) |
 | `docs/benchmark-results/` | Dated run reports (canonical history) |
 | `crates/collector/tests/startup_timing.rs` | Guards against reintroducing constructor sleep |
-| `Dockerfile` | Builds `-p sentinel` only (bench stays on the host) |
+| `Dockerfile` | Builds `-p sentinel -p flux` only (bench stays on the host) |

@@ -54,6 +54,8 @@ jobs:
           file: Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
+          cache-from: type=gha,scope=sentinel-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=sentinel-${{ matrix.arch }}
           tags: |
             ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:next-${{ matrix.arch }}
             ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:next-${{ matrix.arch }}

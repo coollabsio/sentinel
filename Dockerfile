@@ -1,48 +1,73 @@
-# Build stage
-FROM rust:1.97.1-alpine3.24 AS builder
+# One Dockerfile builds every Rust image, with a single compile per arch:
+#   default (last stage)  -> coollabsio/sentinel       (alpine + sentinel)
+#   --target host         -> coollabsio/sentinel-host  (scratch + sentinel)
+#   --target flux         -> coollabsio/flux           (alpine + flux)
+#
+# cargo-chef puts the dependency compile in its own layer, keyed only on the
+# Cargo manifests and lockfile. With a registry cache (`cache-from: type=gha`)
+# a source-only change recompiles the workspace crates and nothing else.
 
-# rusqlite's bundled SQLite compiles from C source, so the build stage needs a
-# C toolchain. The runtime image is alpine:3.24, which ships musl's shared
-# libraries natively — the binary is dynamically linked against musl, not
-# static, and needs nothing beyond that to run in the runtime stage below.
-RUN apk upgrade --no-cache && apk add --no-cache musl-dev gcc
-
+FROM rust:1.97.1-alpine3.24 AS chef
+# rusqlite's bundled SQLite and ring compile from C source, so the build needs
+# a C toolchain. `file` checks that the binaries are static.
+RUN apk upgrade --no-cache && apk add --no-cache musl-dev gcc file
+RUN cargo install --locked cargo-chef --version 0.1.78
 WORKDIR /app
 
-# Cache dependencies ahead of the source copy.
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
 
+FROM chef AS builder
+# Static binaries: the same sentinel binary ships in the alpine image and in
+# the scratch host image. The explicit `--target` keeps RUSTFLAGS away from
+# build scripts and proc-macros, which must stay dynamic on a musl host.
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+# `--features sentinel/traffic`: the workspace default is `default = []`, so
+# without it the shipped binary has no traffic routes and no traffic service,
+# and `TRAFFIC_ENABLED=true` silently 404s every endpoint. The runtime gate is
+# `TRAFFIC_ENABLED` (default false), like every other optional subsystem.
+# Only sentinel and flux are built: the workspace also contains
+# `sentinel-bench` (a host-side harness from BENCHMARK.md), which never ships.
+ENV CARGO_ARGS="--release --locked -p sentinel -p flux --features sentinel/traffic"
+COPY rust-toolchain.toml ./
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook $CARGO_ARGS --target "$(rustc -vV | sed -n 's/^host: //p')" --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY src ./src
 ARG VERSION
 # Visible to option_env!("SENTINEL_BUILD_VERSION") at compile time, so a dev
 # build tagged via `--build-arg VERSION=...` (see scripts/coolify-dev.sh)
-# shows up in logs and /api/version — matching the Go implementation's
-# equivalent -ldflags override.
+# shows up in logs and /api/version. Declared after the cook step, so a new
+# VERSION does not rebuild the dependencies.
 ENV SENTINEL_BUILD_VERSION=$VERSION
-# Build only the agent binary. Workspace also contains `sentinel-bench` (a
-# host-side harness from BENCHMARK.md) which must not ship in the image.
-#
-# `--features traffic` is required for the traffic-analytics subsystem to
-# exist in the shipped image at all: the workspace default is `default = []`,
-# so without it the binary has no traffic routes and no traffic service, and
-# setting `TRAFFIC_ENABLED=true` silently 404s every endpoint. Compiling it in
-# and leaving the runtime gate to `TRAFFIC_ENABLED` (default false) matches
-# how every other optional subsystem ships here — `STORAGE_ENABLED` and
-# friends are plain runtime booleans, always compiled in.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/target \
-    cargo build --release --locked -p sentinel --features traffic && \
-    cp /app/target/release/sentinel /app/sentinel
+RUN target="$(rustc -vV | sed -n 's/^host: //p')" && \
+    cargo build $CARGO_ARGS --target "$target" && \
+    cp "target/$target/release/sentinel" "target/$target/release/flux" / && \
+    file /sentinel | grep -Eq 'static.*linked' && \
+    file /flux | grep -Eq 'static.*linked'
 
-# Final stage
-FROM alpine:3.24
+FROM scratch AS host
+COPY --from=builder /sentinel /sentinel
+
+FROM alpine:3.24 AS flux
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates
+COPY --from=builder /flux /usr/local/bin/flux
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/flux"]
+
+# Default target: keep it last, so a plain `docker build .` builds it.
+FROM alpine:3.24 AS sentinel
 
 RUN apk upgrade --no-cache && apk add --no-cache ca-certificates tzdata curl
 
 ENV PORT=8888
 
-COPY --from=builder /app/sentinel /app/sentinel
+COPY --from=builder /sentinel /app/sentinel
 
 RUN mkdir -p /app/db && chmod 750 /app/db
 
