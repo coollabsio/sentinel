@@ -497,6 +497,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "workload.resources.v1",
             "workload.lifecycle.v1",
             "workload.healthcheck.v1",
+            "workload.secrets.v1",
             "logs.read.v1",
             "container.logs.v1",
             "trust.bundle.update.v1",
@@ -1232,6 +1233,7 @@ fn builds_shell_free_podman_deploy_arguments() {
         pull_policy: "newer".into(),
         mounts: Vec::new(),
         health_check: None,
+        secrets: Vec::new(),
     };
 
     let deploy = crate::commands::podman_deploy_args(&request).unwrap();
@@ -1869,8 +1871,12 @@ fn workload_commands_keep_a_durable_stop_marker() {
             "restart present",
             "stop present",
             "rm present",
+            // A remove also deletes the secrets of the container.
+            "secret absent",
             "stop present",
             "run absent",
+            // A deploy deletes the secrets that the new revision does not use.
+            "secret absent",
         ]
     );
 

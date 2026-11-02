@@ -5,5 +5,6 @@ edition.workspace = true
 
 [dependencies]
 rusqlite.workspace = true
+sha2 = "0.10"
 thiserror.workspace = true
 tracing.workspace = true

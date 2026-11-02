@@ -2713,6 +2713,7 @@ name = "store"
 version = "1.1.4"
 dependencies = [
  "rusqlite",
+ "sha2",
  "thiserror",
  "tracing",
 ]

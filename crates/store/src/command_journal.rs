@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 
 use crate::StoreError;
 
@@ -62,7 +63,10 @@ impl CommandJournal {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Overwritten pages are zeroed, so a scrubbed request leaves no copy in the file.
+        connection.pragma_update(None, "secure_delete", "ON")?;
         connection.execute_batch(DDL)?;
+        scrub_stored_requests(&connection)?;
 
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -86,7 +90,7 @@ impl CommandJournal {
         let connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
         connection.execute(
             "INSERT INTO command_executions (command_id, request, status, started_at) VALUES (?1, ?2, 'running', ?3)",
-            params![command_id, request, now_ms],
+            params![command_id, request_digest(request), now_ms],
         )?;
         Ok(CommandStart::Started)
     }
@@ -108,7 +112,7 @@ impl CommandJournal {
             .optional()?;
 
         if let Some((stored_request, result, status)) = existing {
-            if stored_request != request {
+            if stored_request != request_digest(request) {
                 return Ok(CommandLookup::Conflict);
             }
             return if status == "completed" {
@@ -153,4 +157,30 @@ impl CommandJournal {
         }
         Ok(deleted)
     }
+}
+
+/// The journal keeps only a SHA-256 digest of a request. A request can hold
+/// workload secrets, and the digest is enough to detect a reused command ID
+/// with a different request (decision 0008).
+fn request_digest(request: &[u8]) -> Vec<u8> {
+    Sha256::digest(request).to_vec()
+}
+
+/// Replaces the requests that older versions stored in full by their digest.
+fn scrub_stored_requests(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT command_id, request FROM command_executions WHERE length(request) != 32",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (command_id, request) in rows {
+        connection.execute(
+            "UPDATE command_executions SET request = ?2 WHERE command_id = ?1",
+            params![command_id, request_digest(&request)],
+        )?;
+    }
+    Ok(())
 }

@@ -17,7 +17,7 @@ use sentinel_protocol::control::v1::{
     SystemPingRequest, TrustBundleUpdateRequest, WireguardInspectRequest,
     WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest,
     WorkloadEnvironmentVariable, WorkloadHealthCheck, WorkloadLabel, WorkloadLifecycleAction,
-    WorkloadLifecycleRequest, WorkloadName,
+    WorkloadLifecycleRequest, WorkloadName, WorkloadSecret,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -152,6 +152,8 @@ struct WorkloadDeployApiRequest {
     mounts: Vec<volume::DeployMount>,
     #[serde(default)]
     health_check: Option<DeployHealthCheck>,
+    #[serde(default)]
+    secrets: std::collections::HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -1104,6 +1106,10 @@ async fn workload_deploy(
                         retries: check.retries,
                         start_period_seconds: check.start_period_seconds,
                     }),
+                    secrets: sorted_pairs(request.secrets)
+                        .into_iter()
+                        .map(|(key, value)| WorkloadSecret { key, value })
+                        .collect(),
                 })),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },

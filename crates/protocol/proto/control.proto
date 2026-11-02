@@ -258,6 +258,19 @@ message WorkloadDeployRequest {
   // A health check that replaces the HEALTHCHECK of the image. Absent means
   // the container keeps the HEALTHCHECK of the image, if it has one.
   optional WorkloadHealthCheck health_check = 18;
+  // Values that the container reads as files at `/run/secrets/<key>`
+  // (decision 0008). Sentinel stores each one as a Podman secret for this
+  // revision; the value is never in the environment of the container. Needs
+  // the label `coolify.revision` and `workload.secrets.v1`. At most 128.
+  repeated WorkloadSecret secrets = 19;
+}
+
+message WorkloadSecret {
+  // The file name: 1 to 255 ASCII letters, digits, `_`, `.` or `-`, not `.`
+  // or `..`. Unique in a request.
+  string key = 1;
+  // 1 byte to 512 kB.
+  string value = 2;
 }
 
 // `podman run --health-*`. The command runs in the container with `/bin/sh -c`.

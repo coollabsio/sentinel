@@ -52,6 +52,11 @@ pub const CAPABILITY_VOLUME_VERIFY: &str = "volume.verify.v1";
 /// `workload.lifecycle.v1` accepts `stop_timeout_seconds`, so a move can give
 /// the source time for a clean shutdown. Not a command.
 pub const CAPABILITY_WORKLOAD_STOP_TIMEOUT: &str = "workload.stop_timeout.v1";
+/// `workload.deploy.v1` accepts `secrets`, mounted as files at
+/// `/run/secrets/<key>`, and `workload.lifecycle.v1` with `remove` deletes the
+/// secrets of the container (decision 0008). Not a command: an older Sentinel
+/// ignores the field and would start the container without its secrets.
+pub const CAPABILITY_WORKLOAD_SECRETS: &str = "workload.secrets.v1";
 pub const VOLUME_CAPABILITIES: [&str; 7] = [
     CAPABILITY_VOLUME_MOUNTS,
     CAPABILITY_VOLUME_DELETE,

@@ -735,6 +735,9 @@ fn workload_lifecycle(
     if !stopping {
         crate::restore::clear_stopped(root, &request.name)?;
     }
+    if request.action == WorkloadLifecycleAction::Remove as i32 {
+        crate::secrets::delete_all(podman, &request.name)?;
+    }
 
     Ok(WorkloadLifecycleResult {
         name: request.name.clone(),
@@ -811,6 +814,7 @@ fn workload_deploy(
             .iter()
             .map(|mount| mount.volume_name.as_str()),
     )?;
+    crate::secrets::create(podman, request)?;
     let mut command = std::process::Command::new(podman);
     command
         .args(deploy.arguments)
@@ -835,6 +839,11 @@ fn workload_deploy(
     }
     // A deploy means "run": the workload must come back after a reboot.
     crate::restore::clear_stopped(root, &request.name)?;
+    // The new container runs, so the secrets of older revisions are unused. A
+    // failure leaves them until the next deploy or remove.
+    if let Err(error) = crate::secrets::delete_unused(podman, request) {
+        tracing::warn!(%error, container = %request.name, "could not delete unused workload secrets");
+    }
     Ok(WorkloadDeployResult {
         runtime_id,
         name: request.name.clone(),
@@ -1185,6 +1194,7 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Podm
         return Err("A command argument is invalid.".into());
     }
     args.extend(crate::volumes::mount_args(&request.mounts)?);
+    args.extend(crate::secrets::mount_args(request)?);
     args.push(request.image.clone());
     args.extend(request.command.clone());
     Ok(PodmanDeploy {
