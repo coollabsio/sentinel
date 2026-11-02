@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
-    NewOrder, OrderStatus, RetryPolicy,
+    Account, AccountBuilder, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier,
+    NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -211,13 +211,24 @@ fn account_context(directory_url: &str) -> String {
     format!("acme-account:{directory_url}")
 }
 
+/// The ACME client: the system roots, or only the configured test CA.
+fn builder(root: &Path, settings: &IssuerSettings) -> Result<AccountBuilder, String> {
+    if settings.custom_ca {
+        return Account::builder_with_root(crate::ingress_tls::acme_ca_file(root))
+            .map_err(|error| format!("The ACME CA certificate could not be loaded: {error}"));
+    }
+    Account::builder().map_err(|error| error.to_string())
+}
+
 /// The ACME account for the directory: from Corrosion, or registered once and
 /// stored there, so a new issuer keeps the same account.
 async fn account(
+    root: &Path,
     owner: &str,
     key: &[u8; KEY_LENGTH],
-    directory_url: &str,
+    settings: &IssuerSettings,
 ) -> Result<Account, String> {
+    let directory_url = settings.directory_url.as_str();
     let rows = query(
         owner,
         "SELECT directory_url, credentials_sealed FROM acme_accounts",
@@ -234,14 +245,12 @@ async fn account(
             serde_json::from_slice(&plain)
                 .map_err(|_| "The stored ACME account is invalid.".to_string())
         })?;
-        return Account::builder()
-            .map_err(|error| error.to_string())?
+        return builder(root, settings)?
             .from_credentials(credentials)
             .await
             .map_err(|error| format!("The ACME account could not be restored: {error}"));
     }
-    let (account, credentials) = Account::builder()
-        .map_err(|error| error.to_string())?
+    let (account, credentials) = builder(root, settings)?
         .create(
             &NewAccount {
                 contact: &[],
@@ -455,7 +464,7 @@ async fn tick(root: &Path, state: &mut IssuerState) -> Result<(), String> {
     if plan.order.is_empty() {
         return Ok(());
     }
-    let account = account_for(state, &owner, &key, &settings).await?;
+    let account = account_for(root, state, &owner, &key, &settings).await?;
     for host in plan.order {
         let outcome = tokio::time::timeout(
             ORDER_TIMEOUT,
@@ -493,6 +502,7 @@ async fn tick(root: &Path, state: &mut IssuerState) -> Result<(), String> {
 }
 
 async fn account_for(
+    root: &Path,
     state: &mut IssuerState,
     owner: &str,
     key: &[u8; KEY_LENGTH],
@@ -503,7 +513,7 @@ async fn account_for(
     {
         return Ok(account.clone());
     }
-    let account = account(owner, key, &settings.directory_url).await?;
+    let account = account(root, owner, key, settings).await?;
     state.account = Some((settings.directory_url.clone(), account.clone()));
     Ok(account)
 }

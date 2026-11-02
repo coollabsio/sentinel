@@ -286,6 +286,8 @@ struct IngressReconcileApiRequest {
     acme_directory_url: String,
     #[serde(default)]
     ingress_public_ips: Vec<String>,
+    #[serde(default)]
+    acme_ca_pem: String,
 }
 #[derive(Deserialize)]
 struct WorkloadNameApiRequest {
@@ -884,6 +886,7 @@ async fn ingress_reconcile(
             tls_issuer: request.tls_issuer,
             acme_directory_url: request.acme_directory_url,
             ingress_public_ips: request.ingress_public_ips,
+            acme_ca_pem: request.acme_ca_pem,
         }),
     )
     .await?;

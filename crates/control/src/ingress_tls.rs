@@ -31,6 +31,8 @@ pub(crate) const KEY_LENGTH: usize = 32;
 const KEY_FILE: &str = "etc/coolify/network/ingress-tls.key";
 const KEY_DIR: &str = "etc/coolify/network";
 const ISSUER_FILE: &str = "etc/coolify/network/ingress-acme.json";
+const ACME_CA_FILE: &str = "etc/coolify/network/ingress-acme-ca.pem";
+const MAX_ACME_CA_LENGTH: usize = 65_536;
 const MAX_INGRESS_ADDRESSES: usize = 64;
 /// Inside the Caddy service's `StateDirectory`.
 pub(crate) const CERTIFICATES_DIR: &str = "var/lib/coolify-ingress/certs";
@@ -51,7 +53,10 @@ pub(crate) fn validate_request(request: &IngressReconcileRequest) -> Result<(), 
         return Err("The certificate issuer needs HTTPS to be enabled.".into());
     }
     if !request.tls_issuer {
-        if !request.acme_directory_url.is_empty() || !request.ingress_public_ips.is_empty() {
+        if !request.acme_directory_url.is_empty()
+            || !request.ingress_public_ips.is_empty()
+            || !request.acme_ca_pem.is_empty()
+        {
             return Err("Only the certificate issuer gets ACME settings.".into());
         }
         return Ok(());
@@ -60,6 +65,16 @@ pub(crate) fn validate_request(request: &IngressReconcileRequest) -> Result<(), 
         .map_err(|_| "The ACME directory URL is invalid.".to_string())?;
     if directory.scheme() != "https" || request.acme_directory_url.len() > 2048 {
         return Err("The ACME directory URL must use HTTPS.".into());
+    }
+    if !request.acme_ca_pem.is_empty()
+        && (request.acme_ca_pem.len() > MAX_ACME_CA_LENGTH
+            || !rustls_pemfile::certs(&mut request.acme_ca_pem.as_bytes())
+                .all(|certificate| certificate.is_ok())
+            || rustls_pemfile::certs(&mut request.acme_ca_pem.as_bytes())
+                .next()
+                .is_none())
+    {
+        return Err("The ACME CA certificate is invalid.".into());
     }
     if request.ingress_public_ips.is_empty()
         || request.ingress_public_ips.len() > MAX_INGRESS_ADDRESSES
@@ -84,6 +99,14 @@ pub(crate) struct IssuerSettings {
     pub(crate) directory_url: String,
     /// The public addresses of the ingress Nodes.
     pub(crate) public_ips: Vec<IpAddr>,
+    /// Whether the issuer trusts only [`acme_ca_file`] for the directory.
+    #[serde(default)]
+    pub(crate) custom_ca: bool,
+}
+
+/// The test CA that the issuer trusts instead of the system roots.
+pub(crate) fn acme_ca_file(root: &Path) -> PathBuf {
+    root.join(ACME_CA_FILE)
 }
 
 /// The issuer settings, when this Node is the certificate issuer.
@@ -96,6 +119,9 @@ pub(crate) fn read_issuer(root: &Path) -> Option<IssuerSettings> {
 pub(crate) fn apply(root: &Path, request: &IngressReconcileRequest) -> Result<(), String> {
     if !request.tls_issuer {
         remove_file(&root.join(ISSUER_FILE))?;
+    }
+    if request.acme_ca_pem.is_empty() {
+        remove_file(&root.join(ACME_CA_FILE))?;
     }
     if !request.tls_enabled {
         return remove_file(&root.join(KEY_FILE));
@@ -113,7 +139,15 @@ pub(crate) fn apply(root: &Path, request: &IngressReconcileRequest) -> Result<()
                 .iter()
                 .filter_map(|address| address.parse().ok())
                 .collect(),
+            custom_ca: !request.acme_ca_pem.is_empty(),
         };
+        if settings.custom_ca {
+            write_if_changed(
+                &root.join(ACME_CA_FILE),
+                request.acme_ca_pem.as_bytes(),
+                0o600,
+            )?;
+        }
         let encoded = serde_json::to_vec(&settings)
             .map_err(|_| "The issuer settings could not be encoded.".to_string())?;
         write_if_changed(&root.join(ISSUER_FILE), &encoded, 0o600)?;
@@ -125,6 +159,7 @@ pub(crate) fn apply(root: &Path, request: &IngressReconcileRequest) -> Result<()
 /// `ingress_lock` and has removed the Caddy configuration.
 pub(crate) fn remove(root: &Path) -> Result<(), String> {
     remove_file(&root.join(ISSUER_FILE))?;
+    remove_file(&root.join(ACME_CA_FILE))?;
     remove_file(&root.join(KEY_FILE))?;
     match fs::remove_dir_all(root.join(CERTIFICATES_DIR)) {
         Ok(()) => Ok(()),

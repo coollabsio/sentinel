@@ -385,6 +385,9 @@ message IngressReconcileRequest {
   // resolve to one of them, and checks on each of them that the challenge is
   // served before the CA validates it. Set exactly when `tls_issuer` is set.
   repeated string ingress_public_ips = 10;
+  // PEM of the only root CA the issuer trusts for the ACME directory, for a
+  // test CA like Pebble. Empty uses the system roots. Only with `tls_issuer`.
+  string acme_ca_pem = 11;
 }
 
 // An internal DNS name, `<name>.<namespace>.coolify.internal`, of a workload.
