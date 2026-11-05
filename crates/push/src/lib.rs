@@ -20,6 +20,9 @@ const MAX_CONCURRENT_INSPECTS: usize = 10;
 /// body echoed in `PushError::Status` can't bloat `/api/push-status`.
 pub const MAX_ERROR_CHARS: usize = 500;
 
+/// Upper bound on a `Retry-After` wait, so a wrong header cannot stop pushes for days.
+const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
     #[error("docker: {0}")]
@@ -35,7 +38,18 @@ pub enum PushError {
         url: String,
         status: u16,
         body: String,
+        /// Wait that Coolify asked for with `Retry-After` (in seconds), capped at 24 hours.
+        retry_after: Option<std::time::Duration>,
     },
+}
+
+impl PushError {
+    fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            PushError::Status { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,6 +198,19 @@ impl Pusher {
                         tracing::warn!(error = %e, "push operation failed");
                     }
                     record_attempt(&self.status, OffsetDateTime::now_utc(), &result);
+
+                    // Coolify sends Retry-After when it rejects pushes from this server for a
+                    // long time (deleted server, unpaid subscription). Wait, then push again.
+                    if let Some(wait) = result.as_ref().err().and_then(PushError::retry_after) {
+                        tracing::warn!(retry_after_seconds = wait.as_secs(), "Coolify asked to pause pushes");
+                        tokio::select! {
+                            _ = shutdown.changed() => {
+                                tracing::info!("stopping push service");
+                                return;
+                            }
+                            _ = tokio::time::sleep(wait) => ticker.reset(),
+                        }
+                    }
                 }
             }
         }
@@ -199,6 +226,12 @@ impl Pusher {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(|seconds| std::time::Duration::from_secs(seconds).min(MAX_RETRY_AFTER));
             let body = response.text().await.unwrap_or_default();
             return Err(PushError::Status {
                 url: self.config.push_url.clone(),
@@ -209,6 +242,7 @@ impl Pusher {
                     .collect::<String>()
                     .trim()
                     .to_string(),
+                retry_after,
             });
         }
         Ok(())

@@ -387,6 +387,7 @@ async fn push_status_reports_the_last_attempt() {
             url: "https://coolify.example/api/v1/sentinel/push".into(),
             status: 401,
             body: "Unauthenticated.".into(),
+            retry_after: None,
         }),
     );
 
