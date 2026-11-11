@@ -63,7 +63,7 @@ TOKEN=your-secret-token cargo watch -x run
 just dev
 ```
 
-In development mode, the SQLite database is written to `./db/` instead of `/app/db/`.
+In development mode, the SQLite database is written to `./db/` instead of `/app/db/`. Set `DATA_DIR` to use a different directory.
 
 ## Configuration
 
@@ -90,6 +90,7 @@ Sentinel is configured using environment variables:
 | `STORAGE_VOLUMES_ENABLED` | `true` | Enable/disable per-container volume and bind mount sizes |
 | `STORAGE_VOLUMES_REFRESH_RATE_SECONDS` | 900 | Interval for the expensive volume walk (kept separate so it can't hammer host I/O) |
 | `HOST_MOUNT_PREFIX` | *(empty)* | Path prefix under which host paths are mounted into Sentinel's container. When set, bind mount sources are `du`-walked under it; when empty, bind mounts are not sized |
+| `DATA_DIR` | `/app/db` (`./db` in development) | Directory of the SQLite databases (`metrics.sqlite`, `commands.sqlite`, `analytics.sqlite`). Set it when Sentinel runs on the host without the container mount |
 | `DOCKER_HOST` | `/var/run/docker.sock` | Docker Engine API socket; `unix://` URLs and bare paths only — e.g. `unix:///run/user/1000/podman/podman.sock` for rootless Podman |
 | `DEBUG` | `false` | Enable verbose logging, `human_friendly_time` fields, and the `/api/stats` route |
 | `PORT` | `8888` | HTTP server port |

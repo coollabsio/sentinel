@@ -246,6 +246,7 @@ fn defaults_match_go_implementation() {
         ("STORAGE_VOLUMES_ENABLED", ""),
         ("STORAGE_VOLUMES_REFRESH_RATE_SECONDS", ""),
         ("HOST_MOUNT_PREFIX", ""),
+        ("DATA_DIR", ""),
         ("SENTINEL_COMMAND_RETENTION_DAYS", ""),
         ("SENTINEL_COMMAND_MAX_RECORDS", ""),
     ]);
@@ -469,4 +470,29 @@ fn traffic_ip_mode_reads_env_and_rejects_unknown_values() {
         Config::load(false),
         Err(ConfigError::InvalidIpMode)
     ));
+}
+
+#[test]
+fn data_dir_overrides_the_database_directory() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "http://x"),
+        ("DATA_DIR", "/data/coolify/sentinel"),
+    ]);
+    for development in [false, true] {
+        let c = Config::load(development).unwrap();
+        assert_eq!(
+            c.metrics_file.to_str().unwrap(),
+            "/data/coolify/sentinel/metrics.sqlite"
+        );
+        assert_eq!(
+            c.command_journal_file.to_str().unwrap(),
+            "/data/coolify/sentinel/commands.sqlite"
+        );
+        assert_eq!(
+            c.traffic.analytics_file.to_str().unwrap(),
+            "/data/coolify/sentinel/analytics.sqlite"
+        );
+    }
 }

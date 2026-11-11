@@ -119,16 +119,14 @@ pub struct Config {
 
 impl Config {
     pub fn load(development: bool) -> Result<Self, ConfigError> {
-        let metrics_file = if development {
-            PathBuf::from("./db/metrics.sqlite")
-        } else {
-            PathBuf::from("/app/db/metrics.sqlite")
-        };
-        let command_journal_file = if development {
-            PathBuf::from("./db/commands.sqlite")
-        } else {
-            PathBuf::from("/app/db/commands.sqlite")
-        };
+        // DATA_DIR lets a host install (no container mount) keep the
+        // databases in the directory the container mounted on /app/db.
+        let data_dir = PathBuf::from(
+            non_empty("DATA_DIR")
+                .unwrap_or_else(|| if development { "./db" } else { "/app/db" }.to_string()),
+        );
+        let metrics_file = data_dir.join("metrics.sqlite");
+        let command_journal_file = data_dir.join("commands.sqlite");
         let command_retention_days = u32_from_env("SENTINEL_COMMAND_RETENTION_DAYS", 7)?;
         let command_max_records = u32_from_env("SENTINEL_COMMAND_MAX_RECORDS", 100_000)?;
 
@@ -165,11 +163,7 @@ impl Config {
             positive_from_env("STORAGE_VOLUMES_REFRESH_RATE_SECONDS", 900)?;
         let host_mount_prefix = non_empty("HOST_MOUNT_PREFIX").unwrap_or_default();
 
-        let analytics_file = if development {
-            PathBuf::from("./db/analytics.sqlite")
-        } else {
-            PathBuf::from("/app/db/analytics.sqlite")
-        };
+        let analytics_file = data_dir.join("analytics.sqlite");
         let traffic = TrafficSettings {
             enabled: bool_from_env("TRAFFIC_ENABLED", false)?,
             access_log_path: PathBuf::from(
