@@ -94,6 +94,11 @@ pub const CAPABILITY_VOLUME_RESTORE: &str = "volume.restore.v1";
 /// secrets of the container (decision 0008). Not a command: an older Sentinel
 /// ignores the field and would start the container without its secrets.
 pub const CAPABILITY_WORKLOAD_SECRETS: &str = "workload.secrets.v1";
+/// `workload.lifecycle.v1` with `stop` or `remove` drains the endpoint from
+/// ingress and internal DNS whenever another endpoint of the workload serves,
+/// so Coolify can start a second container of a workload and then remove the
+/// old one without failed requests (decision 0022). Not a command.
+pub const CAPABILITY_WORKLOAD_ROLLING_DEPLOY: &str = "workload.rolling_deploy.v1";
 pub const VOLUME_CAPABILITIES: [&str; 9] = [
     CAPABILITY_VOLUME_MOUNTS,
     CAPABILITY_VOLUME_DELETE,

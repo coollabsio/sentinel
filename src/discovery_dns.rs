@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 const MAX_DNS_PACKET: usize = 1232;
-const DNS_TTL_SECONDS: u32 = 30;
+/// Shorter than the endpoint drain (`discovery::DRAIN_DURATION`, 7 s), so a
+/// client that caches an answer stops using a container before it stops.
+const DNS_TTL_SECONDS: u32 = 5;
 const SYSTEMD_RESOLVED_STUB: &str = "127.0.0.53:53";
 /// A hung Corrosion query must not stall the single DNS request loop.
 const CORROSION_QUERY_TIMEOUT: Duration = Duration::from_secs(2);

@@ -63,8 +63,9 @@ static DRAINING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 /// How long a drained endpoint stays out of service before its container
 /// stops, when another endpoint can take its traffic: Corrosion replicates the
-/// change within about a second and every ingress renderer reads it on its
-/// next pass, at most `ingress::RENDER_INTERVAL` (5 s) later.
+/// change within about a second, every ingress renderer reads it on its next
+/// pass, at most `ingress::RENDER_INTERVAL` (5 s) later, and a cached internal
+/// DNS answer expires after its TTL (5 s).
 pub(crate) const DRAIN_DURATION: Duration = Duration::from_secs(7);
 
 fn draining() -> MutexGuard<'static, BTreeSet<String>> {
@@ -95,13 +96,14 @@ pub(crate) fn mark_draining(containers: &mut [ContainerObservation]) {
     }
 }
 
-/// Counts the other serving endpoints of a workload that has an ingress route.
+/// Counts the other serving endpoints of a workload. Ingress and internal DNS
+/// both send its traffic there.
 pub(crate) fn serving_elsewhere_sql() -> &'static str {
-    "SELECT COUNT(*) FROM workload_endpoints WHERE namespace = 'default' AND workload_id = ? AND state = 'running' AND health NOT IN ('unhealthy', 'starting') AND expires_at > unixepoch() AND EXISTS (SELECT 1 FROM ingress_http_routes WHERE ingress_http_routes.workload_id = workload_endpoints.workload_id AND ingress_http_routes.namespace = workload_endpoints.namespace)"
+    "SELECT COUNT(*) FROM workload_endpoints WHERE namespace = 'default' AND workload_id = ? AND state = 'running' AND health NOT IN ('unhealthy', 'starting') AND expires_at > unixepoch()"
 }
 
-/// How long to wait before the container stops: only a routed workload with
-/// another serving endpoint has somewhere else to send its traffic.
+/// How long to wait before the container stops: only a workload with another
+/// serving endpoint has somewhere else to send its traffic.
 pub(crate) fn drain_wait(serving_elsewhere: i64) -> Duration {
     if serving_elsewhere > 0 {
         DRAIN_DURATION
@@ -825,7 +827,6 @@ mod tests {
         assert!(sql.contains("workload_id = ?") && sql.contains("state = 'running'"));
         assert!(sql.contains("health NOT IN ('unhealthy', 'starting')"));
         assert!(sql.contains("expires_at > unixepoch()"));
-        assert!(sql.contains("FROM ingress_http_routes"));
         assert_eq!(drain_wait(0), Duration::ZERO);
         assert_eq!(drain_wait(1), DRAIN_DURATION);
         assert!(DRAIN_DURATION > crate::ingress::RENDER_INTERVAL);

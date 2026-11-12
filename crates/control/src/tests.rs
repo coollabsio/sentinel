@@ -498,6 +498,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "workload.lifecycle.v1",
             "workload.healthcheck.v1",
             "workload.secrets.v1",
+            "workload.rolling_deploy.v1",
             "logs.read.v1",
             "container.logs.v1",
             "trust.bundle.update.v1",

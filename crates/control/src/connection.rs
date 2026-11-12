@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config::ControlTlsConfig;
+use sentinel_protocol::CAPABILITY_WORKLOAD_ROLLING_DEPLOY;
 use sentinel_protocol::control::v1::agent_message;
 use sentinel_protocol::control::v1::control_message;
 use sentinel_protocol::control::v1::{
@@ -115,6 +116,7 @@ pub async fn connect(
                     CAPABILITY_WORKLOAD_LIFECYCLE.into(),
                     CAPABILITY_WORKLOAD_HEALTHCHECK.into(),
                     CAPABILITY_WORKLOAD_SECRETS.into(),
+                    CAPABILITY_WORKLOAD_ROLLING_DEPLOY.into(),
                     CAPABILITY_LOGS_READ.into(),
                     CAPABILITY_CONTAINER_LOGS.into(),
                     CAPABILITY_TRUST_BUNDLE_UPDATE.into(),

@@ -1,3 +1,4 @@
+use sentinel_protocol::CAPABILITY_WORKLOAD_ROLLING_DEPLOY;
 use sentinel_protocol::control::v1::Hello;
 use sentinel_protocol::{
     BUILD_CAPABILITIES, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
@@ -53,6 +54,7 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
         CAPABILITY_WORKLOAD_LIFECYCLE,
         CAPABILITY_WORKLOAD_HEALTHCHECK,
         CAPABILITY_WORKLOAD_SECRETS,
+        CAPABILITY_WORKLOAD_ROLLING_DEPLOY,
         CAPABILITY_LOGS_READ,
         CAPABILITY_CONTAINER_LOGS,
         CAPABILITY_TRUST_BUNDLE_UPDATE,
