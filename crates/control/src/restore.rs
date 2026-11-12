@@ -227,7 +227,6 @@ pub(crate) fn restore_once(root: &Path) -> RestoreReport {
             0
         }
     };
-    complete &= apply_steps(root, &plan.after_workloads);
 
     RestoreReport {
         complete,

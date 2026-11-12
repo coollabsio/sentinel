@@ -14,6 +14,7 @@ use sentinel_protocol::control::v1::{
 use sha2::{Digest, Sha256};
 
 pub(crate) const COOLIFY_NFT_TABLE: &str = "coolify_cluster";
+const MESH_NAT_CHAIN: &str = "mesh_nat";
 const COOLIFY_NFT_BRIDGE_TABLE: &str = "coolify_cluster_bridge";
 const BRIDGE_SYSCTL_FILE: &str = "etc/sysctl.d/90-coolify-workload-firewall.conf";
 pub(crate) const CORROSION_VERSION: &str = "v1.0.0";
@@ -91,13 +92,7 @@ pub(crate) fn leave_cluster(
             "bridge",
             COOLIFY_NFT_BRIDGE_TABLE,
         ]));
-        for cidr in &request.workload_cidrs {
-            run_best_effort(
-                Command::new("iptables")
-                    .args(["-t", "nat", "-D", "POSTROUTING"])
-                    .args(mesh_nat_rule_arguments(&request.interface, cidr)),
-            );
-        }
+        remove_legacy_mesh_nat(&request.interface, &request.workload_cidrs);
     }
 
     let managed_files = [
@@ -431,11 +426,18 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
         )
     };
 
+    // Netavark masquerades everything that leaves a workload network, in a nat
+    // chain of its own table. A verdict in another chain cannot stop that
+    // chain; only an earlier NAT binding can, because the kernel ends NAT
+    // evaluation at the first binding. The mesh NAT chain runs first and binds
+    // the source of workload-to-workload traffic to itself, so the firewall of
+    // the destination Node sees the workload address.
     Ok(format!(
         "table inet {COOLIFY_NFT_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
  chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; ip saddr {} udp dport 8787 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} udp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 8080 accept; {input_registry_rule}ip saddr {} drop; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
  chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} {forward_ingress_rules} ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; ip saddr != @workload_networks ip daddr @workload_networks drop; }}
+ chain {MESH_NAT_CHAIN} {{ type nat hook postrouting priority srcnat - 5; policy accept; oifname \"{}\" ip saddr @workload_networks ip daddr @workload_networks snat ip to ip saddr; }}
  chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; ip daddr {local_node_ip} udp dport 53 accept; ip daddr {local_node_ip} tcp dport 53 accept; ip daddr {local_node_ip} tcp dport 8080 accept; {output_allow_rules} {output_ingress_rules} {output_registry_rule}ip daddr {} drop; ip daddr @workload_networks drop; }}
 }}
 table bridge {COOLIFY_NFT_BRIDGE_TABLE} {{
@@ -449,6 +451,7 @@ table bridge {COOLIFY_NFT_BRIDGE_TABLE} {{
         request.wireguard_interface,
         request.cluster_cidr,
         request.cluster_cidr,
+        request.wireguard_interface,
         request.cluster_cidr,
         request.cluster_cidr
     ))
@@ -970,7 +973,7 @@ pub(crate) fn reconcile_firewall(
     if prior
         .as_ref()
         .is_some_and(|state| state.0 == request.revision && state.1 == configuration_hash)
-        && firewall_tables_active(root)
+        && firewall_current(root)
     {
         return Ok(FirewallReconcileResult {
             state: Some(firewall_state(request.revision, configuration_hash, false)),
@@ -1086,8 +1089,7 @@ fn activate_firewall(
                 "Flux connectivity validation failed.",
             )
         }
-    })
-    .and_then(|_| configure_mesh_nat(&request.wireguard_interface, &request.workload_cidrs));
+    });
     if let Err(error) = activated {
         let rollback = run(
             Command::new("systemctl").args(rollback_start_arguments(
@@ -1107,7 +1109,9 @@ fn activate_firewall(
         Command::new("systemctl").args(["stop", "coolify-firewall-rollback.timer"]),
         "The firewall rollback could not be cancelled.",
     )?;
-    atomic_write(&last_good, snapshot.as_bytes(), 0o600)
+    atomic_write(&last_good, snapshot.as_bytes(), 0o600)?;
+    remove_legacy_mesh_nat(&request.wireguard_interface, &request.workload_cidrs);
+    Ok(())
 }
 
 /// Writes the persistent forwarding settings and loads them. `br_netfilter` is
@@ -1132,30 +1136,23 @@ fn load_bridge_sysctls(root: &Path) -> Result<(), String> {
     )
 }
 
-fn configure_mesh_nat(interface: &str, workload_cidrs: &[String]) -> Result<(), String> {
+/// Removes the iptables exemption of older Sentinel versions. It had no effect
+/// on Netavark's nftables rules.
+fn remove_legacy_mesh_nat(interface: &str, workload_cidrs: &[String]) {
     for cidr in workload_cidrs {
-        let rule = mesh_nat_rule_arguments(interface, cidr);
-        let exists = Command::new("iptables")
-            .args(["-t", "nat", "-C", "POSTROUTING"])
-            .args(rule)
-            .status()
-            .map_err(|_| "iptables is unavailable.")?
-            .success();
-        if !exists {
-            run(
-                Command::new("iptables")
-                    .args(["-t", "nat", "-I", "POSTROUTING", "1"])
-                    .args(rule),
-                "The workload mesh NAT exemption could not be activated.",
-            )?;
-        }
+        run_best_effort(Command::new("iptables").args([
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-s",
+            cidr,
+            "-o",
+            interface,
+            "-j",
+            "RETURN",
+        ]));
     }
-
-    Ok(())
-}
-
-fn mesh_nat_rule_arguments<'a>(interface: &'a str, cidr: &'a str) -> [&'a str; 6] {
-    ["-s", cidr, "-o", interface, "-j", "RETURN"]
 }
 
 pub(crate) fn inspect_firewall(
@@ -1170,13 +1167,27 @@ pub(crate) fn inspect_firewall(
         configuration_hash: state
             .as_ref()
             .map_or_else(String::new, |state| state.1.clone()),
-        drifted: !tables_active
+        drifted: !firewall_current(root)
             || state
                 .as_ref()
                 .is_none_or(|state| state.0 != expected_revision || state.1 != expected_hash),
         table: COOLIFY_NFT_TABLE.into(),
         ingress_enforced: tables_active,
     }
+}
+
+/// The tables are loaded and have the mesh NAT chain. A table that an older
+/// Sentinel loaded has no such chain; it counts as drifted, so that Coolify
+/// applies the firewall again.
+fn firewall_current(root: &Path) -> bool {
+    firewall_tables_active(root)
+        && (root != Path::new("/")
+            || Command::new("nft")
+                .args(["list", "chain", "inet", COOLIFY_NFT_TABLE, MESH_NAT_CHAIN])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success()))
 }
 
 fn firewall_tables_active(root: &Path) -> bool {
@@ -2051,21 +2062,14 @@ pub(crate) enum RestoreStep {
     RefreshCorrosionUnits,
     RestartCorrosion,
     StartDiscoveryDns,
-    MeshNat {
-        interface: String,
-        workload_cidrs: Vec<String>,
-    },
     RefreshIngressUnit,
     StartIngress,
 }
 
-/// Network restore steps, split around the workload restart: the mesh NAT
-/// exemption goes last so it is inserted ahead of the rules Netavark adds when
-/// the workloads start.
+/// Network restore steps. All of them run before the workloads restart.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct RestorePlan {
     pub(crate) before_workloads: Vec<RestoreStep>,
-    pub(crate) after_workloads: Vec<RestoreStep>,
 }
 
 pub(crate) fn read_applied_network(root: &Path) -> AppliedNetwork {
@@ -2261,7 +2265,7 @@ pub(crate) fn observe_live_network(root: &Path, applied: &AppliedNetwork) -> Liv
 
 pub(crate) fn restore_plan(applied: &AppliedNetwork, live: &LiveNetwork) -> RestorePlan {
     let mut plan = RestorePlan::default();
-    if let Some(firewall) = &applied.firewall {
+    if applied.firewall.is_some() {
         plan.before_workloads.push(RestoreStep::BridgeSysctls);
         if !(live.inet_table_exists && live.bridge_table_exists) {
             plan.before_workloads.push(RestoreStep::LoadFirewall {
@@ -2269,10 +2273,6 @@ pub(crate) fn restore_plan(applied: &AppliedNetwork, live: &LiveNetwork) -> Rest
                 bridge_table_exists: live.bridge_table_exists,
             });
         }
-        plan.after_workloads.push(RestoreStep::MeshNat {
-            interface: firewall.wireguard_interface.clone(),
-            workload_cidrs: firewall.workload_cidrs.clone(),
-        });
     }
     let mut link_restored = false;
     for wireguard in &applied.wireguard {
@@ -2364,10 +2364,6 @@ pub(crate) fn apply_restore_step(root: &Path, step: &RestoreStep) -> Result<(), 
                 "The Coolify discovery DNS service could not start.",
             )
         }
-        RestoreStep::MeshNat {
-            interface,
-            workload_cidrs,
-        } => configure_mesh_nat(interface, workload_cidrs),
         RestoreStep::RefreshIngressUnit => Ok(()),
         RestoreStep::StartIngress => {
             let _ = Command::new("systemctl")
@@ -3070,10 +3066,9 @@ mod tests {
 
     #[test]
     fn workload_mesh_nat_bypasses_netavark_masquerading() {
-        assert_eq!(
-            mesh_nat_rule_arguments("coolify0", "100.64.0.0/24"),
-            ["-s", "100.64.0.0/24", "-o", "coolify0", "-j", "RETURN",]
-        );
+        assert!(render_firewall(&firewall_request()).unwrap().contains(
+            "chain mesh_nat { type nat hook postrouting priority srcnat - 5; policy accept; oifname \"coolify0\" ip saddr @workload_networks ip daddr @workload_networks snat ip to ip saddr; }"
+        ));
     }
 
     #[test]
@@ -3597,15 +3592,8 @@ mod tests {
                 RestoreStep::StartDiscoveryDns,
             ]
         );
-        assert_eq!(
-            plan.after_workloads,
-            vec![RestoreStep::MeshNat {
-                interface: "coolify0".into(),
-                workload_cidrs: vec!["100.64.0.0/24".into(), "100.64.1.0/24".into()],
-            }]
-        );
         // A test root never runs host commands, so every step succeeds.
-        for step in plan.before_workloads.iter().chain(&plan.after_workloads) {
+        for step in &plan.before_workloads {
             apply_restore_step(temp.path(), step).unwrap();
         }
     }
@@ -3629,7 +3617,6 @@ mod tests {
                 RestoreStep::StartDiscoveryDns,
             ]
         );
-        assert_eq!(plan.after_workloads.len(), 1);
 
         // Only one firewall table missing still reloads, replacing the other.
         let plan = restore_plan(
