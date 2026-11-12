@@ -13,8 +13,8 @@ use sentinel_protocol::control::v1::{
     WorkloadLifecycleRequest, WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
-    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_REGISTRY_INSPECT,
-    CAPABILITY_REGISTRY_RECONCILE, REGISTRY_HOST,
+    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_LOAD,
+    CAPABILITY_REGISTRY_INSPECT, CAPABILITY_REGISTRY_RECONCILE, REGISTRY_HOST,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -25,7 +25,8 @@ use sentinel_protocol::{
     CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use sentinel_protocol::{
-    CAPABILITY_VOLUME_DELETE, CAPABILITY_VOLUME_RECEIVE, CAPABILITY_VOLUME_SERVE,
+    CAPABILITY_VOLUME_BACKUP, CAPABILITY_VOLUME_DELETE, CAPABILITY_VOLUME_RECEIVE,
+    CAPABILITY_VOLUME_RESTORE, CAPABILITY_VOLUME_SERVE,
 };
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
@@ -146,6 +147,7 @@ impl CommandExecutor {
         // journaled; a repeated ID reads again. volume.serve and
         // volume.receive are idempotent per transfer and carry the transfer
         // secret, which must not be stored. registry.inspect is a read-only report.
+        // volume.backup and volume.restore carry presigned S3 URLs.
         let journaled = !matches!(
             command.command_type.as_str(),
             CAPABILITY_LOGS_READ
@@ -153,6 +155,8 @@ impl CommandExecutor {
                 | CAPABILITY_VOLUME_SERVE
                 | CAPABILITY_VOLUME_RECEIVE
                 | CAPABILITY_REGISTRY_INSPECT
+                | CAPABILITY_VOLUME_BACKUP
+                | CAPABILITY_VOLUME_RESTORE
         );
         let lookup = if journaled {
             self.journal.lookup(&command.command_id, &request)
@@ -266,6 +270,9 @@ impl CommandExecutor {
                 crate::registry::validate(request).is_ok()
             }
             (CAPABILITY_REGISTRY_INSPECT, Some(Payload::RegistryInspect(_))) => true,
+            (CAPABILITY_IMAGE_LOAD, Some(Payload::ImageLoad(request))) => {
+                crate::builder::validate_load(request).is_ok()
+            }
             (CAPABILITY_VOLUME_DELETE, Some(Payload::VolumeDelete(request))) => {
                 crate::volumes::validate_delete(request).is_ok()
             }
@@ -274,6 +281,12 @@ impl CommandExecutor {
             }
             (CAPABILITY_VOLUME_RECEIVE, Some(Payload::VolumeReceive(request))) => {
                 crate::volume_transfer::validate_receive(request).is_ok()
+            }
+            (CAPABILITY_VOLUME_BACKUP, Some(Payload::VolumeBackup(request))) => {
+                crate::volume_backup::validate_backup(request).is_ok()
+            }
+            (CAPABILITY_VOLUME_RESTORE, Some(Payload::VolumeRestore(request))) => {
+                crate::volume_backup::validate_restore(request).is_ok()
             }
             _ => false,
         };
@@ -301,9 +314,12 @@ impl CommandExecutor {
                     | CAPABILITY_BUILDER_RECONCILE
                     | CAPABILITY_REGISTRY_RECONCILE
                     | CAPABILITY_REGISTRY_INSPECT
+                    | CAPABILITY_IMAGE_LOAD
                     | CAPABILITY_VOLUME_DELETE
                     | CAPABILITY_VOLUME_SERVE
                     | CAPABILITY_VOLUME_RECEIVE
+                    | CAPABILITY_VOLUME_BACKUP
+                    | CAPABILITY_VOLUME_RESTORE
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
@@ -582,6 +598,14 @@ impl CommandExecutor {
                 ),
                 Err(message) => failed(&command.command_id, "builder_reconcile_failed", &message),
             }
+        } else if let Some(Payload::ImageLoad(request)) = command.payload {
+            match crate::builder::load(&self.network_root, &self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::ImageLoad(result),
+                ),
+                Err(message) => failed(&command.command_id, "image_load_failed", &message),
+            }
         } else if let Some(Payload::RegistryInspect(_)) = command.payload {
             succeeded(
                 &command.command_id,
@@ -626,6 +650,22 @@ impl CommandExecutor {
                     command_result::Payload::VolumeReceive(result),
                 ),
                 Err(message) => failed(&command.command_id, "volume_receive_failed", &message),
+            }
+        } else if let Some(Payload::VolumeBackup(request)) = command.payload {
+            match crate::volume_backup::backup(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::VolumeBackup(result),
+                ),
+                Err(message) => failed(&command.command_id, "volume_backup_failed", &message),
+            }
+        } else if let Some(Payload::VolumeRestore(request)) = command.payload {
+            match crate::volume_backup::restore(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::VolumeRestore(result),
+                ),
+                Err(message) => failed(&command.command_id, "volume_restore_failed", &message),
             }
         } else {
             failed(
@@ -798,10 +838,27 @@ fn workload_deploy(
 ) -> Result<WorkloadDeployResult, String> {
     let mut deploy = podman_deploy_args(request)?;
     let auth = crate::registry::pull_auth_path(root);
+    // Lives until `podman run` has pulled the image; dropping it deletes the file.
+    let mut _login = None;
     if request.image.starts_with(&format!("{REGISTRY_HOST}/")) && auth.exists() {
         deploy
             .arguments
             .splice(1..1, ["--authfile".to_string(), auth.display().to_string()]);
+    } else if !request.registry_username.is_empty() {
+        let login = TemporaryAuthFile::write(
+            root,
+            &request.name,
+            &crate::registry::login_auth_file(
+                &crate::registry::image_registry_host(&request.image),
+                &request.registry_username,
+                &request.registry_password,
+            ),
+        )?;
+        deploy.arguments.splice(
+            1..1,
+            ["--authfile".to_string(), login.0.display().to_string()],
+        );
+        _login = Some(login);
     }
     if !request.network_name.is_empty() {
         ensure_workload_network(podman, &request.network_name, &request.network_subnet)?;
@@ -1036,9 +1093,59 @@ pub(crate) fn podman_health_args(check: &WorkloadHealthCheck) -> Result<Vec<Stri
     ])
 }
 
+/// The registry login of one deploy on the host `/run` (tmpfs), 0600 in a 0700
+/// directory of root, so it never reaches the disk. Dropping it deletes it.
+struct TemporaryAuthFile(PathBuf);
+
+const REGISTRY_LOGIN_DIR: &str = "run/coolify-registry-login";
+
+impl TemporaryAuthFile {
+    fn write(root: &Path, name: &str, contents: &[u8]) -> Result<Self, String> {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+        let error = || "The registry login could not be written.".to_string();
+        let dir = root.join(REGISTRY_LOGIN_DIR);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|_| error())?;
+        let path = dir.join(format!("{name}.json"));
+        let _ = std::fs::remove_file(&path);
+        let file = Self(path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&file.0)
+            .and_then(|mut handle| handle.write_all(contents))
+            .map_err(|_| error())?;
+        Ok(file)
+    }
+}
+
+impl Drop for TemporaryAuthFile {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(%error, "could not remove a registry login file"),
+        }
+    }
+}
+
 pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<PodmanDeploy, String> {
     if !valid_container_name(&request.name) {
         return Err("The container name is invalid.".into());
+    }
+    if crate::registry::validate_login(&request.registry_username, &request.registry_password)?
+        && (request.image.starts_with(&format!("{REGISTRY_HOST}/"))
+            || request
+                .image
+                .starts_with(crate::builder::LOCAL_IMAGE_PREFIX))
+    {
+        return Err("A registry login is not used for a cluster image.".into());
     }
     if request.image.is_empty()
         || request.image.starts_with('-')
@@ -1291,10 +1398,22 @@ pub(crate) fn parse_podman_containers(
 /// `podman ps --format json` puts the health check state in `Status`: empty
 /// without a check, else `starting`, `healthy`, or `unhealthy`. Podman builds
 /// the "Up 5 seconds (healthy)" text of the table output from it.
+/// Podman 6 has no `Health` field in `podman ps --format json`; the health is only the
+/// suffix of `Status`, as in "Up 3 minutes (healthy)".
 fn container_health(value: &serde_json::Value) -> Option<String> {
-    string_field(value, &["Health", "HealthStatus", "Status"])
-        .map(|health| health.trim().to_ascii_lowercase())
-        .filter(|health| matches!(health.as_str(), "starting" | "healthy" | "unhealthy"))
+    ["Health", "HealthStatus", "Status"]
+        .iter()
+        .find_map(|name| {
+            let field = value.get(*name)?.as_str()?.trim().to_ascii_lowercase();
+            let health = match field
+                .strip_suffix(')')
+                .and_then(|rest| rest.rsplit_once('('))
+            {
+                Some((_, suffix)) => suffix.trim_start_matches("health:").trim().to_string(),
+                None => field,
+            };
+            matches!(health.as_str(), "starting" | "healthy" | "unhealthy").then_some(health)
+        })
 }
 
 fn string_field<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {

@@ -16,6 +16,7 @@ mod registry_inspect;
 mod restore;
 mod secrets;
 mod trust;
+mod volume_backup;
 mod volume_transfer;
 mod volumes;
 

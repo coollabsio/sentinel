@@ -7,12 +7,12 @@ use axum::http::{HeaderMap, StatusCode};
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    BuilderReconcileRequest, ImageBuildRequest, RegistryInspectRequest, RegistryReconcileRequest,
-    RegistryServer,
+    BuilderReconcileRequest, ImageBuildRequest, ImageLoadRequest, RegistryInspectRequest,
+    RegistryReconcileRequest, RegistryServer,
 };
 use sentinel_protocol::{
-    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_REGISTRY_INSPECT,
-    CAPABILITY_REGISTRY_RECONCILE,
+    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_LOAD,
+    CAPABILITY_REGISTRY_INSPECT, CAPABILITY_REGISTRY_RECONCILE,
 };
 use serde::Deserialize;
 
@@ -32,6 +32,16 @@ pub(super) struct ImageBuildApiRequest {
     #[serde(default)]
     dockerfile_path: String,
     image: String,
+    #[serde(default)]
+    git_https_token: String,
+    #[serde(default)]
+    git_ssh_private_key: String,
+    #[serde(default)]
+    push_image: String,
+    #[serde(default)]
+    push_username: String,
+    #[serde(default)]
+    push_password: String,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +103,11 @@ pub(super) async fn image_build(
             base_directory: request.base_directory,
             dockerfile_path: request.dockerfile_path,
             image: request.image,
+            git_https_token: request.git_https_token,
+            git_ssh_private_key: request.git_ssh_private_key,
+            push_image: request.push_image,
+            push_username: request.push_username,
+            push_password: request.push_password,
         }),
         DEPLOY_TIMEOUT,
     )
@@ -220,5 +235,45 @@ pub(super) async fn registry_inspect(
         "registry_bytes": value.registry_bytes,
         "build_cache_bytes": value.build_cache_bytes,
         "builder_running": value.builder_running,
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct ImageLoadApiRequest {
+    server_id: String,
+    command_id: String,
+    build_id: String,
+    image: String,
+    keep_tags: u32,
+}
+
+/// Loads a finished local build into the Podman store of its Node.
+pub(super) async fn image_load(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ImageLoadApiRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = dispatch_with_timeout(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_IMAGE_LOAD,
+        Payload::ImageLoad(ImageLoadRequest {
+            build_id: request.build_id,
+            image: request.image,
+            keep_tags: request.keep_tags,
+        }),
+        DEPLOY_TIMEOUT,
+    )
+    .await?;
+    let Some(command_result::Payload::ImageLoad(value)) = result.payload else {
+        return Err(invalid_response());
+    };
+    Ok(Json(serde_json::json!({
+        "command_id": request.command_id,
+        "observed_at_unix_ms": result.observed_at_unix_ms,
+        "image": value.image,
+        "image_id": value.image_id,
     })))
 }

@@ -117,10 +117,60 @@ fn validate_server(server: &RegistryServer) -> Result<(), String> {
 
 /// A Docker-format auth file for one user of the cluster registry.
 pub(crate) fn auth_file(username: &str, password: &str) -> Vec<u8> {
+    login_auth_file(REGISTRY_HOST, username, password)
+}
+
+const DOCKER_HUB: &str = "docker.io";
+
+/// A Docker-format auth file with one login that only `host` gets. Docker Hub
+/// also gets the legacy key that BuildKit looks up.
+pub(crate) fn login_auth_file(host: &str, username: &str, password: &str) -> Vec<u8> {
     use base64::Engine;
     let token = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
-    serde_json::to_vec_pretty(&serde_json::json!({ "auths": { REGISTRY_HOST: { "auth": token } } }))
-        .unwrap_or_default()
+    let mut auths = serde_json::Map::new();
+    auths.insert(host.into(), serde_json::json!({ "auth": token }));
+    if host == DOCKER_HUB {
+        auths.insert(
+            "https://index.docker.io/v1/".into(),
+            serde_json::json!({ "auth": token }),
+        );
+    }
+    serde_json::to_vec_pretty(&serde_json::json!({ "auths": auths })).unwrap_or_default()
+}
+
+/// The registry host of an image reference, the way Podman reads it: the first
+/// path part is a host only when it has a `.` or a `:`, or is `localhost`.
+pub(crate) fn image_registry_host(image: &str) -> String {
+    let host = match image.split_once('/') {
+        Some((first, _)) if first.contains('.') || first.contains(':') || first == "localhost" => {
+            first.to_ascii_lowercase()
+        }
+        _ => return DOCKER_HUB.into(),
+    };
+    match host.as_str() {
+        "index.docker.io" | "registry-1.docker.io" | "registry.hub.docker.com" => DOCKER_HUB.into(),
+        _ => host,
+    }
+}
+
+/// An optional registry login: `Ok(false)` when both values are empty, an
+/// error when only one is set or a value cannot be a Basic login.
+pub(crate) fn validate_login(username: &str, password: &str) -> Result<bool, String> {
+    if username.is_empty() && password.is_empty() {
+        return Ok(false);
+    }
+    let printable = |value: &str| value.chars().all(|character| !character.is_control());
+    if username.is_empty()
+        || username.len() > 255
+        || username.contains(':')
+        || !printable(username)
+        || password.is_empty()
+        || password.len() > 8_192
+        || !printable(password)
+    {
+        return Err("The registry login is invalid.".into());
+    }
+    Ok(true)
 }
 
 pub(crate) fn zot_config(address: &str, push_username: &str, keep_tags: u32) -> Vec<u8> {

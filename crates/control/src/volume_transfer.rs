@@ -728,7 +728,7 @@ fn tail(text: &str, fallback: &str) -> String {
 
 /// The apparent size of the files under `path`, like `du -sb`: a hard-linked
 /// file counts once, and symbolic links are not followed.
-fn used_bytes(path: &Path) -> u64 {
+pub(crate) fn used_bytes(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut seen = HashSet::new();
     let mut pending = vec![path.to_path_buf()];

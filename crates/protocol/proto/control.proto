@@ -87,6 +87,9 @@ message Command {
     VolumeServeRequest volume_serve = 33;
     VolumeReceiveRequest volume_receive = 34;
     RegistryInspectRequest registry_inspect = 35;
+    ImageLoadRequest image_load = 36;
+    VolumeBackupRequest volume_backup = 37;
+    VolumeRestoreRequest volume_restore = 38;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -136,6 +139,9 @@ message CommandResult {
     VolumeServeResult volume_serve = 33;
     VolumeReceiveResult volume_receive = 34;
     RegistryInspectResult registry_inspect = 35;
+    ImageLoadResult image_load = 36;
+    VolumeBackupResult volume_backup = 37;
+    VolumeRestoreResult volume_restore = 38;
     CommandError error = 20;
   }
 }
@@ -263,6 +269,13 @@ message WorkloadDeployRequest {
   // revision; the value is never in the environment of the container. Needs
   // the label `coolify.revision` and `workload.secrets.v1`. At most 128.
   repeated WorkloadSecret secrets = 19;
+  // A login for the registry of `image`, for example a private GHCR or Docker
+  // Hub image. Both set or both empty; not for the cluster registry. Needs
+  // `workload.registry_auth.v1`. Sentinel writes them to a temporary Podman
+  // `--authfile` on tmpfs (0600, only the registry host of `image`), deletes it
+  // after `podman run`, and never journals or logs them.
+  string registry_username = 20;
+  string registry_password = 21;
 }
 
 message WorkloadSecret {
@@ -516,7 +529,10 @@ message ImageBuildRequest {
   // The coolify-builder image, for example
   // "ghcr.io/coollabsio/coolify-builder:1.0.0@sha256:...".
   string builder_image = 2;
-  // A public `https://` Git URL without credentials.
+  // A Git URL without credentials. Without a Git credential: a public
+  // `https://` URL. With `git_https_token`: an `https://` URL. With
+  // `git_ssh_private_key`: also `ssh://[user@]host[:port]/path` or
+  // `user@host:path`.
   string repository_url = 3;
   // The full commit SHA (40 or 64 lowercase hex characters).
   string commit_sha = 4;
@@ -527,13 +543,54 @@ message ImageBuildRequest {
   // Relative to `base_directory`; empty is "Dockerfile". Only for "dockerfile".
   string dockerfile_path = 7;
   // The target in the cluster registry:
-  // "registry.cluster.coolify.internal:5443/<repository>:<tag>".
+  // "registry.cluster.coolify.internal:5443/<repository>:<tag>". Or, with
+  // `image.load.v1`, a local image "localhost/<repository>:<tag>": the build
+  // writes a docker archive on this Node instead of a push, and
+  // `image.load.v1` loads it after the build.
   string image = 8;
+  // A short-lived HTTPS token for the repository host, for example a GitHub
+  // App installation token. Git sends it as the password of `x-access-token`.
+  // At most one Git credential is set. Needs `image.build.private_git.v1`.
+  // Sentinel gives it to the build container as a file on tmpfs, deletes it
+  // when the build ends, and never journals or logs it.
+  string git_https_token = 9;
+  // An OpenSSH or PEM private key (a deploy key) for an SSH repository URL.
+  // Handled like `git_https_token`.
+  string git_ssh_private_key = 10;
+  // A second target outside the cluster, for example
+  // "ghcr.io/acme/api:latest" (the v4 "Docker registry image name"). The build
+  // also pushes the image there; a failed push fails the build. The digest of
+  // the result stays the one of `image`. Needs `image.build.external_push.v1`.
+  string push_image = 11;
+  // An optional login for the registry of `push_image`. Both set or both
+  // empty. Handled like `git_https_token`: a read-only file on tmpfs that only
+  // the push to `push_image` uses.
+  string push_username = 12;
+  string push_password = 13;
 }
 
 message ImageBuildResult {
   string runtime_id = 1;
   string name = 2;
+}
+
+// Loads the archive of a finished local build (`image` "localhost/...") into
+// the Podman store of this Node and deletes the archive. A repeated request
+// succeeds when the image is already loaded. Then removes the oldest tags of
+// the same repository so that `keep_tags` remain; a tag that a container
+// uses stays.
+message ImageLoadRequest {
+  string build_id = 1;
+  // The `image` of the build: "localhost/<repository>:<tag>".
+  string image = 2;
+  // 1 to 100.
+  uint32 keep_tags = 3;
+}
+
+message ImageLoadResult {
+  string image = 1;
+  // The Podman image ID, `sha256:...`.
+  string image_id = 2;
 }
 
 // Converges BuildKit on this Node: the `coolify-buildkitd` container (rootless
@@ -683,6 +740,95 @@ message VolumeReceiveResult {
   uint64 bytes_total = 2;
   uint64 bytes_done = 3;
   // The end of the rsync error output when the pass failed.
+  string error = 4;
+}
+
+// Backs up one volume to S3 (decision 0009): `tar | zstd` of the volume,
+// sent as an S3 multipart upload through presigned part URLs. The Node never
+// gets an S3 key. The first call for a `backup_id` starts the backup in the
+// background; every call adds part URLs and returns the current state.
+// Sentinel chooses the part size from the used size of the volume and asks
+// for the next part URL with `next_part_number`. A finished backup is not
+// started again. Never journaled: the part URLs are credentials.
+message VolumeBackupRequest {
+  // 1 to 64 ASCII letters, digits or `-`.
+  string backup_id = 1;
+  // A `coolify-vol-<uuid>` name.
+  string volume_name = 2;
+  // A container that Sentinel stops before the backup and starts again after
+  // it, when it runs. Empty: the container runs during the backup.
+  string stop_container = 3;
+  // 1 to 600. Only with `stop_container`.
+  uint32 stop_timeout_seconds = 4;
+  // Presigned UploadPart URLs. A URL for a part number replaces the earlier one.
+  repeated VolumeBackupPartUrl part_urls = 5;
+  // Stops a running backup. Sentinel starts the stopped container again.
+  bool abort = 6;
+}
+
+message VolumeBackupPartUrl {
+  // 1 to 10000.
+  uint32 part_number = 1;
+  // An `http://` or `https://` URL of at most 8192 characters.
+  string url = 2;
+}
+
+message VolumeBackupPart {
+  uint32 part_number = 1;
+  // The ETag header of the UploadPart response, for CompleteMultipartUpload.
+  string etag = 2;
+  uint64 size_bytes = 3;
+}
+
+message VolumeBackupResult {
+  // "running", "succeeded" or "failed".
+  string state = 1;
+  // The apparent size of the files in the volume; 0 while unknown.
+  uint64 used_bytes = 2;
+  // 0 while unknown.
+  uint64 part_size_bytes = 3;
+  // The part that Sentinel needs a URL for next; 0 when it needs none.
+  uint32 next_part_number = 4;
+  // Every uploaded part, in order.
+  repeated VolumeBackupPart parts = 5;
+  // Archive bytes uploaded so far.
+  uint64 bytes_done = 6;
+  // After "succeeded": the size and the lowercase hex SHA-256 of the archive.
+  uint64 archive_bytes = 7;
+  string sha256 = 8;
+  string error = 9;
+}
+
+// Restores a backup archive into a volume (decision 0009). Never journaled:
+// a download holds a presigned URL.
+message VolumeRestoreRequest {
+  // 1 to 64 ASCII letters, digits or `-`.
+  string restore_id = 1;
+  // "download": the first call creates `volume_name` when it is missing,
+  // empties it, and starts to download and unpack the archive in the
+  // background; every call returns the current state. A volume that a
+  // container uses is rejected. A mismatch of the SHA-256 fails the download
+  // and empties the volume again.
+  // "switch": exchanges the data of `volume_name` and `target_volume_name`, so
+  // the target has the restored data and `volume_name` the old data. No
+  // running container may use either volume. Idempotent per `restore_id`.
+  string step = 2;
+  string volume_name = 3;
+  // Download: a presigned GetObject URL.
+  string url = 4;
+  // Download: the lowercase hex SHA-256 of the archive.
+  string sha256 = 5;
+  // Download: the size of the archive; 0 when unknown.
+  uint64 archive_bytes = 6;
+  // Switch: the volume that gets the restored data.
+  string target_volume_name = 7;
+}
+
+message VolumeRestoreResult {
+  // "running", "succeeded" or "failed".
+  string state = 1;
+  uint64 bytes_total = 2;
+  uint64 bytes_done = 3;
   string error = 4;
 }
 

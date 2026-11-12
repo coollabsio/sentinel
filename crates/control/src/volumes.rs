@@ -114,6 +114,33 @@ fn volume_exists(podman: &Path, name: &str) -> Result<bool, String> {
     }
 }
 
+/// The names of the containers that use a volume: every container with
+/// `all`, else only the running ones.
+pub(crate) fn containers_using(
+    podman: &Path,
+    name: &str,
+    all: bool,
+) -> Result<Vec<String>, String> {
+    let filter = format!("volume={name}");
+    let mut args = vec!["ps", "--filter", &filter, "--format", "{{.Names}}"];
+    if all {
+        args.push("--all");
+    }
+    let output = podman_query(podman, &args)?;
+    if !output.status.success() {
+        return Err(stderr_message(
+            &output,
+            "Podman could not list the containers of the volume.",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Creates each volume that does not exist yet. Podman cannot change the
 /// labels of an existing volume, so an existing volume stays as it is.
 pub(crate) fn ensure_volumes<'a>(

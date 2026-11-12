@@ -154,6 +154,10 @@ struct WorkloadDeployApiRequest {
     health_check: Option<DeployHealthCheck>,
     #[serde(default)]
     secrets: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    registry_username: String,
+    #[serde(default)]
+    registry_password: String,
 }
 
 #[derive(Deserialize)]
@@ -537,6 +541,7 @@ pub async fn serve(
         )
         .route("/v1/commands/ingress.reconcile", post(ingress_reconcile))
         .route("/v1/commands/image.build", post(build::image_build))
+        .route("/v1/commands/image.load", post(build::image_load))
         .route(
             "/v1/commands/builder.reconcile",
             post(build::builder_reconcile),
@@ -552,6 +557,8 @@ pub async fn serve(
         .route("/v1/commands/volume.delete", post(volume::volume_delete))
         .route("/v1/commands/volume.serve", post(volume::volume_serve))
         .route("/v1/commands/volume.receive", post(volume::volume_receive))
+        .route("/v1/commands/volume.backup", post(volume::volume_backup))
+        .route("/v1/commands/volume.restore", post(volume::volume_restore))
         .with_state(ApiState { registry, token });
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "Flux internal command API is listening");
@@ -1134,6 +1141,8 @@ async fn workload_deploy(
                         .into_iter()
                         .map(|(key, value)| WorkloadSecret { key, value })
                         .collect(),
+                    registry_username: request.registry_username,
+                    registry_password: request.registry_password,
                 })),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },

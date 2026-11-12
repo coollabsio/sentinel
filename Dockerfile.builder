@@ -16,7 +16,7 @@ RUN apk add --no-cache curl && \
     tar -xzf /tmp/railpack.tar.gz -C /usr/local/bin railpack
 
 FROM alpine:3.24
-RUN apk upgrade --no-cache && apk add --no-cache ca-certificates git git-lfs jq && \
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates git git-lfs jq openssh-client && \
     addgroup -g 1000 build && adduser -D -u 1000 -G build -h /home/build build
 COPY --from=buildkit /usr/bin/buildctl /usr/local/bin/buildctl
 COPY --from=railpack /usr/local/bin/railpack /usr/local/bin/railpack

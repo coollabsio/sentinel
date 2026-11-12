@@ -6,6 +6,10 @@
 //! container with the same uid range; it clones the commit and builds through
 //! the BuildKit socket. Coolify follows it with `container.list` and
 //! `container.logs`, so a build never holds the command executor.
+//!
+//! A cluster with one Node runs no registry. Its builds target a
+//! `localhost/` image: the build writes a docker archive to a per-build
+//! directory, and `image.load.v1` loads it into the Podman store.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,6 +17,7 @@ use std::process::Command;
 use sentinel_protocol::REGISTRY_HOST;
 use sentinel_protocol::control::v1::{
     BuilderReconcileRequest, BuilderReconcileResult, ImageBuildRequest, ImageBuildResult,
+    ImageLoadRequest, ImageLoadResult,
 };
 
 use crate::commands::{PODMAN_DEPLOY_TIMEOUT, PODMAN_QUERY_TIMEOUT, podman_failure};
@@ -35,9 +40,21 @@ const BUILD_USER: u32 = 1_000;
 const BUILDER_DIR: &str = "etc/coolify/builder";
 /// Persistent, so the socket mount exists again after a reboot.
 const SOCKET_DIR: &str = "var/lib/coolify/builder/run";
+/// Host tmpfs for the Git credential of a running build (decision 0011).
+const GIT_CREDENTIAL_DIR: &str = "run/coolify-build-git";
+/// Where the build container sees the credential file, read-only.
+const GIT_CREDENTIAL_MOUNT: &str = "/run/coolify-git";
 const APPARMOR_PROFILE: &str = "coolify-buildkit";
 const APPARMOR_PROFILE_PATH: &str = "etc/apparmor.d/coolify-buildkit";
 const DEFAULT_CACHE_PERCENT: u64 = 20;
+/// One directory per local build. It holds the docker archive until
+/// `image.load.v1` loads it.
+const OUTPUT_DIR: &str = "var/lib/coolify/builder/out";
+/// Where the build container writes the archive. Matches the entrypoint.
+const OUTPUT_MOUNT: &str = "/coolify/out";
+const ARCHIVE_FILE: &str = "image.tar";
+/// A build image with this prefix stays on the builder Node.
+pub(crate) const LOCAL_IMAGE_PREFIX: &str = "localhost/";
 
 fn builder_dir(root: &Path) -> PathBuf {
     root.join(BUILDER_DIR)
@@ -45,6 +62,37 @@ fn builder_dir(root: &Path) -> PathBuf {
 
 fn socket_dir(root: &Path) -> PathBuf {
     root.join(SOCKET_DIR)
+}
+
+fn output_dir(root: &Path, build_id: &str) -> PathBuf {
+    root.join(OUTPUT_DIR).join(build_id)
+}
+
+fn is_local_image(image: &str) -> bool {
+    image.starts_with(LOCAL_IMAGE_PREFIX)
+}
+
+fn valid_build_id(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+/// The part after the registry host or `localhost/`: `<repository>:<tag>`,
+/// without a digest.
+fn build_target(image: &str) -> Option<&str> {
+    let target = image
+        .strip_prefix(&format!("{REGISTRY_HOST}/"))
+        .or_else(|| image.strip_prefix(LOCAL_IMAGE_PREFIX))?;
+    let valid = !target.is_empty()
+        && !target.starts_with('-')
+        && target.len() <= 2_048
+        && target
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-/:".contains(character))
+        && target.contains(':');
+    valid.then_some(target)
 }
 
 fn uid_map() -> [String; 4] {
@@ -269,6 +317,87 @@ fn valid_relative_path(value: &str) -> bool {
             .all(|segment| segment != ".." && !segment.starts_with('-'))
 }
 
+/// The Git credential of one build (decision 0011).
+#[derive(Clone, Copy)]
+enum GitCredential<'a> {
+    None,
+    HttpsToken(&'a str),
+    SshKey(&'a str),
+}
+
+impl<'a> GitCredential<'a> {
+    fn of(request: &'a ImageBuildRequest) -> Result<Self, String> {
+        match (
+            request.git_https_token.as_str(),
+            request.git_ssh_private_key.as_str(),
+        ) {
+            ("", "") => Ok(Self::None),
+            (token, "") if valid_https_token(token) => Ok(Self::HttpsToken(token)),
+            ("", key) if valid_ssh_private_key(key) => Ok(Self::SshKey(key)),
+            ("", _) => Err("The Git SSH private key is invalid.".into()),
+            (_, "") => Err("The Git HTTPS token is invalid.".into()),
+            _ => Err("A build takes at most one Git credential.".into()),
+        }
+    }
+
+    /// The file name under [`GIT_CREDENTIAL_MOUNT`]; the entrypoint picks the
+    /// Git transport by the file that exists.
+    fn file_name(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::HttpsToken(_) => Some("token"),
+            Self::SshKey(_) => Some("ssh-key"),
+        }
+    }
+}
+
+fn valid_https_token(value: &str) -> bool {
+    (1..=1_024).contains(&value.len())
+        && value.chars().all(|character| character.is_ascii_graphic())
+}
+
+fn valid_ssh_private_key(value: &str) -> bool {
+    let key = value.trim();
+    key.len() <= 16_384
+        && key.starts_with("-----BEGIN ")
+        && key
+            .lines()
+            .next()
+            .is_some_and(|line| line.ends_with("PRIVATE KEY-----"))
+        && key.ends_with("PRIVATE KEY-----")
+        && key
+            .chars()
+            .all(|character| character.is_ascii_graphic() || " \r\n".contains(character))
+}
+
+fn valid_url_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-._~/%+".contains(character))
+}
+
+fn valid_ssh_user(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-._".contains(character))
+}
+
+fn valid_ssh_host(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && !value.starts_with(['-', '.'])
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-.".contains(character))
+}
+
+/// `https://host/path` without user info. Only these characters, so no
+/// newline and no `-` prefix reaches Git.
 fn valid_repository_url(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("https://") else {
         return false;
@@ -283,6 +412,36 @@ fn valid_repository_url(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || "-._~/:%+".contains(character))
 }
 
+/// `ssh://[user@]host[:port]/path` or the scp-like `user@host:path`.
+fn valid_ssh_repository_url(value: &str) -> bool {
+    if value.len() > 2_048 {
+        return false;
+    }
+    if let Some(rest) = value.strip_prefix("ssh://") {
+        let Some((authority, path)) = rest.split_once('/') else {
+            return false;
+        };
+        let host_port = match authority.split_once('@') {
+            Some((user, host_port)) if valid_ssh_user(user) => host_port,
+            Some(_) => return false,
+            None => authority,
+        };
+        let host = match host_port.split_once(':') {
+            Some((host, port)) if port.parse::<u16>().is_ok_and(|port| port > 0) => host,
+            Some(_) => return false,
+            None => host_port,
+        };
+        return valid_ssh_host(host) && valid_url_path(path);
+    }
+    let Some((user, rest)) = value.split_once('@') else {
+        return false;
+    };
+    let Some((host, path)) = rest.split_once(':') else {
+        return false;
+    };
+    valid_ssh_user(user) && valid_ssh_host(host) && valid_url_path(path)
+}
+
 pub(crate) fn validate_build(request: &ImageBuildRequest) -> Result<(), String> {
     let image_valid = |value: &str| {
         !value.is_empty()
@@ -292,19 +451,30 @@ pub(crate) fn validate_build(request: &ImageBuildRequest) -> Result<(), String> 
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || "._-/:@".contains(character))
     };
-    if !(1..=64).contains(&request.build_id.len())
-        || !request
-            .build_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-')
-    {
+    if !valid_build_id(&request.build_id) {
         return Err("The build ID is invalid.".into());
     }
     if !image_valid(&request.builder_image) {
         return Err("The builder image is invalid.".into());
     }
-    if !valid_repository_url(&request.repository_url) {
-        return Err("The repository URL must be a public https:// URL without credentials.".into());
+    match GitCredential::of(request)? {
+        GitCredential::None if !valid_repository_url(&request.repository_url) => {
+            return Err(
+                "The repository URL must be a public https:// URL without credentials.".into(),
+            );
+        }
+        GitCredential::HttpsToken(_) if !valid_repository_url(&request.repository_url) => {
+            return Err("The repository URL must be an https:// URL without credentials.".into());
+        }
+        GitCredential::SshKey(_)
+            if !valid_repository_url(&request.repository_url)
+                && !valid_ssh_repository_url(&request.repository_url) =>
+        {
+            return Err(
+                "The repository URL must be an https://, ssh://, or user@host:path URL without a password.".into(),
+            );
+        }
+        _ => {}
     }
     if !matches!(request.commit_sha.len(), 40 | 64)
         || !request
@@ -324,13 +494,162 @@ pub(crate) fn validate_build(request: &ImageBuildRequest) -> Result<(), String> 
     {
         return Err("A build path is invalid.".into());
     }
-    let Some(target) = request.image.strip_prefix(&format!("{REGISTRY_HOST}/")) else {
-        return Err("The build image must be in the cluster registry.".into());
-    };
-    if !image_valid(target) || target.contains('@') || !target.contains(':') {
-        return Err("The build image is invalid.".into());
+    if build_target(&request.image).is_none() {
+        return Err(
+            "The build image must be a tag in the cluster registry or a localhost/ image.".into(),
+        );
+    }
+    validate_push(request)
+}
+
+/// The optional external target (`image.build.external_push.v1`): a tag
+/// outside the cluster registry, with an optional login for its registry.
+fn validate_push(request: &ImageBuildRequest) -> Result<(), String> {
+    let has_login =
+        crate::registry::validate_login(&request.push_username, &request.push_password)?;
+    let image = request.push_image.as_str();
+    if image.is_empty() {
+        return if has_login {
+            Err("A push login needs a push image.".into())
+        } else {
+            Ok(())
+        };
+    }
+    let repository_end = image.rfind('/').map_or(0, |slash| slash + 1);
+    let valid = !image.starts_with('-')
+        && image.len() <= 2_048
+        && image
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-/:".contains(character))
+        && image[repository_end..].contains(':')
+        && !image.starts_with(&format!("{REGISTRY_HOST}/"))
+        && !is_local_image(image);
+    if !valid {
+        return Err("The push image must be a tag outside the cluster registry.".into());
     }
     Ok(())
+}
+
+const PUSH_LOGIN_FILE: &str = "push-config.json";
+const PUSH_LOGIN_MOUNT: &str = "/run/coolify-push";
+
+/// Writes the Docker config with the login of `push_image` next to the Git
+/// credential, 0600 and owned by the build user. Only the push step reads it.
+fn write_push_login(root: &Path, request: &ImageBuildRequest) -> Result<bool, String> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    if request.push_username.is_empty() {
+        return Ok(false);
+    }
+    let error = || "The push login could not be written.".to_string();
+    let dir = git_credential_dir(root, &request.build_id);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|_| error())?;
+    let path = dir.join(PUSH_LOGIN_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|_| error())?;
+    file.write_all(&crate::registry::login_auth_file(
+        &crate::registry::image_registry_host(&request.push_image),
+        &request.push_username,
+        &request.push_password,
+    ))
+    .map_err(|_| error())?;
+    own_by_build_user(&path)?;
+    Ok(true)
+}
+
+/// One directory per build under the host `/run` (tmpfs), so a credential
+/// never reaches the disk and is gone after a reboot.
+fn git_credential_dir(root: &Path, build_id: &str) -> PathBuf {
+    root.join(GIT_CREDENTIAL_DIR).join(build_id)
+}
+
+/// Writes the credential file, 0600 and owned by the build user, in a 0700
+/// directory of root.
+fn write_git_credential(
+    root: &Path,
+    build_id: &str,
+    credential: GitCredential,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let contents = match credential {
+        GitCredential::None => return Ok(()),
+        GitCredential::HttpsToken(token) => token.to_string(),
+        // OpenSSH needs the final newline and no carriage returns.
+        GitCredential::SshKey(key) => format!("{}\n", key.replace('\r', "").trim()),
+    };
+    let Some(file_name) = credential.file_name() else {
+        return Ok(());
+    };
+    let error = || "The Git credential could not be written.".to_string();
+    let dir = git_credential_dir(root, build_id);
+    remove_git_credential(root, build_id);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|_| error())?;
+    let path = dir.join(file_name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|_| error())?;
+    file.write_all(contents.as_bytes()).map_err(|_| error())?;
+    own_by_build_user(&path)
+}
+
+fn remove_git_credential(root: &Path, build_id: &str) {
+    match std::fs::remove_dir_all(git_credential_dir(root, build_id)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(%error, build_id, "could not remove the Git credential of a build")
+        }
+    }
+}
+
+/// Deletes the credential of a build once its container is no longer running:
+/// it exited, was stopped (a cancel), or was removed. `podman wait` returns at
+/// once for a container that is already gone.
+fn remove_git_credential_after_build(root: &Path, podman: &Path, build_id: &str) {
+    let (root, podman, build_id) = (
+        root.to_path_buf(),
+        podman.to_path_buf(),
+        build_id.to_string(),
+    );
+    std::thread::spawn(move || {
+        let _ = Command::new(&podman)
+            .args(["wait", &build_container_name(&build_id)])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        remove_git_credential(&root, &build_id);
+    });
+}
+
+/// Watches the credentials that an earlier Sentinel process wrote, so they
+/// are deleted when their builds end.
+pub(crate) fn remove_git_credentials_after_builds(root: &Path, podman: &Path) {
+    let Ok(entries) = std::fs::read_dir(root.join(GIT_CREDENTIAL_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if let Some(build_id) = entry.file_name().to_str() {
+            remove_git_credential_after_build(root, podman, build_id);
+        }
+    }
 }
 
 pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<String> {
@@ -366,6 +685,42 @@ pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<S
             "{}:/coolify/docker:ro",
             builder_dir(root).join("docker").display()
         ),
+    ]);
+    if let Some(file_name) = GitCredential::of(request)
+        .ok()
+        .and_then(GitCredential::file_name)
+    {
+        arguments.extend([
+            "--volume".into(),
+            format!(
+                "{}:{GIT_CREDENTIAL_MOUNT}/{file_name}:ro",
+                git_credential_dir(root, &request.build_id)
+                    .join(file_name)
+                    .display()
+            ),
+        ]);
+    }
+    if !request.push_username.is_empty() {
+        arguments.extend([
+            "--volume".into(),
+            format!(
+                "{}:{PUSH_LOGIN_MOUNT}/config.json:ro",
+                git_credential_dir(root, &request.build_id)
+                    .join(PUSH_LOGIN_FILE)
+                    .display()
+            ),
+        ]);
+    }
+    if is_local_image(&request.image) {
+        arguments.extend([
+            "--volume".into(),
+            format!(
+                "{}:{OUTPUT_MOUNT}",
+                output_dir(root, &request.build_id).display()
+            ),
+        ]);
+    }
+    arguments.extend([
         request.builder_image.clone(),
         "--repository".into(),
         request.repository_url.clone(),
@@ -380,6 +735,9 @@ pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<S
         "--image".into(),
         request.image.clone(),
     ]);
+    if !request.push_image.is_empty() {
+        arguments.extend(["--push-image".into(), request.push_image.clone()]);
+    }
     arguments
 }
 
@@ -406,6 +764,39 @@ pub(crate) fn start(
     if !socket_dir(root).join("buildkitd.sock").exists() {
         return Err("BuildKit is not running on this Node.".into());
     }
+    let local = is_local_image(&request.image);
+    if local {
+        remove_stale_outputs(root, podman);
+        let dir = output_dir(root, &request.build_id);
+        std::fs::create_dir_all(&dir)
+            .map_err(|_| "The build output directory could not be created.")?;
+        own_by_build_user(&dir)?;
+    }
+    let credential = GitCredential::of(request)?;
+    let push_login = write_git_credential(root, &request.build_id, credential)
+        .and_then(|()| write_push_login(root, request))
+        .inspect_err(|_| {
+            remove_git_credential(root, &request.build_id);
+        })?;
+    let started = run_build(root, podman, request, name);
+    if local && started.is_err() {
+        let _ = std::fs::remove_dir_all(output_dir(root, &request.build_id));
+    }
+    if push_login || !matches!(credential, GitCredential::None) {
+        match &started {
+            Ok(_) => remove_git_credential_after_build(root, podman, &request.build_id),
+            Err(_) => remove_git_credential(root, &request.build_id),
+        }
+    }
+    started
+}
+
+fn run_build(
+    root: &Path,
+    podman: &Path,
+    request: &ImageBuildRequest,
+    name: String,
+) -> Result<ImageBuildResult, String> {
     let output = output_with_timeout(
         Command::new(podman).args(build_arguments(root, request)),
         PODMAN_DEPLOY_TIMEOUT,
@@ -422,4 +813,139 @@ pub(crate) fn start(
         return Err("Podman did not return a container ID.".into());
     }
     Ok(ImageBuildResult { runtime_id, name })
+}
+
+/// Deletes the output of builds whose container is gone: they failed, were
+/// cancelled, or Coolify never loaded them. Coolify runs one build at a time
+/// on a builder Node and loads it before the next one starts, so no archive
+/// that waits for its load is deleted.
+fn remove_stale_outputs(root: &Path, podman: &Path) {
+    let Ok(entries) = std::fs::read_dir(root.join(OUTPUT_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(build_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let exists = output_with_timeout(
+            Command::new(podman).args(["container", "exists", &build_container_name(&build_id)]),
+            PODMAN_QUERY_TIMEOUT,
+        )
+        .is_ok_and(|output| output.status.success());
+        if !exists {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+pub(crate) fn validate_load(request: &ImageLoadRequest) -> Result<(), String> {
+    if !valid_build_id(&request.build_id) {
+        return Err("The build ID is invalid.".into());
+    }
+    if !is_local_image(&request.image) || build_target(&request.image).is_none() {
+        return Err("The image must be a localhost/ image.".into());
+    }
+    if !(1..=100).contains(&request.keep_tags) {
+        return Err("keep_tags must be 1 to 100.".into());
+    }
+    Ok(())
+}
+
+fn image_id(podman: &Path, image: &str) -> Option<String> {
+    let output = output_with_timeout(
+        Command::new(podman).args(["image", "inspect", "--format", "{{.Id}}", image]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .ok()?;
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !id.is_empty()).then(|| format!("sha256:{id}"))
+}
+
+/// Loads the archive of a local build, then keeps the newest `keep_tags`
+/// tags of its repository.
+pub(crate) fn load(
+    root: &Path,
+    podman: &Path,
+    request: &ImageLoadRequest,
+) -> Result<ImageLoadResult, String> {
+    validate_load(request)?;
+    let dir = output_dir(root, &request.build_id);
+    let archive = dir.join(ARCHIVE_FILE);
+    if archive.is_file() {
+        let output = output_with_timeout(
+            Command::new(podman)
+                .arg("load")
+                .arg("--input")
+                .arg(&archive),
+            PODMAN_DEPLOY_TIMEOUT,
+        )
+        .map_err(|error| podman_failure(&error))?;
+        if !output.status.success() {
+            return Err(stderr_or(
+                &output.stderr,
+                "Podman could not load the build.",
+            ));
+        }
+    }
+    let Some(image_id) = image_id(podman, &request.image) else {
+        return Err("The build left no image to load.".into());
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    remove_old_tags(podman, &request.image, request.keep_tags as usize);
+    Ok(ImageLoadResult {
+        image: request.image.clone(),
+        image_id,
+    })
+}
+
+/// `podman rmi` without `--force`: a tag that a container uses stays.
+fn remove_old_tags(podman: &Path, image: &str, keep: usize) {
+    let Some((repository, _)) = image.rsplit_once(':') else {
+        return;
+    };
+    let Ok(output) = output_with_timeout(
+        Command::new(podman).args(["images", "--format", "json"]),
+        PODMAN_QUERY_TIMEOUT,
+    ) else {
+        return;
+    };
+    let Ok(images) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) else {
+        return;
+    };
+    for name in old_tags(&images, repository, image, keep) {
+        let _ = output_with_timeout(
+            Command::new(podman).args(["rmi", &name]),
+            PODMAN_QUERY_TIMEOUT,
+        );
+    }
+}
+
+/// The tags of `repository` beyond the newest `keep`, by creation time. The
+/// image that was just loaded is never one of them.
+pub(crate) fn old_tags(
+    images: &[serde_json::Value],
+    repository: &str,
+    current: &str,
+    keep: usize,
+) -> Vec<String> {
+    let prefix = format!("{repository}:");
+    let mut tags: Vec<(i64, String)> = images
+        .iter()
+        .flat_map(|image| {
+            let created = image["Created"].as_i64().unwrap_or(0);
+            image["Names"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|name| name.starts_with(&prefix))
+                .map(move |name| (created, name.to_string()))
+        })
+        .collect();
+    tags.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    tags.into_iter()
+        .map(|(_, name)| name)
+        .filter(|name| name != current)
+        .skip(keep.saturating_sub(1))
+        .collect()
 }

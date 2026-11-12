@@ -513,6 +513,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "ingress.tls.v1",
             "ingress.routes.v2",
             "image.build.v1",
+            "image.build.private_git.v1",
             "builder.reconcile.v1",
             "registry.reconcile.v1",
             "registry.inspect.v1",
@@ -1235,6 +1236,8 @@ fn builds_shell_free_podman_deploy_arguments() {
         mounts: Vec::new(),
         health_check: None,
         secrets: Vec::new(),
+        registry_username: String::new(),
+        registry_password: String::new(),
     };
 
     let deploy = crate::commands::podman_deploy_args(&request).unwrap();

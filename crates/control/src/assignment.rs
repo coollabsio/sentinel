@@ -323,9 +323,14 @@ impl AssignmentClient {
             .with_control_tls(self.control_tls.clone()),
         ));
         // Volume transfers keep their state in memory; daemons and firewall
-        // elements of an earlier Sentinel process have no owner any more.
+        // elements of an earlier Sentinel process have no owner any more. Git
+        // credentials of builds that an earlier process started get a watcher.
         let _ = tokio::task::spawn_blocking(|| {
-            crate::volume_transfer::remove_leftovers(std::path::Path::new("/"))
+            crate::volume_transfer::remove_leftovers(std::path::Path::new("/"));
+            crate::builder::remove_git_credentials_after_builds(
+                std::path::Path::new("/"),
+                std::path::Path::new("podman"),
+            );
         })
         .await;
         // Restores the approved cluster network and stopped workloads once per

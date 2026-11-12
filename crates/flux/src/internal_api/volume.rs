@@ -7,11 +7,12 @@ use axum::http::{HeaderMap, StatusCode};
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    VolumeDeleteRequest, VolumeObservation, VolumeReceiveRequest, VolumeServeRequest,
-    WorkloadVolumeMount,
+    VolumeBackupPartUrl, VolumeBackupRequest, VolumeDeleteRequest, VolumeObservation,
+    VolumeReceiveRequest, VolumeRestoreRequest, VolumeServeRequest, WorkloadVolumeMount,
 };
 use sentinel_protocol::{
-    CAPABILITY_VOLUME_DELETE, CAPABILITY_VOLUME_RECEIVE, CAPABILITY_VOLUME_SERVE,
+    CAPABILITY_VOLUME_BACKUP, CAPABILITY_VOLUME_DELETE, CAPABILITY_VOLUME_RECEIVE,
+    CAPABILITY_VOLUME_RESTORE, CAPABILITY_VOLUME_SERVE,
 };
 use serde::{Deserialize, Serialize};
 
@@ -191,6 +192,143 @@ pub(super) async fn volume_receive(
     )
     .await?;
     let Some(command_result::Payload::VolumeReceive(value)) = result.payload else {
+        return Err(invalid_response());
+    };
+    Ok(Json(serde_json::json!({
+        "command_id": request.command_id,
+        "observed_at_unix_ms": result.observed_at_unix_ms,
+        "state": value.state,
+        "bytes_total": value.bytes_total,
+        "bytes_done": value.bytes_done,
+        "error": value.error,
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct PartUrl {
+    part_number: u32,
+    url: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct VolumeBackupApiRequest {
+    server_id: String,
+    command_id: String,
+    backup_id: String,
+    volume_name: String,
+    #[serde(default)]
+    stop_container: String,
+    #[serde(default)]
+    stop_timeout_seconds: u32,
+    #[serde(default)]
+    part_urls: Vec<PartUrl>,
+    #[serde(default)]
+    abort: bool,
+}
+
+#[derive(Deserialize)]
+pub(super) struct VolumeRestoreApiRequest {
+    server_id: String,
+    command_id: String,
+    restore_id: String,
+    step: String,
+    volume_name: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    sha256: String,
+    #[serde(default)]
+    archive_bytes: u64,
+    #[serde(default)]
+    target_volume_name: String,
+}
+
+/// Starts a volume backup on the Node, adds part URLs, or reads its state
+/// (decision 0009). It never waits for the backup.
+pub(super) async fn volume_backup(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<VolumeBackupApiRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = dispatch_with_timeout(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_VOLUME_BACKUP,
+        Payload::VolumeBackup(VolumeBackupRequest {
+            backup_id: request.backup_id,
+            volume_name: request.volume_name,
+            stop_container: request.stop_container,
+            stop_timeout_seconds: request.stop_timeout_seconds,
+            part_urls: request
+                .part_urls
+                .into_iter()
+                .map(|part| VolumeBackupPartUrl {
+                    part_number: part.part_number,
+                    url: part.url,
+                })
+                .collect(),
+            abort: request.abort,
+        }),
+        LIFECYCLE_TIMEOUT,
+    )
+    .await?;
+    let Some(command_result::Payload::VolumeBackup(value)) = result.payload else {
+        return Err(invalid_response());
+    };
+    let parts = value
+        .parts
+        .into_iter()
+        .map(|part| {
+            serde_json::json!({
+                "part_number": part.part_number,
+                "etag": part.etag,
+                "size_bytes": part.size_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({
+        "command_id": request.command_id,
+        "observed_at_unix_ms": result.observed_at_unix_ms,
+        "state": value.state,
+        "used_bytes": value.used_bytes,
+        "part_size_bytes": value.part_size_bytes,
+        "next_part_number": value.next_part_number,
+        "parts": parts,
+        "bytes_done": value.bytes_done,
+        "archive_bytes": value.archive_bytes,
+        "sha256": value.sha256,
+        "error": value.error,
+    })))
+}
+
+/// Starts or reads a restore download, or switches the data of two volumes
+/// (decision 0009).
+pub(super) async fn volume_restore(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<VolumeRestoreApiRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = dispatch_with_timeout(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_VOLUME_RESTORE,
+        Payload::VolumeRestore(VolumeRestoreRequest {
+            restore_id: request.restore_id,
+            step: request.step,
+            volume_name: request.volume_name,
+            url: request.url,
+            sha256: request.sha256,
+            archive_bytes: request.archive_bytes,
+            target_volume_name: request.target_volume_name,
+        }),
+        LIFECYCLE_TIMEOUT,
+    )
+    .await?;
+    let Some(command_result::Payload::VolumeRestore(value)) = result.payload else {
         return Err(invalid_response());
     };
     Ok(Json(serde_json::json!({
