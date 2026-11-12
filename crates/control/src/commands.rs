@@ -28,6 +28,7 @@ use sentinel_protocol::{
     CAPABILITY_VOLUME_BACKUP, CAPABILITY_VOLUME_DELETE, CAPABILITY_VOLUME_RECEIVE,
     CAPABILITY_VOLUME_RESTORE, CAPABILITY_VOLUME_SERVE,
 };
+use sentinel_protocol::{CAPABILITY_WORKLOAD_EXEC, CAPABILITY_WORKLOAD_TERMINAL};
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 use tokio::sync::Notify;
@@ -148,6 +149,7 @@ impl CommandExecutor {
         // volume.receive are idempotent per transfer and carry the transfer
         // secret, which must not be stored. registry.inspect is a read-only report.
         // volume.backup and volume.restore carry presigned S3 URLs.
+        // workload.exec and workload.terminal carry commands and sessions.
         let journaled = !matches!(
             command.command_type.as_str(),
             CAPABILITY_LOGS_READ
@@ -157,6 +159,8 @@ impl CommandExecutor {
                 | CAPABILITY_REGISTRY_INSPECT
                 | CAPABILITY_VOLUME_BACKUP
                 | CAPABILITY_VOLUME_RESTORE
+                | CAPABILITY_WORKLOAD_EXEC
+                | CAPABILITY_WORKLOAD_TERMINAL
         );
         let lookup = if journaled {
             self.journal.lookup(&command.command_id, &request)
@@ -288,6 +292,12 @@ impl CommandExecutor {
             (CAPABILITY_VOLUME_RESTORE, Some(Payload::VolumeRestore(request))) => {
                 crate::volume_backup::validate_restore(request).is_ok()
             }
+            (CAPABILITY_WORKLOAD_EXEC, Some(Payload::WorkloadExec(request))) => {
+                crate::exec::validate(request).is_ok()
+            }
+            (CAPABILITY_WORKLOAD_TERMINAL, Some(Payload::WorkloadTerminal(request))) => {
+                crate::terminal::validate(request).is_ok()
+            }
             _ => false,
         };
         let accepted = !(command.command_id.is_empty()
@@ -320,6 +330,8 @@ impl CommandExecutor {
                     | CAPABILITY_VOLUME_RECEIVE
                     | CAPABILITY_VOLUME_BACKUP
                     | CAPABILITY_VOLUME_RESTORE
+                    | CAPABILITY_WORKLOAD_EXEC
+                    | CAPABILITY_WORKLOAD_TERMINAL
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
@@ -666,6 +678,22 @@ impl CommandExecutor {
                     command_result::Payload::VolumeRestore(result),
                 ),
                 Err(message) => failed(&command.command_id, "volume_restore_failed", &message),
+            }
+        } else if let Some(Payload::WorkloadExec(request)) = command.payload {
+            match crate::exec::exec(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::WorkloadExec(result),
+                ),
+                Err(message) => failed(&command.command_id, "workload_exec_failed", &message),
+            }
+        } else if let Some(Payload::WorkloadTerminal(request)) = command.payload {
+            match crate::terminal::open(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::WorkloadTerminal(result),
+                ),
+                Err(message) => failed(&command.command_id, "workload_terminal_failed", &message),
             }
         } else {
             failed(

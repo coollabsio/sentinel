@@ -7,6 +7,8 @@ use sentinel_protocol::{
     PROTOCOL_MIN, VOLUME_CAPABILITIES, intersect_capabilities, select_protocol,
 };
 
+use sentinel_protocol::EXEC_CAPABILITIES;
+
 use crate::CredentialClaims;
 
 const MAX_HELLO_FIELD_BYTES: usize = 128;
@@ -59,6 +61,7 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
     .chain(NETWORK_CAPABILITIES)
     .chain(BUILD_CAPABILITIES)
     .chain(VOLUME_CAPABILITIES)
+    .chain(EXEC_CAPABILITIES)
     .collect::<Vec<_>>();
     let capabilities =
         intersect_capabilities(&claims.capabilities, &hello.capabilities, &supported);

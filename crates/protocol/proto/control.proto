@@ -13,6 +13,7 @@ message AgentMessage {
     CommandAccepted command_accepted = 3;
     CommandResult command_result = 4;
     RuntimeChanged runtime_changed = 5;
+    TerminalOutput terminal_output = 6;
   }
 }
 
@@ -22,6 +23,7 @@ message ControlMessage {
     Command command = 2;
     EventAck event_ack = 3;
     ShutdownHint shutdown_hint = 4;
+    TerminalInput terminal_input = 5;
   }
 }
 
@@ -90,6 +92,8 @@ message Command {
     ImageLoadRequest image_load = 36;
     VolumeBackupRequest volume_backup = 37;
     VolumeRestoreRequest volume_restore = 38;
+    WorkloadExecRequest workload_exec = 50;
+    WorkloadTerminalRequest workload_terminal = 51;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -142,6 +146,8 @@ message CommandResult {
     ImageLoadResult image_load = 36;
     VolumeBackupResult volume_backup = 37;
     VolumeRestoreResult volume_restore = 38;
+    WorkloadExecResult workload_exec = 50;
+    WorkloadTerminalResult workload_terminal = 51;
     CommandError error = 20;
   }
 }
@@ -850,4 +856,91 @@ message VolumeRestoreResult {
 message CommandError {
   string code = 1;
   string message = 2;
+}
+
+// Runs one command in a container that Coolify manages (decision 0018). The
+// argv runs without a host shell. The first call for an `exec_id` starts the
+// command in the background; every call returns the current state, so a long
+// command does not hold the command queue. Never journaled: the arguments and
+// the output can hold secrets.
+message WorkloadExecRequest {
+  // 1 to 64 ASCII letters, digits or `-`.
+  string exec_id = 1;
+  // The container name. It must carry `coolify.managed=true`.
+  string container = 2;
+  // 1 to 256 arguments, at most 64 KiB together, without NUL bytes.
+  repeated string argv = 3;
+  // 1 to 36000. Sentinel stops `podman exec` after this time.
+  uint32 timeout_seconds = 4;
+}
+
+message WorkloadExecResult {
+  // "running", "succeeded" (exit code 0) or "failed".
+  string state = 1;
+  // Set when the command ended.
+  optional int32 exit_code = 2;
+  // stdout and stderr in one stream, the first 1 MiB.
+  bytes output = 3;
+  bool truncated = 4;
+  bool timed_out = 5;
+  // Why the command could not run or did not end normally.
+  string error = 6;
+}
+
+// Opens an interactive shell with a PTY in a container that Coolify manages
+// (decision 0018). Sentinel chooses the shell; the request holds no command.
+// After the result, `TerminalInput` and `TerminalOutput` carry the session.
+// Never journaled.
+message WorkloadTerminalRequest {
+  // 1 to 64 ASCII letters, digits or `-`, chosen by Flux.
+  string session_id = 1;
+  // The container name. It must carry `coolify.managed=true`.
+  string container = 2;
+  // 1 to 1000.
+  uint32 cols = 3;
+  uint32 rows = 4;
+}
+
+message WorkloadTerminalResult {
+  string session_id = 1;
+}
+
+// Flux to Sentinel, for a session from `workload.terminal.v1`.
+message TerminalInput {
+  string session_id = 1;
+  oneof frame {
+    // Keyboard input, at most 16 KiB.
+    bytes stdin = 2;
+    TerminalSize resize = 3;
+    // Flux delivered one output frame of this many bytes. Sentinel keeps at
+    // most 256 KiB and 256 frames of output unacknowledged.
+    uint32 ack = 4;
+    // Flux still holds the session. Sentinel ends a session that gets no
+    // frame for 3 minutes.
+    bool keepalive = 5;
+    // Ends the session.
+    bool close = 6;
+  }
+}
+
+message TerminalSize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+// Sentinel to Flux.
+message TerminalOutput {
+  string session_id = 1;
+  oneof frame {
+    // PTY output, at most 32 KiB.
+    bytes stdout = 2;
+    TerminalExit exit = 3;
+  }
+}
+
+message TerminalExit {
+  // Unset when the shell did not exit by itself.
+  optional int32 exit_code = 1;
+  // "exited", "closed", "idle", or an error.
+  string reason = 2;
 }

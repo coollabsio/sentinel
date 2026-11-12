@@ -145,6 +145,9 @@ impl Agent for AgentService {
                             .await;
                     }
                     Some(agent_message::Message::CommandAccepted(_)) => {}
+                    Some(agent_message::Message::TerminalOutput(frame)) => {
+                        registry.terminals().deliver(&server_id, frame);
+                    }
                     Some(agent_message::Message::CommandResult(result)) => {
                         registry.complete(&server_id, result).await;
                     }

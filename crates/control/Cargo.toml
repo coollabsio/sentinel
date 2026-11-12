@@ -15,6 +15,7 @@ reqwest.workspace = true
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-pemfile = "2.2"
+rustix = { version = "1.1", features = ["pty", "termios"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

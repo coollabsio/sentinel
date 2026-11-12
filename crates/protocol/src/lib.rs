@@ -105,6 +105,11 @@ pub const VOLUME_CAPABILITIES: [&str; 9] = [
     CAPABILITY_VOLUME_BACKUP,
     CAPABILITY_VOLUME_RESTORE,
 ];
+/// Runs one command in a managed container (decision 0018).
+pub const CAPABILITY_WORKLOAD_EXEC: &str = "workload.exec.v1";
+/// Opens an interactive shell in a managed container (decision 0018).
+pub const CAPABILITY_WORKLOAD_TERMINAL: &str = "workload.terminal.v1";
+pub const EXEC_CAPABILITIES: [&str; 2] = [CAPABILITY_WORKLOAD_EXEC, CAPABILITY_WORKLOAD_TERMINAL];
 /// The cluster registry. Sentinel discovery DNS resolves it to the Node that
 /// runs the registry.
 pub const REGISTRY_HOST: &str = "registry.cluster.coolify.internal:5443";

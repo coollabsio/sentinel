@@ -530,7 +530,9 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "volume.verify.v1",
             "workload.stop_timeout.v1",
             "volume.backup.v1",
-            "volume.restore.v1"
+            "volume.restore.v1",
+            "workload.exec.v1",
+            "workload.terminal.v1"
         ])
     );
 }

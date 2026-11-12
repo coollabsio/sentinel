@@ -33,6 +33,7 @@ use uuid::Uuid;
 use crate::{CommandDispatchError, ConnectionRegistry, now_millis};
 
 mod build;
+mod exec;
 mod volume;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -559,6 +560,12 @@ pub async fn serve(
         .route("/v1/commands/volume.receive", post(volume::volume_receive))
         .route("/v1/commands/volume.backup", post(volume::volume_backup))
         .route("/v1/commands/volume.restore", post(volume::volume_restore))
+        .route("/v1/commands/workload.exec", post(exec::workload_exec))
+        .route("/v1/terminals", post(exec::terminal_open))
+        .route(
+            "/v1/terminals/{session_id}/attach",
+            axum::routing::get(exec::terminal_attach),
+        )
         .with_state(ApiState { registry, token });
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "Flux internal command API is listening");

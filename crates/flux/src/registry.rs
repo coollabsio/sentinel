@@ -25,6 +25,7 @@ struct Connection {
 pub struct ConnectionRegistry {
     connections: Arc<RwLock<HashMap<String, Connection>>>,
     pending: Arc<Mutex<HashMap<String, PendingCommand>>>,
+    terminals: crate::terminal::TerminalSessions,
 }
 
 struct PendingCommand {
@@ -177,6 +178,39 @@ impl ConnectionRegistry {
                 Err(CommandDispatchError::Timeout)
             }
         }
+    }
+
+    pub fn terminals(&self) -> &crate::terminal::TerminalSessions {
+        &self.terminals
+    }
+
+    /// Sends a non-command message, such as a terminal frame, to the current
+    /// connection of `server_id` when it accepted `capability`. Waits while
+    /// the connection's queue is full.
+    pub async fn send_message(
+        &self,
+        server_id: &str,
+        capability: &str,
+        message: ControlMessage,
+    ) -> bool {
+        let sender = {
+            let connections = self.connections.read().await;
+            match connections.get(server_id) {
+                Some(connection)
+                    if connection
+                        .info
+                        .capabilities
+                        .iter()
+                        .any(|accepted| accepted == capability) =>
+                {
+                    connection.sender.clone()
+                }
+                _ => return false,
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), sender.send(message))
+            .await
+            .is_ok_and(|sent| sent.is_ok())
     }
 
     pub async fn complete(&self, server_id: &str, result: CommandResult) -> bool {

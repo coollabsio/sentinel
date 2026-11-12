@@ -12,8 +12,8 @@ use sentinel_protocol::{
     BUILD_CAPABILITIES, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
     CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_HEALTHCHECK, CAPABILITY_WORKLOAD_LIFECYCLE,
-    CAPABILITY_WORKLOAD_RESOURCES, CAPABILITY_WORKLOAD_SECRETS, NETWORK_CAPABILITIES,
-    VOLUME_CAPABILITIES,
+    CAPABILITY_WORKLOAD_RESOURCES, CAPABILITY_WORKLOAD_SECRETS, CAPABILITY_WORKLOAD_TERMINAL,
+    EXEC_CAPABILITIES, NETWORK_CAPABILITIES, VOLUME_CAPABILITIES,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
@@ -123,6 +123,7 @@ pub async fn connect(
                 .chain(NETWORK_CAPABILITIES.map(str::to_string))
                 .chain(BUILD_CAPABILITIES.map(str::to_string))
                 .chain(VOLUME_CAPABILITIES.map(str::to_string))
+                .chain(EXEC_CAPABILITIES.map(str::to_string))
                 .collect(),
                 boot_id: boot_id(),
                 trust_bundle_version,
@@ -169,6 +170,8 @@ pub async fn connect(
             .iter()
             .any(|capability| capability == required)
     };
+    let terminal_outbound = capability_accepted(CAPABILITY_WORKLOAD_TERMINAL)
+        .then(|| crate::terminal::attach(sender.clone()));
     let (runtime_shutdown, runtime_shutdown_receiver) = watch::channel(false);
     let _runtime_watcher = RuntimeWatcherGuard(runtime_shutdown);
     tokio::spawn(watch_runtime_changes(
@@ -199,6 +202,9 @@ pub async fn connect(
                 Ok(Some(message)) => {
                     match message.message {
                         Some(control_message::Message::ShutdownHint(_)) => return Ok(()),
+                        Some(control_message::Message::TerminalInput(frame)) if terminal_outbound.is_some() => {
+                            crate::terminal::input(frame);
+                        }
                         Some(control_message::Message::Command(command)) => {
                             let command_capability_accepted = capability_accepted(&command.command_type);
                             command_sender.send((command, command_capability_accepted)).await.map_err(|_| FluxConnectionError::Connection)?;
