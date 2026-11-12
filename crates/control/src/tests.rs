@@ -514,6 +514,9 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "ingress.routes.v2",
             "image.build.v1",
             "image.build.private_git.v1",
+            "image.load.v1",
+            "image.build.external_push.v1",
+            "workload.registry_auth.v1",
             "builder.reconcile.v1",
             "registry.reconcile.v1",
             "registry.inspect.v1",
@@ -523,7 +526,9 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "volume.receive.v1",
             "volume.transfer.v1",
             "volume.verify.v1",
-            "workload.stop_timeout.v1"
+            "workload.stop_timeout.v1",
+            "volume.backup.v1",
+            "volume.restore.v1"
         ])
     );
 }
