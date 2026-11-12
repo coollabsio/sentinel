@@ -51,9 +51,29 @@ impl OutputWithTimeout for Command {
     }
 }
 
+/// The reverse zones that systemd-resolved routes to this server, one name on
+/// each line. Sentinel writes the file next to the Corrosion configuration,
+/// together with the routing domains.
+const REVERSE_ZONES_FILE: &str = "coolify-reverse-zones";
+
+/// Reads the reverse zones of this server. Without the file, every name under
+/// `in-addr.arpa` counts as a name of this server: the routing domains are
+/// then unknown, and a forward of a routed name comes back as a new query.
+fn read_reverse_zones(corrosion_config: &Path) -> Option<Vec<String>> {
+    let zones =
+        std::fs::read_to_string(corrosion_config.with_file_name(REVERSE_ZONES_FILE)).ok()?;
+    Some(
+        zones
+            .lines()
+            .map(|zone| zone.trim().to_ascii_lowercase())
+            .filter(|zone| !zone.is_empty())
+            .collect(),
+    )
+}
+
 /// A name that this server answers itself. systemd-resolved routes the
-/// internal zone and the mesh reverse zones to this server, so a forward of
-/// such a name comes back as a new query.
+/// internal zone and the cluster reverse zones to this server, so a forward
+/// of such a name comes back as a new query.
 #[derive(Debug, PartialEq, Eq)]
 enum Name {
     Workload {
@@ -83,7 +103,11 @@ fn valid_label(value: &str) -> bool {
         && !value.ends_with('-')
 }
 
-fn parse_question(packet: &[u8], zone: &str) -> Result<Question, &'static str> {
+fn parse_question(
+    packet: &[u8],
+    zone: &str,
+    reverse_zones: Option<&[String]>,
+) -> Result<Question, &'static str> {
     if packet.len() < 17 || u16::from_be_bytes([packet[4], packet[5]]) != 1 {
         return Err("invalid DNS question count");
     }
@@ -120,6 +144,13 @@ fn parse_question(packet: &[u8], zone: &str) -> Result<Question, &'static str> {
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
     let name = if let Some(octets) = labels.strip_suffix(&["in-addr".into(), "arpa".into()]) {
+        if reverse_zones.is_some_and(|zones| {
+            !zones.iter().any(|zone| {
+                labels.ends_with(&zone.split('.').map(str::to_string).collect::<Vec<_>>())
+            })
+        }) {
+            return Err("name is outside the cluster reverse zones");
+        }
         let address = octets
             .iter()
             .rev()
@@ -356,7 +387,8 @@ fn answer_request(
     corrosion_config: &Path,
     max_packet: usize,
 ) -> Option<Vec<u8>> {
-    let question = parse_question(request, zone).ok()?;
+    let reverse_zones = read_reverse_zones(corrosion_config);
+    let question = parse_question(request, zone, reverse_zones.as_deref()).ok()?;
     Some(match (&question.name, question.record_type) {
         (
             Name::Workload {
@@ -531,7 +563,7 @@ mod tests {
     #[test]
     fn parses_only_namespace_qualified_internal_names() {
         let packet = query("web.default.coolify.internal.");
-        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
 
         assert_eq!(
             question.name,
@@ -541,14 +573,15 @@ mod tests {
             }
         );
         assert!(
-            super::parse_question(&query("web.default.example.com."), "coolify.internal").is_err()
+            super::parse_question(&query("web.default.example.com."), "coolify.internal", None)
+                .is_err()
         );
     }
 
     #[test]
     fn parses_ipv4_ptr_queries() {
         let packet = query_with_type("2.0.240.10.in-addr.arpa.", 12);
-        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
 
         assert_eq!(
             question.name,
@@ -587,7 +620,7 @@ mod tests {
     #[test]
     fn builds_an_authoritative_a_response_for_each_endpoint() {
         let packet = query("web.default.coolify.internal.");
-        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
         let response = super::build_response(
             &packet,
             &question,
@@ -605,7 +638,7 @@ mod tests {
     #[test]
     fn builds_an_empty_authoritative_response_for_aaaa_queries() {
         let packet = query_with_type("web.default.coolify.internal.", 28);
-        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
         let response = super::build_response(&packet, &question, &[]);
 
         assert_eq!(&response[2..4], &[0x85, 0x80]);
@@ -615,7 +648,7 @@ mod tests {
     #[test]
     fn builds_an_authoritative_ptr_response_for_each_workload() {
         let packet = query_with_type("2.0.240.10.in-addr.arpa.", 12);
-        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
         let response = super::build_ptr_response(
             &packet,
             &question,
@@ -634,7 +667,7 @@ mod tests {
     #[test]
     fn ptr_responses_stay_within_the_dns_udp_packet_limit() {
         let packet = query_with_type("2.0.240.10.in-addr.arpa.", 12);
-        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
         let names = (0..64)
             .map(|index| {
                 format!(

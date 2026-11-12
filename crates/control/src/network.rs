@@ -23,6 +23,9 @@ const CORROSION_SHA512_X86_64: &str = "d8303bd383683f990162956d69fdb89d85bcbe39d
 const CORROSION_SHA512_AARCH64: &str = "23f55e40f71c3fc884f6f58eb8ebc22b5fc00511f370ce0611cec69bc3578edc5009f754b19ee96a2e68fe88fb38a062837e01a366ec0bb32dceb3076e7df6c6";
 /// The Node WireGuard IP that owns this Node's discovery rows and serves its Corrosion API.
 pub(crate) const CORROSION_OWNER_FILE: &str = "etc/corrosion/coolify-owner";
+/// The reverse zones of the discovery DNS, one name on each line. The discovery
+/// DNS reads the file next to the Corrosion configuration.
+const DISCOVERY_REVERSE_ZONES_FILE: &str = "etc/corrosion/coolify-reverse-zones";
 /// The Node DNS label published as `<name>.nodes.coolify.internal`.
 pub(crate) const CORROSION_NODE_NAME_FILE: &str = "etc/corrosion/coolify-node-name";
 
@@ -109,6 +112,7 @@ pub(crate) fn leave_cluster(
         root.join("etc/corrosion/schemas/coolify.sql"),
         root.join(CORROSION_OWNER_FILE),
         root.join(CORROSION_NODE_NAME_FILE),
+        root.join(DISCOVERY_REVERSE_ZONES_FILE),
         root.join("etc/corrosion/coolify-cluster-id"),
         root.join("etc/corrosion/coolify-peer-count"),
         root.join("etc/systemd/system/corrosion.service"),
@@ -787,6 +791,7 @@ pub(crate) fn reconcile_wireguard(
     atomic_write(&staged_path, config.as_bytes(), 0o600)?;
     if root == Path::new("/") {
         activate_wireguard(
+            root,
             request,
             &staged_path,
             &config_path,
@@ -874,6 +879,7 @@ fn arm_rollback(unit: &str, script: &str, error: &str) -> Result<(), String> {
 }
 
 fn activate_wireguard(
+    root: &Path,
     request: &WireguardReconcileRequest,
     staged_path: &Path,
     config_path: &Path,
@@ -929,7 +935,7 @@ fn activate_wireguard(
             .iter()
             .flat_map(|peer| peer.allowed_ips.iter().map(String::as_str))
             .collect::<Vec<_>>();
-        configure_discovery_resolver(&request.interface, &request.address, &peer_addresses)
+        configure_discovery_resolver(root, &request.interface, &request.address, &peer_addresses)
     });
     if healthy.is_err() {
         let rollback_service = format!("{rollback_unit}.service");
@@ -943,7 +949,12 @@ fn activate_wireguard(
                 .iter()
                 .flat_map(|peer| peer.allowed_ips.iter().map(String::as_str))
                 .collect::<Vec<_>>();
-            configure_discovery_resolver(&request.interface, &request.address, &peer_addresses)
+            configure_discovery_resolver(
+                root,
+                &request.interface,
+                &request.address,
+                &peer_addresses,
+            )
         });
         let _ = Command::new("systemctl")
             .args(["stop", &format!("{rollback_unit}.timer")])
@@ -975,6 +986,7 @@ pub(crate) fn reconcile_firewall(
         .is_some_and(|state| state.0 == request.revision && state.1 == configuration_hash)
         && firewall_current(root)
     {
+        refresh_discovery_resolver(root)?;
         return Ok(FirewallReconcileResult {
             state: Some(firewall_state(request.revision, configuration_hash, false)),
             changed: false,
@@ -987,6 +999,7 @@ pub(crate) fn reconcile_firewall(
         activate_firewall(root, &snapshot, request)?;
         // The new table has no volume transfer rules.
         crate::volume_transfer::restore_firewall();
+        refresh_discovery_resolver(root)?;
     }
     atomic_write(
         &state_file,
@@ -1167,7 +1180,10 @@ pub(crate) fn inspect_firewall(
         configuration_hash: state
             .as_ref()
             .map_or_else(String::new, |state| state.1.clone()),
+        // The reverse zones follow the workload subnets, so the firewall
+        // reconcile repairs them.
         drifted: !firewall_current(root)
+            || !stale_discovery_resolvers(root).is_empty()
             || state
                 .as_ref()
                 .is_none_or(|state| state.0 != expected_revision || state.1 != expected_hash),
@@ -1653,10 +1669,59 @@ fn set_corrosion_cluster_id(cluster_id: u16) -> Result<(), String> {
     Err(last_error)
 }
 
+/// The reverse zones that the discovery DNS answers: the mesh addresses of this
+/// Node and its peers, and the workload subnets of the cluster. systemd-resolved
+/// routes exactly these zones to the discovery DNS, and the discovery DNS
+/// forwards every other reverse name, so a forward never comes back.
+fn discovery_reverse_zones(
+    address: &str,
+    peer_addresses: &[&str],
+    workload_cidrs: &[String],
+) -> Vec<String> {
+    let mut zones = peer_addresses
+        .iter()
+        .copied()
+        .chain(std::iter::once(address))
+        .chain(workload_cidrs.iter().map(String::as_str))
+        .flat_map(reverse_dns_zones)
+        .collect::<Vec<_>>();
+    zones.sort();
+    zones.dedup();
+    zones
+}
+
+/// The `in-addr.arpa` zones that cover a CIDR and nothing else. A prefix
+/// inside an octet gives one zone for each value of that octet, at most 128.
+fn reverse_dns_zones(cidr: &str) -> Vec<String> {
+    let (address, prefix) = cidr.split_once('/').unwrap_or((cidr, "32"));
+    let (Ok(address), Ok(prefix)) = (address.parse::<std::net::Ipv4Addr>(), prefix.parse::<u32>())
+    else {
+        return Vec::new();
+    };
+    if !(1..=32).contains(&prefix) {
+        return Vec::new();
+    }
+    let labels = prefix.div_ceil(8);
+    let zone_bits = labels * 8;
+    let network = u32::from(address) & (u32::MAX << (32 - prefix));
+    (0..1_u32 << (zone_bits - prefix))
+        .map(|index| {
+            let octets = std::net::Ipv4Addr::from(network | (index << (32 - zone_bits))).octets();
+            let name = octets[..labels as usize]
+                .iter()
+                .rev()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(".");
+            format!("{name}.in-addr.arpa")
+        })
+        .collect()
+}
+
 fn discovery_resolver_commands(
     interface: &str,
     address: &str,
-    peer_addresses: &[&str],
+    reverse_zones: &[String],
 ) -> Result<Vec<Vec<String>>, String> {
     validate_interface(interface)?;
     let bind_address = address.strip_suffix("/32").unwrap_or(address);
@@ -1667,57 +1732,95 @@ fn discovery_resolver_commands(
         .ok_or("The discovery DNS address is invalid.")?
         .to_string();
 
-    let mut reverse_zones = peer_addresses
-        .iter()
-        .copied()
-        .chain(std::iter::once(bind_address.as_str()))
-        .filter_map(reverse_dns_zone)
-        .collect::<Vec<_>>();
-    reverse_zones.sort();
-    reverse_zones.dedup();
-
     Ok(vec![
         vec!["dns".into(), interface.into(), bind_address],
-        std::iter::once("domain".into())
-            .chain(std::iter::once(interface.into()))
-            .chain(std::iter::once("~coolify.internal".into()))
-            .chain(reverse_zones)
+        ["domain", interface, "~coolify.internal"]
+            .into_iter()
+            .map(String::from)
+            .chain(reverse_zones.iter().map(|zone| format!("~{zone}")))
             .collect(),
     ])
 }
 
-fn reverse_dns_zone(cidr: &str) -> Option<String> {
-    let (address, prefix) = cidr.split_once('/').unwrap_or((cidr, "32"));
-    let address = address.parse::<std::net::Ipv4Addr>().ok()?;
-    let prefix = prefix.parse::<u8>().ok()?;
-    let octets = address.octets();
-    match prefix {
-        8 => Some(format!("~{}.in-addr.arpa", octets[0])),
-        16 => Some(format!("~{}.{}.in-addr.arpa", octets[1], octets[0])),
-        24 => Some(format!(
-            "~{}.{}.{}.in-addr.arpa",
-            octets[2], octets[1], octets[0]
-        )),
-        32 => Some(format!(
-            "~{}.{}.{}.{}.in-addr.arpa",
-            octets[3], octets[2], octets[1], octets[0]
-        )),
-        _ => None,
-    }
+/// The reverse zones for the applied network: the workload subnets come from
+/// the firewall snapshot, because the WireGuard configuration has only the
+/// subnets of the peers.
+fn applied_reverse_zones(root: &Path, address: &str, peer_addresses: &[&str]) -> Vec<String> {
+    let workload_cidrs = fs::read_to_string(state_path(root, "firewall.last-good.nft"))
+        .ok()
+        .and_then(|snapshot| parse_firewall_snapshot(&snapshot))
+        .map(|firewall| firewall.workload_cidrs)
+        .unwrap_or_default();
+    discovery_reverse_zones(address, peer_addresses, &workload_cidrs)
 }
 
+fn reverse_zones_file(zones: &[String]) -> String {
+    zones.iter().map(|zone| format!("{zone}\n")).collect()
+}
+
+/// Points systemd-resolved at the discovery DNS for the internal zone and the
+/// cluster reverse zones, and gives the discovery DNS the same reverse zones.
+/// While the routing changes, the discovery DNS keeps the zones of both the
+/// old and the new routing, so it never forwards a name that is routed to it.
 fn configure_discovery_resolver(
+    root: &Path,
     interface: &str,
     address: &str,
     peer_addresses: &[&str],
 ) -> Result<(), String> {
-    for arguments in discovery_resolver_commands(interface, address, peer_addresses)? {
+    let zones = applied_reverse_zones(root, address, peer_addresses);
+    let commands = discovery_resolver_commands(interface, address, &zones)?;
+    let zones_path = root.join(DISCOVERY_REVERSE_ZONES_FILE);
+    if let Ok(routed) = fs::read_to_string(&zones_path) {
+        let mut both = routed.lines().map(str::to_string).collect::<Vec<_>>();
+        both.extend(zones.iter().cloned());
+        both.sort();
+        both.dedup();
+        write_if_changed(&zones_path, reverse_zones_file(&both).as_bytes(), 0o644)?;
+    }
+    for arguments in commands {
         run(
             Command::new("resolvectl").args(arguments),
             "The Coolify discovery resolver could not be configured.",
         )?;
     }
+    write_if_changed(&zones_path, reverse_zones_file(&zones).as_bytes(), 0o644)?;
 
+    Ok(())
+}
+
+/// The applied WireGuard links whose reverse zones are not the zones that the
+/// discovery DNS has: the workload subnets changed, or an older Sentinel
+/// configured the resolver.
+fn stale_discovery_resolvers(root: &Path) -> Vec<AppliedWireguard> {
+    if root != Path::new("/") {
+        return Vec::new();
+    }
+    let current = fs::read_to_string(root.join(DISCOVERY_REVERSE_ZONES_FILE)).ok();
+    read_applied_network(root)
+        .wireguard
+        .into_iter()
+        .filter(|wireguard| {
+            let peers = wireguard
+                .peer_addresses
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let zones = applied_reverse_zones(root, &wireguard.address, &peers);
+            current.as_deref() != Some(reverse_zones_file(&zones).as_str())
+        })
+        .collect()
+}
+
+fn refresh_discovery_resolver(root: &Path) -> Result<(), String> {
+    for wireguard in stale_discovery_resolvers(root) {
+        let peers = wireguard
+            .peer_addresses
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        configure_discovery_resolver(root, &wireguard.interface, &wireguard.address, &peers)?;
+    }
     Ok(())
 }
 
@@ -2343,7 +2446,7 @@ pub(crate) fn apply_restore_step(root: &Path, step: &RestoreStep) -> Result<(), 
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            configure_discovery_resolver(interface, address, &peers)
+            configure_discovery_resolver(root, interface, address, &peers)
         }
         RestoreStep::RefreshCorrosionUnits => refresh_corrosion_units(root),
         RestoreStep::RestartCorrosion => {
@@ -2739,12 +2842,12 @@ mod tests {
 
     #[test]
     fn discovery_resolver_configuration_tracks_a_recreated_wireguard_link() {
-        let commands = discovery_resolver_commands(
-            "mesh0",
+        let zones = discovery_reverse_zones(
             "10.0.0.130/32",
             &["10.0.0.129/32", "10.0.0.131/32", "100.64.1.0/24"],
-        )
-        .unwrap();
+            &[],
+        );
+        let commands = discovery_resolver_commands("mesh0", "10.0.0.130/32", &zones).unwrap();
 
         assert_eq!(
             commands,
