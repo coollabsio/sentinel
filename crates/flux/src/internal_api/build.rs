@@ -1,6 +1,8 @@
 //! Image builds and the cluster registry (decision 0006). Sentinel validates
 //! every field; these handlers only map the JSON from Coolify.
 
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -24,7 +26,10 @@ pub(super) struct ImageBuildApiRequest {
     command_id: String,
     build_id: String,
     builder_image: String,
+    /// Empty for an inline Dockerfile; Sentinel checks the combination.
+    #[serde(default)]
     repository_url: String,
+    #[serde(default)]
     commit_sha: String,
     source_type: String,
     #[serde(default)]
@@ -42,6 +47,12 @@ pub(super) struct ImageBuildApiRequest {
     push_username: String,
     #[serde(default)]
     push_password: String,
+    #[serde(default)]
+    build_args: HashMap<String, String>,
+    #[serde(default)]
+    build_secrets: HashMap<String, String>,
+    #[serde(default)]
+    dockerfile_content: String,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +119,9 @@ pub(super) async fn image_build(
             push_image: request.push_image,
             push_username: request.push_username,
             push_password: request.push_password,
+            build_args: request.build_args,
+            build_secrets: request.build_secrets,
+            dockerfile_content: request.dockerfile_content,
         }),
         DEPLOY_TIMEOUT,
     )

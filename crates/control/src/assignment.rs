@@ -327,7 +327,7 @@ impl AssignmentClient {
         // credentials of builds that an earlier process started get a watcher.
         let _ = tokio::task::spawn_blocking(|| {
             crate::volume_transfer::remove_leftovers(std::path::Path::new("/"));
-            crate::builder::remove_git_credentials_after_builds(
+            crate::builder::remove_build_inputs_after_builds(
                 std::path::Path::new("/"),
                 std::path::Path::new("podman"),
             );

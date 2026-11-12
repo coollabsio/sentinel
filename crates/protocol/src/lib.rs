@@ -52,11 +52,20 @@ pub const CAPABILITY_IMAGE_BUILD_EXTERNAL_PUSH: &str = "image.build.external_pus
 /// Not a command: an older Sentinel ignores the fields and would pull without
 /// the login.
 pub const CAPABILITY_WORKLOAD_REGISTRY_AUTH: &str = "workload.registry_auth.v1";
-pub const BUILD_CAPABILITIES: [&str; 8] = [
+/// `image.build.v1` accepts `build_args` and `build_secrets` (decision 0012).
+/// Not a command: an older Sentinel ignores the fields and would build
+/// without the variables.
+pub const CAPABILITY_IMAGE_BUILD_VARIABLES: &str = "image.build.variables.v1";
+/// `image.build.v1` accepts `dockerfile_content` without a repository. Not a
+/// command: an older Sentinel rejects the request for its empty repository.
+pub const CAPABILITY_IMAGE_BUILD_INLINE_DOCKERFILE: &str = "image.build.inline_dockerfile.v1";
+pub const BUILD_CAPABILITIES: [&str; 10] = [
     CAPABILITY_IMAGE_BUILD,
     CAPABILITY_IMAGE_BUILD_PRIVATE_GIT,
     CAPABILITY_IMAGE_LOAD,
     CAPABILITY_IMAGE_BUILD_EXTERNAL_PUSH,
+    CAPABILITY_IMAGE_BUILD_VARIABLES,
+    CAPABILITY_IMAGE_BUILD_INLINE_DOCKERFILE,
     CAPABILITY_WORKLOAD_REGISTRY_AUTH,
     CAPABILITY_BUILDER_RECONCILE,
     CAPABILITY_REGISTRY_RECONCILE,
@@ -135,6 +144,15 @@ pub mod control {
                     .field("push_image", &self.push_image)
                     .field("push_username", &self.push_username)
                     .field("push_password", &redacted(&self.push_password))
+                    .field(
+                        "build_arg_keys",
+                        &self.build_args.keys().collect::<Vec<_>>(),
+                    )
+                    .field(
+                        "build_secret_keys",
+                        &self.build_secrets.keys().collect::<Vec<_>>(),
+                    )
+                    .field("dockerfile_content_bytes", &self.dockerfile_content.len())
                     .finish()
             }
         }

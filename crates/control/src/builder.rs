@@ -40,10 +40,21 @@ const BUILD_USER: u32 = 1_000;
 const BUILDER_DIR: &str = "etc/coolify/builder";
 /// Persistent, so the socket mount exists again after a reboot.
 const SOCKET_DIR: &str = "var/lib/coolify/builder/run";
-/// Host tmpfs for the Git credential of a running build (decision 0011).
-const GIT_CREDENTIAL_DIR: &str = "run/coolify-build-git";
+/// Host tmpfs for the inputs of a running build that must not reach the disk:
+/// the Git credential (decision 0011), the push login, the build-time
+/// variables (decision 0012), and an inline Dockerfile.
+const BUILD_INPUT_DIR: &str = "run/coolify-build-git";
 /// Where the build container sees the credential file, read-only.
 const GIT_CREDENTIAL_MOUNT: &str = "/run/coolify-git";
+/// Where the build container sees the variables and an inline Dockerfile,
+/// read-only. Matches the entrypoint.
+const BUILD_INPUT_MOUNT: &str = "/run/coolify-build";
+const BUILD_ARGS: &str = "args";
+const BUILD_SECRETS: &str = "secrets";
+const INLINE_DOCKERFILE: &str = "dockerfile";
+const MAX_BUILD_VARIABLES: usize = 128;
+const MAX_BUILD_VARIABLE_BYTES: usize = 64 * 1024;
+const MAX_INLINE_DOCKERFILE_BYTES: usize = 128 * 1024;
 const APPARMOR_PROFILE: &str = "coolify-buildkit";
 const APPARMOR_PROFILE_PATH: &str = "etc/apparmor.d/coolify-buildkit";
 const DEFAULT_CACHE_PERCENT: u64 = 20;
@@ -457,6 +468,86 @@ pub(crate) fn validate_build(request: &ImageBuildRequest) -> Result<(), String> 
     if !image_valid(&request.builder_image) {
         return Err("The builder image is invalid.".into());
     }
+    validate_variables(request)?;
+    if !request.dockerfile_content.is_empty() {
+        validate_inline_dockerfile(request)?;
+    } else {
+        validate_git_source(request)?;
+    }
+    if build_target(&request.image).is_none() {
+        return Err(
+            "The build image must be a tag in the cluster registry or a localhost/ image.".into(),
+        );
+    }
+    validate_push(request)
+}
+
+/// An inline Dockerfile has no repository, so no Git field may be set.
+fn validate_inline_dockerfile(request: &ImageBuildRequest) -> Result<(), String> {
+    if request.dockerfile_content.len() > MAX_INLINE_DOCKERFILE_BYTES
+        || request.dockerfile_content.contains('\0')
+    {
+        return Err("The Dockerfile must be text of at most 128 KiB.".into());
+    }
+    let git_fields = [
+        &request.repository_url,
+        &request.commit_sha,
+        &request.base_directory,
+        &request.dockerfile_path,
+        &request.git_https_token,
+        &request.git_ssh_private_key,
+    ];
+    if request.source_type != "dockerfile" || git_fields.iter().any(|field| !field.is_empty()) {
+        return Err("A build from an inline Dockerfile takes no repository.".into());
+    }
+    Ok(())
+}
+
+fn valid_build_variable_key(key: &str) -> bool {
+    (1..=255).contains(&key.len())
+        && !key.starts_with(|character: char| character.is_ascii_digit())
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// The keys become file names and BuildKit option values, so only this set.
+/// A build arg is a command argument inside the build container, so no NUL.
+fn validate_variables(request: &ImageBuildRequest) -> Result<(), String> {
+    for (variables, kind) in [
+        (&request.build_args, "build arg"),
+        (&request.build_secrets, "build secret"),
+    ] {
+        if variables.len() > MAX_BUILD_VARIABLES {
+            return Err(format!(
+                "A build takes at most {MAX_BUILD_VARIABLES} of each build-time variable kind."
+            ));
+        }
+        for (key, value) in variables {
+            if !valid_build_variable_key(key) {
+                return Err(format!(
+                    "The {kind} name {key:?} is invalid. Use letters, digits, and _, not starting with a digit."
+                ));
+            }
+            if value.len() > MAX_BUILD_VARIABLE_BYTES {
+                return Err(format!("The {kind} {key} is larger than 64 KiB."));
+            }
+            if kind == "build arg" && value.contains('\0') {
+                return Err(format!("The build arg {key} contains a NUL character."));
+            }
+        }
+    }
+    if let Some(key) = request
+        .build_args
+        .keys()
+        .find(|key| request.build_secrets.contains_key(*key))
+    {
+        return Err(format!("{key} is both a build arg and a build secret."));
+    }
+    Ok(())
+}
+
+fn validate_git_source(request: &ImageBuildRequest) -> Result<(), String> {
     match GitCredential::of(request)? {
         GitCredential::None if !valid_repository_url(&request.repository_url) => {
             return Err(
@@ -494,12 +585,7 @@ pub(crate) fn validate_build(request: &ImageBuildRequest) -> Result<(), String> 
     {
         return Err("A build path is invalid.".into());
     }
-    if build_target(&request.image).is_none() {
-        return Err(
-            "The build image must be a tag in the cluster registry or a localhost/ image.".into(),
-        );
-    }
-    validate_push(request)
+    Ok(())
 }
 
 /// The optional external target (`image.build.external_push.v1`): a tag
@@ -533,85 +619,101 @@ fn validate_push(request: &ImageBuildRequest) -> Result<(), String> {
 const PUSH_LOGIN_FILE: &str = "push-config.json";
 const PUSH_LOGIN_MOUNT: &str = "/run/coolify-push";
 
-/// Writes the Docker config with the login of `push_image` next to the Git
-/// credential, 0600 and owned by the build user. Only the push step reads it.
-fn write_push_login(root: &Path, request: &ImageBuildRequest) -> Result<bool, String> {
-    use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+/// One directory per build under the host `/run` (tmpfs), so an input never
+/// reaches the disk and is gone after a reboot.
+fn build_input_dir(root: &Path, build_id: &str) -> PathBuf {
+    root.join(BUILD_INPUT_DIR).join(build_id)
+}
 
-    if request.push_username.is_empty() {
-        return Ok(false);
+/// Creates the 0700 input directory of root, or one of its subdirectories,
+/// which the build container mounts and so belongs to the build user.
+fn create_input_dir(path: &Path, owned_by_build_user: bool) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .map_err(|_| "The build inputs could not be written.".to_string())?;
+    if owned_by_build_user {
+        own_by_build_user(path)?;
     }
-    let error = || "The push login could not be written.".to_string();
-    let dir = git_credential_dir(root, &request.build_id);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|_| error())?;
-    let path = dir.join(PUSH_LOGIN_FILE);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|_| error())?;
-    file.write_all(&crate::registry::login_auth_file(
-        &crate::registry::image_registry_host(&request.push_image),
-        &request.push_username,
-        &request.push_password,
-    ))
-    .map_err(|_| error())?;
-    own_by_build_user(&path)?;
-    Ok(true)
+    Ok(())
 }
 
-/// One directory per build under the host `/run` (tmpfs), so a credential
-/// never reaches the disk and is gone after a reboot.
-fn git_credential_dir(root: &Path, build_id: &str) -> PathBuf {
-    root.join(GIT_CREDENTIAL_DIR).join(build_id)
-}
-
-/// Writes the credential file, 0600 and owned by the build user, in a 0700
-/// directory of root.
-fn write_git_credential(
-    root: &Path,
-    build_id: &str,
-    credential: GitCredential,
-) -> Result<(), String> {
+/// Writes one new file, 0600 and owned by the build user.
+fn write_input_file(path: &Path, contents: &[u8]) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let contents = match credential {
-        GitCredential::None => return Ok(()),
-        GitCredential::HttpsToken(token) => token.to_string(),
-        // OpenSSH needs the final newline and no carriage returns.
-        GitCredential::SshKey(key) => format!("{}\n", key.replace('\r', "").trim()),
-    };
-    let Some(file_name) = credential.file_name() else {
-        return Ok(());
-    };
-    let error = || "The Git credential could not be written.".to_string();
-    let dir = git_credential_dir(root, build_id);
-    remove_git_credential(root, build_id);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|_| error())?;
-    let path = dir.join(file_name);
+    let error = || "The build inputs could not be written.".to_string();
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&path)
+        .open(path)
         .map_err(|_| error())?;
-    file.write_all(contents.as_bytes()).map_err(|_| error())?;
-    own_by_build_user(&path)
+    file.write_all(contents).map_err(|_| error())?;
+    own_by_build_user(path)
 }
 
-fn remove_git_credential(root: &Path, build_id: &str) {
-    match std::fs::remove_dir_all(git_credential_dir(root, build_id)) {
+/// Writes every input of a build to its directory on tmpfs. Returns whether
+/// the build has one, so the caller deletes them when the build ends.
+fn write_build_inputs(root: &Path, request: &ImageBuildRequest) -> Result<bool, String> {
+    remove_build_inputs(root, &request.build_id);
+    let dir = build_input_dir(root, &request.build_id);
+    let credential = GitCredential::of(request)?;
+    let mut wrote = false;
+    let mut write = |relative: &str, contents: &[u8]| -> Result<(), String> {
+        create_input_dir(&dir, false)?;
+        wrote = true;
+        write_input_file(&dir.join(relative), contents)
+    };
+    let credential_contents = match credential {
+        GitCredential::None => None,
+        GitCredential::HttpsToken(token) => Some(token.to_string()),
+        // OpenSSH needs the final newline and no carriage returns.
+        GitCredential::SshKey(key) => Some(format!("{}\n", key.replace('\r', "").trim())),
+    };
+    if let (Some(file_name), Some(contents)) = (credential.file_name(), credential_contents) {
+        write(file_name, contents.as_bytes())?;
+    }
+    if !request.push_username.is_empty() {
+        write(
+            PUSH_LOGIN_FILE,
+            &crate::registry::login_auth_file(
+                &crate::registry::image_registry_host(&request.push_image),
+                &request.push_username,
+                &request.push_password,
+            ),
+        )?;
+    }
+    for (subdir, variables) in [
+        (BUILD_ARGS, &request.build_args),
+        (BUILD_SECRETS, &request.build_secrets),
+    ] {
+        if variables.is_empty() {
+            continue;
+        }
+        create_input_dir(&dir, false)?;
+        create_input_dir(&dir.join(subdir), true)?;
+        for (key, value) in variables {
+            write(&format!("{subdir}/{key}"), value.as_bytes())?;
+        }
+    }
+    if !request.dockerfile_content.is_empty() {
+        create_input_dir(&dir, false)?;
+        create_input_dir(&dir.join(INLINE_DOCKERFILE), true)?;
+        write(
+            &format!("{INLINE_DOCKERFILE}/Dockerfile"),
+            request.dockerfile_content.as_bytes(),
+        )?;
+    }
+    Ok(wrote)
+}
+
+fn remove_build_inputs(root: &Path, build_id: &str) {
+    match std::fs::remove_dir_all(build_input_dir(root, build_id)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -623,7 +725,7 @@ fn remove_git_credential(root: &Path, build_id: &str) {
 /// Deletes the credential of a build once its container is no longer running:
 /// it exited, was stopped (a cancel), or was removed. `podman wait` returns at
 /// once for a container that is already gone.
-fn remove_git_credential_after_build(root: &Path, podman: &Path, build_id: &str) {
+fn remove_build_inputs_after_build(root: &Path, podman: &Path, build_id: &str) {
     let (root, podman, build_id) = (
         root.to_path_buf(),
         podman.to_path_buf(),
@@ -635,19 +737,19 @@ fn remove_git_credential_after_build(root: &Path, podman: &Path, build_id: &str)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
-        remove_git_credential(&root, &build_id);
+        remove_build_inputs(&root, &build_id);
     });
 }
 
 /// Watches the credentials that an earlier Sentinel process wrote, so they
 /// are deleted when their builds end.
-pub(crate) fn remove_git_credentials_after_builds(root: &Path, podman: &Path) {
-    let Ok(entries) = std::fs::read_dir(root.join(GIT_CREDENTIAL_DIR)) else {
+pub(crate) fn remove_build_inputs_after_builds(root: &Path, podman: &Path) {
+    let Ok(entries) = std::fs::read_dir(root.join(BUILD_INPUT_DIR)) else {
         return;
     };
     for entry in entries.flatten() {
         if let Some(build_id) = entry.file_name().to_str() {
-            remove_git_credential_after_build(root, podman, build_id);
+            remove_build_inputs_after_build(root, podman, build_id);
         }
     }
 }
@@ -694,7 +796,7 @@ pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<S
             "--volume".into(),
             format!(
                 "{}:{GIT_CREDENTIAL_MOUNT}/{file_name}:ro",
-                git_credential_dir(root, &request.build_id)
+                build_input_dir(root, &request.build_id)
                     .join(file_name)
                     .display()
             ),
@@ -705,11 +807,28 @@ pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<S
             "--volume".into(),
             format!(
                 "{}:{PUSH_LOGIN_MOUNT}/config.json:ro",
-                git_credential_dir(root, &request.build_id)
+                build_input_dir(root, &request.build_id)
                     .join(PUSH_LOGIN_FILE)
                     .display()
             ),
         ]);
+    }
+    for (subdir, present) in [
+        (BUILD_ARGS, !request.build_args.is_empty()),
+        (BUILD_SECRETS, !request.build_secrets.is_empty()),
+        (INLINE_DOCKERFILE, !request.dockerfile_content.is_empty()),
+    ] {
+        if present {
+            arguments.extend([
+                "--volume".into(),
+                format!(
+                    "{}:{BUILD_INPUT_MOUNT}/{subdir}:ro",
+                    build_input_dir(root, &request.build_id)
+                        .join(subdir)
+                        .display()
+                ),
+            ]);
+        }
     }
     if is_local_image(&request.image) {
         arguments.extend([
@@ -720,12 +839,16 @@ pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<S
             ),
         ]);
     }
+    arguments.push(request.builder_image.clone());
+    if request.dockerfile_content.is_empty() {
+        arguments.extend([
+            "--repository".into(),
+            request.repository_url.clone(),
+            "--commit".into(),
+            request.commit_sha.clone(),
+        ]);
+    }
     arguments.extend([
-        request.builder_image.clone(),
-        "--repository".into(),
-        request.repository_url.clone(),
-        "--commit".into(),
-        request.commit_sha.clone(),
         "--type".into(),
         request.source_type.clone(),
         "--base-directory".into(),
@@ -772,20 +895,17 @@ pub(crate) fn start(
             .map_err(|_| "The build output directory could not be created.")?;
         own_by_build_user(&dir)?;
     }
-    let credential = GitCredential::of(request)?;
-    let push_login = write_git_credential(root, &request.build_id, credential)
-        .and_then(|()| write_push_login(root, request))
-        .inspect_err(|_| {
-            remove_git_credential(root, &request.build_id);
-        })?;
+    let has_inputs = write_build_inputs(root, request).inspect_err(|_| {
+        remove_build_inputs(root, &request.build_id);
+    })?;
     let started = run_build(root, podman, request, name);
     if local && started.is_err() {
         let _ = std::fs::remove_dir_all(output_dir(root, &request.build_id));
     }
-    if push_login || !matches!(credential, GitCredential::None) {
+    if has_inputs {
         match &started {
-            Ok(_) => remove_git_credential_after_build(root, podman, &request.build_id),
-            Err(_) => remove_git_credential(root, &request.build_id),
+            Ok(_) => remove_build_inputs_after_build(root, podman, &request.build_id),
+            Err(_) => remove_build_inputs(root, &request.build_id),
         }
     }
     started

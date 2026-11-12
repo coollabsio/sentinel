@@ -567,6 +567,21 @@ message ImageBuildRequest {
   // the push to `push_image` uses.
   string push_username = 12;
   string push_password = 13;
+  // Build-time variables (decision 0012). A build arg goes to the build as
+  // `--build-arg KEY=VALUE` and can stay in the image history. A secret goes
+  // only as a BuildKit secret mount: a Dockerfile reads it with
+  // `RUN --mount=type=secret,id=<KEY>`, Railpack through its secrets. A key
+  // is used once across both maps. Keys: 1 to 255 ASCII letters, digits, or
+  // `_`, not starting with a digit. Values: at most 64 KiB, 128 entries in
+  // each map. Sentinel gives both to the build container as files on tmpfs,
+  // like `git_https_token`. Needs `image.build.variables.v1`.
+  map<string, string> build_args = 14;
+  map<string, string> build_secrets = 15;
+  // A Dockerfile that Coolify sends instead of a repository, at most 128 KiB.
+  // The build context is empty. `repository_url`, `commit_sha`,
+  // `base_directory`, `dockerfile_path`, and the Git credentials stay empty;
+  // `source_type` is "dockerfile". Needs `image.build.inline_dockerfile.v1`.
+  string dockerfile_content = 16;
 }
 
 message ImageBuildResult {
