@@ -92,6 +92,8 @@ message Command {
     ImageLoadRequest image_load = 36;
     VolumeBackupRequest volume_backup = 37;
     VolumeRestoreRequest volume_restore = 38;
+    DatabaseDumpRequest database_dump = 45;
+    DatabaseRestoreRequest database_restore = 46;
     WorkloadExecRequest workload_exec = 50;
     WorkloadTerminalRequest workload_terminal = 51;
   }
@@ -146,6 +148,8 @@ message CommandResult {
     ImageLoadResult image_load = 36;
     VolumeBackupResult volume_backup = 37;
     VolumeRestoreResult volume_restore = 38;
+    VolumeBackupResult database_dump = 45;
+    VolumeRestoreResult database_restore = 46;
     WorkloadExecResult workload_exec = 50;
     WorkloadTerminalResult workload_terminal = 51;
     CommandError error = 20;
@@ -851,6 +855,50 @@ message VolumeRestoreResult {
   uint64 bytes_total = 2;
   uint64 bytes_done = 3;
   string error = 4;
+}
+
+// Dumps a database of a workload container to S3 (decision 0010). Sentinel
+// runs the fixed dump command of the engine with `podman exec`, compresses
+// the output with zstd, and uploads it like `volume.backup.v1`; the result is
+// a `VolumeBackupResult`. The command reads the credentials from the
+// environment and the secret files of the container. Never journaled: the
+// part URLs are credentials.
+message DatabaseDumpRequest {
+  // 1 to 64 ASCII letters, digits or `-`.
+  string dump_id = 1;
+  // A running container with `coolify.managed=true` and `coolify.workload`.
+  string container_name = 2;
+  // "postgresql", "mysql", "mariadb", "mongodb", "redis", "keydb" or
+  // "dragonfly".
+  string engine = 3;
+  // One database: 1 to 64 ASCII letters, digits, `_` or `-`, not starting
+  // with `-`. Empty: every database. Redis, KeyDB and Dragonfly have no
+  // database name; they dump the whole instance.
+  string database = 4;
+  // Presigned UploadPart URLs, like `VolumeBackupRequest.part_urls`.
+  repeated VolumeBackupPartUrl part_urls = 5;
+  // Stops a running dump.
+  bool abort = 6;
+}
+
+// Restores a dump of `database.dump.v1` into a workload container (decision
+// 0010). Sentinel downloads the archive to the Node, checks its size and
+// SHA-256, and streams it through `zstd -d` into the fixed restore command of
+// the engine. The result is a `VolumeRestoreResult`. Never journaled: the
+// request holds a presigned URL.
+message DatabaseRestoreRequest {
+  // 1 to 64 ASCII letters, digits or `-`.
+  string restore_id = 1;
+  string container_name = 2;
+  string engine = 3;
+  // The database of the dump; empty for a dump of every database.
+  string database = 4;
+  // A presigned GetObject URL.
+  string url = 5;
+  // The lowercase hex SHA-256 of the archive.
+  string sha256 = 6;
+  // The size of the archive; 0 when unknown.
+  uint64 archive_bytes = 7;
 }
 
 message CommandError {

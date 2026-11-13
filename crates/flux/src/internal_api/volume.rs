@@ -7,8 +7,9 @@ use axum::http::{HeaderMap, StatusCode};
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    VolumeBackupPartUrl, VolumeBackupRequest, VolumeDeleteRequest, VolumeObservation,
-    VolumeReceiveRequest, VolumeRestoreRequest, VolumeServeRequest, WorkloadVolumeMount,
+    VolumeBackupPartUrl, VolumeBackupRequest, VolumeBackupResult, VolumeDeleteRequest,
+    VolumeObservation, VolumeReceiveRequest, VolumeRestoreRequest, VolumeRestoreResult,
+    VolumeServeRequest, WorkloadVolumeMount,
 };
 use sentinel_protocol::{
     CAPABILITY_VOLUME_BACKUP, CAPABILITY_VOLUME_DELETE, CAPABILITY_VOLUME_RECEIVE,
@@ -89,7 +90,7 @@ pub(super) struct VolumeReceiveApiRequest {
     names: Vec<String>,
 }
 
-fn invalid_response() -> ApiError {
+pub(super) fn invalid_response() -> ApiError {
     (StatusCode::BAD_GATEWAY, "invalid Sentinel response").into()
 }
 
@@ -210,6 +211,15 @@ pub(super) struct PartUrl {
     url: String,
 }
 
+impl PartUrl {
+    pub(super) fn protocol(self) -> VolumeBackupPartUrl {
+        VolumeBackupPartUrl {
+            part_number: self.part_number,
+            url: self.url,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub(super) struct VolumeBackupApiRequest {
     server_id: String,
@@ -264,10 +274,7 @@ pub(super) async fn volume_backup(
             part_urls: request
                 .part_urls
                 .into_iter()
-                .map(|part| VolumeBackupPartUrl {
-                    part_number: part.part_number,
-                    url: part.url,
-                })
+                .map(PartUrl::protocol)
                 .collect(),
             abort: request.abort,
         }),
@@ -277,6 +284,19 @@ pub(super) async fn volume_backup(
     let Some(command_result::Payload::VolumeBackup(value)) = result.payload else {
         return Err(invalid_response());
     };
+    Ok(Json(backup_json(
+        &request.command_id,
+        result.observed_at_unix_ms,
+        value,
+    )))
+}
+
+/// The state of a volume backup or a database dump.
+pub(super) fn backup_json(
+    command_id: &str,
+    observed_at_unix_ms: i64,
+    value: VolumeBackupResult,
+) -> serde_json::Value {
     let parts = value
         .parts
         .into_iter()
@@ -288,9 +308,9 @@ pub(super) async fn volume_backup(
             })
         })
         .collect::<Vec<_>>();
-    Ok(Json(serde_json::json!({
-        "command_id": request.command_id,
-        "observed_at_unix_ms": result.observed_at_unix_ms,
+    serde_json::json!({
+        "command_id": command_id,
+        "observed_at_unix_ms": observed_at_unix_ms,
         "state": value.state,
         "used_bytes": value.used_bytes,
         "part_size_bytes": value.part_size_bytes,
@@ -300,7 +320,7 @@ pub(super) async fn volume_backup(
         "archive_bytes": value.archive_bytes,
         "sha256": value.sha256,
         "error": value.error,
-    })))
+    })
 }
 
 /// Starts or reads a restore download, or switches the data of two volumes
@@ -331,12 +351,25 @@ pub(super) async fn volume_restore(
     let Some(command_result::Payload::VolumeRestore(value)) = result.payload else {
         return Err(invalid_response());
     };
-    Ok(Json(serde_json::json!({
-        "command_id": request.command_id,
-        "observed_at_unix_ms": result.observed_at_unix_ms,
+    Ok(Json(restore_json(
+        &request.command_id,
+        result.observed_at_unix_ms,
+        value,
+    )))
+}
+
+/// The state of a volume restore or a database restore.
+pub(super) fn restore_json(
+    command_id: &str,
+    observed_at_unix_ms: i64,
+    value: VolumeRestoreResult,
+) -> serde_json::Value {
+    serde_json::json!({
+        "command_id": command_id,
+        "observed_at_unix_ms": observed_at_unix_ms,
         "state": value.state,
         "bytes_total": value.bytes_total,
         "bytes_done": value.bytes_done,
         "error": value.error,
-    })))
+    })
 }

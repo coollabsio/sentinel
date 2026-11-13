@@ -89,6 +89,12 @@ pub const CAPABILITY_WORKLOAD_STOP_TIMEOUT: &str = "workload.stop_timeout.v1";
 pub const CAPABILITY_VOLUME_BACKUP: &str = "volume.backup.v1";
 /// Restores a volume backup from a presigned URL (decision 0009).
 pub const CAPABILITY_VOLUME_RESTORE: &str = "volume.restore.v1";
+/// Dumps a database with the fixed command of its engine to S3 (decision 0010).
+pub const CAPABILITY_DATABASE_DUMP: &str = "database.dump.v1";
+/// Restores a database dump from a presigned URL (decision 0010).
+pub const CAPABILITY_DATABASE_RESTORE: &str = "database.restore.v1";
+pub const DATABASE_CAPABILITIES: [&str; 2] =
+    [CAPABILITY_DATABASE_DUMP, CAPABILITY_DATABASE_RESTORE];
 /// `workload.deploy.v1` accepts `secrets`, mounted as files at
 /// `/run/secrets/<key>`, and `workload.lifecycle.v1` with `remove` deletes the
 /// secrets of the container (decision 0008). Not a command: an older Sentinel
@@ -191,6 +197,28 @@ pub mod control {
                     .debug_struct("VolumeBackupPartUrl")
                     .field("part_number", &self.part_number)
                     .field("url", &"[redacted]")
+                    .finish()
+            }
+        }
+
+        impl std::fmt::Debug for DatabaseRestoreRequest {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter
+                    .debug_struct("DatabaseRestoreRequest")
+                    .field("restore_id", &self.restore_id)
+                    .field("container_name", &self.container_name)
+                    .field("engine", &self.engine)
+                    .field("database", &self.database)
+                    .field(
+                        "url",
+                        &if self.url.is_empty() {
+                            ""
+                        } else {
+                            "[redacted]"
+                        },
+                    )
+                    .field("sha256", &self.sha256)
+                    .field("archive_bytes", &self.archive_bytes)
                     .finish()
             }
         }

@@ -24,6 +24,7 @@ use sentinel_protocol::{
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
     CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
+use sentinel_protocol::{CAPABILITY_DATABASE_DUMP, CAPABILITY_DATABASE_RESTORE};
 use sentinel_protocol::{
     CAPABILITY_VOLUME_BACKUP, CAPABILITY_VOLUME_DELETE, CAPABILITY_VOLUME_RECEIVE,
     CAPABILITY_VOLUME_RESTORE, CAPABILITY_VOLUME_SERVE,
@@ -148,7 +149,8 @@ impl CommandExecutor {
         // journaled; a repeated ID reads again. volume.serve and
         // volume.receive are idempotent per transfer and carry the transfer
         // secret, which must not be stored. registry.inspect is a read-only report.
-        // volume.backup and volume.restore carry presigned S3 URLs.
+        // volume.backup, volume.restore, database.dump, and database.restore
+        // carry presigned S3 URLs.
         // workload.exec and workload.terminal carry commands and sessions.
         let journaled = !matches!(
             command.command_type.as_str(),
@@ -159,6 +161,8 @@ impl CommandExecutor {
                 | CAPABILITY_REGISTRY_INSPECT
                 | CAPABILITY_VOLUME_BACKUP
                 | CAPABILITY_VOLUME_RESTORE
+                | CAPABILITY_DATABASE_DUMP
+                | CAPABILITY_DATABASE_RESTORE
                 | CAPABILITY_WORKLOAD_EXEC
                 | CAPABILITY_WORKLOAD_TERMINAL
         );
@@ -292,6 +296,12 @@ impl CommandExecutor {
             (CAPABILITY_VOLUME_RESTORE, Some(Payload::VolumeRestore(request))) => {
                 crate::volume_backup::validate_restore(request).is_ok()
             }
+            (CAPABILITY_DATABASE_DUMP, Some(Payload::DatabaseDump(request))) => {
+                crate::database_dump::validate_dump(request).is_ok()
+            }
+            (CAPABILITY_DATABASE_RESTORE, Some(Payload::DatabaseRestore(request))) => {
+                crate::database_dump::validate_restore(request).is_ok()
+            }
             (CAPABILITY_WORKLOAD_EXEC, Some(Payload::WorkloadExec(request))) => {
                 crate::exec::validate(request).is_ok()
             }
@@ -330,6 +340,8 @@ impl CommandExecutor {
                     | CAPABILITY_VOLUME_RECEIVE
                     | CAPABILITY_VOLUME_BACKUP
                     | CAPABILITY_VOLUME_RESTORE
+                    | CAPABILITY_DATABASE_DUMP
+                    | CAPABILITY_DATABASE_RESTORE
                     | CAPABILITY_WORKLOAD_EXEC
                     | CAPABILITY_WORKLOAD_TERMINAL
             )
@@ -670,6 +682,22 @@ impl CommandExecutor {
                     command_result::Payload::VolumeBackup(result),
                 ),
                 Err(message) => failed(&command.command_id, "volume_backup_failed", &message),
+            }
+        } else if let Some(Payload::DatabaseDump(request)) = command.payload {
+            match crate::database_dump::dump(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::DatabaseDump(result),
+                ),
+                Err(message) => failed(&command.command_id, "database_dump_failed", &message),
+            }
+        } else if let Some(Payload::DatabaseRestore(request)) = command.payload {
+            match crate::database_dump::restore(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::DatabaseRestore(result),
+                ),
+                Err(message) => failed(&command.command_id, "database_restore_failed", &message),
             }
         } else if let Some(Payload::VolumeRestore(request)) = command.payload {
             match crate::volume_backup::restore(&self.podman, &request) {

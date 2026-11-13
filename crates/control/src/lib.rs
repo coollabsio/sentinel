@@ -6,6 +6,7 @@ mod builder;
 mod commands;
 mod connection;
 mod container_logs;
+mod database_dump;
 mod discovery;
 mod exec;
 mod ingress;

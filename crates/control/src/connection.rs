@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config::ControlTlsConfig;
 use sentinel_protocol::CAPABILITY_WORKLOAD_ROLLING_DEPLOY;
+use sentinel_protocol::DATABASE_CAPABILITIES;
 use sentinel_protocol::control::v1::agent_message;
 use sentinel_protocol::control::v1::control_message;
 use sentinel_protocol::control::v1::{
@@ -125,6 +126,7 @@ pub async fn connect(
                 .chain(NETWORK_CAPABILITIES.map(str::to_string))
                 .chain(BUILD_CAPABILITIES.map(str::to_string))
                 .chain(VOLUME_CAPABILITIES.map(str::to_string))
+                .chain(DATABASE_CAPABILITIES.map(str::to_string))
                 .chain(EXEC_CAPABILITIES.map(str::to_string))
                 .collect(),
                 boot_id: boot_id(),

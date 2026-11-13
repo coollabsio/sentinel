@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ".coolify.sentinel.control.v1.WorkloadDeployRequest",
         ".coolify.sentinel.control.v1.VolumeBackupPartUrl",
         ".coolify.sentinel.control.v1.VolumeRestoreRequest",
+        ".coolify.sentinel.control.v1.DatabaseRestoreRequest",
     ]);
 
     tonic_prost_build::configure()

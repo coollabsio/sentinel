@@ -33,6 +33,7 @@ use uuid::Uuid;
 use crate::{CommandDispatchError, ConnectionRegistry, now_millis};
 
 mod build;
+mod database;
 mod exec;
 mod volume;
 
@@ -560,6 +561,11 @@ pub async fn serve(
         .route("/v1/commands/volume.receive", post(volume::volume_receive))
         .route("/v1/commands/volume.backup", post(volume::volume_backup))
         .route("/v1/commands/volume.restore", post(volume::volume_restore))
+        .route("/v1/commands/database.dump", post(database::database_dump))
+        .route(
+            "/v1/commands/database.restore",
+            post(database::database_restore),
+        )
         .route("/v1/commands/workload.exec", post(exec::workload_exec))
         .route("/v1/terminals", post(exec::terminal_open))
         .route(

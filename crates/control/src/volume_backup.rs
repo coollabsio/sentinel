@@ -12,6 +12,9 @@
 //!
 //! The requests hold presigned URLs, so they are never journaled, state is in
 //! memory only, and no error contains a URL.
+//!
+//! Database dumps (decision 0010) use the same upload and download with
+//! another source and sink, see `database_dump`.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -21,8 +24,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use sentinel_protocol::control::v1::{
-    VolumeBackupPart, VolumeBackupRequest, VolumeBackupResult, VolumeRestoreRequest,
-    VolumeRestoreResult,
+    VolumeBackupPart, VolumeBackupPartUrl, VolumeBackupRequest, VolumeBackupResult,
+    VolumeRestoreRequest, VolumeRestoreResult,
 };
 use sha2::{Digest, Sha256};
 
@@ -33,8 +36,8 @@ use crate::volumes::{containers_using, ensure_volumes, mountpoint, valid_volume_
 
 const MIB: u64 = 1024 * 1024;
 /// S3 needs at least 5 MiB for every part but the last.
-const PART_SIZE_MIN: u64 = 16 * MIB;
-const PART_SIZE_MAX: u64 = 5 * 1024 * MIB;
+pub(crate) const PART_SIZE_MIN: u64 = 16 * MIB;
+pub(crate) const PART_SIZE_MAX: u64 = 5 * 1024 * MIB;
 /// The S3 limit.
 const MAX_PARTS: u32 = 10_000;
 /// The part size makes the used size fit in this many parts. The rest of the
@@ -75,32 +78,32 @@ impl State {
     }
 }
 
-fn valid_id(value: &str) -> bool {
+pub(crate) fn valid_id(value: &str) -> bool {
     (1..=64).contains(&value.len())
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
-fn valid_url(value: &str) -> bool {
+pub(crate) fn valid_url(value: &str) -> bool {
     value.len() <= URL_MAX_CHARS
         && (value.starts_with("https://") || value.starts_with("http://"))
         && !value.chars().any(char::is_control)
 }
 
-fn valid_sha256(value: &str) -> bool {
+pub(crate) fn valid_sha256(value: &str) -> bool {
     value.len() == 64
         && value
             .chars()
             .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character))
 }
 
-fn truncate(message: &str) -> String {
+pub(crate) fn truncate(message: &str) -> String {
     message.chars().take(ERROR_MAX_CHARS).collect()
 }
 
 /// A reqwest error without the URL, which holds the presigned signature.
-fn http_error(error: reqwest::Error) -> String {
+pub(crate) fn http_error(error: reqwest::Error) -> String {
     let error = error.without_url();
     let mut message = error.to_string();
     let mut source = std::error::Error::source(&error);
@@ -128,7 +131,7 @@ fn s3_error_code(body: &str) -> Option<&str> {
     .then_some(code)
 }
 
-async fn rejected(response: reqwest::Response, what: &str) -> String {
+pub(crate) async fn rejected(response: reqwest::Response, what: &str) -> String {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
     match s3_error_code(&body) {
@@ -137,7 +140,7 @@ async fn rejected(response: reqwest::Response, what: &str) -> String {
     }
 }
 
-fn http_client() -> Result<(tokio::runtime::Runtime, reqwest::Client), String> {
+pub(crate) fn http_client() -> Result<(tokio::runtime::Runtime, reqwest::Client), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -151,7 +154,7 @@ fn http_client() -> Result<(tokio::runtime::Runtime, reqwest::Client), String> {
     Ok((runtime, client))
 }
 
-fn spawn(command: &mut Command, program: &str) -> Result<Child, String> {
+pub(crate) fn spawn(command: &mut Command, program: &str) -> Result<Child, String> {
     command.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!("{program} is not installed on this Node.")
@@ -162,7 +165,7 @@ fn spawn(command: &mut Command, program: &str) -> Result<Child, String> {
 }
 
 /// Reads stderr in the background, so a full pipe never blocks the process.
-fn drain(stderr: Option<ChildStderr>) -> std::thread::JoinHandle<String> {
+pub(crate) fn drain(stderr: Option<ChildStderr>) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut output = Vec::new();
         if let Some(mut stderr) = stderr {
@@ -176,7 +179,7 @@ fn drain(stderr: Option<ChildStderr>) -> std::thread::JoinHandle<String> {
     })
 }
 
-fn kill(child: &mut Child) {
+pub(crate) fn kill(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -220,9 +223,9 @@ fn prune<T>(entries: &mut BTreeMap<String, T>, finished: impl Fn(&T) -> Option<I
 // ---------------------------------------------------------------------------
 // volume.backup.v1
 
-struct Backup {
-    volume_name: String,
-    stop_container: String,
+pub(crate) struct Backup {
+    /// What the backup reads; a repeated ID must name the same source.
+    identity: String,
     state: State,
     used_bytes: u64,
     part_size: u64,
@@ -237,7 +240,11 @@ struct Backup {
     finished_at: Option<Instant>,
 }
 
-type SharedBackup = Arc<(Mutex<Backup>, Condvar)>;
+pub(crate) type SharedBackup = Arc<(Mutex<Backup>, Condvar)>;
+/// Runs the backup in the background and returns the size and the SHA-256
+/// of the archive.
+pub(crate) type BackupRunner =
+    Box<dyn FnOnce(&SharedBackup) -> Result<(u64, String), String> + Send>;
 
 static BACKUPS: Mutex<BTreeMap<String, SharedBackup>> = Mutex::new(BTreeMap::new());
 
@@ -254,19 +261,21 @@ pub(crate) fn validate_backup(request: &VolumeBackupRequest) -> Result<(), Strin
     {
         return Err("The container to stop is invalid.".into());
     }
-    if request.part_urls.len() > MAX_URLS_PER_REQUEST
-        || request
-            .part_urls
-            .iter()
-            .any(|part| !(1..=MAX_PARTS).contains(&part.part_number) || !valid_url(&part.url))
-    {
+    if !valid_part_urls(&request.part_urls) {
         return Err("A part URL is invalid.".into());
     }
     Ok(())
 }
 
-fn add_urls(backup: &mut Backup, request: &VolumeBackupRequest) {
-    for part in &request.part_urls {
+pub(crate) fn valid_part_urls(part_urls: &[VolumeBackupPartUrl]) -> bool {
+    part_urls.len() <= MAX_URLS_PER_REQUEST
+        && part_urls
+            .iter()
+            .all(|part| (1..=MAX_PARTS).contains(&part.part_number) && valid_url(&part.url))
+}
+
+fn add_urls(backup: &mut Backup, part_urls: &[VolumeBackupPartUrl]) {
+    for part in part_urls {
         // Parts that are uploaded need no URL any more.
         if part.part_number >= backup.next_part.max(1) {
             backup.urls.insert(part.part_number, part.url.clone());
@@ -307,29 +316,55 @@ pub(crate) fn backup(
     request: &VolumeBackupRequest,
 ) -> Result<VolumeBackupResult, String> {
     validate_backup(request)?;
+    let podman = podman.to_path_buf();
+    let volume_name = request.volume_name.clone();
+    let container = request.stop_container.clone();
+    let stop_timeout = request.stop_timeout_seconds;
+    start_or_poll_backup(
+        &request.backup_id,
+        format!("volume {volume_name} {container}"),
+        &request.part_urls,
+        request.abort,
+        move || {
+            let mount = PathBuf::from(mountpoint(&podman, &volume_name)?);
+            Ok(Box::new(move |shared: &SharedBackup| {
+                run_backup(&podman, &mount, &container, stop_timeout, shared)
+            }))
+        },
+    )
+}
+
+/// Adds part URLs to the backup `backup_id` and returns its state. The first
+/// call runs `prepare`, which fails the call or returns the runner that the
+/// backup thread runs.
+pub(crate) fn start_or_poll_backup(
+    backup_id: &str,
+    identity: String,
+    part_urls: &[VolumeBackupPartUrl],
+    abort: bool,
+    prepare: impl FnOnce() -> Result<BackupRunner, String>,
+) -> Result<VolumeBackupResult, String> {
     let existing = BACKUPS
         .lock()
         .map_err(|_| "The backup state is unavailable.")?
-        .get(&request.backup_id)
+        .get(backup_id)
         .cloned();
     if let Some(shared) = existing {
         let (lock, signal) = &*shared;
         let mut backup = lock
             .lock()
             .map_err(|_| "The backup state is unavailable.")?;
-        if backup.volume_name != request.volume_name
-            || backup.stop_container != request.stop_container
-        {
-            return Err("The backup ID is already used for another volume.".into());
+        if backup.identity != identity {
+            return Err("The backup ID is already used for another backup.".into());
         }
-        add_urls(&mut backup, request);
-        if request.abort && backup.state == State::Running {
+        add_urls(&mut backup, part_urls);
+        if abort && backup.state == State::Running {
             backup.abort = true;
         }
         signal.notify_all();
         return Ok(backup_snapshot(&backup));
     }
-    if request.abort {
+    if abort {
         return Ok(VolumeBackupResult {
             state: State::Failed.as_str().into(),
             error: "The backup is not running.".into(),
@@ -337,10 +372,9 @@ pub(crate) fn backup(
         });
     }
 
-    let mount = PathBuf::from(mountpoint(podman, &request.volume_name)?);
+    let runner = prepare()?;
     let mut backup = Backup {
-        volume_name: request.volume_name.clone(),
-        stop_container: request.stop_container.clone(),
+        identity,
         state: State::Running,
         used_bytes: 0,
         part_size: 0,
@@ -354,7 +388,7 @@ pub(crate) fn backup(
         abort: false,
         finished_at: None,
     };
-    add_urls(&mut backup, request);
+    add_urls(&mut backup, part_urls);
     let snapshot = backup_snapshot(&backup);
     let shared: SharedBackup = Arc::new((Mutex::new(backup), Condvar::new()));
     {
@@ -364,19 +398,29 @@ pub(crate) fn backup(
         prune(&mut backups, |shared| {
             shared.0.lock().ok().and_then(|backup| backup.finished_at)
         });
-        backups.insert(request.backup_id.clone(), shared.clone());
+        backups.insert(backup_id.to_string(), shared.clone());
     }
-    let podman = podman.to_path_buf();
-    let container = request.stop_container.clone();
-    let stop_timeout = request.stop_timeout_seconds;
-    let backup_id = request.backup_id.clone();
+    let backup_id = backup_id.to_string();
     std::thread::spawn(move || {
-        run_backup(&podman, &mount, &container, stop_timeout, &shared);
-        if let Ok(backup) = shared.0.lock()
-            && backup.state == State::Failed
-        {
-            tracing::warn!(backup_id, error = %backup.error, "a volume backup failed");
+        let outcome = runner(&shared);
+        let (lock, signal) = &*shared;
+        if let Ok(mut backup) = lock.lock() {
+            match outcome {
+                Ok((archive_bytes, sha256)) => {
+                    backup.state = State::Succeeded;
+                    backup.archive_bytes = archive_bytes;
+                    backup.sha256 = sha256;
+                }
+                Err(error) => {
+                    backup.state = State::Failed;
+                    backup.error = truncate(&error);
+                    tracing::warn!(backup_id, error = %backup.error, "a backup failed");
+                }
+            }
+            backup.urls.clear();
+            backup.finished_at = Some(Instant::now());
         }
+        signal.notify_all();
     });
     Ok(snapshot)
 }
@@ -387,7 +431,7 @@ fn run_backup(
     container: &str,
     stop_timeout: u32,
     shared: &SharedBackup,
-) {
+) -> Result<(u64, String), String> {
     let used = used_bytes(mount);
     let size = part_size(used);
     if let Ok(mut backup) = shared.0.lock() {
@@ -400,7 +444,20 @@ fn run_backup(
         stop_if_running(podman, container, stop_timeout)
     };
     let mut outcome = match &stopped {
-        Ok(_) => upload_archive(mount, size, shared),
+        Ok(_) => upload_compressed(
+            Command::new("tar")
+                .args(TAR_FLAGS)
+                .args(["-cf", "-", "-C"])
+                .arg(mount)
+                .arg("."),
+            "tar",
+            // GNU tar exits with 1 when a file changed while it was read. The
+            // archive is still valid: the backup of a running container is
+            // crash-consistent.
+            &[0, 1],
+            |_| size,
+            shared,
+        ),
         Err(error) => Err(error.clone()),
     };
     if matches!(stopped, Ok(true))
@@ -411,23 +468,7 @@ fn run_backup(
             Err(earlier) => format!("{earlier} {error}"),
         });
     }
-    let (lock, signal) = &**shared;
-    if let Ok(mut backup) = lock.lock() {
-        match outcome {
-            Ok((archive_bytes, sha256)) => {
-                backup.state = State::Succeeded;
-                backup.archive_bytes = archive_bytes;
-                backup.sha256 = sha256;
-            }
-            Err(error) => {
-                backup.state = State::Failed;
-                backup.error = truncate(&error);
-            }
-        }
-        backup.urls.clear();
-        backup.finished_at = Some(Instant::now());
-    }
-    signal.notify_all();
+    outcome
 }
 
 /// Stops the container when it runs. Returns whether it was stopped.
@@ -488,25 +529,28 @@ fn read_part(reader: &mut impl Read, size: u64) -> Result<Vec<u8>, String> {
     Ok(buffer)
 }
 
-/// Streams `tar | zstd` of the volume as parts of `size` bytes. Returns the
-/// size and the SHA-256 of the archive.
-fn upload_archive(mount: &Path, size: u64, shared: &SharedBackup) -> Result<(u64, String), String> {
+/// Streams the stdout of `source` through `zstd` as parts of
+/// `part_size(part_number)` bytes. Returns the size and the SHA-256 of the
+/// archive. `program` names the source in errors.
+pub(crate) fn upload_compressed(
+    source: &mut Command,
+    program: &str,
+    accepted_exit_codes: &[i32],
+    part_size: impl Fn(u32) -> u64,
+    shared: &SharedBackup,
+) -> Result<(u64, String), String> {
     let (runtime, client) = http_client()?;
     let mut tar = spawn(
-        Command::new("tar")
-            .args(TAR_FLAGS)
-            .args(["-cf", "-", "-C"])
-            .arg(mount)
-            .arg(".")
+        source
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
-        "tar",
+        program,
     )?;
     let tar_errors = drain(tar.stderr.take());
     let Some(tar_output) = tar.stdout.take() else {
         kill(&mut tar);
-        return Err("tar could not be started.".into());
+        return Err(format!("{program} could not be started."));
     };
     let mut zstd = match spawn(
         Command::new("zstd")
@@ -532,6 +576,7 @@ fn upload_archive(mount: &Path, size: u64, shared: &SharedBackup) -> Result<(u64
             .as_mut()
             .ok_or("zstd could not be started.".to_string())?;
         for part_number in 1..=MAX_PARTS {
+            let size = part_size(part_number);
             let buffer = read_part(archive, size)?;
             if buffer.is_empty() {
                 if part_number == 1 {
@@ -561,10 +606,7 @@ fn upload_archive(mount: &Path, size: u64, shared: &SharedBackup) -> Result<(u64
         if read_part(archive, 1)?.is_empty() {
             Ok(())
         } else {
-            Err(format!(
-                "The archive needs more than {MAX_PARTS} parts of {} MiB.",
-                size / MIB
-            ))
+            Err(format!("The archive needs more than {MAX_PARTS} parts."))
         }
     })();
     drop(archive);
@@ -577,10 +619,12 @@ fn upload_archive(mount: &Path, size: u64, shared: &SharedBackup) -> Result<(u64
     let tar_errors = tar_errors.join().unwrap_or_default();
     let zstd_errors = zstd_errors.join().unwrap_or_default();
     uploaded?;
-    // GNU tar exits with 1 when a file changed while it was read. The archive
-    // is still valid: the backup of a running container is crash-consistent.
-    if !tar_status.is_ok_and(|status| matches!(status.code(), Some(0 | 1))) {
-        return Err(format!("tar failed: {tar_errors}"));
+    if !tar_status.is_ok_and(|status| {
+        status
+            .code()
+            .is_some_and(|code| accepted_exit_codes.contains(&code))
+    }) {
+        return Err(format!("{program} failed: {tar_errors}"));
     }
     if !zstd_status.is_ok_and(|status| status.success()) {
         return Err(format!("zstd failed: {zstd_errors}"));
@@ -588,7 +632,7 @@ fn upload_archive(mount: &Path, size: u64, shared: &SharedBackup) -> Result<(u64
     Ok((total, hex(&hasher.finalize())))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -668,19 +712,20 @@ fn upload_part(
 // ---------------------------------------------------------------------------
 // volume.restore.v1
 
-struct Restore {
-    volume_name: String,
-    sha256: String,
+pub(crate) struct Restore {
+    /// What the restore writes; a repeated ID must name the same target.
+    identity: String,
     state: State,
-    bytes_total: u64,
-    bytes_done: u64,
+    pub(crate) bytes_total: u64,
+    pub(crate) bytes_done: u64,
     error: String,
     finished_at: Option<Instant>,
     /// A failure was returned to Coolify; the next request starts again.
     failure_reported: bool,
 }
 
-type SharedRestore = Arc<Mutex<Restore>>;
+pub(crate) type SharedRestore = Arc<Mutex<Restore>>;
+pub(crate) type RestoreRunner = Box<dyn FnOnce(&SharedRestore) -> Result<(), String> + Send>;
 
 static RESTORES: Mutex<BTreeMap<String, SharedRestore>> = Mutex::new(BTreeMap::new());
 
@@ -738,61 +783,85 @@ pub(crate) fn restore(
         });
     }
 
+    let podman = podman.to_path_buf();
+    let volume_name = request.volume_name.clone();
+    let url = request.url.clone();
+    let sha256 = request.sha256.clone();
+    let archive_bytes = request.archive_bytes;
+    start_or_poll_restore(
+        &request.restore_id,
+        format!("volume {volume_name} {sha256}"),
+        archive_bytes,
+        move || {
+            // The download empties the volume, so it never writes into live data.
+            let users = containers_using(&podman, &volume_name, true)?;
+            if !users.is_empty() {
+                return Err(format!(
+                    "The volume is used by the container {}.",
+                    users.join(", ")
+                ));
+            }
+            ensure_volumes(&podman, [volume_name.as_str()])?;
+            let mount = PathBuf::from(mountpoint(&podman, &volume_name)?);
+            Ok(Box::new(move |shared: &SharedRestore| {
+                let outcome = download(&mount, &url, &sha256, archive_bytes, shared);
+                if outcome.is_err() {
+                    let _ = empty_directory(&mount);
+                }
+                outcome
+            }))
+        },
+    )
+}
+
+/// Returns the state of the restore `restore_id`. The first call, and the
+/// first call after a reported failure, runs `prepare` and then its runner in
+/// the background.
+pub(crate) fn start_or_poll_restore(
+    restore_id: &str,
+    identity: String,
+    archive_bytes: u64,
+    prepare: impl FnOnce() -> Result<RestoreRunner, String>,
+) -> Result<VolumeRestoreResult, String> {
     let mut restores = RESTORES
         .lock()
         .map_err(|_| "The restore state is unavailable.")?;
     prune(&mut restores, |restore| {
         restore.lock().ok().and_then(|restore| restore.finished_at)
     });
-    if let Some(existing) = restores.get(&request.restore_id) {
+    if let Some(existing) = restores.get(restore_id) {
         let mut restore = existing
             .lock()
             .map_err(|_| "The restore state is unavailable.")?;
-        if restore.volume_name != request.volume_name || restore.sha256 != request.sha256 {
-            return Err("The restore ID is already used for another volume.".into());
+        if restore.identity != identity {
+            return Err("The restore ID is already used for another restore.".into());
         }
         if !(restore.state == State::Failed && restore.failure_reported) {
             return Ok(restore_snapshot(&mut restore));
         }
     }
-    // The download empties the volume, so it never writes into live data.
-    let users = containers_using(podman, &request.volume_name, true)?;
-    if !users.is_empty() {
-        return Err(format!(
-            "The volume is used by the container {}.",
-            users.join(", ")
-        ));
-    }
-    ensure_volumes(podman, [request.volume_name.as_str()])?;
-    let mount = PathBuf::from(mountpoint(podman, &request.volume_name)?);
+    let runner = prepare()?;
     let shared: SharedRestore = Arc::new(Mutex::new(Restore {
-        volume_name: request.volume_name.clone(),
-        sha256: request.sha256.clone(),
+        identity,
         state: State::Running,
-        bytes_total: request.archive_bytes,
+        bytes_total: archive_bytes,
         bytes_done: 0,
         error: String::new(),
         finished_at: None,
         failure_reported: false,
     }));
-    restores.insert(request.restore_id.clone(), shared.clone());
+    restores.insert(restore_id.to_string(), shared.clone());
     drop(restores);
 
-    let url = request.url.clone();
-    let sha256 = request.sha256.clone();
-    let archive_bytes = request.archive_bytes;
-    let restore_id = request.restore_id.clone();
+    let restore_id = restore_id.to_string();
     let snapshot = shared
         .lock()
         .map(|mut restore| restore_snapshot(&mut restore))
         .map_err(|_| "The restore state is unavailable.")?;
     std::thread::spawn(move || {
-        let outcome = download(&mount, &url, &sha256, archive_bytes, &shared);
-        if outcome.is_err() {
-            let _ = empty_directory(&mount);
-        }
+        let outcome = runner(&shared);
         if let Err(error) = &outcome {
-            tracing::warn!(restore_id, %error, "a volume restore failed");
+            tracing::warn!(restore_id, %error, "a restore failed");
         }
         if let Ok(mut restore) = shared.lock() {
             match outcome {

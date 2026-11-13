@@ -532,6 +532,8 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "workload.stop_timeout.v1",
             "volume.backup.v1",
             "volume.restore.v1",
+            "database.dump.v1",
+            "database.restore.v1",
             "workload.exec.v1",
             "workload.terminal.v1"
         ])

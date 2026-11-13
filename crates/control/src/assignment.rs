@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use config::ControlTlsConfig;
 use reqwest::StatusCode;
 use sentinel_protocol::CAPABILITY_WORKLOAD_ROLLING_DEPLOY;
+use sentinel_protocol::DATABASE_CAPABILITIES;
 use sentinel_protocol::{
     BUILD_CAPABILITIES, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
@@ -253,6 +254,7 @@ impl AssignmentClient {
             .chain(NETWORK_CAPABILITIES)
             .chain(BUILD_CAPABILITIES)
             .chain(VOLUME_CAPABILITIES)
+            .chain(DATABASE_CAPABILITIES)
             .chain(EXEC_CAPABILITIES)
             .collect(),
             trust_bundle_version: crate::trust::installed_version(&self.control_tls),
