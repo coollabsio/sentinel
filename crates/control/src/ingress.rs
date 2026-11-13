@@ -675,8 +675,11 @@ pub(crate) fn render_caddy_config(
                         "try_duration": "5s",
                         "try_interval": "250ms",
                     },
+                    // One failed request takes an upstream out for
+                    // `fail_duration`. Keep it short: a stop-then-start deploy
+                    // fails one request while its only container restarts.
                     "health_checks": {
-                        "passive": {"fail_duration": "30s", "max_fails": 1},
+                        "passive": {"fail_duration": "5s", "max_fails": 1},
                     },
                 })
             });
@@ -1893,7 +1896,7 @@ mod tests {
         );
         assert_eq!(
             proxy["health_checks"],
-            json!({"passive": {"fail_duration": "30s", "max_fails": 1}})
+            json!({"passive": {"fail_duration": "5s", "max_fails": 1}})
         );
         // The client Host header is passed through: no header rewrite.
         assert!(proxy.get("headers").is_none());
