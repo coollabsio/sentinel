@@ -24,6 +24,9 @@ use crate::network::{
 };
 
 pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_secs(15);
+/// The publish interval while a workload health check is still `starting`, so
+/// ingress and DNS use a container soon after its first passing check.
+pub(crate) const STARTING_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const ENDPOINT_TTL_SECONDS: i64 = 120;
 const MAX_ENDPOINTS: usize = 10_000;
 const MANAGED_LABEL: &str = "coolify.managed";
@@ -202,7 +205,15 @@ pub(crate) struct InspectedContainer {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PublishOutcome {
     Skipped(&'static str),
-    Published { endpoints: usize },
+    Published { endpoints: usize, starting: bool },
+}
+
+/// How long the publisher waits for its next pass after a publish.
+fn next_publish_delay(outcome: &Result<PublishOutcome, String>) -> Duration {
+    match outcome {
+        Ok(PublishOutcome::Published { starting: true, .. }) => STARTING_PUBLISH_INTERVAL,
+        _ => PUBLISH_INTERVAL,
+    }
 }
 
 pub(crate) fn validate_workload_endpoint(
@@ -600,11 +611,13 @@ pub(crate) fn publish_once(root: &Path) -> Result<PublishOutcome, String> {
     post_transaction(&identity.owner_node_ip, &transaction)?;
     Ok(PublishOutcome::Published {
         endpoints: rows.len(),
+        starting: rows.iter().any(|row| row.health == "starting"),
     })
 }
 
-/// Publishes once at start, then every `PUBLISH_INTERVAL` and whenever
-/// `trigger` is notified, until shutdown. `published` is notified after each
+/// Publishes once at start, then every `PUBLISH_INTERVAL` (every
+/// `STARTING_PUBLISH_INTERVAL` while a health check is `starting`) and
+/// whenever `trigger` is notified, until shutdown. `published` is notified after each
 /// successful publish, so the ingress renderer follows endpoint changes.
 pub(crate) async fn run(
     root: PathBuf,
@@ -612,8 +625,7 @@ pub(crate) async fn run(
     published: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut ticker = tokio::time::interval(PUBLISH_INTERVAL);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut delay = Duration::ZERO;
     let mut last_error: Option<String> = None;
     loop {
         if *shutdown.borrow() {
@@ -621,15 +633,16 @@ pub(crate) async fn run(
         }
         tokio::select! {
             _ = shutdown.changed() => return,
-            _ = ticker.tick() => {}
+            _ = tokio::time::sleep(delay) => {}
             _ = trigger.notified() => {}
         }
         let publish_root = root.clone();
         let result = tokio::task::spawn_blocking(move || publish_once(&publish_root))
             .await
             .unwrap_or_else(|_| Err("The endpoint publisher task failed.".into()));
+        delay = next_publish_delay(&result);
         match result {
-            Ok(PublishOutcome::Published { endpoints }) => {
+            Ok(PublishOutcome::Published { endpoints, .. }) => {
                 if last_error.take().is_some() {
                     tracing::info!(endpoints, "discovery endpoint publishing recovered");
                 }
@@ -1005,6 +1018,26 @@ mod tests {
         .unwrap();
         assert!(read_identity(temp.path()).is_err());
         assert!(publish_once(temp.path()).is_err());
+    }
+
+    #[test]
+    fn publishes_again_soon_while_a_health_check_is_starting() {
+        let published = |starting| {
+            Ok(PublishOutcome::Published {
+                endpoints: 1,
+                starting,
+            })
+        };
+        assert_eq!(
+            next_publish_delay(&published(true)),
+            STARTING_PUBLISH_INTERVAL
+        );
+        assert_eq!(next_publish_delay(&published(false)), PUBLISH_INTERVAL);
+        assert_eq!(
+            next_publish_delay(&Ok(PublishOutcome::Skipped("not in a cluster"))),
+            PUBLISH_INTERVAL
+        );
+        assert_eq!(next_publish_delay(&Err("failed".into())), PUBLISH_INTERVAL);
     }
 
     #[tokio::test]
