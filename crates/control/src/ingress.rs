@@ -667,7 +667,8 @@ pub(crate) fn render_caddy_config(
             handle.push(if dials.is_empty() {
                 static_response(502, NO_UPSTREAM_BODY)
             } else {
-                json!({
+                let several = dials.len() > 1;
+                let mut proxy = json!({
                     "handler": "reverse_proxy",
                     "upstreams": dials,
                     "load_balancing": {
@@ -675,13 +676,17 @@ pub(crate) fn render_caddy_config(
                         "try_duration": "5s",
                         "try_interval": "250ms",
                     },
-                    // One failed request takes an upstream out for
-                    // `fail_duration`. Keep it short: a stop-then-start deploy
-                    // fails one request while its only container restarts.
-                    "health_checks": {
-                        "passive": {"fail_duration": "5s", "max_fails": 1},
-                    },
-                })
+                });
+                // One failed request takes an upstream out for
+                // `fail_duration`, so the next request goes to another one. A
+                // single upstream has no other one: without the check, Caddy
+                // dials it again until `try_duration`, for example while its
+                // container restarts.
+                if several {
+                    proxy["health_checks"] =
+                        json!({"passive": {"fail_duration": "5s", "max_fails": 1}});
+                }
+                proxy
             });
         } else {
             let scheme = if secure.contains(route.redirect_host.as_str()) {
@@ -1859,6 +1864,20 @@ mod tests {
     }
 
     #[test]
+    fn a_single_upstream_has_no_passive_health_check() {
+        let rendered = config(
+            &[stored("app.example.com", "web", 3000)],
+            &[endpoint("web", "10.240.0.2", "100.64.0.8")],
+        );
+
+        let proxy = &rendered["apps"]["http"]["servers"]["ingress"]["routes"][0]["handle"][0];
+        assert_eq!(proxy["upstreams"], json!([{"dial": "100.64.0.8:3000"}]));
+        // Caddy dials it again until `try_duration`, for example while its
+        // container restarts.
+        assert!(proxy.get("health_checks").is_none());
+    }
+
+    #[test]
     fn renders_local_upstreams_first_with_passive_health_and_first_policy() {
         let rendered = config(
             &[stored("app.example.com", "web", 3000)],
@@ -1900,6 +1919,7 @@ mod tests {
         );
         // The client Host header is passed through: no header rewrite.
         assert!(proxy.get("headers").is_none());
+
         assert!(
             !String::from_utf8(render_caddy_config(&[], &[], "", &[], &[]))
                 .unwrap()
