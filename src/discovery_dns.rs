@@ -298,11 +298,14 @@ const NODE_NAMESPACE: &str = "nodes";
 /// Cluster services, for example `registry.cluster`. Endpoint rows of their own.
 const CLUSTER_NAMESPACE: &str = "cluster";
 
+/// A workload name in any other namespace, `default` or the name of a stack
+/// (decision 0023), resolves to the endpoints of its workload, which Sentinel
+/// publishes in namespace `default`.
 fn endpoint_lookup_sql(namespace: &str) -> &'static str {
     if namespace == NODE_NAMESPACE || namespace == CLUSTER_NAMESPACE {
         "SELECT container_ip FROM workload_endpoints WHERE workload_id = ? AND namespace = ? AND state = 'running' AND health IN ('healthy', 'unknown') AND expires_at > unixepoch() ORDER BY container_ip"
     } else {
-        "SELECT e.container_ip FROM workload_names n JOIN workload_endpoints e ON e.namespace = n.namespace AND e.workload_id = n.workload_id WHERE n.name = ? AND n.namespace = ? AND n.revision = (SELECT MAX(revision) FROM workload_names) AND e.state = 'running' AND e.health IN ('healthy', 'unknown') AND e.expires_at > unixepoch() ORDER BY e.container_ip"
+        "SELECT e.container_ip FROM workload_names n JOIN workload_endpoints e ON e.namespace = 'default' AND e.workload_id = n.workload_id WHERE n.name = ? AND n.namespace = ? AND n.revision = (SELECT MAX(revision) FROM workload_names) AND e.state = 'running' AND e.health IN ('healthy', 'unknown') AND e.expires_at > unixepoch() ORDER BY e.container_ip"
     }
 }
 
@@ -706,7 +709,10 @@ mod tests {
                 INSERT INTO workload_names VALUES
                     ('default', 'api', 'uuid-api', 4, 1),
                     ('default', 'web', 'uuid-web', 4, 1),
-                    ('default', 'old-api', 'uuid-api', 3, 1);",
+                    ('default', 'old-api', 'uuid-api', 3, 1),
+                    ('shop', 'api', 'uuid-api', 4, 1),
+                    ('shop', 'web', 'uuid-web', 4, 1),
+                    ('shop', 'old-db', 'uuid-api', 3, 1);",
                 control::corrosion_schema()
             ))
             .unwrap();
@@ -744,6 +750,26 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_lookup_resolves_stack_names_to_the_default_endpoints() {
+        let connection = database();
+        let lookup = |name: &str, namespace: &str| {
+            rows(
+                &connection,
+                super::endpoint_lookup_sql(namespace),
+                &[name, namespace],
+            )
+        };
+
+        assert_eq!(lookup("api", "shop"), ["10.241.0.2", "10.241.1.2"]);
+        assert_eq!(lookup("api", "default"), lookup("api", "shop"));
+        assert!(lookup("web", "shop").is_empty());
+        assert!(lookup("old-db", "shop").is_empty());
+        assert!(lookup("api", "other").is_empty());
+        // A stack name is never a Node or cluster service row.
+        assert!(lookup("worker-1", "shop").is_empty());
+    }
+
+    #[test]
     fn reverse_lookup_returns_current_names_for_an_address() {
         let connection = database();
         let lookup = |address: &str| {
@@ -754,6 +780,7 @@ mod tests {
             )
         };
 
+        // Stack names do not change the PTR answer.
         assert_eq!(lookup("10.241.0.2"), ["api.default"]);
         assert_eq!(lookup("10.240.0.1"), ["worker-1.nodes"]);
         assert!(lookup("10.241.1.3").is_empty());
