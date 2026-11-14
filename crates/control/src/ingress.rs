@@ -177,7 +177,10 @@ pub(crate) fn validate_routes(request: &IngressReconcileRequest) -> Result<(), S
     }
     let mut names = HashSet::with_capacity(request.names.len());
     for name in &request.names {
-        if !valid_discovery_label(&name.name)
+        let stack_namespace = !matches!(name.namespace.as_str(), "default" | "nodes" | "cluster");
+        let valid_name = valid_discovery_label(&name.name)
+            || (stack_namespace && crate::network::valid_stack_service_name(&name.name));
+        if !valid_name
             || !valid_discovery_label(&name.workload_id)
             || !valid_discovery_label(&name.namespace)
             || name.namespace == NODE_NAMESPACE
@@ -1683,6 +1686,30 @@ mod tests {
             ))
             .is_ok()
         );
+
+        // A stack service name may hold `_` inside; default names may not.
+        let in_namespace = |namespace: &str, service: &str| WorkloadName {
+            namespace: namespace.into(),
+            ..name(service, "uuid-api")
+        };
+        for (namespace, service, accepted) in [
+            ("shop", "rallly_db", true),
+            ("shop", "a_b_c", true),
+            ("shop", "_db", false),
+            ("shop", "db_", false),
+            ("shop", "db_-x", true),
+            ("shop", "db.x", false),
+            ("default", "rallly_db", false),
+            ("cluster", "rallly_db", false),
+            ("nodes", "rallly_db", false),
+            ("sh_op", "db", false),
+        ] {
+            assert_eq!(
+                validate_request(&named(1, vec![in_namespace(namespace, service)])).is_ok(),
+                accepted,
+                "{service}.{namespace}"
+            );
+        }
 
         let too_many = (0..=MAX_NAMES)
             .map(|index| name(&format!("app-{index}"), "uuid-api"))

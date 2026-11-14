@@ -105,6 +105,14 @@ fn valid_label(value: &str) -> bool {
         && !value.ends_with('-')
 }
 
+/// A stack service name may hold `_` inside, as Compose service names do;
+/// names in `default`, `nodes`, and `cluster` may not (decision 0023).
+fn valid_workload_label(workload: &str, namespace: &str) -> bool {
+    valid_label(workload)
+        || (!matches!(namespace, "default" | NODE_NAMESPACE | CLUSTER_NAMESPACE)
+            && valid_label(&workload.replace('_', "-")))
+}
+
 fn parse_question(
     packet: &[u8],
     zone: &str,
@@ -169,7 +177,9 @@ fn parse_question(
         match labels {
             [] => Name::Empty,
             [namespace] if valid_label(namespace) => Name::Empty,
-            [workload, namespace] if valid_label(workload) && valid_label(namespace) => {
+            [workload, namespace]
+                if valid_label(namespace) && valid_workload_label(workload, namespace) =>
+            {
                 Name::Workload {
                     workload: workload.clone(),
                     namespace: namespace.clone(),
@@ -584,6 +594,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_stack_service_names_with_underscores() {
+        let parse = |name: &str| {
+            super::parse_question(&query(name), "coolify.internal", None)
+                .unwrap()
+                .name
+        };
+        assert_eq!(
+            parse("Rallly_DB.shop.coolify.internal."),
+            super::Name::Workload {
+                workload: "rallly_db".into(),
+                namespace: "shop".into(),
+            }
+        );
+        for name in [
+            "rallly_db.default.coolify.internal.",
+            "rallly_db.nodes.coolify.internal.",
+            "rallly_db.cluster.coolify.internal.",
+            "_db.shop.coolify.internal.",
+            "db_.shop.coolify.internal.",
+            "db.sh_op.coolify.internal.",
+        ] {
+            assert_eq!(parse(name), super::Name::Missing, "{name}");
+        }
+    }
+
+    #[test]
     fn parses_ipv4_ptr_queries() {
         let packet = query_with_type("2.0.240.10.in-addr.arpa.", 12);
         let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
@@ -712,7 +748,8 @@ mod tests {
                     ('default', 'old-api', 'uuid-api', 3, 1),
                     ('shop', 'api', 'uuid-api', 4, 1),
                     ('shop', 'web', 'uuid-web', 4, 1),
-                    ('shop', 'old-db', 'uuid-api', 3, 1);",
+                    ('shop', 'old-db', 'uuid-api', 3, 1),
+                    ('shop', 'api_db', 'uuid-api', 4, 1);",
                 control::corrosion_schema()
             ))
             .unwrap();
@@ -762,6 +799,7 @@ mod tests {
 
         assert_eq!(lookup("api", "shop"), ["10.241.0.2", "10.241.1.2"]);
         assert_eq!(lookup("api", "default"), lookup("api", "shop"));
+        assert_eq!(lookup("api_db", "shop"), ["10.241.0.2", "10.241.1.2"]);
         assert!(lookup("web", "shop").is_empty());
         assert!(lookup("old-db", "shop").is_empty());
         assert!(lookup("api", "other").is_empty());
