@@ -105,6 +105,15 @@ pub const CAPABILITY_WORKLOAD_SECRETS: &str = "workload.secrets.v1";
 /// so Coolify can start a second container of a workload and then remove the
 /// old one without failed requests (decision 0022). Not a command.
 pub const CAPABILITY_WORKLOAD_ROLLING_DEPLOY: &str = "workload.rolling_deploy.v1";
+/// `workload.deploy.v1` accepts `dns_search`, passed as `--dns-search`
+/// (decision 0023). Not a command.
+pub const CAPABILITY_WORKLOAD_DNS_SEARCH: &str = "workload.dns_search.v1";
+/// `workload.deploy.v1` accepts `files`, written on the host and bind-mounted
+/// into the container, and `workload.lifecycle.v1` with `remove` deletes them
+/// (decision 0023). Not a command.
+pub const CAPABILITY_WORKLOAD_FILES: &str = "workload.files.v1";
+pub const STACK_CAPABILITIES: [&str; 2] =
+    [CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES];
 pub const VOLUME_CAPABILITIES: [&str; 9] = [
     CAPABILITY_VOLUME_MOUNTS,
     CAPABILITY_VOLUME_DELETE,
@@ -183,6 +192,8 @@ pub mod control {
                     .field("environment_count", &self.environment.len())
                     .field("secret_count", &self.secrets.len())
                     .field("mount_count", &self.mounts.len())
+                    .field("file_count", &self.files.len())
+                    .field("dns_search", &self.dns_search)
                     .field("network_name", &self.network_name)
                     .field("container_ip", &self.container_ip)
                     .field("registry_username", &self.registry_username)

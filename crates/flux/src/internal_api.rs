@@ -16,8 +16,8 @@ use sentinel_protocol::control::v1::{
     IngressReconcileRequest, IngressRoute, LogSource, LogsReadRequest, SystemInfoRequest,
     SystemPingRequest, TrustBundleUpdateRequest, WireguardInspectRequest,
     WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest,
-    WorkloadEnvironmentVariable, WorkloadHealthCheck, WorkloadLabel, WorkloadLifecycleAction,
-    WorkloadLifecycleRequest, WorkloadName, WorkloadSecret,
+    WorkloadEnvironmentVariable, WorkloadFile, WorkloadHealthCheck, WorkloadLabel,
+    WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadName, WorkloadSecret,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -25,7 +25,8 @@ use sentinel_protocol::{
     CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES,
+    CAPABILITY_WORKLOAD_LIFECYCLE,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -160,7 +161,53 @@ struct WorkloadDeployApiRequest {
     registry_username: String,
     #[serde(default)]
     registry_password: String,
+    #[serde(default)]
+    dns_search: Vec<String>,
+    #[serde(default)]
+    files: Vec<DeployFile>,
 }
+
+/// A file of `workload.files.v1`. Sentinel validates the path, mode, and sizes.
+#[derive(Deserialize)]
+struct DeployFile {
+    path: String,
+    #[serde(default)]
+    content_base64: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    directory: bool,
+}
+
+/// Decodes the files of a deploy. A file is at most 1 MiB, so a longer
+/// encoding is refused before it is decoded.
+fn deploy_files(files: Vec<DeployFile>) -> Result<Vec<WorkloadFile>, (StatusCode, &'static str)> {
+    const MAX_FILES: usize = 64;
+    const MAX_ENCODED_BYTES: usize = (1024 * 1024usize).div_ceil(3) * 4;
+    if files.len() > MAX_FILES {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "too many files"));
+    }
+    files
+        .into_iter()
+        .map(|file| {
+            if file.content_base64.len() > MAX_ENCODED_BYTES {
+                return Err((StatusCode::UNPROCESSABLE_ENTITY, "a file is too large"));
+            }
+            let content = base64::engine::general_purpose::STANDARD
+                .decode(file.content_base64.as_bytes())
+                .map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, "invalid file content"))?;
+            Ok(WorkloadFile {
+                path: file.path,
+                content,
+                mode: file.mode,
+                directory: file.directory,
+            })
+        })
+        .collect()
+}
+
+/// The files of one deploy are at most 4 MiB, about 5.4 MiB as base64.
+const WORKLOAD_DEPLOY_BODY_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct DeployHealthCheck {
@@ -485,6 +532,7 @@ struct ContainerResponse {
     labels: std::collections::HashMap<String, String>,
     created_at_unix_ms: Option<i64>,
     started_at_unix_ms: Option<i64>,
+    exit_code: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -511,7 +559,12 @@ pub async fn serve(
             post(trust_bundle_update),
         )
         .route("/v1/commands/network.cluster.leave", post(cluster_leave))
-        .route("/v1/commands/workload.deploy", post(workload_deploy))
+        .route(
+            "/v1/commands/workload.deploy",
+            post(workload_deploy).layer(axum::extract::DefaultBodyLimit::max(
+                WORKLOAD_DEPLOY_BODY_LIMIT,
+            )),
+        )
         .route("/v1/commands/workload.lifecycle", post(workload_lifecycle))
         .route(
             "/v1/commands/network.wireguard.key.ensure",
@@ -1096,6 +1149,25 @@ async fn workload_deploy(
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request").into());
     }
     let pull_policy = workload_pull_policy(&request.pull_policy)?;
+    let files = deploy_files(request.files)?;
+    // An older Sentinel ignores the fields and would start the container
+    // without its files or search domains.
+    let needed = [
+        (!request.dns_search.is_empty()).then_some(CAPABILITY_WORKLOAD_DNS_SEARCH),
+        (!files.is_empty()).then_some(CAPABILITY_WORKLOAD_FILES),
+    ];
+    if needed.iter().flatten().next().is_some() {
+        let Some(connection) = state.registry.get(&request.server_id).await else {
+            return Err(dispatch_error(CommandDispatchError::Offline).into());
+        };
+        if needed
+            .iter()
+            .flatten()
+            .any(|capability| !connection.capabilities.iter().any(|c| c == capability))
+        {
+            return Err(dispatch_error(CommandDispatchError::Unsupported).into());
+        }
+    }
     let now = now_millis();
     let result = state
         .registry
@@ -1156,6 +1228,8 @@ async fn workload_deploy(
                         .collect(),
                     registry_username: request.registry_username,
                     registry_password: request.registry_password,
+                    dns_search: request.dns_search,
+                    files,
                 })),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },
@@ -1242,6 +1316,7 @@ async fn container_list(
             labels: container.labels,
             created_at_unix_ms: container.created_at_unix_ms,
             started_at_unix_ms: container.started_at_unix_ms,
+            exit_code: container.exit_code,
         })
         .collect();
 

@@ -534,6 +534,8 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "volume.restore.v1",
             "database.dump.v1",
             "database.restore.v1",
+            "workload.dns_search.v1",
+            "workload.files.v1",
             "workload.exec.v1",
             "workload.terminal.v1"
         ])
@@ -1026,6 +1028,162 @@ fn parses_podman_container_inventory() {
     assert_eq!(container.created_at_unix_ms, Some(1_789_237_060_000));
     assert_eq!(container.ports[0].host_port, Some(8080));
     assert_eq!(container.labels["coolify.managed"], "true");
+    assert_eq!(container.exit_code, None);
+}
+
+#[test]
+fn reports_the_exit_code_only_for_containers_that_ended() {
+    let containers = crate::commands::parse_podman_containers(
+        br#"[
+            {"Id":"a","Image":"alpine","Names":["once-ok"],"State":"exited","Exited":true,"ExitCode":0},
+            {"Id":"b","Image":"alpine","Names":["once-failed"],"State":"exited","Exited":true,"ExitCode":3},
+            {"Id":"c","Image":"alpine","Names":["running"],"State":"running","Exited":false,"ExitCode":0},
+            {"Id":"d","Image":"alpine","Names":["created"],"State":"created","Exited":false,"ExitCode":0}
+        ]"#,
+    )
+    .unwrap();
+
+    let codes: Vec<_> = containers
+        .iter()
+        .map(|container| (container.name.as_str(), container.exit_code))
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            ("once-ok", Some(0)),
+            ("once-failed", Some(3)),
+            ("running", None),
+            ("created", None)
+        ]
+    );
+}
+
+#[test]
+fn passes_dns_search_domains_of_the_coolify_zone() {
+    let request = |domains: &[&str]| sentinel_protocol::control::v1::WorkloadDeployRequest {
+        name: "coolify-web".into(),
+        image: "alpine".into(),
+        restart_policy: "no".into(),
+        dns_server: "10.240.0.2".into(),
+        dns_search: domains.iter().map(|domain| domain.to_string()).collect(),
+        ..Default::default()
+    };
+    let deploy = |domains: &[&str]| {
+        crate::commands::podman_deploy_args(std::path::Path::new("/"), &request(domains))
+    };
+
+    let arguments = deploy(&["shop.coolify.internal", "a.b-c.coolify.internal"])
+        .unwrap()
+        .arguments;
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--dns-search", "shop.coolify.internal"])
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--dns-search", "a.b-c.coolify.internal"])
+    );
+    assert!(arguments.windows(2).any(|v| v == ["--restart", "no"]));
+    assert!(
+        !deploy(&[])
+            .unwrap()
+            .arguments
+            .contains(&"--dns-search".to_string())
+    );
+    assert!(deploy(&["s1.coolify.internal"; 6]).is_ok());
+    assert!(deploy(&["s1.coolify.internal"; 7]).is_err());
+    let long_label = format!("{}.coolify.internal", "a".repeat(64));
+    for invalid in [
+        "coolify.internal",
+        ".coolify.internal",
+        "shop.example.com",
+        "Shop.coolify.internal",
+        "-shop.coolify.internal",
+        "shop-.coolify.internal",
+        "sh op.coolify.internal",
+        "a..coolify.internal",
+        "shop.coolify.internal.",
+        "--privileged.coolify.internal",
+        long_label.as_str(),
+        "",
+    ] {
+        assert!(deploy(&[invalid]).is_err(), "{invalid:?} must be rejected");
+    }
+}
+
+#[test]
+fn deploy_writes_workload_files_and_remove_deletes_them() {
+    use sentinel_protocol::control::v1::CommandStatus;
+    use sentinel_protocol::control::v1::WorkloadLifecycleAction::Remove;
+
+    let root = tempfile::tempdir().unwrap();
+    let podman = root.path().join("fake-podman");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            &podman,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}/podman.log'\nif [ \"$1\" = run ]; then echo 0123abcd; fi\n",
+                root.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut executor = crate::commands::CommandExecutor::new("dev")
+        .with_network_root(root.path())
+        .with_podman(&podman);
+    let mut command = workload_deploy_command("deploy-files", "coolify-p1test-main");
+    let Some(sentinel_protocol::control::v1::command::Payload::WorkloadDeploy(request)) =
+        command.payload.as_mut()
+    else {
+        unreachable!()
+    };
+    request.restart_policy = "no".into();
+    request.files = vec![
+        sentinel_protocol::control::v1::WorkloadFile {
+            path: "/etc/app.conf".into(),
+            content: b"secret=value".to_vec(),
+            mode: "0600".into(),
+            directory: false,
+        },
+        sentinel_protocol::control::v1::WorkloadFile {
+            path: "/data".into(),
+            directory: true,
+            ..Default::default()
+        },
+    ];
+
+    let execution = executor.execute(command, true);
+    assert_eq!(
+        execution.result.status,
+        CommandStatus::Succeeded as i32,
+        "{:?}",
+        execution.result
+    );
+    let base = root
+        .path()
+        .join("var/lib/coolify/workload-files/coolify-p1test-main");
+    assert_eq!(
+        std::fs::read(base.join("etc/app.conf")).unwrap(),
+        b"secret=value"
+    );
+    assert!(base.join("data").is_dir());
+    let log = std::fs::read_to_string(root.path().join("podman.log")).unwrap();
+    assert!(log.contains(&format!(
+        "--mount type=bind,source={}/etc/app.conf,target=/etc/app.conf",
+        base.display()
+    )));
+    assert!(!log.contains("secret=value"));
+
+    let execution = executor.execute(
+        workload_lifecycle_command("remove-files", "coolify-p1test-main", Remove),
+        true,
+    );
+    assert_eq!(execution.result.status, CommandStatus::Succeeded as i32);
+    assert!(!base.exists());
 }
 
 #[test]
@@ -1250,9 +1408,11 @@ fn builds_shell_free_podman_deploy_arguments() {
         secrets: Vec::new(),
         registry_username: String::new(),
         registry_password: String::new(),
+        dns_search: vec!["web.coolify.internal".into()],
+        files: Vec::new(),
     };
 
-    let deploy = crate::commands::podman_deploy_args(&request).unwrap();
+    let deploy = crate::commands::podman_deploy_args(std::path::Path::new("/"), &request).unwrap();
     let arguments = deploy.arguments;
 
     assert_eq!(arguments[0], "run");
@@ -1337,9 +1497,24 @@ fn rejects_unsafe_or_oversized_deploy_requests() {
         ..Default::default()
     };
 
-    assert!(crate::commands::podman_deploy_args(&request("bad name", "alpine")).is_err());
-    assert!(crate::commands::podman_deploy_args(&request("safe-name", "")).is_err());
-    assert!(crate::commands::podman_deploy_args(&request("safe-name", "alpine;rm")).is_err());
+    assert!(
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request("bad name", "alpine")
+        )
+        .is_err()
+    );
+    assert!(
+        crate::commands::podman_deploy_args(std::path::Path::new("/"), &request("safe-name", ""))
+            .is_err()
+    );
+    assert!(
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request("safe-name", "alpine;rm")
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1352,9 +1527,10 @@ fn uses_the_requested_image_pull_policy() {
         ..Default::default()
     };
     let pull = |pull_policy: &str| {
-        let arguments = crate::commands::podman_deploy_args(&request(pull_policy))
-            .unwrap()
-            .arguments;
+        let arguments =
+            crate::commands::podman_deploy_args(std::path::Path::new("/"), &request(pull_policy))
+                .unwrap()
+                .arguments;
         let index = arguments.iter().position(|v| v == "--pull").unwrap();
         assert_eq!(arguments.iter().filter(|v| *v == "--pull").count(), 1);
         arguments[index + 1].clone()
@@ -1365,7 +1541,10 @@ fn uses_the_requested_image_pull_policy() {
     assert_eq!(pull("newer"), "newer");
     assert_eq!(pull("always"), "always");
     for invalid in ["never", "Newer", "newer --privileged", " always"] {
-        assert!(crate::commands::podman_deploy_args(&request(invalid)).is_err());
+        assert!(
+            crate::commands::podman_deploy_args(std::path::Path::new("/"), &request(invalid))
+                .is_err()
+        );
     }
 }
 
@@ -1384,17 +1563,41 @@ fn rejects_invalid_workload_resource_settings() {
         }
     };
 
-    assert!(crate::commands::podman_deploy_args(&request(Some(0.0), None, None, None)).is_err());
     assert!(
-        crate::commands::podman_deploy_args(&request(Some(f64::NAN), None, None, None)).is_err()
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request(Some(0.0), None, None, None)
+        )
+        .is_err()
     );
     assert!(
-        crate::commands::podman_deploy_args(&request(Some(1.0), Some(2.0), None, None)).is_err()
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request(Some(f64::NAN), None, None, None)
+        )
+        .is_err()
     );
     assert!(
-        crate::commands::podman_deploy_args(&request(None, None, Some(1024), Some(2048))).is_err()
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request(Some(1.0), Some(2.0), None, None)
+        )
+        .is_err()
     );
-    assert!(crate::commands::podman_deploy_args(&request(None, None, Some(0), None)).is_err());
+    assert!(
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request(None, None, Some(1024), Some(2048))
+        )
+        .is_err()
+    );
+    assert!(
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request(None, None, Some(0), None)
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -2841,7 +3044,9 @@ fn passes_any_podman_environment_variable_and_rejects_unpassable_ones() {
     ];
     environment.extend((0..300).map(|index| variable(&format!("VAR_{index}"), "value")));
 
-    let deploy = crate::commands::podman_deploy_args(&request(environment)).unwrap();
+    let deploy =
+        crate::commands::podman_deploy_args(std::path::Path::new("/"), &request(environment))
+            .unwrap();
     let arguments = deploy.arguments;
 
     // Values go to Podman's process environment, not to its world-readable argument list.
@@ -2878,6 +3083,9 @@ fn passes_any_podman_environment_variable_and_rejects_unpassable_ones() {
         variable("A\0B", "x"),
         variable("A", "x\0y"),
     ] {
-        assert!(crate::commands::podman_deploy_args(&request(vec![invalid])).is_err());
+        assert!(
+            crate::commands::podman_deploy_args(std::path::Path::new("/"), &request(vec![invalid]))
+                .is_err()
+        );
     }
 }

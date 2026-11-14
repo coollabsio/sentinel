@@ -240,6 +240,8 @@ message ContainerObservation {
   map<string, string> labels = 8;
   optional int64 created_at_unix_ms = 9;
   optional int64 started_at_unix_ms = 10;
+  // The exit code of a container that is not running (`exited`, `stopped`).
+  optional int32 exit_code = 11;
 }
 
 message ContainerPort {
@@ -286,6 +288,27 @@ message WorkloadDeployRequest {
   // after `podman run`, and never journals or logs them.
   string registry_username = 20;
   string registry_password = 21;
+  // `--dns-search` domains, for example `<stack>.coolify.internal`
+  // (decision 0023). At most 6, each a DNS name in `.coolify.internal`.
+  // Needs `workload.dns_search.v1`.
+  repeated string dns_search = 22;
+  // Files and empty directories that Sentinel writes on the host for this
+  // container name and bind-mounts read-write at `path` (decision 0023).
+  // Rewritten on each deploy, deleted on remove. At most 64, 1 MiB each, 4 MiB
+  // together. Needs `workload.files.v1`.
+  repeated WorkloadFile files = 23;
+}
+
+message WorkloadFile {
+  // Absolute and normalized, not `/`, without `,`, not under `/proc`,
+  // `/sys`, `/dev`, or `/run/secrets`. Unique in a request.
+  string path = 1;
+  // Empty for a directory.
+  bytes content = 2;
+  // Octal, for example "0644". Empty means 0644 for a file, 0755 for a
+  // directory.
+  string mode = 3;
+  bool directory = 4;
 }
 
 message WorkloadSecret {

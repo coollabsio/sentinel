@@ -238,7 +238,7 @@ impl CommandExecutor {
                 crate::network::validate_cluster_leave(request).is_ok()
             }
             (CAPABILITY_WORKLOAD_DEPLOY, Some(Payload::WorkloadDeploy(request))) => {
-                podman_deploy_args(request).is_ok()
+                podman_deploy_args(Path::new("/"), request).is_ok()
             }
             (CAPABILITY_WORKLOAD_LIFECYCLE, Some(Payload::WorkloadLifecycle(request))) => {
                 podman_lifecycle_args(request).is_ok()
@@ -833,6 +833,7 @@ fn workload_lifecycle(
     }
     if request.action == WorkloadLifecycleAction::Remove as i32 {
         crate::secrets::delete_all(podman, &request.name)?;
+        crate::files::remove(root, &request.name)?;
     }
 
     Ok(WorkloadLifecycleResult {
@@ -892,7 +893,7 @@ fn workload_deploy(
     podman: &Path,
     request: &WorkloadDeployRequest,
 ) -> Result<WorkloadDeployResult, String> {
-    let mut deploy = podman_deploy_args(request)?;
+    let mut deploy = podman_deploy_args(root, request)?;
     let auth = crate::registry::pull_auth_path(root);
     // Lives until `podman run` has pulled the image; dropping it deletes the file.
     let mut _login = None;
@@ -928,6 +929,7 @@ fn workload_deploy(
             .map(|mount| mount.volume_name.as_str()),
     )?;
     crate::secrets::create(podman, request)?;
+    crate::files::write(root, request)?;
     let mut command = std::process::Command::new(podman);
     command
         .args(deploy.arguments)
@@ -1191,7 +1193,11 @@ impl Drop for TemporaryAuthFile {
     }
 }
 
-pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<PodmanDeploy, String> {
+/// `root` is the host root under which the workload files of the request live.
+pub(crate) fn podman_deploy_args(
+    root: &Path,
+    request: &WorkloadDeployRequest,
+) -> Result<PodmanDeploy, String> {
     if !valid_container_name(&request.name) {
         return Err("The container name is invalid.".into());
     }
@@ -1276,6 +1282,17 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Podm
     if !request.dns_server.is_empty() {
         args.extend(["--dns".into(), request.dns_server.clone()]);
     }
+    if request.dns_search.len() > MAX_DNS_SEARCH_DOMAINS
+        || !request
+            .dns_search
+            .iter()
+            .all(|domain| valid_dns_search_domain(domain))
+    {
+        return Err("The workload DNS search domains are invalid.".into());
+    }
+    for domain in &request.dns_search {
+        args.extend(["--dns-search".into(), domain.clone()]);
+    }
     if let Some(cpu_limit) = request.cpu_limit {
         args.extend(["--cpus".into(), cpu_limit.to_string()]);
     }
@@ -1358,12 +1375,32 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Podm
     }
     args.extend(crate::volumes::mount_args(&request.mounts)?);
     args.extend(crate::secrets::mount_args(request)?);
+    args.extend(crate::files::mount_args(root, request)?);
     args.push(request.image.clone());
     args.extend(request.command.clone());
     Ok(PodmanDeploy {
         arguments: args,
         environment,
     })
+}
+
+const MAX_DNS_SEARCH_DOMAINS: usize = 6;
+const DNS_SEARCH_ZONE: &str = ".coolify.internal";
+
+/// A lowercase DNS name with at least one label before `.coolify.internal`.
+pub(crate) fn valid_dns_search_domain(domain: &str) -> bool {
+    domain.len() <= 253
+        && domain.strip_suffix(DNS_SEARCH_ZONE).is_some_and(|labels| {
+            !labels.is_empty()
+                && labels.split('.').all(|label| {
+                    (1..=63).contains(&label.len())
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                })
+        })
 }
 
 fn container_list() -> Result<Vec<ContainerObservation>, &'static str> {
@@ -1446,6 +1483,7 @@ pub(crate) fn parse_podman_containers(
                 labels,
                 created_at_unix_ms: unix_millis(value, &["Created"]),
                 started_at_unix_ms: unix_millis(value, &["StartedAt"]),
+                exit_code: container_exit_code(value, state),
             })
         })
         .collect()
@@ -1470,6 +1508,17 @@ fn container_health(value: &serde_json::Value) -> Option<String> {
             };
             matches!(health.as_str(), "starting" | "healthy" | "unhealthy").then_some(health)
         })
+}
+
+/// Podman reports `ExitCode` 0 for a container that never exited, so the code
+/// counts only for a container that is not running.
+fn container_exit_code(value: &serde_json::Value, state: &str) -> Option<i32> {
+    let exited = matches!(state, "exited" | "stopped")
+        || value.get("Exited").and_then(serde_json::Value::as_bool) == Some(true);
+    exited
+        .then(|| value.get("ExitCode")?.as_i64())
+        .flatten()
+        .and_then(|code| i32::try_from(code).ok())
 }
 
 fn string_field<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {

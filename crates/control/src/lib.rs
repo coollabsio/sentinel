@@ -9,6 +9,7 @@ mod container_logs;
 mod database_dump;
 mod discovery;
 mod exec;
+mod files;
 mod ingress;
 mod ingress_tls;
 mod logs;

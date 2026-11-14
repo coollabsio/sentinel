@@ -11,6 +11,7 @@ use sentinel_protocol::{
 use sentinel_protocol::EXEC_CAPABILITIES;
 
 use sentinel_protocol::DATABASE_CAPABILITIES;
+use sentinel_protocol::STACK_CAPABILITIES;
 
 use crate::CredentialClaims;
 
@@ -66,6 +67,7 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
     .chain(BUILD_CAPABILITIES)
     .chain(VOLUME_CAPABILITIES)
     .chain(DATABASE_CAPABILITIES)
+    .chain(STACK_CAPABILITIES)
     .chain(EXEC_CAPABILITIES)
     .collect::<Vec<_>>();
     let capabilities =

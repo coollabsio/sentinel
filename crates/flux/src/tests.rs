@@ -701,6 +701,150 @@ async fn workload_deploy_route_rejects_an_invalid_pull_policy() {
 }
 
 #[tokio::test]
+async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_supports_them() {
+    use base64::Engine;
+
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![
+                sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_DNS_SEARCH.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_FILES.into(),
+            ],
+        )
+        .await;
+    let (old_sender, _old_receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-old",
+            "connection-2",
+            old_sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let encoded = base64::engine::general_purpose::STANDARD.encode(b"listen 80;");
+    let body = |server_id: &str, files: serde_json::Value| {
+        serde_json::json!({
+            "server_id": server_id,
+            "command_id": "deploy-1",
+            "name": "coolify-p1test-main",
+            "image": "docker.io/library/nginx:latest",
+            "restart_policy": "no",
+            "dns_search": ["shop.coolify.internal"],
+            "files": files,
+        })
+    };
+    let post = |body: serde_json::Value| {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/workload.deploy"))
+            .bearer_auth("internal-secret")
+            .json(&body)
+            .send()
+    };
+
+    // A Sentinel without the capabilities would drop the fields.
+    let response = post(body(
+        "server-old",
+        serde_json::json!([{"path": "/etc/nginx.conf", "content_base64": encoded}]),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let response = post(body(
+        "server-1",
+        serde_json::json!([{"path": "/etc/nginx.conf", "content_base64": "not base64!"}]),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let too_large = "A".repeat(1_398_108);
+    let response = post(body(
+        "server-1",
+        serde_json::json!([{"path": "/big", "content_base64": too_large}]),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Four files of 1 MiB fit in the body limit.
+    let mib = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 1024 * 1024]);
+    let mut files: Vec<_> = (0..4)
+        .map(|index| serde_json::json!({"path": format!("/f{index}"), "content_base64": mib}))
+        .collect();
+    files.push(serde_json::json!({
+        "path": "/etc/nginx.conf",
+        "content_base64": encoded,
+        "mode": "0600",
+    }));
+    files.push(serde_json::json!({"path": "/data", "directory": true}));
+    let mut request = tokio::spawn(post(body("server-1", serde_json::Value::Array(files))));
+
+    let message = tokio::select! {
+        message = receiver.recv() => message.unwrap(),
+        response = &mut request => panic!("no dispatch: {:?}", response.unwrap().unwrap().text().await),
+    };
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    let Some(sentinel_protocol::control::v1::command::Payload::WorkloadDeploy(deploy)) =
+        command.payload
+    else {
+        panic!("expected a deploy");
+    };
+    assert_eq!(deploy.dns_search, ["shop.coolify.internal"]);
+    assert_eq!(deploy.files.len(), 6);
+    assert_eq!(deploy.files[0].content.len(), 1024 * 1024);
+    assert_eq!(deploy.files[4].path, "/etc/nginx.conf");
+    assert_eq!(deploy.files[4].content, b"listen 80;");
+    assert_eq!(deploy.files[4].mode, "0600");
+    assert!(!deploy.files[4].directory);
+    assert!(deploy.files[5].directory);
+    assert!(deploy.files[5].content.is_empty());
+    // The debug output never holds file contents.
+    assert!(!format!("{deploy:?}").contains("listen"));
+
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: "deploy-1:result".into(),
+                command_id: "deploy-1".into(),
+                status: sentinel_protocol::control::v1::CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: now_millis(),
+                payload: Some(
+                    sentinel_protocol::control::v1::command_result::Payload::WorkloadDeploy(
+                        sentinel_protocol::control::v1::WorkloadDeployResult {
+                            runtime_id: "0123abcd".into(),
+                            name: "coolify-p1test-main".into(),
+                            image: "docker.io/library/nginx:latest".into(),
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    server.abort();
+}
+
+#[tokio::test]
 async fn workload_deploy_route_returns_the_sentinel_failure_message() {
     let registry = ConnectionRegistry::default();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
