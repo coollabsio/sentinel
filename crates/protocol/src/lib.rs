@@ -119,11 +119,16 @@ pub const CAPABILITY_FIREWALL_STACK_RULES: &str = "network.firewall.stack_rules.
 /// namespace (not `default`, `nodes`, or `cluster`), and the discovery DNS
 /// answers them, for Compose service names such as `app_db`. Not a command.
 pub const CAPABILITY_DISCOVERY_NAMES_UNDERSCORE: &str = "discovery.names.underscore.v1";
-pub const STACK_CAPABILITIES: [&str; 4] = [
+/// The health check `command` of `workload.deploy.v1` can be a JSON array, the
+/// exec form of the Compose `CMD` test, which runs without `/bin/sh` (decision
+/// 0023). Not a command.
+pub const CAPABILITY_WORKLOAD_HEALTHCHECK_EXEC: &str = "workload.healthcheck.exec.v1";
+pub const STACK_CAPABILITIES: [&str; 5] = [
     CAPABILITY_WORKLOAD_DNS_SEARCH,
     CAPABILITY_WORKLOAD_FILES,
     CAPABILITY_FIREWALL_STACK_RULES,
     CAPABILITY_DISCOVERY_NAMES_UNDERSCORE,
+    CAPABILITY_WORKLOAD_HEALTHCHECK_EXEC,
 ];
 pub const VOLUME_CAPABILITIES: [&str; 9] = [
     CAPABILITY_VOLUME_MOUNTS,

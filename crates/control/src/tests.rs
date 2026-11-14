@@ -538,6 +538,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "workload.files.v1",
             "network.firewall.stack_rules.v1",
             "discovery.names.underscore.v1",
+            "workload.healthcheck.exec.v1",
             "workload.exec.v1",
             "workload.terminal.v1"
         ])
@@ -3090,4 +3091,42 @@ fn passes_any_podman_environment_variable_and_rejects_unpassable_ones() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn health_check_accepts_the_shell_form_and_the_exec_form() {
+    use sentinel_protocol::control::v1::WorkloadHealthCheck;
+
+    let check = |command: &str| WorkloadHealthCheck {
+        command: command.into(),
+        interval_seconds: 10,
+        timeout_seconds: 5,
+        retries: 3,
+        start_period_seconds: 0,
+    };
+    let command_of = |command: &str| {
+        crate::commands::podman_health_args(&check(command)).map(|args| args[1].clone())
+    };
+
+    assert_eq!(
+        command_of("curl -f http://localhost/").unwrap(),
+        "curl -f http://localhost/"
+    );
+    // The exec form runs without a shell; it is passed in a canonical form.
+    assert_eq!(
+        command_of(r#"[ "/app/vikunja", "healthcheck" ]"#).unwrap(),
+        r#"["/app/vikunja","healthcheck"]"#
+    );
+    for invalid in [
+        "",
+        "[]",
+        r#"["/bin/x", ""]"#,
+        "[not json",
+        r#"["a\u0000b"]"#,
+        "a\nb",
+    ] {
+        assert!(command_of(invalid).is_err(), "{invalid:?} must be rejected");
+    }
+    let too_many = serde_json::to_string(&vec!["x"; 65]).unwrap();
+    assert!(command_of(&too_many).is_err());
 }

@@ -1119,16 +1119,12 @@ pub(crate) fn podman_runtime_variable(name: &str) -> bool {
 }
 
 /// The `podman run` flags of a health check. Podman runs a command that is not
-/// a JSON array with `/bin/sh -c`, like the `CMD-SHELL` form of `HEALTHCHECK`.
+/// a JSON array with `/bin/sh -c`, like the `CMD-SHELL` form of `HEALTHCHECK`,
+/// and a JSON array of arguments without a shell, like the `CMD` form, for
+/// images that have no shell.
 pub(crate) fn podman_health_args(check: &WorkloadHealthCheck) -> Result<Vec<String>, String> {
-    let command = check.command.trim();
-    if command.is_empty()
-        || command.len() > 4_096
-        || command.starts_with('[')
-        || command.contains(['\0', '\n', '\r'])
-    {
-        return Err("The health check command is invalid.".into());
-    }
+    let command = health_command(check.command.trim())
+        .ok_or_else(|| "The health check command is invalid.".to_string())?;
     let seconds = |value: u32, minimum: u32| (minimum..=3_600).contains(&value);
     if !seconds(check.interval_seconds, 1)
         || !seconds(check.timeout_seconds, 1)
@@ -1139,7 +1135,7 @@ pub(crate) fn podman_health_args(check: &WorkloadHealthCheck) -> Result<Vec<Stri
     }
     Ok(vec![
         "--health-cmd".into(),
-        command.into(),
+        command,
         "--health-interval".into(),
         format!("{}s", check.interval_seconds),
         "--health-timeout".into(),
@@ -1149,6 +1145,27 @@ pub(crate) fn podman_health_args(check: &WorkloadHealthCheck) -> Result<Vec<Stri
         "--health-start-period".into(),
         format!("{}s", check.start_period_seconds),
     ])
+}
+
+/// A shell command, or a JSON array of at most 64 non-empty arguments without
+/// NUL, written back in a canonical form so Podman reads it as the exec form.
+fn health_command(command: &str) -> Option<String> {
+    if command.is_empty() || command.len() > 4_096 || command.contains(['\0', '\n', '\r']) {
+        return None;
+    }
+    if !command.starts_with('[') {
+        return Some(command.to_string());
+    }
+    let arguments: Vec<String> = serde_json::from_str(command).ok()?;
+    if arguments.is_empty()
+        || arguments.len() > 64
+        || arguments
+            .iter()
+            .any(|argument| argument.is_empty() || argument.contains('\0'))
+    {
+        return None;
+    }
+    serde_json::to_string(&arguments).ok()
 }
 
 /// The registry login of one deploy on the host `/run` (tmpfs), 0600 in a 0700
