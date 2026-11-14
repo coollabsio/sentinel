@@ -112,8 +112,19 @@ pub const CAPABILITY_WORKLOAD_DNS_SEARCH: &str = "workload.dns_search.v1";
 /// into the container, and `workload.lifecycle.v1` with `remove` deletes them
 /// (decision 0023). Not a command.
 pub const CAPABILITY_WORKLOAD_FILES: &str = "workload.files.v1";
-pub const STACK_CAPABILITIES: [&str; 2] =
-    [CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES];
+/// `network.firewall.reconcile.v1` accepts `stack_rules`: all protocols and
+/// ports between two workload addresses (decision 0023). Not a command.
+pub const CAPABILITY_FIREWALL_STACK_RULES: &str = "network.firewall.stack_rules.v1";
+/// `ingress.reconcile.v1` accepts `_` inside the internal names of a stack
+/// namespace (not `default`, `nodes`, or `cluster`), and the discovery DNS
+/// answers them, for Compose service names such as `app_db`. Not a command.
+pub const CAPABILITY_DISCOVERY_NAMES_UNDERSCORE: &str = "discovery.names.underscore.v1";
+pub const STACK_CAPABILITIES: [&str; 4] = [
+    CAPABILITY_WORKLOAD_DNS_SEARCH,
+    CAPABILITY_WORKLOAD_FILES,
+    CAPABILITY_FIREWALL_STACK_RULES,
+    CAPABILITY_DISCOVERY_NAMES_UNDERSCORE,
+];
 pub const VOLUME_CAPABILITIES: [&str; 9] = [
     CAPABILITY_VOLUME_MOUNTS,
     CAPABILITY_VOLUME_DELETE,

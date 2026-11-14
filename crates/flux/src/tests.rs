@@ -1806,3 +1806,64 @@ fn negotiates_the_container_logs_capability_when_granted() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn firewall_reconcile_route_passes_stack_rules_to_sentinel() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_FIREWALL_RECONCILE.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let _request = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!(
+                "http://{address}/v1/commands/network.firewall.reconcile"
+            ))
+            .bearer_auth("internal-secret")
+            .json(&serde_json::json!({
+                "server_id": "server-1",
+                "command_id": "firewall-1",
+                "revision": 4,
+                "wireguard_port": 51820,
+                "cluster_cidr": "10.240.0.0/24",
+                "local_node_ip": "10.240.0.2",
+                "wireguard_interface": "coolify0",
+                "workload_cidrs": ["100.64.0.0/24"],
+                "stack_rules": [{"source_ip": "100.64.0.2", "destination_ip": "100.64.0.3"}],
+            }))
+            .send(),
+    );
+
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    let Some(sentinel_protocol::control::v1::command::Payload::FirewallReconcile(firewall)) =
+        command.payload
+    else {
+        panic!("expected a firewall reconcile");
+    };
+    assert_eq!(
+        firewall.stack_rules,
+        [sentinel_protocol::control::v1::FirewallStackRule {
+            source_ip: "100.64.0.2".into(),
+            destination_ip: "100.64.0.3".into(),
+        }]
+    );
+    server.abort();
+}

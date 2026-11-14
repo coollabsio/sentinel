@@ -277,6 +277,18 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
             && !ipv4_in_cidr(&request.registry_ip, &request.cluster_cidr))
         || request.rules.len() > 100_000
         || request.ingress_rules.len() > 100_000
+        || request.stack_rules.len() > 100_000
+        || request.stack_rules.iter().any(|rule| {
+            [&rule.source_ip, &rule.destination_ip]
+                .into_iter()
+                .any(|ip| {
+                    ip.parse::<std::net::Ipv4Addr>().is_err()
+                        || !request
+                            .workload_cidrs
+                            .iter()
+                            .any(|cidr| ipv4_in_cidr(ip, cidr))
+                })
+        })
         || request.rules.iter().any(|rule| {
             rule.source_ip.parse::<std::net::Ipv4Addr>().is_err()
                 || rule.destination_ip.parse::<std::net::Ipv4Addr>().is_err()
@@ -308,6 +320,21 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
     {
         return Err("The firewall configuration is invalid.".into());
     }
+    let mut stack_rules = request
+        .stack_rules
+        .iter()
+        .map(|rule| (rule.source_ip.as_str(), rule.destination_ip.as_str()))
+        .collect::<Vec<_>>();
+    stack_rules.sort_unstable();
+    if stack_rules.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("The firewall stack rules must be unique.".into());
+    }
+    // Both ends are workloads, so the rules belong in forward and in the
+    // bridge chain (same-Node traffic), never in output.
+    let stack_allow_rules = stack_rules
+        .iter()
+        .map(|(source, destination)| format!("ip saddr {source} ip daddr {destination} accept; "))
+        .collect::<String>();
 
     let mut workload_cidrs = request.workload_cidrs.clone();
     workload_cidrs.sort();
@@ -440,13 +467,13 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
         "table inet {COOLIFY_NFT_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
  chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; ip saddr {} udp dport 8787 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} udp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 8080 accept; {input_registry_rule}ip saddr {} drop; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
- chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} {forward_ingress_rules} ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; ip saddr != @workload_networks ip daddr @workload_networks drop; }}
+ chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} {stack_allow_rules}{forward_ingress_rules} ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; ip saddr != @workload_networks ip daddr @workload_networks drop; }}
  chain {MESH_NAT_CHAIN} {{ type nat hook postrouting priority srcnat - 5; policy accept; oifname \"{}\" ip saddr @workload_networks ip daddr @workload_networks snat ip to ip saddr; }}
  chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; ip daddr {local_node_ip} udp dport 53 accept; ip daddr {local_node_ip} tcp dport 53 accept; ip daddr {local_node_ip} tcp dport 8080 accept; {output_allow_rules} {output_ingress_rules} {output_registry_rule}ip daddr {} drop; ip daddr @workload_networks drop; }}
 }}
 table bridge {COOLIFY_NFT_BRIDGE_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
- chain forward {{ type filter hook forward priority -200; policy accept; meta protocol != ip accept; ct state established,related accept; {bridge_allow_rules} ip saddr @workload_networks ip daddr @workload_networks drop; }}
+ chain forward {{ type filter hook forward priority -200; policy accept; meta protocol != ip accept; ct state established,related accept; {bridge_allow_rules} {stack_allow_rules}ip saddr @workload_networks ip daddr @workload_networks drop; }}
 }}
 ",
         request.wireguard_port,
@@ -508,6 +535,12 @@ pub(crate) fn valid_discovery_label(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
         && !value.starts_with('-')
         && !value.ends_with('-')
+}
+
+/// A name of a stack service: a discovery label that may also hold `_`, not
+/// first or last, as Compose service names do (decision 0023).
+pub(crate) fn valid_stack_service_name(value: &str) -> bool {
+    valid_discovery_label(&value.replace('_', "-"))
 }
 
 pub(crate) fn ensure_key(root: &Path, interface: &str) -> Result<String, String> {
@@ -2594,7 +2627,9 @@ fn read_state_file(path: &Path) -> Option<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_protocol::control::v1::{FirewallIngressRule, FirewallRule, WireguardPeer};
+    use sentinel_protocol::control::v1::{
+        FirewallIngressRule, FirewallRule, FirewallStackRule, WireguardPeer,
+    };
 
     #[test]
     fn renders_deterministic_full_mesh_without_peer_secrets() {
@@ -2647,6 +2682,7 @@ mod tests {
             workload_cidrs: vec!["100.64.0.0/24".into(), "100.64.1.0/24".into()],
             flux_probe_host: "10.240.0.1".into(),
             registry_ip: String::new(),
+            stack_rules: vec![],
         })
         .unwrap();
         assert!(rendered.contains("table inet coolify_cluster"));
@@ -2974,6 +3010,97 @@ mod tests {
     }
 
     #[test]
+    fn stack_rules_allow_every_port_between_two_workloads_before_the_drops() {
+        let workload_cidrs = ["100.64.0.0/24", "100.64.1.0/24"];
+        let stack_rule = |source: &str, destination: &str| FirewallStackRule {
+            source_ip: source.into(),
+            destination_ip: destination.into(),
+        };
+        let request = |stack_rules| FirewallReconcileRequest {
+            stack_rules,
+            ..firewall_request()
+        };
+        let rendered = render_firewall(&request(vec![
+            stack_rule("100.64.1.3", "100.64.0.2"),
+            stack_rule("100.64.0.2", "100.64.1.3"),
+        ]))
+        .unwrap();
+        let packet = |saddr, daddr, protocol, dport| Packet {
+            iifname: "podman1",
+            saddr,
+            daddr,
+            protocol,
+            dport,
+            established: false,
+        };
+
+        for (protocol, port) in [("tcp", 5432), ("udp", 9999), ("icmp", 0)] {
+            assert_eq!(
+                evaluate_chain(
+                    &rendered,
+                    "forward",
+                    &workload_cidrs,
+                    &packet("100.64.0.2", "100.64.1.3", protocol, port)
+                ),
+                "accept"
+            );
+        }
+        // Only the listed pairs: another workload stays dropped.
+        assert_eq!(
+            evaluate_chain(
+                &rendered,
+                "forward",
+                &workload_cidrs,
+                &packet("100.64.0.9", "100.64.1.3", "tcp", 5432)
+            ),
+            "drop"
+        );
+        // Same-Node traffic passes the bridge chain, before its drop.
+        let bridge = rendered.split("table bridge").nth(1).unwrap();
+        let allow = bridge
+            .find("ip saddr 100.64.0.2 ip daddr 100.64.1.3 accept;")
+            .unwrap();
+        assert!(
+            allow
+                < bridge
+                    .find("ip saddr @workload_networks ip daddr @workload_networks drop")
+                    .unwrap()
+        );
+        assert!(bridge.contains("ip saddr 100.64.1.3 ip daddr 100.64.0.2 accept;"));
+        // Workloads never send from the host.
+        let output = rendered.split("chain output").nth(1).unwrap();
+        assert!(
+            !output
+                .split("}\n")
+                .next()
+                .unwrap()
+                .contains("100.64.1.3 ip daddr")
+        );
+        // Without stack rules the ruleset is unchanged.
+        assert_eq!(
+            render_firewall(&request(Vec::new())).unwrap(),
+            render_firewall(&firewall_request()).unwrap()
+        );
+
+        for invalid in [
+            vec![
+                stack_rule("100.64.0.2", "100.64.1.3"),
+                stack_rule("100.64.0.2", "100.64.1.3"),
+            ],
+            vec![stack_rule("10.240.0.2", "100.64.1.3")],
+            vec![stack_rule("100.64.0.2", "192.0.2.1")],
+            vec![stack_rule("100.64.0.2", "100.64.1.3 accept")],
+            vec![stack_rule("", "100.64.1.3")],
+        ] {
+            assert!(render_firewall(&request(invalid)).is_err());
+        }
+        let many = (0..=100_000u32)
+            .map(|index| stack_rule("100.64.0.2", &format!("100.64.1.{}", index % 256)))
+            .collect();
+        assert!(render_firewall(&request(many)).is_err());
+    }
+
+    #[test]
     fn ingress_rules_admit_caddy_on_the_same_and_on_another_node() {
         let workload_cidrs = ["100.64.0.0/24", "100.64.1.0/24"];
         let request = |local_node_ip: &str| FirewallReconcileRequest {
@@ -3146,6 +3273,7 @@ mod tests {
             workload_cidrs: vec!["100.64.0.0/24".into()],
             ingress_rules: vec![],
             registry_ip: String::new(),
+            stack_rules: vec![],
         };
         let first = reconcile_firewall(temp.path(), &request).unwrap();
         let second = reconcile_firewall(temp.path(), &request).unwrap();
@@ -3561,6 +3689,7 @@ mod tests {
             workload_cidrs: vec!["100.64.1.0/24".into(), "100.64.0.0/24".into()],
             ingress_rules: vec![],
             registry_ip: String::new(),
+            stack_rules: vec![],
         }
     }
 

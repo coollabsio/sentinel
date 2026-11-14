@@ -59,6 +59,7 @@ fn network_capabilities_are_typed_and_versioned() {
         workload_cidrs: vec!["100.64.0.0/24".into()],
         ingress_rules: vec![],
         registry_ip: String::new(),
+        stack_rules: vec![],
     };
     assert_eq!(firewall.flux_probe_host, "10.240.0.1");
 

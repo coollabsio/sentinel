@@ -536,6 +536,8 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "database.restore.v1",
             "workload.dns_search.v1",
             "workload.files.v1",
+            "network.firewall.stack_rules.v1",
+            "discovery.names.underscore.v1",
             "workload.exec.v1",
             "workload.terminal.v1"
         ])

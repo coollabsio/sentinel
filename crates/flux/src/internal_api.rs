@@ -13,8 +13,8 @@ use sentinel_protocol::control::v1::{
     ClusterLeaveRequest, Command, CommandResult, CommandStatus, ContainerListRequest,
     ContainerLogsRequest, ContainerPort, CorrosionInspectRequest, CorrosionReconcileRequest,
     FirewallIngressRule, FirewallInspectRequest, FirewallReconcileRequest, FirewallRule,
-    IngressReconcileRequest, IngressRoute, LogSource, LogsReadRequest, SystemInfoRequest,
-    SystemPingRequest, TrustBundleUpdateRequest, WireguardInspectRequest,
+    FirewallStackRule, IngressReconcileRequest, IngressRoute, LogSource, LogsReadRequest,
+    SystemInfoRequest, SystemPingRequest, TrustBundleUpdateRequest, WireguardInspectRequest,
     WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest,
     WorkloadEnvironmentVariable, WorkloadFile, WorkloadHealthCheck, WorkloadLabel,
     WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadName, WorkloadSecret,
@@ -319,6 +319,13 @@ struct FirewallReconcileApiRequest {
     ingress_rules: Vec<FirewallIngressRuleApiRequest>,
     #[serde(default)]
     registry_ip: String,
+    #[serde(default)]
+    stack_rules: Vec<FirewallStackRuleApiRequest>,
+}
+#[derive(Deserialize)]
+struct FirewallStackRuleApiRequest {
+    source_ip: String,
+    destination_ip: String,
 }
 #[derive(Deserialize)]
 struct CorrosionInspectApiRequest {
@@ -925,6 +932,14 @@ async fn firewall_reconcile(
             workload_cidrs: request.workload_cidrs,
             ingress_rules,
             registry_ip: request.registry_ip,
+            stack_rules: request
+                .stack_rules
+                .into_iter()
+                .map(|rule| FirewallStackRule {
+                    source_ip: rule.source_ip,
+                    destination_ip: rule.destination_ip,
+                })
+                .collect(),
         }),
     )
     .await?;
