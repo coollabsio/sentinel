@@ -37,6 +37,94 @@ fn watches_container_runtime_events_and_builds_typed_notifications() {
     ));
 }
 
+#[tokio::test]
+async fn a_read_only_command_does_not_wait_behind_the_serial_lane() {
+    use sentinel_protocol::control::v1::agent_message;
+    use sentinel_protocol::control::v1::command::Payload;
+    use sentinel_protocol::control::v1::{Command, SystemPingRequest};
+
+    let ping = |id: &str| Command {
+        command_id: id.into(),
+        command_type: sentinel_protocol::CAPABILITY_SYSTEM_PING.into(),
+        payload_version: 1,
+        created_at_unix_ms: 1,
+        payload: Some(Payload::SystemPing(SystemPingRequest { nonce: id.into() })),
+        expires_at_unix_ms: i64::MAX,
+    };
+    let serial = Arc::new(tokio::sync::Mutex::new(
+        crate::commands::CommandExecutor::new("dev"),
+    ));
+    let read = Arc::new(tokio::sync::Mutex::new(
+        crate::commands::CommandExecutor::new("dev"),
+    ));
+    let (results, mut received) = tokio::sync::mpsc::channel(8);
+    let (serial_lane, serial_commands) = tokio::sync::mpsc::channel(8);
+    let (read_lane, read_commands) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(crate::connection::run_commands(
+        serial_commands,
+        serial.clone(),
+        results.clone(),
+    ));
+    tokio::spawn(crate::connection::run_commands(
+        read_commands,
+        read,
+        results,
+    ));
+
+    // A long command holds the serial lane.
+    let busy = serial.lock().await;
+    serial_lane.send((ping("serial"), true)).await.unwrap();
+    read_lane.send((ping("read"), true)).await.unwrap();
+
+    let mut finished = Vec::new();
+    while let Ok(Some(message)) =
+        tokio::time::timeout(Duration::from_secs(2), received.recv()).await
+    {
+        if let Some(agent_message::Message::CommandResult(result)) = message.message {
+            finished.push(result.command_id);
+        }
+    }
+    assert_eq!(finished, vec!["read".to_string()]);
+
+    drop(busy);
+    let message = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(agent_message::Message::CommandResult(result)) =
+                received.recv().await.unwrap().message
+            {
+                break result.command_id;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(message, "serial");
+
+    for command in [
+        sentinel_protocol::CAPABILITY_SYSTEM_PING,
+        sentinel_protocol::CAPABILITY_SYSTEM_INFO,
+        sentinel_protocol::CAPABILITY_CONTAINER_LIST,
+        sentinel_protocol::CAPABILITY_CONTAINER_LOGS,
+        sentinel_protocol::CAPABILITY_LOGS_READ,
+    ] {
+        assert!(
+            crate::connection::is_read_only(command),
+            "{command} is read-only"
+        );
+    }
+    for command in [
+        sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY,
+        sentinel_protocol::CAPABILITY_WORKLOAD_LIFECYCLE,
+        sentinel_protocol::CAPABILITY_FIREWALL_INSPECT,
+        sentinel_protocol::CAPABILITY_VOLUME_BACKUP,
+    ] {
+        assert!(
+            !crate::connection::is_read_only(command),
+            "{command} stays serial"
+        );
+    }
+}
+
 #[test]
 fn executes_and_deduplicates_system_ping_commands() {
     use sentinel_protocol::control::v1::command::Payload;
@@ -996,8 +1084,15 @@ async fn rejects_assignment_with_a_different_trust_bundle_version_before_connect
     ));
 
     assert!(matches!(
-        crate::connection::connect(&assignment, "1.0.1", tls_config, shutdown, command_executor,)
-            .await,
+        crate::connection::connect(
+            &assignment,
+            "1.0.1",
+            tls_config,
+            shutdown,
+            command_executor.clone(),
+            command_executor,
+        )
+        .await,
         Err(FluxConnectionError::TrustBundleVersionMismatch)
     ));
 }

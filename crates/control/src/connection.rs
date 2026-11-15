@@ -32,8 +32,24 @@ use crate::commands::CommandExecutor;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MESSAGE_LIMIT: usize = 16 * 1024 * 1024;
-/// Commands received but not started yet. The executor runs one at a time.
+/// Commands received but not started yet. Each lane runs one at a time.
 const COMMAND_QUEUE: usize = 64;
+
+/// Commands that only read and that callers poll with a short timeout. They
+/// run in their own lane, so a long command (a drain and stop, an image
+/// pull, a backup) does not delay them. Inspections of the network stay in
+/// the serial lane, because a reconcile changes what they read.
+const READ_ONLY_COMMANDS: [&str; 5] = [
+    CAPABILITY_SYSTEM_PING,
+    CAPABILITY_SYSTEM_INFO,
+    CAPABILITY_CONTAINER_LIST,
+    CAPABILITY_CONTAINER_LOGS,
+    CAPABILITY_LOGS_READ,
+];
+
+pub(crate) fn is_read_only(command_type: &str) -> bool {
+    READ_ONLY_COMMANDS.contains(&command_type)
+}
 static RUNTIME_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct RuntimeWatcherGuard(watch::Sender<bool>);
@@ -87,6 +103,7 @@ pub async fn connect(
     control_tls: ControlTlsConfig,
     mut shutdown: watch::Receiver<bool>,
     command_executor: Arc<tokio::sync::Mutex<CommandExecutor>>,
+    read_executor: Arc<tokio::sync::Mutex<CommandExecutor>>,
 ) -> Result<(), FluxConnectionError> {
     // The installed version can change at runtime through trust.bundle.update.v1.
     let trust_bundle_version = crate::trust::installed_version(&control_tls);
@@ -186,13 +203,16 @@ pub async fn connect(
     ));
     // Commands run on a blocking thread, in arrival order, so this loop keeps
     // sending heartbeats while a long command (an image pull, a network
-    // reconcile) runs. Flux drops a connection that stays silent.
+    // reconcile) runs. Flux drops a connection that stays silent. Read-only
+    // commands have a second lane with their own executor.
     let (command_sender, command_receiver) = mpsc::channel(COMMAND_QUEUE);
     tokio::spawn(run_commands(
         command_receiver,
         command_executor,
         sender.clone(),
     ));
+    let (read_sender, read_receiver) = mpsc::channel(COMMAND_QUEUE);
+    tokio::spawn(run_commands(read_receiver, read_executor, sender.clone()));
     ticker.tick().await;
     loop {
         tokio::select! {
@@ -213,7 +233,8 @@ pub async fn connect(
                         }
                         Some(control_message::Message::Command(command)) => {
                             let command_capability_accepted = capability_accepted(&command.command_type);
-                            command_sender.send((command, command_capability_accepted)).await.map_err(|_| FluxConnectionError::Connection)?;
+                            let lane = if is_read_only(&command.command_type) { &read_sender } else { &command_sender };
+                            lane.send((command, command_capability_accepted)).await.map_err(|_| FluxConnectionError::Connection)?;
                         }
                         _ => {}
                     }
@@ -224,10 +245,10 @@ pub async fn connect(
     }
 }
 
-/// Executes the commands of one connection in order and sends their results.
+/// Executes the commands of one lane of a connection in order and sends their results.
 /// It stops when the connection closes; a command that already started still
 /// finishes and is journaled, so a redelivery returns its stored result.
-async fn run_commands(
+pub(crate) async fn run_commands(
     mut commands: mpsc::Receiver<(Command, bool)>,
     command_executor: Arc<tokio::sync::Mutex<CommandExecutor>>,
     sender: mpsc::Sender<AgentMessage>,

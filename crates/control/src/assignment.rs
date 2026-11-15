@@ -329,6 +329,14 @@ impl AssignmentClient {
             .with_ingress_trigger(ingress_trigger.clone())
             .with_control_tls(self.control_tls.clone()),
         ));
+        // Read-only commands run beside the serial lane (see connection.rs).
+        // They share the journal, which serializes its own writes.
+        let read_executor = Arc::new(tokio::sync::Mutex::new(
+            crate::commands::CommandExecutor::with_journal(
+                &self.sentinel_version,
+                self.command_journal.clone(),
+            ),
+        ));
         // Volume transfers keep their state in memory; daemons and firewall
         // elements of an earlier Sentinel process have no owner any more. Git
         // credentials of builds that an earlier process started get a watcher.
@@ -404,6 +412,7 @@ impl AssignmentClient {
                         self.control_tls.clone(),
                         shutdown.clone(),
                         command_executor.clone(),
+                        read_executor.clone(),
                     )
                     .await
                     {
