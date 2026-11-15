@@ -39,7 +39,7 @@ use crate::network::{COOLIFY_NFT_TABLE, ipv4_in_cidr, output_with_timeout, read_
 use crate::volumes::{ensure_volumes, mountpoint, validate_names};
 
 const RUNTIME_DIR: &str = "run/coolify-volume-transfer";
-const PORTS: std::ops::RangeInclusive<u16> = 7800..=7899;
+pub(crate) const PORTS: std::ops::RangeInclusive<u16> = 7800..=7899;
 const NFT_SET: &str = "volume_transfers";
 const NFT_SOURCE_SET: &str = "volume_transfer_sources";
 const RSYNC_USER: &str = "coolify";

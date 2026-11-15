@@ -32,6 +32,9 @@ pub const CAPABILITY_INGRESS_TLS: &str = "ingress.tls.v1";
 /// http_only, allow_http, temporary_redirect, noindex, and strip_path. Not a
 /// command.
 pub const CAPABILITY_INGRESS_ROUTES_V2: &str = "ingress.routes.v2";
+/// `network.firewall.reconcile.v1` accepts `published_ports`, translated in
+/// `table ip coolify_cluster_nat` (decision 0016). Not a command.
+pub const CAPABILITY_FIREWALL_PUBLISHED_PORTS: &str = "network.firewall.published_ports.v1";
 pub const CAPABILITY_IMAGE_BUILD: &str = "image.build.v1";
 pub const CAPABILITY_BUILDER_RECONCILE: &str = "builder.reconcile.v1";
 pub const CAPABILITY_REGISTRY_RECONCILE: &str = "registry.reconcile.v1";
@@ -153,7 +156,7 @@ pub const EXEC_CAPABILITIES: [&str; 2] = [CAPABILITY_WORKLOAD_EXEC, CAPABILITY_W
 /// The cluster registry. Sentinel discovery DNS resolves it to the Node that
 /// runs the registry.
 pub const REGISTRY_HOST: &str = "registry.cluster.coolify.internal:5443";
-pub const NETWORK_CAPABILITIES: [&str; 11] = [
+pub const NETWORK_CAPABILITIES: [&str; 12] = [
     CAPABILITY_CLUSTER_LEAVE,
     CAPABILITY_WIREGUARD_KEY_ENSURE,
     CAPABILITY_WIREGUARD_INSPECT,
@@ -165,6 +168,7 @@ pub const NETWORK_CAPABILITIES: [&str; 11] = [
     CAPABILITY_INGRESS_RECONCILE,
     CAPABILITY_INGRESS_TLS,
     CAPABILITY_INGRESS_ROUTES_V2,
+    CAPABILITY_FIREWALL_PUBLISHED_PORTS,
 ];
 
 pub mod control {
