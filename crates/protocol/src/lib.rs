@@ -107,6 +107,10 @@ pub const DATABASE_CAPABILITIES: [&str; 2] =
 /// secrets of the container (decision 0008). Not a command: an older Sentinel
 /// ignores the field and would start the container without its secrets.
 pub const CAPABILITY_WORKLOAD_SECRETS: &str = "workload.secrets.v1";
+/// A workload secret accepts `uid`, `gid`, and `mode`, the owner and the
+/// permission bits of its file (decision 0008). Not a command: an older
+/// Sentinel ignores the fields and mounts the file as root with mode 0444.
+pub const CAPABILITY_WORKLOAD_SECRETS_OWNER: &str = "workload.secrets.owner.v1";
 /// `workload.lifecycle.v1` with `stop` or `remove` drains the endpoint from
 /// ingress and internal DNS whenever another endpoint of the workload serves,
 /// so Coolify can start a second container of a workload and then remove the

@@ -845,6 +845,114 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
 }
 
 #[tokio::test]
+async fn workload_deploy_route_sends_secret_owners_only_to_a_sentinel_that_supports_them() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![
+                sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_SECRETS.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_SECRETS_OWNER.into(),
+            ],
+        )
+        .await;
+    let (old_sender, _old_receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-old",
+            "connection-2",
+            old_sender,
+            1,
+            vec![
+                sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_SECRETS.into(),
+            ],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let body = |server_id: &str, secrets: serde_json::Value| {
+        serde_json::json!({
+            "server_id": server_id,
+            "command_id": "deploy-1",
+            "name": "coolify-p1test-main",
+            "image": "docker.io/library/nginx:latest",
+            "restart_policy": "no",
+            "secrets": secrets,
+        })
+    };
+    let post = |body: serde_json::Value| {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/workload.deploy"))
+            .bearer_auth("internal-secret")
+            .json(&body)
+            .send()
+    };
+
+    let owned = serde_json::json!({
+        "db_password": {"value": "hunter2", "uid": 1000, "gid": 1001, "mode": 256},
+        "api_key": "plain",
+        "token": {"value": "t", "uid": null},
+    });
+    let response = post(body("server-old", owned.clone())).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let response = post(body(
+        "server-1",
+        serde_json::json!({"db_password": {"value": "x", "mode": -1}}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+    let request = tokio::spawn(post(body("server-1", owned)));
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    let Some(sentinel_protocol::control::v1::command::Payload::WorkloadDeploy(deploy)) =
+        command.payload
+    else {
+        panic!("expected a deploy");
+    };
+    let secret =
+        |key: &str, value: &str, uid, gid, mode| sentinel_protocol::control::v1::WorkloadSecret {
+            key: key.into(),
+            value: value.into(),
+            uid,
+            gid,
+            mode,
+        };
+    assert_eq!(
+        deploy.secrets,
+        [
+            secret("api_key", "plain", None, None, None),
+            secret(
+                "db_password",
+                "hunter2",
+                Some(1000),
+                Some(1001),
+                Some(0o400)
+            ),
+            secret("token", "t", None, None, None),
+        ]
+    );
+    request.abort();
+    server.abort();
+}
+
+#[tokio::test]
 async fn workload_deploy_route_returns_the_sentinel_failure_message() {
     let registry = ConnectionRegistry::default();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);

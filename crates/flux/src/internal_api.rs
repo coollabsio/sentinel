@@ -26,7 +26,7 @@ use sentinel_protocol::{
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
     CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES,
-    CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_SECRETS_OWNER,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -156,7 +156,7 @@ struct WorkloadDeployApiRequest {
     #[serde(default)]
     health_check: Option<DeployHealthCheck>,
     #[serde(default)]
-    secrets: std::collections::HashMap<String, String>,
+    secrets: std::collections::HashMap<String, DeploySecret>,
     #[serde(default)]
     registry_username: String,
     #[serde(default)]
@@ -208,6 +208,45 @@ fn deploy_files(files: Vec<DeployFile>) -> Result<Vec<WorkloadFile>, (StatusCode
 
 /// The files of one deploy are at most 4 MiB, about 5.4 MiB as base64.
 const WORKLOAD_DEPLOY_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+/// The value of a secret file, or the value with the owner and the mode of
+/// the file (`workload.secrets.owner.v1`). An unset field keeps the Podman
+/// default.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DeploySecret {
+    Value(String),
+    File {
+        value: String,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: Option<u32>,
+    },
+}
+
+impl DeploySecret {
+    fn protocol(self, key: String) -> WorkloadSecret {
+        match self {
+            Self::Value(value) => WorkloadSecret {
+                key,
+                value,
+                ..Default::default()
+            },
+            Self::File {
+                value,
+                uid,
+                gid,
+                mode,
+            } => WorkloadSecret {
+                key,
+                value,
+                uid,
+                gid,
+                mode,
+            },
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct DeployHealthCheck {
@@ -1187,11 +1226,21 @@ async fn workload_deploy(
     }
     let pull_policy = workload_pull_policy(&request.pull_policy)?;
     let files = deploy_files(request.files)?;
+    let mut secrets: Vec<_> = request
+        .secrets
+        .into_iter()
+        .map(|(key, secret)| secret.protocol(key))
+        .collect();
+    secrets.sort_by(|left, right| left.key.cmp(&right.key));
     // An older Sentinel ignores the fields and would start the container
-    // without its files or search domains.
+    // without its files, search domains, or secret file owners.
     let needed = [
         (!request.dns_search.is_empty()).then_some(CAPABILITY_WORKLOAD_DNS_SEARCH),
         (!files.is_empty()).then_some(CAPABILITY_WORKLOAD_FILES),
+        secrets
+            .iter()
+            .any(|secret| secret.uid.is_some() || secret.gid.is_some() || secret.mode.is_some())
+            .then_some(CAPABILITY_WORKLOAD_SECRETS_OWNER),
     ];
     if needed.iter().flatten().next().is_some() {
         let Some(connection) = state.registry.get(&request.server_id).await else {
@@ -1259,10 +1308,7 @@ async fn workload_deploy(
                         retries: check.retries,
                         start_period_seconds: check.start_period_seconds,
                     }),
-                    secrets: sorted_pairs(request.secrets)
-                        .into_iter()
-                        .map(|(key, value)| WorkloadSecret { key, value })
-                        .collect(),
+                    secrets,
                     registry_username: request.registry_username,
                     registry_password: request.registry_password,
                     dns_search: request.dns_search,

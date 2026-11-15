@@ -317,6 +317,13 @@ message WorkloadSecret {
   string key = 1;
   // 1 byte to 512 kB.
   string value = 2;
+  // The owner of the file, 0 to 2147483647. Unset means root
+  // (`workload.secrets.owner.v1`).
+  optional uint32 uid = 3;
+  optional uint32 gid = 4;
+  // The permission bits, 0 to 0o777, for example 256 for 0400. Unset means
+  // 0444.
+  optional uint32 mode = 5;
 }
 
 // `podman run --health-*`. The command runs in the container with `/bin/sh -c`.

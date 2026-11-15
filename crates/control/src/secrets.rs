@@ -15,6 +15,7 @@ use crate::network::output_with_timeout;
 
 const MAX_SECRETS: usize = 128;
 const MAX_VALUE_BYTES: usize = 512_000;
+const MAX_ID: u32 = i32::MAX as u32;
 const REVISION_LABEL: &str = "coolify.revision";
 /// `podman secret create --env` reads the value from this variable of its own
 /// process, so the value is never in a command line.
@@ -44,14 +45,32 @@ pub(crate) fn mount_args(request: &WorkloadDeployRequest) -> Result<Vec<String>,
                 secret.key
             ));
         }
-        args.extend([
-            "--secret".into(),
-            format!(
-                "{},type=mount,target={}",
-                secret_name(&request.name, revision, &secret.key),
-                secret.key
-            ),
-        ]);
+        let mut option = format!(
+            "{},type=mount,target={}",
+            secret_name(&request.name, revision, &secret.key),
+            secret.key
+        );
+        for (field, id) in [("uid", secret.uid), ("gid", secret.gid)] {
+            match id {
+                Some(id) if id > MAX_ID => {
+                    return Err(format!(
+                        "The {field} of the secret {} is invalid.",
+                        secret.key
+                    ));
+                }
+                Some(id) => option.push_str(&format!(",{field}={id}")),
+                None => {}
+            }
+        }
+        match secret.mode {
+            Some(mode) if mode > 0o777 => {
+                return Err(format!("The mode of the secret {} is invalid.", secret.key));
+            }
+            // Podman reads the mode as an octal number.
+            Some(mode) => option.push_str(&format!(",mode={mode:04o}")),
+            None => {}
+        }
+        args.extend(["--secret".into(), option]);
     }
     Ok(args)
 }
@@ -192,4 +211,95 @@ pub(crate) fn secret_name(container: &str, revision: &str, key: &str) -> String 
 
 fn short_hash(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))[..16].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use sentinel_protocol::control::v1::{WorkloadLabel, WorkloadSecret};
+
+    use super::*;
+
+    fn request(secrets: Vec<WorkloadSecret>) -> WorkloadDeployRequest {
+        WorkloadDeployRequest {
+            name: "coolify-web".into(),
+            labels: vec![WorkloadLabel {
+                key: REVISION_LABEL.into(),
+                value: "7".into(),
+            }],
+            secrets,
+            ..Default::default()
+        }
+    }
+
+    fn secret(uid: Option<u32>, gid: Option<u32>, mode: Option<u32>) -> WorkloadSecret {
+        WorkloadSecret {
+            key: "db_password".into(),
+            value: "hunter2".into(),
+            uid,
+            gid,
+            mode,
+        }
+    }
+
+    fn option(secret: WorkloadSecret) -> Result<String, String> {
+        let args = mount_args(&request(vec![secret]))?;
+        assert_eq!(args[0], "--secret");
+        let name = secret_name("coolify-web", "7", "db_password");
+        Ok(args[1].strip_prefix(&name).unwrap().to_string())
+    }
+
+    #[test]
+    fn mounts_a_secret_with_the_podman_defaults_without_owner_or_mode() {
+        assert_eq!(
+            option(secret(None, None, None)).unwrap(),
+            ",type=mount,target=db_password"
+        );
+    }
+
+    #[test]
+    fn passes_each_owner_and_mode_field() {
+        assert_eq!(
+            option(secret(Some(1000), None, None)).unwrap(),
+            ",type=mount,target=db_password,uid=1000"
+        );
+        assert_eq!(
+            option(secret(None, Some(0), None)).unwrap(),
+            ",type=mount,target=db_password,gid=0"
+        );
+        assert_eq!(
+            option(secret(None, None, Some(0o400))).unwrap(),
+            ",type=mount,target=db_password,mode=0400"
+        );
+        assert_eq!(
+            option(secret(Some(2_147_483_647), Some(1000), Some(0o777))).unwrap(),
+            ",type=mount,target=db_password,uid=2147483647,gid=1000,mode=0777"
+        );
+        assert_eq!(
+            option(secret(None, None, Some(0))).unwrap(),
+            ",type=mount,target=db_password,mode=0000"
+        );
+    }
+
+    #[test]
+    fn rejects_an_owner_or_mode_out_of_range() {
+        assert_eq!(
+            option(secret(Some(2_147_483_648), None, None)).unwrap_err(),
+            "The uid of the secret db_password is invalid."
+        );
+        assert_eq!(
+            option(secret(None, Some(u32::MAX), None)).unwrap_err(),
+            "The gid of the secret db_password is invalid."
+        );
+        assert_eq!(
+            option(secret(None, None, Some(0o1000))).unwrap_err(),
+            "The mode of the secret db_password is invalid."
+        );
+    }
+
+    #[test]
+    fn keeps_the_secret_name_when_owner_or_mode_change() {
+        let plain = mount_args(&request(vec![secret(None, None, None)])).unwrap();
+        let owned = mount_args(&request(vec![secret(Some(1), Some(2), Some(0o400))])).unwrap();
+        assert_eq!(plain[1].split(',').next(), owned[1].split(',').next());
+    }
 }
