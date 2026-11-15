@@ -18,15 +18,24 @@ use sentinel_protocol::control::v1::ContainerObservation;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, watch};
 
-use crate::network::{CORROSION_NODE_NAME_FILE, CORROSION_OWNER_FILE, valid_discovery_label};
+use crate::commands::PODMAN_QUERY_TIMEOUT;
+use crate::network::{
+    CORROSION_NODE_NAME_FILE, CORROSION_OWNER_FILE, output_with_timeout, valid_discovery_label,
+};
 
 pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_secs(15);
+/// The publish interval while a workload health check is still `starting`, so
+/// ingress and DNS use a container soon after its first passing check.
+pub(crate) const STARTING_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const ENDPOINT_TTL_SECONDS: i64 = 120;
 const MAX_ENDPOINTS: usize = 10_000;
 const MANAGED_LABEL: &str = "coolify.managed";
 const WORKLOAD_LABEL: &str = "coolify.workload";
 const WORKLOAD_NAMESPACE: &str = "default";
 const NODE_NAMESPACE: &str = "nodes";
+/// Cluster services such as `registry.cluster.coolify.internal`. Like Node
+/// names, they are endpoint rows of their own.
+const CLUSTER_NAMESPACE: &str = "cluster";
 const WORKLOAD_NETWORK_PREFIX: &str = "coolify-";
 const ALLOWED_STATES: [&str; 9] = [
     "configured",
@@ -57,8 +66,9 @@ static DRAINING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 /// How long a drained endpoint stays out of service before its container
 /// stops, when another endpoint can take its traffic: Corrosion replicates the
-/// change within about a second and every ingress renderer reads it on its
-/// next pass, at most `ingress::RENDER_INTERVAL` (5 s) later.
+/// change within about a second, every ingress renderer reads it on its next
+/// pass, at most `ingress::RENDER_INTERVAL` (5 s) later, and a cached internal
+/// DNS answer expires after its TTL (5 s).
 pub(crate) const DRAIN_DURATION: Duration = Duration::from_secs(7);
 
 fn draining() -> MutexGuard<'static, BTreeSet<String>> {
@@ -89,13 +99,14 @@ pub(crate) fn mark_draining(containers: &mut [ContainerObservation]) {
     }
 }
 
-/// Counts the other serving endpoints of a workload that has an ingress route.
+/// Counts the other serving endpoints of a workload. Ingress and internal DNS
+/// both send its traffic there.
 pub(crate) fn serving_elsewhere_sql() -> &'static str {
-    "SELECT COUNT(*) FROM workload_endpoints WHERE namespace = 'default' AND workload_id = ? AND state = 'running' AND health NOT IN ('unhealthy', 'starting') AND expires_at > unixepoch() AND EXISTS (SELECT 1 FROM ingress_routes WHERE ingress_routes.workload_id = workload_endpoints.workload_id AND ingress_routes.namespace = workload_endpoints.namespace)"
+    "SELECT COUNT(*) FROM workload_endpoints WHERE namespace = 'default' AND workload_id = ? AND state = 'running' AND health NOT IN ('unhealthy', 'starting') AND expires_at > unixepoch()"
 }
 
-/// How long to wait before the container stops: only a routed workload with
-/// another serving endpoint has somewhere else to send its traffic.
+/// How long to wait before the container stops: only a workload with another
+/// serving endpoint has somewhere else to send its traffic.
 pub(crate) fn drain_wait(serving_elsewhere: i64) -> Duration {
     if serving_elsewhere > 0 {
         DRAIN_DURATION
@@ -127,16 +138,17 @@ fn drained_wait(root: &Path, name: &str) -> Result<Duration, String> {
     let Some(identity) = read_identity(root)? else {
         return Ok(Duration::ZERO);
     };
-    let output = Command::new("podman")
-        .args([
+    let output = output_with_timeout(
+        Command::new("podman").args([
             "container",
             "inspect",
             "--format",
             &format!("{{{{ index .Config.Labels \"{WORKLOAD_LABEL}\" }}}}"),
             name,
-        ])
-        .output()
-        .map_err(|_| "Podman is unavailable.".to_string())?;
+        ]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .map_err(|_| "Podman is unavailable or did not answer.".to_string())?;
     let workload_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || !valid_discovery_label(&workload_id) {
         return Ok(Duration::ZERO);
@@ -193,7 +205,15 @@ pub(crate) struct InspectedContainer {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PublishOutcome {
     Skipped(&'static str),
-    Published { endpoints: usize },
+    Published { endpoints: usize, starting: bool },
+}
+
+/// How long the publisher waits for its next pass after a publish.
+fn next_publish_delay(outcome: &Result<PublishOutcome, String>) -> Duration {
+    match outcome {
+        Ok(PublishOutcome::Published { starting: true, .. }) => STARTING_PUBLISH_INTERVAL,
+        _ => PUBLISH_INTERVAL,
+    }
 }
 
 pub(crate) fn validate_workload_endpoint(
@@ -323,7 +343,8 @@ fn normalize_health(health: Option<&str>) -> String {
 }
 
 /// Builds the deduplicated endpoint snapshot of this Node: one row for the
-/// Node itself plus one per published workload container with a workload IP.
+/// Node itself, one for the cluster registry when this Node runs it, plus one
+/// per published workload container with a workload IP.
 pub(crate) fn endpoint_rows(
     identity: &NodeIdentity,
     containers: &[ContainerObservation],
@@ -351,6 +372,25 @@ pub(crate) fn endpoint_rows(
         "healthy".into(),
     );
     rows.insert(endpoint_key(&node), node);
+    let runs_registry = containers.iter().any(|container| {
+        container.name == crate::registry::REGISTRY_CONTAINER
+            && container.state == "running"
+            && container
+                .labels
+                .get(crate::registry::SERVICE_LABEL)
+                .map(String::as_str)
+                == Some("registry")
+    });
+    if runs_registry {
+        let registry = row(
+            CLUSTER_NAMESPACE,
+            "registry",
+            &identity.owner_node_ip,
+            "running".into(),
+            "healthy".into(),
+        );
+        rows.insert(endpoint_key(&registry), registry);
+    }
 
     for container in containers {
         let Some(workload_id) = published_workload_id(container) else {
@@ -526,10 +566,10 @@ pub(crate) fn publish_once(root: &Path) -> Result<PublishOutcome, String> {
         ));
     }
 
-    let listed = match Command::new("podman")
-        .args(["ps", "--all", "--no-trunc", "--format", "json"])
-        .output()
-    {
+    let listed = match output_with_timeout(
+        Command::new("podman").args(["ps", "--all", "--no-trunc", "--format", "json"]),
+        PODMAN_QUERY_TIMEOUT,
+    ) {
         Ok(output) => output,
         Err(_) => return Ok(PublishOutcome::Skipped("Podman is unavailable")),
     };
@@ -547,11 +587,13 @@ pub(crate) fn publish_once(root: &Path) -> Result<PublishOutcome, String> {
     let inspected = if ids.is_empty() {
         HashMap::new()
     } else {
-        let output = Command::new("podman")
-            .args(["inspect", "--format", "json"])
-            .args(&ids)
-            .output()
-            .map_err(|_| "Podman is unavailable.".to_string())?;
+        let output = output_with_timeout(
+            Command::new("podman")
+                .args(["inspect", "--format", "json"])
+                .args(&ids),
+            PODMAN_QUERY_TIMEOUT,
+        )
+        .map_err(|_| "Podman is unavailable or did not answer.".to_string())?;
         // A container removed after `ps` makes inspect exit non-zero while
         // still printing the others, so use any parseable output.
         match parse_podman_inspect(&output.stdout) {
@@ -569,11 +611,13 @@ pub(crate) fn publish_once(root: &Path) -> Result<PublishOutcome, String> {
     post_transaction(&identity.owner_node_ip, &transaction)?;
     Ok(PublishOutcome::Published {
         endpoints: rows.len(),
+        starting: rows.iter().any(|row| row.health == "starting"),
     })
 }
 
-/// Publishes once at start, then every `PUBLISH_INTERVAL` and whenever
-/// `trigger` is notified, until shutdown. `published` is notified after each
+/// Publishes once at start, then every `PUBLISH_INTERVAL` (every
+/// `STARTING_PUBLISH_INTERVAL` while a health check is `starting`) and
+/// whenever `trigger` is notified, until shutdown. `published` is notified after each
 /// successful publish, so the ingress renderer follows endpoint changes.
 pub(crate) async fn run(
     root: PathBuf,
@@ -581,8 +625,7 @@ pub(crate) async fn run(
     published: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut ticker = tokio::time::interval(PUBLISH_INTERVAL);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut delay = Duration::ZERO;
     let mut last_error: Option<String> = None;
     loop {
         if *shutdown.borrow() {
@@ -590,15 +633,16 @@ pub(crate) async fn run(
         }
         tokio::select! {
             _ = shutdown.changed() => return,
-            _ = ticker.tick() => {}
+            _ = tokio::time::sleep(delay) => {}
             _ = trigger.notified() => {}
         }
         let publish_root = root.clone();
         let result = tokio::task::spawn_blocking(move || publish_once(&publish_root))
             .await
             .unwrap_or_else(|_| Err("The endpoint publisher task failed.".into()));
+        delay = next_publish_delay(&result);
         match result {
-            Ok(PublishOutcome::Published { endpoints }) => {
+            Ok(PublishOutcome::Published { endpoints, .. }) => {
                 if last_error.take().is_some() {
                     tracing::info!(endpoints, "discovery endpoint publishing recovered");
                 }
@@ -796,7 +840,6 @@ mod tests {
         assert!(sql.contains("workload_id = ?") && sql.contains("state = 'running'"));
         assert!(sql.contains("health NOT IN ('unhealthy', 'starting')"));
         assert!(sql.contains("expires_at > unixepoch()"));
-        assert!(sql.contains("FROM ingress_routes"));
         assert_eq!(drain_wait(0), Duration::ZERO);
         assert_eq!(drain_wait(1), DRAIN_DURATION);
         assert!(DRAIN_DURATION > crate::ingress::RENDER_INTERVAL);
@@ -975,6 +1018,26 @@ mod tests {
         .unwrap();
         assert!(read_identity(temp.path()).is_err());
         assert!(publish_once(temp.path()).is_err());
+    }
+
+    #[test]
+    fn publishes_again_soon_while_a_health_check_is_starting() {
+        let published = |starting| {
+            Ok(PublishOutcome::Published {
+                endpoints: 1,
+                starting,
+            })
+        };
+        assert_eq!(
+            next_publish_delay(&published(true)),
+            STARTING_PUBLISH_INTERVAL
+        );
+        assert_eq!(next_publish_delay(&published(false)), PUBLISH_INTERVAL);
+        assert_eq!(
+            next_publish_delay(&Ok(PublishOutcome::Skipped("not in a cluster"))),
+            PUBLISH_INTERVAL
+        );
+        assert_eq!(next_publish_delay(&Err("failed".into())), PUBLISH_INTERVAL);
     }
 
     #[tokio::test]

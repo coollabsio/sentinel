@@ -121,6 +121,7 @@ Example start:
 ```bash
 docker run -d --name sentinel-bench-a \
   -p 127.0.0.1:18888:8888 \
+  -e BIND_ADDRESS=:: \
   -e TOKEN -e PUSH_ENDPOINT \
   -e COLLECTOR_ENABLED -e COLLECTOR_REFRESH_RATE_SECONDS \
   -e PUSH_INTERVAL_SECONDS -e DEBUG \
@@ -625,4 +626,4 @@ Copy into `docs/benchmark-results/YYYY-MM-DD-<label>.md`:
 | `crates/sentinel-bench/src/storage_bench.rs` | Storage-feature micro-bench (§4.9) |
 | `docs/benchmark-results/` | Dated run reports (canonical history) |
 | `crates/collector/tests/startup_timing.rs` | Guards against reintroducing constructor sleep |
-| `Dockerfile` | Builds `-p sentinel` only (bench stays on the host) |
+| `Dockerfile` | Builds `-p sentinel -p flux` only (bench stays on the host) |

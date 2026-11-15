@@ -21,6 +21,7 @@ fn status_error(status: u16, body: &str) -> PushError {
         url: "https://coolify.example/api/v1/sentinel/push".into(),
         status,
         body: body.into(),
+        retry_after: None,
     }
 }
 

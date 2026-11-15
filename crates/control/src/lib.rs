@@ -1,15 +1,28 @@
 #![forbid(unsafe_code)]
 
+mod acme;
 mod assignment;
+mod builder;
 mod commands;
 mod connection;
 mod container_logs;
+mod database_dump;
 mod discovery;
+mod exec;
+mod files;
 mod ingress;
+mod ingress_tls;
 mod logs;
 mod network;
+mod registry;
+mod registry_inspect;
 mod restore;
+mod secrets;
+mod terminal;
 mod trust;
+mod volume_backup;
+mod volume_transfer;
+mod volumes;
 
 pub use assignment::{
     Assignment, AssignmentClient, AssignmentError, AssignmentErrorKind, AssignmentOutcome,

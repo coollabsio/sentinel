@@ -7,14 +7,23 @@ use super::*;
 #[test]
 fn network_capabilities_are_typed_and_versioned() {
     let capabilities = NETWORK_CAPABILITIES;
-    assert_eq!(capabilities.len(), 9);
+    assert_eq!(capabilities.len(), 12);
+    assert!(capabilities.contains(&CAPABILITY_FIREWALL_PUBLISHED_PORTS));
+    assert_eq!(
+        CAPABILITY_FIREWALL_PUBLISHED_PORTS,
+        "network.firewall.published_ports.v1"
+    );
     assert!(capabilities.contains(&CAPABILITY_INGRESS_RECONCILE));
     assert_eq!(CAPABILITY_INGRESS_RECONCILE, "ingress.reconcile.v1");
+    assert!(capabilities.contains(&CAPABILITY_INGRESS_TLS));
+    assert_eq!(CAPABILITY_INGRESS_TLS, "ingress.tls.v1");
+    assert!(capabilities.contains(&CAPABILITY_INGRESS_ROUTES_V2));
+    assert_eq!(CAPABILITY_INGRESS_ROUTES_V2, "ingress.routes.v2");
     assert!(!capabilities.contains(&"discovery.corrosion.endpoints.reconcile.v1"));
     assert!(
         capabilities
             .iter()
-            .all(|capability| capability.ends_with(".v1"))
+            .all(|capability| capability.ends_with(".v1") || capability.ends_with(".v2"))
     );
 
     let command = control::v1::Command {
@@ -54,6 +63,9 @@ fn network_capabilities_are_typed_and_versioned() {
         flux_probe_host: "10.240.0.1".into(),
         workload_cidrs: vec!["100.64.0.0/24".into()],
         ingress_rules: vec![],
+        registry_ip: String::new(),
+        stack_rules: vec![],
+        published_ports: vec![],
     };
     assert_eq!(firewall.flux_probe_host, "10.240.0.1");
 
@@ -324,12 +336,14 @@ fn ingress_reconcile_command_and_result_round_trip() {
                     workload_id: "web".into(),
                     namespace: "default".into(),
                     port: 3000,
+                    ..Default::default()
                 }],
                 names: vec![control::v1::WorkloadName {
                     name: "web".into(),
                     workload_id: "uuid-web".into(),
                     namespace: "default".into(),
                 }],
+                ..Default::default()
             },
         )),
         expires_at_unix_ms: 2,
@@ -351,6 +365,7 @@ fn ingress_reconcile_command_and_result_round_trip() {
                 revision: 4,
                 route_count: 1,
                 name_count: 1,
+                tls_enabled: false,
             },
         )),
     };

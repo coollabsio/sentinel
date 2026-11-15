@@ -83,7 +83,7 @@ fn assignment_client(
 async fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => Ok(listener),
-        Err(e) if addr.is_ipv6() => {
+        Err(e) if addr.is_ipv6() && addr.ip().is_unspecified() => {
             let v4 = SocketAddr::from(([0, 0, 0, 0], addr.port()));
             tracing::warn!(error = %e, %v4, "IPv6 bind failed, falling back to IPv4");
             tokio::net::TcpListener::bind(v4).await
@@ -637,17 +637,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    loop {
-        tokio::select! {
-            _ = wait_for_signal() => break,
-            result = services.join_next() => return unexpected_service_exit(result),
-            result = control_services.join_next(), if !control_services.is_empty() => {
-                match result {
-                    Some(Ok(())) => tracing::error!("Sentinel control task stopped unexpectedly; existing services remain active"),
-                    Some(Err(error)) => tracing::error!(%error, "Sentinel control task failed; existing services remain active"),
-                    None => {}
-                }
+    tokio::select! {
+        _ = wait_for_signal() => {}
+        result = services.join_next() => return unexpected_service_exit(result),
+        // A running control task only stops at shutdown. If it stops or
+        // panics before that, the Node is unmanageable, so exit non-zero
+        // and let the service manager restart Sentinel.
+        result = control_services.join_next(), if !control_services.is_empty() => {
+            return Err(match result {
+                Some(Err(error)) => format!("Sentinel control task failed: {error}"),
+                _ => "Sentinel control task stopped unexpectedly".to_string(),
             }
+            .into());
         }
     }
     tracing::info!("shutdown signal received");

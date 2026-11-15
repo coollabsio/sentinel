@@ -37,6 +37,94 @@ fn watches_container_runtime_events_and_builds_typed_notifications() {
     ));
 }
 
+#[tokio::test]
+async fn a_read_only_command_does_not_wait_behind_the_serial_lane() {
+    use sentinel_protocol::control::v1::agent_message;
+    use sentinel_protocol::control::v1::command::Payload;
+    use sentinel_protocol::control::v1::{Command, SystemPingRequest};
+
+    let ping = |id: &str| Command {
+        command_id: id.into(),
+        command_type: sentinel_protocol::CAPABILITY_SYSTEM_PING.into(),
+        payload_version: 1,
+        created_at_unix_ms: 1,
+        payload: Some(Payload::SystemPing(SystemPingRequest { nonce: id.into() })),
+        expires_at_unix_ms: i64::MAX,
+    };
+    let serial = Arc::new(tokio::sync::Mutex::new(
+        crate::commands::CommandExecutor::new("dev"),
+    ));
+    let read = Arc::new(tokio::sync::Mutex::new(
+        crate::commands::CommandExecutor::new("dev"),
+    ));
+    let (results, mut received) = tokio::sync::mpsc::channel(8);
+    let (serial_lane, serial_commands) = tokio::sync::mpsc::channel(8);
+    let (read_lane, read_commands) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(crate::connection::run_commands(
+        serial_commands,
+        serial.clone(),
+        results.clone(),
+    ));
+    tokio::spawn(crate::connection::run_commands(
+        read_commands,
+        read,
+        results,
+    ));
+
+    // A long command holds the serial lane.
+    let busy = serial.lock().await;
+    serial_lane.send((ping("serial"), true)).await.unwrap();
+    read_lane.send((ping("read"), true)).await.unwrap();
+
+    let mut finished = Vec::new();
+    while let Ok(Some(message)) =
+        tokio::time::timeout(Duration::from_secs(2), received.recv()).await
+    {
+        if let Some(agent_message::Message::CommandResult(result)) = message.message {
+            finished.push(result.command_id);
+        }
+    }
+    assert_eq!(finished, vec!["read".to_string()]);
+
+    drop(busy);
+    let message = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(agent_message::Message::CommandResult(result)) =
+                received.recv().await.unwrap().message
+            {
+                break result.command_id;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(message, "serial");
+
+    for command in [
+        sentinel_protocol::CAPABILITY_SYSTEM_PING,
+        sentinel_protocol::CAPABILITY_SYSTEM_INFO,
+        sentinel_protocol::CAPABILITY_CONTAINER_LIST,
+        sentinel_protocol::CAPABILITY_CONTAINER_LOGS,
+        sentinel_protocol::CAPABILITY_LOGS_READ,
+    ] {
+        assert!(
+            crate::connection::is_read_only(command),
+            "{command} is read-only"
+        );
+    }
+    for command in [
+        sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY,
+        sentinel_protocol::CAPABILITY_WORKLOAD_LIFECYCLE,
+        sentinel_protocol::CAPABILITY_FIREWALL_INSPECT,
+        sentinel_protocol::CAPABILITY_VOLUME_BACKUP,
+    ] {
+        assert!(
+            !crate::connection::is_read_only(command),
+            "{command} stays serial"
+        );
+    }
+}
+
 #[test]
 fn executes_and_deduplicates_system_ping_commands() {
     use sentinel_protocol::control::v1::command::Payload;
@@ -496,6 +584,10 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "workload.deploy.v1",
             "workload.resources.v1",
             "workload.lifecycle.v1",
+            "workload.healthcheck.v1",
+            "workload.secrets.v1",
+            "workload.secrets.owner.v1",
+            "workload.rolling_deploy.v1",
             "logs.read.v1",
             "container.logs.v1",
             "trust.bundle.update.v1",
@@ -507,7 +599,39 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "network.firewall.reconcile.v1",
             "discovery.corrosion.inspect.v1",
             "discovery.corrosion.reconcile.v1",
-            "ingress.reconcile.v1"
+            "ingress.reconcile.v1",
+            "ingress.tls.v1",
+            "ingress.routes.v2",
+            "network.firewall.published_ports.v1",
+            "image.build.v1",
+            "image.build.private_git.v1",
+            "image.load.v1",
+            "image.build.external_push.v1",
+            "image.build.variables.v1",
+            "image.build.inline_dockerfile.v1",
+            "image.build.target.v1",
+            "workload.registry_auth.v1",
+            "builder.reconcile.v1",
+            "registry.reconcile.v1",
+            "registry.inspect.v1",
+            "volume.mounts.v1",
+            "volume.delete.v1",
+            "volume.serve.v1",
+            "volume.receive.v1",
+            "volume.transfer.v1",
+            "volume.verify.v1",
+            "workload.stop_timeout.v1",
+            "volume.backup.v1",
+            "volume.restore.v1",
+            "database.dump.v1",
+            "database.restore.v1",
+            "workload.dns_search.v1",
+            "workload.files.v1",
+            "network.firewall.stack_rules.v1",
+            "discovery.names.underscore.v1",
+            "workload.healthcheck.exec.v1",
+            "workload.exec.v1",
+            "workload.terminal.v1"
         ])
     );
 }
@@ -962,8 +1086,15 @@ async fn rejects_assignment_with_a_different_trust_bundle_version_before_connect
     ));
 
     assert!(matches!(
-        crate::connection::connect(&assignment, "1.0.1", tls_config, shutdown, command_executor,)
-            .await,
+        crate::connection::connect(
+            &assignment,
+            "1.0.1",
+            tls_config,
+            shutdown,
+            command_executor.clone(),
+            command_executor,
+        )
+        .await,
         Err(FluxConnectionError::TrustBundleVersionMismatch)
     ));
 }
@@ -998,6 +1129,162 @@ fn parses_podman_container_inventory() {
     assert_eq!(container.created_at_unix_ms, Some(1_789_237_060_000));
     assert_eq!(container.ports[0].host_port, Some(8080));
     assert_eq!(container.labels["coolify.managed"], "true");
+    assert_eq!(container.exit_code, None);
+}
+
+#[test]
+fn reports_the_exit_code_only_for_containers_that_ended() {
+    let containers = crate::commands::parse_podman_containers(
+        br#"[
+            {"Id":"a","Image":"alpine","Names":["once-ok"],"State":"exited","Exited":true,"ExitCode":0},
+            {"Id":"b","Image":"alpine","Names":["once-failed"],"State":"exited","Exited":true,"ExitCode":3},
+            {"Id":"c","Image":"alpine","Names":["running"],"State":"running","Exited":false,"ExitCode":0},
+            {"Id":"d","Image":"alpine","Names":["created"],"State":"created","Exited":false,"ExitCode":0}
+        ]"#,
+    )
+    .unwrap();
+
+    let codes: Vec<_> = containers
+        .iter()
+        .map(|container| (container.name.as_str(), container.exit_code))
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            ("once-ok", Some(0)),
+            ("once-failed", Some(3)),
+            ("running", None),
+            ("created", None)
+        ]
+    );
+}
+
+#[test]
+fn passes_dns_search_domains_of_the_coolify_zone() {
+    let request = |domains: &[&str]| sentinel_protocol::control::v1::WorkloadDeployRequest {
+        name: "coolify-web".into(),
+        image: "alpine".into(),
+        restart_policy: "no".into(),
+        dns_server: "10.240.0.2".into(),
+        dns_search: domains.iter().map(|domain| domain.to_string()).collect(),
+        ..Default::default()
+    };
+    let deploy = |domains: &[&str]| {
+        crate::commands::podman_deploy_args(std::path::Path::new("/"), &request(domains))
+    };
+
+    let arguments = deploy(&["shop.coolify.internal", "a.b-c.coolify.internal"])
+        .unwrap()
+        .arguments;
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--dns-search", "shop.coolify.internal"])
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|v| v == ["--dns-search", "a.b-c.coolify.internal"])
+    );
+    assert!(arguments.windows(2).any(|v| v == ["--restart", "no"]));
+    assert!(
+        !deploy(&[])
+            .unwrap()
+            .arguments
+            .contains(&"--dns-search".to_string())
+    );
+    assert!(deploy(&["s1.coolify.internal"; 6]).is_ok());
+    assert!(deploy(&["s1.coolify.internal"; 7]).is_err());
+    let long_label = format!("{}.coolify.internal", "a".repeat(64));
+    for invalid in [
+        "coolify.internal",
+        ".coolify.internal",
+        "shop.example.com",
+        "Shop.coolify.internal",
+        "-shop.coolify.internal",
+        "shop-.coolify.internal",
+        "sh op.coolify.internal",
+        "a..coolify.internal",
+        "shop.coolify.internal.",
+        "--privileged.coolify.internal",
+        long_label.as_str(),
+        "",
+    ] {
+        assert!(deploy(&[invalid]).is_err(), "{invalid:?} must be rejected");
+    }
+}
+
+#[test]
+fn deploy_writes_workload_files_and_remove_deletes_them() {
+    use sentinel_protocol::control::v1::CommandStatus;
+    use sentinel_protocol::control::v1::WorkloadLifecycleAction::Remove;
+
+    let root = tempfile::tempdir().unwrap();
+    let podman = root.path().join("fake-podman");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            &podman,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}/podman.log'\nif [ \"$1\" = run ]; then echo 0123abcd; fi\n",
+                root.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut executor = crate::commands::CommandExecutor::new("dev")
+        .with_network_root(root.path())
+        .with_podman(&podman);
+    let mut command = workload_deploy_command("deploy-files", "coolify-p1test-main");
+    let Some(sentinel_protocol::control::v1::command::Payload::WorkloadDeploy(request)) =
+        command.payload.as_mut()
+    else {
+        unreachable!()
+    };
+    request.restart_policy = "no".into();
+    request.files = vec![
+        sentinel_protocol::control::v1::WorkloadFile {
+            path: "/etc/app.conf".into(),
+            content: b"secret=value".to_vec(),
+            mode: "0600".into(),
+            directory: false,
+        },
+        sentinel_protocol::control::v1::WorkloadFile {
+            path: "/data".into(),
+            directory: true,
+            ..Default::default()
+        },
+    ];
+
+    let execution = executor.execute(command, true);
+    assert_eq!(
+        execution.result.status,
+        CommandStatus::Succeeded as i32,
+        "{:?}",
+        execution.result
+    );
+    let base = root
+        .path()
+        .join("var/lib/coolify/workload-files/coolify-p1test-main");
+    assert_eq!(
+        std::fs::read(base.join("etc/app.conf")).unwrap(),
+        b"secret=value"
+    );
+    assert!(base.join("data").is_dir());
+    let log = std::fs::read_to_string(root.path().join("podman.log")).unwrap();
+    assert!(log.contains(&format!(
+        "--mount type=bind,source={}/etc/app.conf,target=/etc/app.conf",
+        base.display()
+    )));
+    assert!(!log.contains("secret=value"));
+
+    let execution = executor.execute(
+        workload_lifecycle_command("remove-files", "coolify-p1test-main", Remove),
+        true,
+    );
+    assert_eq!(execution.result.status, CommandStatus::Succeeded as i32);
+    assert!(!base.exists());
 }
 
 #[test]
@@ -1217,9 +1504,17 @@ fn builds_shell_free_podman_deploy_arguments() {
         memory_limit_bytes: Some(1_073_741_824),
         memory_reservation_bytes: Some(536_870_912),
         pull_policy: "newer".into(),
+        mounts: Vec::new(),
+        health_check: None,
+        secrets: Vec::new(),
+        registry_username: String::new(),
+        registry_password: String::new(),
+        dns_search: vec!["web.coolify.internal".into()],
+        files: Vec::new(),
     };
 
-    let arguments = crate::commands::podman_deploy_args(&request).unwrap();
+    let deploy = crate::commands::podman_deploy_args(std::path::Path::new("/"), &request).unwrap();
+    let arguments = deploy.arguments;
 
     assert_eq!(arguments[0], "run");
     assert!(
@@ -1253,10 +1548,11 @@ fn builds_shell_free_podman_deploy_arguments() {
             .windows(2)
             .any(|v| v == ["--memory-reservation", "536870912b"])
     );
-    assert!(
-        arguments
-            .windows(2)
-            .any(|v| v == ["--env", "APP_ENV=production"])
+    assert!(arguments.windows(2).any(|v| v == ["--env", "APP_ENV"]));
+    assert!(!arguments.iter().any(|v| v.contains("production")));
+    assert_eq!(
+        deploy.environment,
+        [("APP_ENV".to_string(), "production".to_string())]
     );
     assert!(
         arguments
@@ -1302,9 +1598,24 @@ fn rejects_unsafe_or_oversized_deploy_requests() {
         ..Default::default()
     };
 
-    assert!(crate::commands::podman_deploy_args(&request("bad name", "alpine")).is_err());
-    assert!(crate::commands::podman_deploy_args(&request("safe-name", "")).is_err());
-    assert!(crate::commands::podman_deploy_args(&request("safe-name", "alpine;rm")).is_err());
+    assert!(
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request("bad name", "alpine")
+        )
+        .is_err()
+    );
+    assert!(
+        crate::commands::podman_deploy_args(std::path::Path::new("/"), &request("safe-name", ""))
+            .is_err()
+    );
+    assert!(
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request("safe-name", "alpine;rm")
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1317,7 +1628,10 @@ fn uses_the_requested_image_pull_policy() {
         ..Default::default()
     };
     let pull = |pull_policy: &str| {
-        let arguments = crate::commands::podman_deploy_args(&request(pull_policy)).unwrap();
+        let arguments =
+            crate::commands::podman_deploy_args(std::path::Path::new("/"), &request(pull_policy))
+                .unwrap()
+                .arguments;
         let index = arguments.iter().position(|v| v == "--pull").unwrap();
         assert_eq!(arguments.iter().filter(|v| *v == "--pull").count(), 1);
         arguments[index + 1].clone()
@@ -1328,7 +1642,10 @@ fn uses_the_requested_image_pull_policy() {
     assert_eq!(pull("newer"), "newer");
     assert_eq!(pull("always"), "always");
     for invalid in ["never", "Newer", "newer --privileged", " always"] {
-        assert!(crate::commands::podman_deploy_args(&request(invalid)).is_err());
+        assert!(
+            crate::commands::podman_deploy_args(std::path::Path::new("/"), &request(invalid))
+                .is_err()
+        );
     }
 }
 
@@ -1347,17 +1664,41 @@ fn rejects_invalid_workload_resource_settings() {
         }
     };
 
-    assert!(crate::commands::podman_deploy_args(&request(Some(0.0), None, None, None)).is_err());
     assert!(
-        crate::commands::podman_deploy_args(&request(Some(f64::NAN), None, None, None)).is_err()
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request(Some(0.0), None, None, None)
+        )
+        .is_err()
     );
     assert!(
-        crate::commands::podman_deploy_args(&request(Some(1.0), Some(2.0), None, None)).is_err()
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request(Some(f64::NAN), None, None, None)
+        )
+        .is_err()
     );
     assert!(
-        crate::commands::podman_deploy_args(&request(None, None, Some(1024), Some(2048))).is_err()
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request(Some(1.0), Some(2.0), None, None)
+        )
+        .is_err()
     );
-    assert!(crate::commands::podman_deploy_args(&request(None, None, Some(0), None)).is_err());
+    assert!(
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request(None, None, Some(1024), Some(2048))
+        )
+        .is_err()
+    );
+    assert!(
+        crate::commands::podman_deploy_args(
+            std::path::Path::new("/"),
+            &request(None, None, Some(0), None)
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1367,6 +1708,7 @@ fn builds_shell_free_podman_lifecycle_arguments() {
     let request = |action| WorkloadLifecycleRequest {
         name: "coolify-test-web".into(),
         action,
+        stop_timeout_seconds: None,
     };
 
     assert_eq!(
@@ -1398,14 +1740,16 @@ fn rejects_unsafe_workload_lifecycle_requests() {
     assert!(
         crate::commands::podman_lifecycle_args(&WorkloadLifecycleRequest {
             name: "bad name".into(),
-            action: 1
+            action: 1,
+            stop_timeout_seconds: None,
         })
         .is_err()
     );
     assert!(
         crate::commands::podman_lifecycle_args(&WorkloadLifecycleRequest {
             name: "coolify-safe".into(),
-            action: 0
+            action: 0,
+            stop_timeout_seconds: None,
         })
         .is_err()
     );
@@ -1746,6 +2090,7 @@ fn workload_lifecycle_command(
                 sentinel_protocol::control::v1::WorkloadLifecycleRequest {
                     name: name.into(),
                     action: action.into(),
+                    stop_timeout_seconds: None,
                 },
             ),
         ),
@@ -1846,8 +2191,12 @@ fn workload_commands_keep_a_durable_stop_marker() {
             "restart present",
             "stop present",
             "rm present",
+            // A remove also deletes the secrets of the container.
+            "secret absent",
             "stop present",
             "run absent",
+            // A deploy deletes the secrets that the new revision does not use.
+            "secret absent",
         ]
     );
 
@@ -2244,12 +2593,14 @@ fn ingress_request(
             workload_id: "web".into(),
             namespace: "default".into(),
             port: 3000,
+            ..Default::default()
         }],
         names: vec![sentinel_protocol::control::v1::WorkloadName {
             name: "frontend".into(),
             workload_id: "web".into(),
             namespace: "default".into(),
         }],
+        ..Default::default()
     }
 }
 
@@ -2330,6 +2681,7 @@ fn executes_capability_gated_ingress_reconciles_and_wakes_the_renderer() {
                 revision: 2,
                 route_count: 1,
                 name_count: 1,
+                tls_enabled: false,
             }
         ))
     );
@@ -2784,20 +3136,47 @@ fn passes_any_podman_environment_variable_and_rejects_unpassable_ones() {
         ..Default::default()
     };
     let long_value = "x".repeat(10_000);
-    let mut environment = vec![variable("app.name", "demo"), variable("1BAD", &long_value)];
+    let mut environment = vec![
+        variable("app.name", "demo"),
+        variable("1BAD", &long_value),
+        variable("PATH", "/app/bin"),
+        variable("http_proxy", "http://proxy:3128"),
+        variable("SECRET*", "literal"),
+    ];
     environment.extend((0..300).map(|index| variable(&format!("VAR_{index}"), "value")));
 
-    let arguments = crate::commands::podman_deploy_args(&request(environment)).unwrap();
+    let deploy =
+        crate::commands::podman_deploy_args(std::path::Path::new("/"), &request(environment))
+            .unwrap();
+    let arguments = deploy.arguments;
 
+    // Values go to Podman's process environment, not to its world-readable argument list.
+    assert!(arguments.windows(2).any(|v| v == ["--env", "app.name"]));
+    assert!(arguments.windows(2).any(|v| v == ["--env", "1BAD"]));
+    assert!(!arguments.iter().any(|v| v.contains(&long_value)));
     assert!(
-        arguments
-            .windows(2)
-            .any(|v| v == ["--env", "app.name=demo"])
+        deploy
+            .environment
+            .contains(&("app.name".to_string(), "demo".to_string()))
     );
     assert!(
-        arguments
-            .windows(2)
-            .any(|v| v[0] == "--env" && v[1] == format!("1BAD={long_value}"))
+        deploy
+            .environment
+            .contains(&("1BAD".to_string(), long_value.clone()))
+    );
+    // Names that Podman reads itself, and wildcard names, stay inline.
+    for inline in [
+        "PATH=/app/bin",
+        "http_proxy=http://proxy:3128",
+        "SECRET*=literal",
+    ] {
+        assert!(arguments.windows(2).any(|v| v == ["--env", inline]));
+    }
+    assert!(
+        !deploy
+            .environment
+            .iter()
+            .any(|(key, _)| ["PATH", "http_proxy", "SECRET*"].contains(&key.as_str()))
     );
     for invalid in [
         variable("", "x"),
@@ -2805,6 +3184,47 @@ fn passes_any_podman_environment_variable_and_rejects_unpassable_ones() {
         variable("A\0B", "x"),
         variable("A", "x\0y"),
     ] {
-        assert!(crate::commands::podman_deploy_args(&request(vec![invalid])).is_err());
+        assert!(
+            crate::commands::podman_deploy_args(std::path::Path::new("/"), &request(vec![invalid]))
+                .is_err()
+        );
     }
+}
+
+#[test]
+fn health_check_accepts_the_shell_form_and_the_exec_form() {
+    use sentinel_protocol::control::v1::WorkloadHealthCheck;
+
+    let check = |command: &str| WorkloadHealthCheck {
+        command: command.into(),
+        interval_seconds: 10,
+        timeout_seconds: 5,
+        retries: 3,
+        start_period_seconds: 0,
+    };
+    let command_of = |command: &str| {
+        crate::commands::podman_health_args(&check(command)).map(|args| args[1].clone())
+    };
+
+    assert_eq!(
+        command_of("curl -f http://localhost/").unwrap(),
+        "curl -f http://localhost/"
+    );
+    // The exec form runs without a shell; it is passed in a canonical form.
+    assert_eq!(
+        command_of(r#"[ "/app/vikunja", "healthcheck" ]"#).unwrap(),
+        r#"["/app/vikunja","healthcheck"]"#
+    );
+    for invalid in [
+        "",
+        "[]",
+        r#"["/bin/x", ""]"#,
+        "[not json",
+        r#"["a\u0000b"]"#,
+        "a\nb",
+    ] {
+        assert!(command_of(invalid).is_err(), "{invalid:?} must be rejected");
+    }
+    let too_many = serde_json::to_string(&vec!["x"; 65]).unwrap();
+    assert!(command_of(&too_many).is_err());
 }

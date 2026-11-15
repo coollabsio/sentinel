@@ -1,3 +1,4 @@
+use base64::Engine;
 use std::time::Duration;
 
 use axum::Json;
@@ -11,12 +12,12 @@ use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
     ClusterLeaveRequest, Command, CommandResult, CommandStatus, ContainerListRequest,
     ContainerLogsRequest, ContainerPort, CorrosionInspectRequest, CorrosionReconcileRequest,
-    FirewallIngressRule, FirewallInspectRequest, FirewallReconcileRequest, FirewallRule,
-    IngressReconcileRequest, IngressRoute, LogSource, LogsReadRequest, SystemInfoRequest,
-    SystemPingRequest, TrustBundleUpdateRequest, WireguardInspectRequest,
-    WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest,
-    WorkloadEnvironmentVariable, WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest,
-    WorkloadName,
+    FirewallIngressRule, FirewallInspectRequest, FirewallPublishedPort, FirewallReconcileRequest,
+    FirewallRule, FirewallStackRule, IngressReconcileRequest, IngressRoute, LogSource,
+    LogsReadRequest, SystemInfoRequest, SystemPingRequest, TrustBundleUpdateRequest,
+    WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest,
+    WorkloadDeployRequest, WorkloadEnvironmentVariable, WorkloadFile, WorkloadHealthCheck,
+    WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadName, WorkloadSecret,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -24,12 +25,18 @@ use sentinel_protocol::{
     CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES,
+    CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_SECRETS_OWNER,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{CommandDispatchError, ConnectionRegistry, now_millis};
+
+mod build;
+mod database;
+mod exec;
+mod volume;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -144,6 +151,110 @@ struct WorkloadDeployApiRequest {
     memory_reservation_bytes: Option<u64>,
     #[serde(default)]
     pull_policy: String,
+    #[serde(default)]
+    mounts: Vec<volume::DeployMount>,
+    #[serde(default)]
+    health_check: Option<DeployHealthCheck>,
+    #[serde(default)]
+    secrets: std::collections::HashMap<String, DeploySecret>,
+    #[serde(default)]
+    registry_username: String,
+    #[serde(default)]
+    registry_password: String,
+    #[serde(default)]
+    dns_search: Vec<String>,
+    #[serde(default)]
+    files: Vec<DeployFile>,
+}
+
+/// A file of `workload.files.v1`. Sentinel validates the path, mode, and sizes.
+#[derive(Deserialize)]
+struct DeployFile {
+    path: String,
+    #[serde(default)]
+    content_base64: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    directory: bool,
+}
+
+/// Decodes the files of a deploy. A file is at most 1 MiB, so a longer
+/// encoding is refused before it is decoded.
+fn deploy_files(files: Vec<DeployFile>) -> Result<Vec<WorkloadFile>, (StatusCode, &'static str)> {
+    const MAX_FILES: usize = 64;
+    const MAX_ENCODED_BYTES: usize = (1024 * 1024usize).div_ceil(3) * 4;
+    if files.len() > MAX_FILES {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "too many files"));
+    }
+    files
+        .into_iter()
+        .map(|file| {
+            if file.content_base64.len() > MAX_ENCODED_BYTES {
+                return Err((StatusCode::UNPROCESSABLE_ENTITY, "a file is too large"));
+            }
+            let content = base64::engine::general_purpose::STANDARD
+                .decode(file.content_base64.as_bytes())
+                .map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, "invalid file content"))?;
+            Ok(WorkloadFile {
+                path: file.path,
+                content,
+                mode: file.mode,
+                directory: file.directory,
+            })
+        })
+        .collect()
+}
+
+/// The files of one deploy are at most 4 MiB, about 5.4 MiB as base64.
+const WORKLOAD_DEPLOY_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+/// The value of a secret file, or the value with the owner and the mode of
+/// the file (`workload.secrets.owner.v1`). An unset field keeps the Podman
+/// default.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DeploySecret {
+    Value(String),
+    File {
+        value: String,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: Option<u32>,
+    },
+}
+
+impl DeploySecret {
+    fn protocol(self, key: String) -> WorkloadSecret {
+        match self {
+            Self::Value(value) => WorkloadSecret {
+                key,
+                value,
+                ..Default::default()
+            },
+            Self::File {
+                value,
+                uid,
+                gid,
+                mode,
+            } => WorkloadSecret {
+                key,
+                value,
+                uid,
+                gid,
+                mode,
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DeployHealthCheck {
+    command: String,
+    interval_seconds: u32,
+    timeout_seconds: u32,
+    retries: u32,
+    start_period_seconds: u32,
 }
 
 /// Validates a workload image pull policy. The default (`missing`) is
@@ -163,6 +274,8 @@ struct WorkloadLifecycleApiRequest {
     command_id: String,
     name: String,
     action: WorkloadLifecycleApiAction,
+    #[serde(default)]
+    stop_timeout_seconds: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -243,6 +356,26 @@ struct FirewallReconcileApiRequest {
     workload_cidrs: Vec<String>,
     #[serde(default)]
     ingress_rules: Vec<FirewallIngressRuleApiRequest>,
+    #[serde(default)]
+    registry_ip: String,
+    #[serde(default)]
+    stack_rules: Vec<FirewallStackRuleApiRequest>,
+    #[serde(default)]
+    published_ports: Vec<FirewallPublishedPortApiRequest>,
+}
+#[derive(Deserialize)]
+struct FirewallStackRuleApiRequest {
+    source_ip: String,
+    destination_ip: String,
+}
+#[derive(Deserialize)]
+struct FirewallPublishedPortApiRequest {
+    protocol: String,
+    host_port: u32,
+    destination_ip: String,
+    container_port: u32,
+    #[serde(default)]
+    source_cidrs: Vec<String>,
 }
 #[derive(Deserialize)]
 struct CorrosionInspectApiRequest {
@@ -274,6 +407,19 @@ struct IngressReconcileApiRequest {
     routes: Vec<IngressRouteApiRequest>,
     #[serde(default)]
     names: Vec<WorkloadNameApiRequest>,
+    #[serde(default)]
+    tls_enabled: bool,
+    /// Base64 of the 32-byte cluster TLS key; empty without HTTPS.
+    #[serde(default)]
+    tls_key: String,
+    #[serde(default)]
+    tls_issuer: bool,
+    #[serde(default)]
+    acme_directory_url: String,
+    #[serde(default)]
+    ingress_public_ips: Vec<String>,
+    #[serde(default)]
+    acme_ca_pem: String,
 }
 #[derive(Deserialize)]
 struct WorkloadNameApiRequest {
@@ -284,9 +430,26 @@ struct WorkloadNameApiRequest {
 #[derive(Deserialize)]
 struct IngressRouteApiRequest {
     host: String,
+    #[serde(default)]
     workload_id: String,
+    #[serde(default)]
     namespace: String,
+    #[serde(default)]
     port: u32,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    redirect_host: String,
+    #[serde(default)]
+    http_only: bool,
+    #[serde(default)]
+    allow_http: bool,
+    #[serde(default)]
+    temporary_redirect: bool,
+    #[serde(default)]
+    noindex: bool,
+    #[serde(default)]
+    strip_path: bool,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -350,6 +513,16 @@ pub struct SystemInfoResponse {
     load_average_one: Option<f64>,
     load_average_five: Option<f64>,
     load_average_fifteen: Option<f64>,
+    ingress_certificates: Vec<IngressCertificateStatusResponse>,
+}
+
+#[derive(Serialize)]
+pub struct IngressCertificateStatusResponse {
+    host: String,
+    status: String,
+    not_after: i64,
+    error: String,
+    next_attempt_at: i64,
 }
 
 #[derive(Serialize)]
@@ -384,6 +557,7 @@ pub struct ContainerListResponse {
     command_id: String,
     observed_at_unix_ms: i64,
     containers: Vec<ContainerResponse>,
+    volumes: Vec<volume::VolumeResponse>,
 }
 
 #[derive(Serialize)]
@@ -415,6 +589,7 @@ struct ContainerResponse {
     labels: std::collections::HashMap<String, String>,
     created_at_unix_ms: Option<i64>,
     started_at_unix_ms: Option<i64>,
+    exit_code: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -441,7 +616,12 @@ pub async fn serve(
             post(trust_bundle_update),
         )
         .route("/v1/commands/network.cluster.leave", post(cluster_leave))
-        .route("/v1/commands/workload.deploy", post(workload_deploy))
+        .route(
+            "/v1/commands/workload.deploy",
+            post(workload_deploy).layer(axum::extract::DefaultBodyLimit::max(
+                WORKLOAD_DEPLOY_BODY_LIMIT,
+            )),
+        )
         .route("/v1/commands/workload.lifecycle", post(workload_lifecycle))
         .route(
             "/v1/commands/network.wireguard.key.ensure",
@@ -472,6 +652,36 @@ pub async fn serve(
             post(corrosion_reconcile),
         )
         .route("/v1/commands/ingress.reconcile", post(ingress_reconcile))
+        .route("/v1/commands/image.build", post(build::image_build))
+        .route("/v1/commands/image.load", post(build::image_load))
+        .route(
+            "/v1/commands/builder.reconcile",
+            post(build::builder_reconcile),
+        )
+        .route(
+            "/v1/commands/registry.reconcile",
+            post(build::registry_reconcile),
+        )
+        .route(
+            "/v1/commands/registry.inspect",
+            post(build::registry_inspect),
+        )
+        .route("/v1/commands/volume.delete", post(volume::volume_delete))
+        .route("/v1/commands/volume.serve", post(volume::volume_serve))
+        .route("/v1/commands/volume.receive", post(volume::volume_receive))
+        .route("/v1/commands/volume.backup", post(volume::volume_backup))
+        .route("/v1/commands/volume.restore", post(volume::volume_restore))
+        .route("/v1/commands/database.dump", post(database::database_dump))
+        .route(
+            "/v1/commands/database.restore",
+            post(database::database_restore),
+        )
+        .route("/v1/commands/workload.exec", post(exec::workload_exec))
+        .route("/v1/terminals", post(exec::terminal_open))
+        .route(
+            "/v1/terminals/{session_id}/attach",
+            axum::routing::get(exec::terminal_attach),
+        )
         .with_state(ApiState { registry, token });
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "Flux internal command API is listening");
@@ -520,12 +730,7 @@ async fn trust_bundle_update(
         || request.bundle_pem.trim().is_empty()
         || request.bundle_pem.len() > MAX_TRUST_BUNDLE_BYTES
     {
-        let authorization = headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok());
-        if authorization != Some(&format!("Bearer {}", state.token)) {
-            return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-        }
+        authorize(&state.token, &headers)?;
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid trust bundle").into());
     }
     let result = dispatch_network(
@@ -562,12 +767,28 @@ async fn dispatch_network(
     command_type: &str,
     payload: Payload,
 ) -> Result<sentinel_protocol::control::v1::CommandResult, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    dispatch_with_timeout(
+        state,
+        headers,
+        server_id,
+        command_id,
+        command_type,
+        payload,
+        LIFECYCLE_TIMEOUT,
+    )
+    .await
+}
+
+async fn dispatch_with_timeout(
+    state: &ApiState,
+    headers: &HeaderMap,
+    server_id: &str,
+    command_id: &str,
+    command_type: &str,
+    payload: Payload,
+    timeout: Duration,
+) -> Result<sentinel_protocol::control::v1::CommandResult, ApiError> {
+    authorize(&state.token, headers)?;
     if server_id.is_empty()
         || server_id.len() > 255
         || command_id.is_empty()
@@ -589,9 +810,9 @@ async fn dispatch_network(
                 payload_version: 1,
                 created_at_unix_ms: now,
                 payload: Some(payload),
-                expires_at_unix_ms: now + LIFECYCLE_TIMEOUT.as_millis() as i64,
+                expires_at_unix_ms: now + timeout.as_millis() as i64,
             },
-            LIFECYCLE_TIMEOUT,
+            timeout,
         )
         .await
         .map_err(dispatch_error)?;
@@ -760,6 +981,26 @@ async fn firewall_reconcile(
             flux_probe_host: request.flux_probe_host,
             workload_cidrs: request.workload_cidrs,
             ingress_rules,
+            registry_ip: request.registry_ip,
+            stack_rules: request
+                .stack_rules
+                .into_iter()
+                .map(|rule| FirewallStackRule {
+                    source_ip: rule.source_ip,
+                    destination_ip: rule.destination_ip,
+                })
+                .collect(),
+            published_ports: request
+                .published_ports
+                .into_iter()
+                .map(|port| FirewallPublishedPort {
+                    protocol: port.protocol,
+                    host_port: port.host_port,
+                    destination_ip: port.destination_ip,
+                    container_port: port.container_port,
+                    source_cidrs: port.source_cidrs,
+                })
+                .collect(),
         }),
     )
     .await?;
@@ -834,6 +1075,10 @@ async fn ingress_reconcile(
     headers: HeaderMap,
     Json(request): Json<IngressReconcileApiRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state.token, &headers)?;
+    let tls_key = base64::engine::general_purpose::STANDARD
+        .decode(&request.tls_key)
+        .map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, "invalid TLS key"))?;
     let result = dispatch_network(
         &state,
         &headers,
@@ -852,6 +1097,13 @@ async fn ingress_reconcile(
                     workload_id: route.workload_id,
                     namespace: route.namespace,
                     port: route.port,
+                    path: route.path,
+                    redirect_host: route.redirect_host,
+                    http_only: route.http_only,
+                    allow_http: route.allow_http,
+                    temporary_redirect: route.temporary_redirect,
+                    noindex: route.noindex,
+                    strip_path: route.strip_path,
                 })
                 .collect(),
             names: request
@@ -863,6 +1115,12 @@ async fn ingress_reconcile(
                     namespace: name.namespace,
                 })
                 .collect(),
+            tls_enabled: request.tls_enabled,
+            tls_key,
+            tls_issuer: request.tls_issuer,
+            acme_directory_url: request.acme_directory_url,
+            ingress_public_ips: request.ingress_public_ips,
+            acme_ca_pem: request.acme_ca_pem,
         }),
     )
     .await?;
@@ -878,6 +1136,7 @@ async fn ingress_reconcile(
         "revision": value.revision,
         "route_count": value.route_count,
         "name_count": value.name_count,
+        "tls_enabled": value.tls_enabled,
     })))
 }
 
@@ -886,12 +1145,7 @@ async fn workload_lifecycle(
     headers: HeaderMap,
     Json(request): Json<WorkloadLifecycleApiRequest>,
 ) -> Result<Json<WorkloadLifecycleResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty()
         || request.server_id.len() > 255
         || request.command_id.is_empty()
@@ -903,8 +1157,18 @@ async fn workload_lifecycle(
     {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request").into());
     }
+    if request
+        .stop_timeout_seconds
+        .is_some_and(|seconds| !(1..=600).contains(&seconds))
+    {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid stop timeout").into());
+    }
     let now = now_millis();
     let action = request.action;
+    // The command waits for the stop timeout, so the wait for its result grows with it.
+    let timeout = LIFECYCLE_TIMEOUT.max(Duration::from_secs(
+        u64::from(request.stop_timeout_seconds.unwrap_or(0)) + 60,
+    ));
     let result = state
         .registry
         .dispatch(
@@ -917,10 +1181,11 @@ async fn workload_lifecycle(
                 payload: Some(Payload::WorkloadLifecycle(WorkloadLifecycleRequest {
                     name: request.name,
                     action: action.protocol().into(),
+                    stop_timeout_seconds: request.stop_timeout_seconds,
                 })),
-                expires_at_unix_ms: now + LIFECYCLE_TIMEOUT.as_millis() as i64,
+                expires_at_unix_ms: now + timeout.as_millis() as i64,
             },
-            LIFECYCLE_TIMEOUT,
+            timeout,
         )
         .await
         .map_err(dispatch_error)?;
@@ -947,12 +1212,7 @@ async fn workload_deploy(
     headers: HeaderMap,
     Json(request): Json<WorkloadDeployApiRequest>,
 ) -> Result<Json<WorkloadDeployResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty()
         || request.server_id.len() > 255
         || request.command_id.is_empty()
@@ -965,6 +1225,35 @@ async fn workload_deploy(
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request").into());
     }
     let pull_policy = workload_pull_policy(&request.pull_policy)?;
+    let files = deploy_files(request.files)?;
+    let mut secrets: Vec<_> = request
+        .secrets
+        .into_iter()
+        .map(|(key, secret)| secret.protocol(key))
+        .collect();
+    secrets.sort_by(|left, right| left.key.cmp(&right.key));
+    // An older Sentinel ignores the fields and would start the container
+    // without its files, search domains, or secret file owners.
+    let needed = [
+        (!request.dns_search.is_empty()).then_some(CAPABILITY_WORKLOAD_DNS_SEARCH),
+        (!files.is_empty()).then_some(CAPABILITY_WORKLOAD_FILES),
+        secrets
+            .iter()
+            .any(|secret| secret.uid.is_some() || secret.gid.is_some() || secret.mode.is_some())
+            .then_some(CAPABILITY_WORKLOAD_SECRETS_OWNER),
+    ];
+    if needed.iter().flatten().next().is_some() {
+        let Some(connection) = state.registry.get(&request.server_id).await else {
+            return Err(dispatch_error(CommandDispatchError::Offline).into());
+        };
+        if needed
+            .iter()
+            .flatten()
+            .any(|capability| !connection.capabilities.iter().any(|c| c == capability))
+        {
+            return Err(dispatch_error(CommandDispatchError::Unsupported).into());
+        }
+    }
     let now = now_millis();
     let result = state
         .registry
@@ -1007,6 +1296,23 @@ async fn workload_deploy(
                     memory_limit_bytes: request.memory_limit_bytes,
                     memory_reservation_bytes: request.memory_reservation_bytes,
                     pull_policy,
+                    mounts: request
+                        .mounts
+                        .into_iter()
+                        .map(volume::DeployMount::protocol)
+                        .collect(),
+                    health_check: request.health_check.map(|check| WorkloadHealthCheck {
+                        command: check.command,
+                        interval_seconds: check.interval_seconds,
+                        timeout_seconds: check.timeout_seconds,
+                        retries: check.retries,
+                        start_period_seconds: check.start_period_seconds,
+                    }),
+                    secrets,
+                    registry_username: request.registry_username,
+                    registry_password: request.registry_password,
+                    dns_search: request.dns_search,
+                    files,
                 })),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },
@@ -1041,12 +1347,7 @@ async fn container_list(
     headers: HeaderMap,
     Json(request): Json<ContainerListApiRequest>,
 ) -> Result<Json<ContainerListResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty() || request.server_id.len() > 255 {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID").into());
     }
@@ -1098,6 +1399,7 @@ async fn container_list(
             labels: container.labels,
             created_at_unix_ms: container.created_at_unix_ms,
             started_at_unix_ms: container.started_at_unix_ms,
+            exit_code: container.exit_code,
         })
         .collect();
 
@@ -1105,6 +1407,11 @@ async fn container_list(
         command_id,
         observed_at_unix_ms,
         containers,
+        volumes: list
+            .volumes
+            .into_iter()
+            .map(volume::VolumeResponse::from)
+            .collect(),
     }))
 }
 
@@ -1113,12 +1420,7 @@ async fn system_info(
     headers: HeaderMap,
     Json(request): Json<SystemInfoApiRequest>,
 ) -> Result<Json<SystemInfoResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty() || request.server_id.len() > 255 {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID").into());
     }
@@ -1171,6 +1473,17 @@ async fn system_info(
         load_average_one: info.load_average_one,
         load_average_five: info.load_average_five,
         load_average_fifteen: info.load_average_fifteen,
+        ingress_certificates: info
+            .ingress_certificates
+            .into_iter()
+            .map(|certificate| IngressCertificateStatusResponse {
+                host: certificate.host,
+                status: certificate.status,
+                not_after: certificate.not_after,
+                error: certificate.error,
+                next_attempt_at: certificate.next_attempt_at,
+            })
+            .collect(),
     }))
 }
 
@@ -1179,12 +1492,7 @@ async fn logs_read(
     headers: HeaderMap,
     Json(request): Json<LogsReadApiRequest>,
 ) -> Result<Json<LogsReadResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty() || request.server_id.len() > 255 {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID").into());
     }
@@ -1250,12 +1558,7 @@ async fn container_logs(
     headers: HeaderMap,
     Json(request): Json<ContainerLogsApiRequest>,
 ) -> Result<Json<ContainerLogsResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty()
         || request.server_id.len() > 255
         || request.command_id.is_empty()
@@ -1322,12 +1625,7 @@ async fn ping(
     headers: HeaderMap,
     Json(request): Json<PingRequest>,
 ) -> Result<Json<PingResponse>, ApiError> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok());
-    if authorization != Some(&format!("Bearer {}", state.token)) {
-        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
-    }
+    authorize(&state.token, &headers)?;
     if request.server_id.is_empty() || request.server_id.len() > 255 {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid server ID").into());
     }
@@ -1371,6 +1669,25 @@ async fn ping(
     }))
 }
 
+/// Checks the internal API bearer token in constant time.
+fn authorize(token: &str, headers: &HeaderMap) -> Result<(), ApiError> {
+    let presented = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default()
+        .as_bytes();
+    let expected = token.as_bytes();
+    let difference = presented.iter().zip(expected).fold(
+        presented.len() ^ expected.len(),
+        |difference, (left, right)| difference | usize::from(left ^ right),
+    );
+    if difference != 0 || expected.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized").into());
+    }
+    Ok(())
+}
+
 /// An internal API error. A failed Sentinel command keeps the message that Sentinel reported.
 pub(crate) struct ApiError(StatusCode, String);
 
@@ -1402,5 +1719,6 @@ fn dispatch_error(error: CommandDispatchError) -> (StatusCode, &'static str) {
         CommandDispatchError::Send => (StatusCode::SERVICE_UNAVAILABLE, "connection closed"),
         CommandDispatchError::QueueFull => (StatusCode::SERVICE_UNAVAILABLE, "connection is busy"),
         CommandDispatchError::Timeout => (StatusCode::GATEWAY_TIMEOUT, "command timed out"),
+        CommandDispatchError::Duplicate => (StatusCode::CONFLICT, "command is already running"),
     }
 }

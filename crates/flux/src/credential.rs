@@ -61,8 +61,9 @@ struct Claims {
 }
 
 pub struct CredentialVerifier {
-    key_id: String,
-    key: VerifyingKey,
+    /// Trusted signing keys by key ID. A second key lets credentials signed
+    /// with the old and the new key both verify during a key rotation.
+    keys: Vec<(String, VerifyingKey)>,
     issuer: String,
     max_lifetime: Duration,
 }
@@ -75,11 +76,17 @@ impl CredentialVerifier {
         max_lifetime: Duration,
     ) -> Self {
         Self {
-            key_id: key_id.into(),
-            key: VerifyingKey::from_bytes(&key).expect("32-byte Ed25519 key"),
+            keys: vec![(key_id.into(), verifying_key(&key))],
             issuer: issuer.into(),
             max_lifetime,
         }
+    }
+
+    /// Also accepts credentials signed with this key, for example the previous
+    /// signing key while Coolify switches to a new one.
+    pub fn with_additional_key(mut self, key_id: impl Into<String>, key: [u8; 32]) -> Self {
+        self.keys.push((key_id.into(), verifying_key(&key)));
+        self
     }
 
     pub fn verify(&self, token: &str) -> Result<CredentialClaims, CredentialError> {
@@ -100,20 +107,22 @@ impl CredentialVerifier {
         if header.alg != "EdDSA" {
             return Err(error(CredentialErrorKind::Algorithm));
         }
-        if header.kid.as_deref() != Some(&self.key_id) {
-            return Err(error(CredentialErrorKind::KeyId));
-        }
+        let key = self
+            .keys
+            .iter()
+            .find(|(key_id, _)| header.kid.as_deref() == Some(key_id.as_str()))
+            .map(|(_, key)| key)
+            .ok_or_else(|| error(CredentialErrorKind::KeyId))?;
         let signature_bytes = URL_SAFE_NO_PAD
             .decode(signature_part)
             .map_err(|_| error(CredentialErrorKind::Format))?;
         let signature = Signature::from_slice(&signature_bytes)
             .map_err(|_| error(CredentialErrorKind::Format))?;
-        self.key
-            .verify(
-                format!("{header_part}.{claims_part}").as_bytes(),
-                &signature,
-            )
-            .map_err(|_| error(CredentialErrorKind::Signature))?;
+        key.verify(
+            format!("{header_part}.{claims_part}").as_bytes(),
+            &signature,
+        )
+        .map_err(|_| error(CredentialErrorKind::Signature))?;
         let claims: Claims = decode_json(claims_part)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -159,6 +168,10 @@ fn decode_json<T: for<'de> Deserialize<'de>>(part: &str) -> Result<T, Credential
         .decode(part)
         .map_err(|_| error(CredentialErrorKind::Format))?;
     serde_json::from_slice(&bytes).map_err(|_| error(CredentialErrorKind::Format))
+}
+
+fn verifying_key(key: &[u8; 32]) -> VerifyingKey {
+    VerifyingKey::from_bytes(key).expect("32-byte Ed25519 key")
 }
 
 fn error(kind: CredentialErrorKind) -> CredentialError {

@@ -5,14 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "0.22"
 config = { path = "../config" }
 protocol = { path = "../protocol" }
 store = { path = "../store" }
 futures-util.workspace = true
 prost.workspace = true
 reqwest.workspace = true
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-pemfile = "2.2"
+rustix = { version = "1.1", features = ["pty", "termios"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
@@ -26,6 +29,7 @@ tracing-subscriber.workspace = true
 url.workspace = true
 x509-parser = "0.18.1"
 sysinfo.workspace = true
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
 
 [dev-dependencies]
 tempfile = "3"

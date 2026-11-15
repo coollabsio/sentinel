@@ -12,9 +12,10 @@ env:
   GITHUB_REGISTRY: ghcr.io
   DOCKER_REGISTRY: docker.io
   IMAGE_NAME: "coollabsio/sentinel"
-  # Host binary and Flux broker images are GHCR-only, like the `main` builds.
+  # Host binary, Flux broker, and builder images are GHCR-only, like the `main` builds.
   HOST_IMAGE_NAME: "coollabsio/sentinel-host"
   FLUX_IMAGE_NAME: "coollabsio/flux"
+  BUILDER_IMAGE_NAME: "coollabsio/coolify-builder"
 
 jobs:
   build-push:
@@ -38,7 +39,7 @@ jobs:
 
       - name: Get version without v prefix
         id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Login to ${{ env.GITHUB_REGISTRY }}
         uses: docker/login-action@v4
@@ -54,6 +55,9 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # The image, host, and Flux steps are targets of one Dockerfile and share
+      # its builder stage, so only the first step compiles. They stay in one
+      # job for this reason, and they must get the same build args.
       - name: Build and Push Image (${{ matrix.arch }})
         uses: docker/build-push-action@v7
         with:
@@ -61,8 +65,10 @@ jobs:
           file: Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ steps.version.outputs.VERSION }}
+          cache-from: type=gha,scope=sentinel-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=sentinel-${{ matrix.arch }}
           tags: |
             ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
             ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
@@ -73,7 +79,8 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile.host
+          file: Dockerfile
+          target: host
           platforms: ${{ matrix.platform }}
           push: true
           build-args: |
@@ -88,14 +95,29 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile.flux
+          file: Dockerfile
+          target: flux
           platforms: ${{ matrix.platform }}
           push: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.VERSION }}
           tags: |
             ${{ env.GITHUB_REGISTRY }}/${{ env.FLUX_IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
           labels: |
             coolify.managed=true
             org.opencontainers.image.description=Coolify Flux connection broker
+
+      - name: Build and Push Builder Image (${{ matrix.arch }})
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.builder
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ${{ env.GITHUB_REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.description=Coolify image build container
 
   merge-manifest:
     runs-on: ubuntu-24.04
@@ -107,7 +129,7 @@ jobs:
 
       - name: Get version without v prefix
         id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v4
 
@@ -139,7 +161,7 @@ jobs:
           ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }} \
           --tag ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
-      - name: Create & publish host artifact and Flux manifests
+      - name: Create & publish host artifact, Flux, and builder manifests
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
@@ -149,7 +171,7 @@ jobs:
             echo "| Image | Digest |"
             echo "| --- | --- |"
           } >> "$GITHUB_STEP_SUMMARY"
-          for image in "$HOST_IMAGE_NAME" "$FLUX_IMAGE_NAME"; do
+          for image in "$HOST_IMAGE_NAME" "$FLUX_IMAGE_NAME" "$BUILDER_IMAGE_NAME"; do
             reference="$GITHUB_REGISTRY/$image:$VERSION"
             docker buildx imagetools create \
               "$reference-amd64" \

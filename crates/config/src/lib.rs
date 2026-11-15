@@ -3,7 +3,7 @@
 // scoped #[allow(unsafe_code)] instead (see Global Constraints).
 #![deny(unsafe_code)]
 
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 // Mirrors the Go implementation's build-time `-ldflags -X ...Version=...`
@@ -29,6 +29,8 @@ pub enum ConfigError {
     InvalidEndpoint,
     #[error("PORT must be an integer between 1 and 65535")]
     InvalidPort,
+    #[error("BIND_ADDRESS must be an IPv4 or IPv6 address")]
+    InvalidBindAddress,
     #[error("{0} must be a positive integer")]
     NotPositive(&'static str),
     #[error("invalid {0}: must be true or false")]
@@ -130,16 +132,14 @@ pub struct Config {
 
 impl Config {
     pub fn load(development: bool) -> Result<Self, ConfigError> {
-        let metrics_file = if development {
-            PathBuf::from("./db/metrics.sqlite")
-        } else {
-            PathBuf::from("/app/db/metrics.sqlite")
-        };
-        let command_journal_file = if development {
-            PathBuf::from("./db/commands.sqlite")
-        } else {
-            PathBuf::from("/app/db/commands.sqlite")
-        };
+        // DATA_DIR lets a host install (no container mount) keep the
+        // databases in the directory the container mounted on /app/db.
+        let data_dir = PathBuf::from(
+            non_empty("DATA_DIR")
+                .unwrap_or_else(|| if development { "./db" } else { "/app/db" }.to_string()),
+        );
+        let metrics_file = data_dir.join("metrics.sqlite");
+        let command_journal_file = data_dir.join("commands.sqlite");
         let command_retention_days = u32_from_env("SENTINEL_COMMAND_RETENTION_DAYS", 7)?;
         let command_max_records = u32_from_env("SENTINEL_COMMAND_MAX_RECORDS", 100_000)?;
 
@@ -176,11 +176,7 @@ impl Config {
             positive_from_env("STORAGE_VOLUMES_REFRESH_RATE_SECONDS", 900)?;
         let host_mount_prefix = non_empty("HOST_MOUNT_PREFIX").unwrap_or_default();
 
-        let analytics_file = if development {
-            PathBuf::from("./db/analytics.sqlite")
-        } else {
-            PathBuf::from("/app/db/analytics.sqlite")
-        };
+        let analytics_file = data_dir.join("analytics.sqlite");
         let traffic = TrafficSettings {
             enabled: bool_from_env("TRAFFIC_ENABLED", false)?,
             access_log_path: PathBuf::from(
@@ -222,12 +218,15 @@ impl Config {
         if port == 0 {
             return Err(ConfigError::InvalidPort);
         }
-        // Bind the unspecified IPv6 address so the listener is dual-stack on
-        // Linux (net.ipv6.bindv6only=0 by default), matching Go's
-        // net.Listen("tcp", ":PORT"), which accepts both IPv4 and IPv6. On
-        // hosts with IPv6 disabled this bind fails, and main.rs falls back to
-        // 0.0.0.0 — again mirroring Go's transparent IPv4 fallback.
-        let bind_addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+        // Loopback by default: Coolify reaches the API only from inside the
+        // container (`docker exec ... curl`), so nothing on the Docker network
+        // has to connect. Set BIND_ADDRESS=:: to listen on every interface
+        // (dual-stack on Linux; main.rs falls back to 0.0.0.0 when IPv6 is off).
+        let bind_ip: IpAddr = match non_empty("BIND_ADDRESS") {
+            None => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Some(v) => v.parse().map_err(|_| ConfigError::InvalidBindAddress)?,
+        };
+        let bind_addr = SocketAddr::new(bind_ip, port);
 
         let token = non_empty("TOKEN").ok_or(ConfigError::MissingToken)?;
 

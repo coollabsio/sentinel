@@ -101,7 +101,7 @@ fn bad_request(field: &str) -> Response {
     ))
 }
 
-fn error_response(error: &str) -> Response {
+pub(crate) fn error_response(error: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(ErrorBody {

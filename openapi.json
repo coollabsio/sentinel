@@ -11,7 +11,7 @@
       "name": "Apache-2.0",
       "url": "https://www.apache.org/licenses/LICENSE-2.0"
     },
-    "version": "1.1.3"
+    "version": "1.1.7"
   },
   "paths": {
     "/api/app/{uuid}/traffic/breakdown/{dimension}": {
@@ -986,6 +986,15 @@
               "type": "integer",
               "format": "int64",
               "minimum": 1
+            }
+          },
+          {
+            "name": "mount",
+            "in": "query",
+            "description": "Comma-separated exact mount points, e.g. `/,/data` (at most 1000).\nOmit or leave empty for every mount.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],

@@ -2,17 +2,95 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 const MAX_DNS_PACKET: usize = 1232;
-const DNS_TTL_SECONDS: u32 = 30;
+/// Shorter than the endpoint drain (`discovery::DRAIN_DURATION`, 7 s), so a
+/// client that caches an answer stops using a container before it stops.
+const DNS_TTL_SECONDS: u32 = 5;
 const SYSTEMD_RESOLVED_STUB: &str = "127.0.0.53:53";
+/// A hung Corrosion query must not stall the single DNS request loop.
+const CORROSION_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bounds the threads that slow TCP DNS clients can hold.
+const MAX_TCP_CONNECTIONS: usize = 32;
+/// Bounds the threads that slow UDP lookups and forwards can hold. A request
+/// over the limit is dropped, and the client sends it again.
+const MAX_UDP_REQUESTS: usize = 64;
+
+trait OutputWithTimeout {
+    fn output_with_timeout(&mut self) -> Result<std::process::Output, String>;
+}
+
+impl OutputWithTimeout for Command {
+    /// Runs the command and kills it after `CORROSION_QUERY_TIMEOUT`. Query
+    /// output is small, so it fits in the pipe buffer until the child exits.
+    fn output_with_timeout(&mut self) -> Result<std::process::Output, String> {
+        let mut child = self
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|_| "Corrosion is unavailable.".to_string())?;
+        let deadline = std::time::Instant::now() + CORROSION_QUERY_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("Corrosion did not answer in time.".into());
+                }
+            }
+        }
+        child
+            .wait_with_output()
+            .map_err(|_| "Corrosion is unavailable.".to_string())
+    }
+}
+
+/// The reverse zones that systemd-resolved routes to this server, one name on
+/// each line. Sentinel writes the file next to the Corrosion configuration,
+/// together with the routing domains.
+const REVERSE_ZONES_FILE: &str = "coolify-reverse-zones";
+
+/// Reads the reverse zones of this server. Without the file, every name under
+/// `in-addr.arpa` counts as a name of this server: the routing domains are
+/// then unknown, and a forward of a routed name comes back as a new query.
+fn read_reverse_zones(corrosion_config: &Path) -> Option<Vec<String>> {
+    let zones =
+        std::fs::read_to_string(corrosion_config.with_file_name(REVERSE_ZONES_FILE)).ok()?;
+    Some(
+        zones
+            .lines()
+            .map(|zone| zone.trim().to_ascii_lowercase())
+            .filter(|zone| !zone.is_empty())
+            .collect(),
+    )
+}
+
+/// A name that this server answers itself. systemd-resolved routes the
+/// internal zone and the cluster reverse zones to this server, so a forward
+/// of such a name comes back as a new query.
+#[derive(Debug, PartialEq, Eq)]
+enum Name {
+    Workload {
+        workload: String,
+        namespace: String,
+    },
+    Address(Ipv4Addr),
+    /// The name has no records, but a name below it can have records.
+    Empty,
+    Missing,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Question {
-    workload: String,
-    namespace: String,
-    address: Option<Ipv4Addr>,
+    name: Name,
     record_type: u16,
     end: usize,
 }
@@ -27,7 +105,19 @@ fn valid_label(value: &str) -> bool {
         && !value.ends_with('-')
 }
 
-fn parse_question(packet: &[u8], zone: &str) -> Result<Question, &'static str> {
+/// A stack service name may hold `_` inside, as Compose service names do;
+/// names in `default`, `nodes`, and `cluster` may not (decision 0023).
+fn valid_workload_label(workload: &str, namespace: &str) -> bool {
+    valid_label(workload)
+        || (!matches!(namespace, "default" | NODE_NAMESPACE | CLUSTER_NAMESPACE)
+            && valid_label(&workload.replace('_', "-")))
+}
+
+fn parse_question(
+    packet: &[u8],
+    zone: &str,
+    reverse_zones: Option<&[String]>,
+) -> Result<Question, &'static str> {
     if packet.len() < 17 || u16::from_be_bytes([packet[4], packet[5]]) != 1 {
         return Err("invalid DNS question count");
     }
@@ -58,48 +148,69 @@ fn parse_question(packet: &[u8], zone: &str) -> Result<Question, &'static str> {
     if class != 1 {
         return Err("unsupported DNS question");
     }
-    if record_type == 12 {
-        if labels.len() != 6 || labels[4] != "in-addr" || labels[5] != "arpa" {
-            return Err("invalid IPv4 reverse lookup name");
-        }
-        let octets = labels[..4]
-            .iter()
-            .rev()
-            .map(|label| {
-                label
-                    .parse::<u8>()
-                    .map_err(|_| "invalid IPv4 reverse lookup name")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        return Ok(Question {
-            workload: String::new(),
-            namespace: String::new(),
-            address: Some(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])),
-            record_type,
-            end: question_end,
-        });
-    }
     let zone_labels = zone
         .trim_end_matches('.')
         .split('.')
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
-    if labels.len() != zone_labels.len() + 2
-        || labels[2..] != zone_labels
-        || !valid_label(&labels[0])
-        || !valid_label(&labels[1])
-    {
+    let name = if let Some(octets) = labels.strip_suffix(&["in-addr".into(), "arpa".into()]) {
+        if reverse_zones.is_some_and(|zones| {
+            !zones.iter().any(|zone| {
+                labels.ends_with(&zone.split('.').map(str::to_string).collect::<Vec<_>>())
+            })
+        }) {
+            return Err("name is outside the cluster reverse zones");
+        }
+        let address = octets
+            .iter()
+            .rev()
+            .map(|label| label.parse::<u8>().ok())
+            .collect::<Option<Vec<_>>>();
+        match (octets.len(), address) {
+            (..4, _) => Name::Empty,
+            (4, Some(address)) => Name::Address(Ipv4Addr::new(
+                address[0], address[1], address[2], address[3],
+            )),
+            _ => Name::Missing,
+        }
+    } else if let Some(labels) = labels.strip_suffix(&zone_labels[..]) {
+        match labels {
+            [] => Name::Empty,
+            [namespace] if valid_label(namespace) => Name::Empty,
+            [workload, namespace]
+                if valid_label(namespace) && valid_workload_label(workload, namespace) =>
+            {
+                Name::Workload {
+                    workload: workload.clone(),
+                    namespace: namespace.clone(),
+                }
+            }
+            _ => Name::Missing,
+        }
+    } else {
         return Err("name is outside the internal discovery zone");
-    }
+    };
 
     Ok(Question {
-        workload: labels[0].clone(),
-        namespace: labels[1].clone(),
-        address: None,
+        name,
         record_type,
         end: question_end,
     })
+}
+
+/// An authoritative response without records: NXDOMAIN, or NOERROR for a name
+/// that exists.
+fn build_empty_response(packet: &[u8], question: &Question, name_exists: bool) -> Vec<u8> {
+    let mut response = Vec::with_capacity(question.end);
+    response.extend_from_slice(&packet[0..2]);
+    response.extend_from_slice(if name_exists {
+        &[0x85, 0x80]
+    } else {
+        &[0x85, 0x83]
+    });
+    response.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+    response.extend_from_slice(&packet[12..question.end]);
+    response
 }
 
 fn build_response(packet: &[u8], question: &Question, endpoints: &[Ipv4Addr]) -> Vec<u8> {
@@ -190,16 +301,21 @@ fn build_ptr_response(
     response
 }
 
-/// Node names are endpoint rows of their own. Workload names map to a
+/// Node and cluster service names are endpoint rows of their own. Workload names map to a
 /// workload ID through `workload_names`, which Coolify writes, so a rename
 /// applies without touching the containers.
 const NODE_NAMESPACE: &str = "nodes";
+/// Cluster services, for example `registry.cluster`. Endpoint rows of their own.
+const CLUSTER_NAMESPACE: &str = "cluster";
 
+/// A workload name in any other namespace, `default` or the name of a stack
+/// (decision 0023), resolves to the endpoints of its workload, which Sentinel
+/// publishes in namespace `default`.
 fn endpoint_lookup_sql(namespace: &str) -> &'static str {
-    if namespace == NODE_NAMESPACE {
+    if namespace == NODE_NAMESPACE || namespace == CLUSTER_NAMESPACE {
         "SELECT container_ip FROM workload_endpoints WHERE workload_id = ? AND namespace = ? AND state = 'running' AND health IN ('healthy', 'unknown') AND expires_at > unixepoch() ORDER BY container_ip"
     } else {
-        "SELECT e.container_ip FROM workload_names n JOIN workload_endpoints e ON e.namespace = n.namespace AND e.workload_id = n.workload_id WHERE n.name = ? AND n.namespace = ? AND n.revision = (SELECT MAX(revision) FROM workload_names) AND e.state = 'running' AND e.health IN ('healthy', 'unknown') AND e.expires_at > unixepoch() ORDER BY e.container_ip"
+        "SELECT e.container_ip FROM workload_names n JOIN workload_endpoints e ON e.namespace = 'default' AND e.workload_id = n.workload_id WHERE n.name = ? AND n.namespace = ? AND n.revision = (SELECT MAX(revision) FROM workload_names) AND e.state = 'running' AND e.health IN ('healthy', 'unknown') AND e.expires_at > unixepoch() ORDER BY e.container_ip"
     }
 }
 
@@ -223,8 +339,7 @@ fn lookup_endpoints(
             namespace,
             endpoint_lookup_sql(namespace),
         ])
-        .output()
-        .map_err(|_| "Corrosion is unavailable.".to_string())?;
+        .output_with_timeout()?;
     if !output.status.success() {
         return Err("Corrosion could not query discovery endpoints.".into());
     }
@@ -260,8 +375,7 @@ fn lookup_names(
             &address.to_string(),
             reverse_lookup_sql(),
         ])
-        .output()
-        .map_err(|_| "Corrosion is unavailable.".to_string())?;
+        .output_with_timeout()?;
     if !output.status.success() {
         return Err("Corrosion could not query reverse discovery endpoints.".into());
     }
@@ -288,26 +402,26 @@ fn answer_request(
     corrosion_config: &Path,
     max_packet: usize,
 ) -> Option<Vec<u8>> {
-    let question = parse_question(request, zone).ok()?;
-    Some(match question.record_type {
-        1 => {
+    let reverse_zones = read_reverse_zones(corrosion_config);
+    let question = parse_question(request, zone, reverse_zones.as_deref()).ok()?;
+    Some(match (&question.name, question.record_type) {
+        (
+            Name::Workload {
+                workload,
+                namespace,
+            },
+            1,
+        ) => {
             let endpoints =
-                lookup_endpoints(corrosion_config, &question.workload, &question.namespace)
-                    .unwrap_or_default();
+                lookup_endpoints(corrosion_config, workload, namespace).unwrap_or_default();
             build_response(request, &question, &endpoints)
         }
-        12 => {
-            let names = lookup_names(
-                corrosion_config,
-                question
-                    .address
-                    .expect("PTR questions have an IPv4 address"),
-                zone,
-            )
-            .unwrap_or_default();
+        (Name::Address(address), 12) => {
+            let names = lookup_names(corrosion_config, *address, zone).unwrap_or_default();
             build_ptr_response(request, &question, &names, max_packet)
         }
-        _ => build_response(request, &question, &[]),
+        (Name::Missing, _) => build_empty_response(request, &question, false),
+        _ => build_empty_response(request, &question, true),
     })
 }
 
@@ -347,30 +461,47 @@ fn forward_tcp(request: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn serve_tcp(listener: TcpListener, zone: String, corrosion_config: PathBuf) {
-    for mut stream in listener.incoming().flatten() {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        let mut length = [0_u8; 2];
-        if stream.read_exact(&mut length).is_err() {
+    let zone = Arc::new(zone);
+    let corrosion_config = Arc::new(corrosion_config);
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming().flatten() {
+        if active.fetch_add(1, Ordering::AcqRel) >= MAX_TCP_CONNECTIONS {
+            active.fetch_sub(1, Ordering::AcqRel);
             continue;
         }
-        let length = u16::from_be_bytes(length) as usize;
-        if length == 0 || length > MAX_DNS_PACKET {
-            continue;
-        }
-        let mut request = vec![0_u8; length];
-        if stream.read_exact(&mut request).is_err() {
-            continue;
-        }
-        let Some(response) = answer_request(&request, &zone, &corrosion_config, u16::MAX as usize)
-            .or_else(|| forward_tcp(&request))
-        else {
-            continue;
-        };
-        let response_length = (response.len() as u16).to_be_bytes();
-        let _ = stream.write_all(&response_length);
-        let _ = stream.write_all(&response);
+        let zone = zone.clone();
+        let corrosion_config = corrosion_config.clone();
+        let active = active.clone();
+        std::thread::spawn(move || {
+            serve_tcp_connection(stream, &zone, &corrosion_config);
+            active.fetch_sub(1, Ordering::AcqRel);
+        });
     }
+}
+
+fn serve_tcp_connection(mut stream: TcpStream, zone: &str, corrosion_config: &Path) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let mut length = [0_u8; 2];
+    if stream.read_exact(&mut length).is_err() {
+        return;
+    }
+    let length = u16::from_be_bytes(length) as usize;
+    if length == 0 || length > MAX_DNS_PACKET {
+        return;
+    }
+    let mut request = vec![0_u8; length];
+    if stream.read_exact(&mut request).is_err() {
+        return;
+    }
+    let Some(response) = answer_request(&request, zone, corrosion_config, u16::MAX as usize)
+        .or_else(|| forward_tcp(&request))
+    else {
+        return;
+    };
+    let response_length = (response.len() as u16).to_be_bytes();
+    let _ = stream.write_all(&response_length);
+    let _ = stream.write_all(&response);
 }
 
 pub(crate) fn run(bind: SocketAddr, zone: &str, corrosion_config: &Path) -> Result<(), String> {
@@ -392,20 +523,35 @@ pub(crate) fn run(bind: SocketAddr, zone: &str, corrosion_config: &Path) -> Resu
         let corrosion_config = corrosion_config.to_path_buf();
         move || serve_tcp(tcp_listener, zone, corrosion_config)
     });
+    let socket = Arc::new(socket);
+    let zone = Arc::new(zone);
+    let corrosion_config = Arc::new(corrosion_config.to_path_buf());
+    let active = Arc::new(AtomicUsize::new(0));
     let mut packet = [0_u8; MAX_DNS_PACKET];
     loop {
         let (length, source) = socket
             .recv_from(&mut packet)
             .map_err(|error| format!("Discovery DNS receive failed: {error}"))?;
-        let request = &packet[..length];
-        let Some(response) = answer_request(request, &zone, corrosion_config, MAX_DNS_PACKET)
-            .or_else(|| forward_udp(request))
-        else {
+        if active.fetch_add(1, Ordering::AcqRel) >= MAX_UDP_REQUESTS {
+            active.fetch_sub(1, Ordering::AcqRel);
             continue;
-        };
-        socket
-            .send_to(&response, source)
-            .map_err(|error| format!("Discovery DNS response failed: {error}"))?;
+        }
+        let request = packet[..length].to_vec();
+        let socket = socket.clone();
+        let zone = zone.clone();
+        let corrosion_config = corrosion_config.clone();
+        let active = active.clone();
+        // A slow lookup or forward must not delay the other requests.
+        std::thread::spawn(move || {
+            if let Some(response) =
+                answer_request(&request, &zone, &corrosion_config, MAX_DNS_PACKET)
+                    .or_else(|| forward_udp(&request))
+            {
+                // A failed reply to one client must not stop the resolver.
+                let _ = socket.send_to(&response, source);
+            }
+            active.fetch_sub(1, Ordering::AcqRel);
+        });
     }
 }
 
@@ -432,44 +578,90 @@ mod tests {
     #[test]
     fn parses_only_namespace_qualified_internal_names() {
         let packet = query("web.default.coolify.internal.");
-        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
 
-        assert_eq!(question.workload, "web");
-        assert_eq!(question.namespace, "default");
-        assert!(
-            super::parse_question(&query("web.coolify.internal."), "coolify.internal").is_err()
+        assert_eq!(
+            question.name,
+            super::Name::Workload {
+                workload: "web".into(),
+                namespace: "default".into(),
+            }
         );
         assert!(
-            super::parse_question(&query("web.default.example.com."), "coolify.internal").is_err()
+            super::parse_question(&query("web.default.example.com."), "coolify.internal", None)
+                .is_err()
         );
+    }
+
+    #[test]
+    fn parses_stack_service_names_with_underscores() {
+        let parse = |name: &str| {
+            super::parse_question(&query(name), "coolify.internal", None)
+                .unwrap()
+                .name
+        };
+        assert_eq!(
+            parse("Rallly_DB.shop.coolify.internal."),
+            super::Name::Workload {
+                workload: "rallly_db".into(),
+                namespace: "shop".into(),
+            }
+        );
+        for name in [
+            "rallly_db.default.coolify.internal.",
+            "rallly_db.nodes.coolify.internal.",
+            "rallly_db.cluster.coolify.internal.",
+            "_db.shop.coolify.internal.",
+            "db_.shop.coolify.internal.",
+            "db.sh_op.coolify.internal.",
+        ] {
+            assert_eq!(parse(name), super::Name::Missing, "{name}");
+        }
     }
 
     #[test]
     fn parses_ipv4_ptr_queries() {
         let packet = query_with_type("2.0.240.10.in-addr.arpa.", 12);
-        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
 
-        assert_eq!(question.address, Some("10.240.0.2".parse().unwrap()));
-        assert!(
-            super::parse_question(
-                &query_with_type("2.0.240.10.in-addr.arpa.", 1),
-                "coolify.internal"
-            )
-            .is_err()
+        assert_eq!(
+            question.name,
+            super::Name::Address("10.240.0.2".parse().unwrap())
         );
-        assert!(
-            super::parse_question(
-                &query_with_type("web.default.coolify.internal.", 12),
-                "coolify.internal"
+    }
+
+    #[test]
+    fn answers_every_name_of_its_zones_without_a_forward() {
+        let answer = |name: &str, record_type: u16| {
+            let packet = query_with_type(name, record_type);
+            let response = super::answer_request(
+                &packet,
+                "coolify.internal",
+                std::path::Path::new("/nonexistent"),
+                super::MAX_DNS_PACKET,
             )
-            .is_err()
-        );
+            .expect("a name of the zone is not forwarded");
+            assert_eq!(&response[6..8], &[0, 0]);
+            [response[2], response[3]]
+        };
+        const NO_RECORDS: [u8; 2] = [0x85, 0x80];
+        const NXDOMAIN: [u8; 2] = [0x85, 0x83];
+
+        assert_eq!(answer("coolify.internal.", 1), NO_RECORDS);
+        assert_eq!(answer("web.coolify.internal.", 1), NO_RECORDS);
+        assert_eq!(answer("web.default.coolify.internal.", 12), NO_RECORDS);
+        assert_eq!(answer("a.web.default.coolify.internal.", 1), NXDOMAIN);
+        assert_eq!(answer("web_1.default.coolify.internal.", 1), NXDOMAIN);
+        assert_eq!(answer("2.0.240.10.in-addr.arpa.", 1), NO_RECORDS);
+        assert_eq!(answer("240.10.in-addr.arpa.", 12), NO_RECORDS);
+        assert_eq!(answer("x.2.0.240.10.in-addr.arpa.", 12), NXDOMAIN);
+        assert_eq!(answer("300.0.240.10.in-addr.arpa.", 12), NXDOMAIN);
     }
 
     #[test]
     fn builds_an_authoritative_a_response_for_each_endpoint() {
         let packet = query("web.default.coolify.internal.");
-        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
         let response = super::build_response(
             &packet,
             &question,
@@ -487,7 +679,7 @@ mod tests {
     #[test]
     fn builds_an_empty_authoritative_response_for_aaaa_queries() {
         let packet = query_with_type("web.default.coolify.internal.", 28);
-        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
         let response = super::build_response(&packet, &question, &[]);
 
         assert_eq!(&response[2..4], &[0x85, 0x80]);
@@ -497,7 +689,7 @@ mod tests {
     #[test]
     fn builds_an_authoritative_ptr_response_for_each_workload() {
         let packet = query_with_type("2.0.240.10.in-addr.arpa.", 12);
-        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
         let response = super::build_ptr_response(
             &packet,
             &question,
@@ -516,7 +708,7 @@ mod tests {
     #[test]
     fn ptr_responses_stay_within_the_dns_udp_packet_limit() {
         let packet = query_with_type("2.0.240.10.in-addr.arpa.", 12);
-        let question = super::parse_question(&packet, "coolify.internal").unwrap();
+        let question = super::parse_question(&packet, "coolify.internal", None).unwrap();
         let names = (0..64)
             .map(|index| {
                 format!(
@@ -553,7 +745,11 @@ mod tests {
                 INSERT INTO workload_names VALUES
                     ('default', 'api', 'uuid-api', 4, 1),
                     ('default', 'web', 'uuid-web', 4, 1),
-                    ('default', 'old-api', 'uuid-api', 3, 1);",
+                    ('default', 'old-api', 'uuid-api', 3, 1),
+                    ('shop', 'api', 'uuid-api', 4, 1),
+                    ('shop', 'web', 'uuid-web', 4, 1),
+                    ('shop', 'old-db', 'uuid-api', 3, 1),
+                    ('shop', 'api_db', 'uuid-api', 4, 1);",
                 control::corrosion_schema()
             ))
             .unwrap();
@@ -591,6 +787,27 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_lookup_resolves_stack_names_to_the_default_endpoints() {
+        let connection = database();
+        let lookup = |name: &str, namespace: &str| {
+            rows(
+                &connection,
+                super::endpoint_lookup_sql(namespace),
+                &[name, namespace],
+            )
+        };
+
+        assert_eq!(lookup("api", "shop"), ["10.241.0.2", "10.241.1.2"]);
+        assert_eq!(lookup("api", "default"), lookup("api", "shop"));
+        assert_eq!(lookup("api_db", "shop"), ["10.241.0.2", "10.241.1.2"]);
+        assert!(lookup("web", "shop").is_empty());
+        assert!(lookup("old-db", "shop").is_empty());
+        assert!(lookup("api", "other").is_empty());
+        // A stack name is never a Node or cluster service row.
+        assert!(lookup("worker-1", "shop").is_empty());
+    }
+
+    #[test]
     fn reverse_lookup_returns_current_names_for_an_address() {
         let connection = database();
         let lookup = |address: &str| {
@@ -601,6 +818,7 @@ mod tests {
             )
         };
 
+        // Stack names do not change the PTR answer.
         assert_eq!(lookup("10.241.0.2"), ["api.default"]);
         assert_eq!(lookup("10.240.0.1"), ["worker-1.nodes"]);
         assert!(lookup("10.241.1.3").is_empty());

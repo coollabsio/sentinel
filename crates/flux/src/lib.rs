@@ -6,6 +6,7 @@ mod negotiation;
 mod registry;
 mod reporter;
 mod service;
+mod terminal;
 mod tls;
 
 pub use credential::{CredentialClaims, CredentialError, CredentialErrorKind, CredentialVerifier};

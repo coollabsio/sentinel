@@ -3,16 +3,20 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config::ControlTlsConfig;
+use sentinel_protocol::CAPABILITY_WORKLOAD_ROLLING_DEPLOY;
+use sentinel_protocol::DATABASE_CAPABILITIES;
+use sentinel_protocol::STACK_CAPABILITIES;
 use sentinel_protocol::control::v1::agent_message;
 use sentinel_protocol::control::v1::control_message;
 use sentinel_protocol::control::v1::{
-    AgentMessage, CommandAccepted, Heartbeat, Hello, RuntimeChanged,
+    AgentMessage, Command, CommandAccepted, Heartbeat, Hello, RuntimeChanged,
 };
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
+    BUILD_CAPABILITIES, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RESOURCES,
-    NETWORK_CAPABILITIES,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_HEALTHCHECK, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_WORKLOAD_RESOURCES, CAPABILITY_WORKLOAD_SECRETS, CAPABILITY_WORKLOAD_SECRETS_OWNER,
+    CAPABILITY_WORKLOAD_TERMINAL, EXEC_CAPABILITIES, NETWORK_CAPABILITIES, VOLUME_CAPABILITIES,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
@@ -28,6 +32,24 @@ use crate::commands::CommandExecutor;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MESSAGE_LIMIT: usize = 16 * 1024 * 1024;
+/// Commands received but not started yet. Each lane runs one at a time.
+const COMMAND_QUEUE: usize = 64;
+
+/// Commands that only read and that callers poll with a short timeout. They
+/// run in their own lane, so a long command (a drain and stop, an image
+/// pull, a backup) does not delay them. Inspections of the network stay in
+/// the serial lane, because a reconcile changes what they read.
+const READ_ONLY_COMMANDS: [&str; 5] = [
+    CAPABILITY_SYSTEM_PING,
+    CAPABILITY_SYSTEM_INFO,
+    CAPABILITY_CONTAINER_LIST,
+    CAPABILITY_CONTAINER_LOGS,
+    CAPABILITY_LOGS_READ,
+];
+
+pub(crate) fn is_read_only(command_type: &str) -> bool {
+    READ_ONLY_COMMANDS.contains(&command_type)
+}
 static RUNTIME_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct RuntimeWatcherGuard(watch::Sender<bool>);
@@ -81,6 +103,7 @@ pub async fn connect(
     control_tls: ControlTlsConfig,
     mut shutdown: watch::Receiver<bool>,
     command_executor: Arc<tokio::sync::Mutex<CommandExecutor>>,
+    read_executor: Arc<tokio::sync::Mutex<CommandExecutor>>,
 ) -> Result<(), FluxConnectionError> {
     // The installed version can change at runtime through trust.bundle.update.v1.
     let trust_bundle_version = crate::trust::installed_version(&control_tls);
@@ -110,12 +133,21 @@ pub async fn connect(
                     CAPABILITY_WORKLOAD_DEPLOY.into(),
                     CAPABILITY_WORKLOAD_RESOURCES.into(),
                     CAPABILITY_WORKLOAD_LIFECYCLE.into(),
+                    CAPABILITY_WORKLOAD_HEALTHCHECK.into(),
+                    CAPABILITY_WORKLOAD_SECRETS.into(),
+                    CAPABILITY_WORKLOAD_SECRETS_OWNER.into(),
+                    CAPABILITY_WORKLOAD_ROLLING_DEPLOY.into(),
                     CAPABILITY_LOGS_READ.into(),
                     CAPABILITY_CONTAINER_LOGS.into(),
                     CAPABILITY_TRUST_BUNDLE_UPDATE.into(),
                 ]
                 .into_iter()
                 .chain(NETWORK_CAPABILITIES.map(str::to_string))
+                .chain(BUILD_CAPABILITIES.map(str::to_string))
+                .chain(VOLUME_CAPABILITIES.map(str::to_string))
+                .chain(DATABASE_CAPABILITIES.map(str::to_string))
+                .chain(STACK_CAPABILITIES.map(str::to_string))
+                .chain(EXEC_CAPABILITIES.map(str::to_string))
                 .collect(),
                 boot_id: boot_id(),
                 trust_bundle_version,
@@ -162,12 +194,26 @@ pub async fn connect(
             .iter()
             .any(|capability| capability == required)
     };
+    let terminal_outbound = capability_accepted(CAPABILITY_WORKLOAD_TERMINAL)
+        .then(|| crate::terminal::attach(sender.clone()));
     let (runtime_shutdown, runtime_shutdown_receiver) = watch::channel(false);
     let _runtime_watcher = RuntimeWatcherGuard(runtime_shutdown);
     tokio::spawn(watch_runtime_changes(
         sender.clone(),
         runtime_shutdown_receiver,
     ));
+    // Commands run on a blocking thread, in arrival order, so this loop keeps
+    // sending heartbeats while a long command (an image pull, a network
+    // reconcile) runs. Flux drops a connection that stays silent. Read-only
+    // commands have a second lane with their own executor.
+    let (command_sender, command_receiver) = mpsc::channel(COMMAND_QUEUE);
+    tokio::spawn(run_commands(
+        command_receiver,
+        command_executor,
+        sender.clone(),
+    ));
+    let (read_sender, read_receiver) = mpsc::channel(COMMAND_QUEUE);
+    tokio::spawn(run_commands(read_receiver, read_executor, sender.clone()));
     ticker.tick().await;
     loop {
         tokio::select! {
@@ -183,27 +229,67 @@ pub async fn connect(
                 Ok(Some(message)) => {
                     match message.message {
                         Some(control_message::Message::ShutdownHint(_)) => return Ok(()),
+                        Some(control_message::Message::TerminalInput(frame)) if terminal_outbound.is_some() => {
+                            crate::terminal::input(frame);
+                        }
                         Some(control_message::Message::Command(command)) => {
-                            let command_id = command.command_id.clone();
                             let command_capability_accepted = capability_accepted(&command.command_type);
-                            let execution = command_executor.lock().await.execute(command, command_capability_accepted);
-                            if execution.accepted {
-                                sender.send(AgentMessage {
-                                    message: Some(agent_message::Message::CommandAccepted(CommandAccepted {
-                                        command_id,
-                                        accepted_at_unix_ms: now_millis(),
-                                    })),
-                                }).await.map_err(|_| FluxConnectionError::Connection)?;
-                            }
-                            sender.send(AgentMessage {
-                                message: Some(agent_message::Message::CommandResult(execution.result)),
-                            }).await.map_err(|_| FluxConnectionError::Connection)?;
+                            let lane = if is_read_only(&command.command_type) { &read_sender } else { &command_sender };
+                            lane.send((command, command_capability_accepted)).await.map_err(|_| FluxConnectionError::Connection)?;
                         }
                         _ => {}
                     }
                 }
                 _ => return Err(FluxConnectionError::Connection),
             }
+        }
+    }
+}
+
+/// Executes the commands of one lane of a connection in order and sends their results.
+/// It stops when the connection closes; a command that already started still
+/// finishes and is journaled, so a redelivery returns its stored result.
+pub(crate) async fn run_commands(
+    mut commands: mpsc::Receiver<(Command, bool)>,
+    command_executor: Arc<tokio::sync::Mutex<CommandExecutor>>,
+    sender: mpsc::Sender<AgentMessage>,
+) {
+    while let Some((command, capability_accepted)) = commands.recv().await {
+        let command_id = command.command_id.clone();
+        let executor = command_executor.clone().lock_owned().await;
+        let execution = match tokio::task::spawn_blocking(move || {
+            let mut executor = executor;
+            executor.execute(command, capability_accepted)
+        })
+        .await
+        {
+            Ok(execution) => execution,
+            Err(_) => {
+                tracing::warn!(%command_id, "the command execution task failed");
+                continue;
+            }
+        };
+        if execution.accepted
+            && sender
+                .send(AgentMessage {
+                    message: Some(agent_message::Message::CommandAccepted(CommandAccepted {
+                        command_id,
+                        accepted_at_unix_ms: now_millis(),
+                    })),
+                })
+                .await
+                .is_err()
+        {
+            return;
+        }
+        if sender
+            .send(AgentMessage {
+                message: Some(agent_message::Message::CommandResult(execution.result)),
+            })
+            .await
+            .is_err()
+        {
+            return;
         }
     }
 }

@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha512};
 use tokio::sync::{Notify, watch};
 
+use crate::ingress_tls::{Challenge, LoadedCertificate};
 use crate::network::{
     atomic_write, run as run_command, state_path, valid_discovery_label, write_if_changed,
 };
@@ -50,7 +51,7 @@ const INGRESS_STATE_FILE: &str = "ingress.state";
 const ADMIN_SOCKET: &str = "/run/coolify-ingress/admin.sock";
 const CADDY_BINARY: &str = "/usr/local/bin/caddy";
 const CADDY_VERSION_FILE: &str = "/usr/local/bin/caddy.version";
-const INGRESS_USER: &str = "coolify-ingress";
+pub(crate) const INGRESS_USER: &str = "coolify-ingress";
 const INGRESS_HOME: &str = "/var/lib/coolify-ingress";
 /// Endpoints in this namespace are Node WireGuard addresses, never workloads.
 const NODE_NAMESPACE: &str = "nodes";
@@ -105,6 +106,18 @@ pub(crate) fn valid_ingress_host(host: &str) -> bool {
     })
 }
 
+/// Empty, or `/segment...` without a trailing slash. `*` is a wildcard in
+/// Caddy path matchers, so it is rejected with whitespace and control bytes.
+fn valid_route_path(path: &str) -> bool {
+    path.is_empty()
+        || (path.len() <= 255
+            && path.starts_with('/')
+            && !path.ends_with('/')
+            && path
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'?' | b'#' | b'*')))
+}
+
 /// Validates the routes, names and revision. The Caddy version is checked by
 /// [`validate_request`] so that a version mismatch gets a specific error.
 pub(crate) fn validate_routes(request: &IngressReconcileRequest) -> Result<(), String> {
@@ -116,22 +129,47 @@ pub(crate) fn validate_routes(request: &IngressReconcileRequest) -> Result<(), S
     if request.routes.len() > MAX_ROUTES {
         return Err(format!("At most {MAX_ROUTES} ingress routes are allowed."));
     }
-    let mut hosts = HashSet::with_capacity(request.routes.len());
+    let mut hosts = BTreeMap::<&str, Vec<&IngressRoute>>::new();
     for route in &request.routes {
         if !valid_ingress_host(&route.host) {
             return Err("An ingress route host is invalid.".into());
         }
-        if !valid_discovery_label(&route.workload_id)
-            || !valid_discovery_label(&route.namespace)
-            || route.namespace == NODE_NAMESPACE
+        if !valid_route_path(&route.path) {
+            return Err("An ingress route path is invalid.".into());
+        }
+        if route.redirect_host.is_empty() {
+            if !valid_discovery_label(&route.workload_id)
+                || !valid_discovery_label(&route.namespace)
+                || route.namespace == NODE_NAMESPACE
+            {
+                return Err("An ingress route workload is invalid.".into());
+            }
+            if route.port == 0 || route.port > 65_535 {
+                return Err("An ingress route port is invalid.".into());
+            }
+        } else if !valid_ingress_host(&route.redirect_host)
+            || route.redirect_host == route.host
+            || !route.path.is_empty()
+            || !route.workload_id.is_empty()
+            || !route.namespace.is_empty()
+            || route.port != 0
         {
-            return Err("An ingress route workload is invalid.".into());
+            return Err("An ingress redirect route is invalid.".into());
         }
-        if route.port == 0 || route.port > 65_535 {
-            return Err("An ingress route port is invalid.".into());
+        hosts.entry(route.host.as_str()).or_default().push(route);
+    }
+    for routes in hosts.values() {
+        let flags =
+            |route: &IngressRoute| (route.http_only, route.allow_http, route.temporary_redirect);
+        if routes.iter().any(|route| flags(route) != flags(routes[0])) {
+            return Err("All ingress routes of a host must use the same HTTP settings.".into());
         }
-        if !hosts.insert(route.host.as_str()) {
-            return Err("Ingress route hosts must be unique.".into());
+        if routes.len() > 1 && routes.iter().any(|route| !route.redirect_host.is_empty()) {
+            return Err("An ingress redirect route must be the only route of its host.".into());
+        }
+        let mut paths = HashSet::with_capacity(routes.len());
+        if !routes.iter().all(|route| paths.insert(route.path.as_str())) {
+            return Err("Ingress route hosts and paths must be unique.".into());
         }
     }
     if request.names.len() > MAX_NAMES {
@@ -139,7 +177,10 @@ pub(crate) fn validate_routes(request: &IngressReconcileRequest) -> Result<(), S
     }
     let mut names = HashSet::with_capacity(request.names.len());
     for name in &request.names {
-        if !valid_discovery_label(&name.name)
+        let stack_namespace = !matches!(name.namespace.as_str(), "default" | "nodes" | "cluster");
+        let valid_name = valid_discovery_label(&name.name)
+            || (stack_namespace && crate::network::valid_stack_service_name(&name.name));
+        if !valid_name
             || !valid_discovery_label(&name.workload_id)
             || !valid_discovery_label(&name.namespace)
             || name.namespace == NODE_NAMESPACE
@@ -155,6 +196,7 @@ pub(crate) fn validate_routes(request: &IngressReconcileRequest) -> Result<(), S
 
 pub(crate) fn validate_request(request: &IngressReconcileRequest) -> Result<(), String> {
     validate_routes(request)?;
+    crate::ingress_tls::validate_request(request)?;
     // Disabling must keep working after a Sentinel upgrade changed the pin.
     let version_accepted = request.caddy_version == CADDY_VERSION
         || (!request.enabled && request.caddy_version.is_empty());
@@ -166,22 +208,36 @@ pub(crate) fn validate_request(request: &IngressReconcileRequest) -> Result<(), 
     Ok(())
 }
 
-/// One `ingress_routes` row, without bookkeeping columns.
+/// One `ingress_http_routes` row, without bookkeeping columns.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct StoredRoute {
     pub(crate) host: String,
+    pub(crate) path: String,
     pub(crate) workload_id: String,
     pub(crate) namespace: String,
     pub(crate) port: u32,
+    pub(crate) redirect_host: String,
+    pub(crate) http_only: bool,
+    pub(crate) allow_http: bool,
+    pub(crate) temporary_redirect: bool,
+    pub(crate) noindex: bool,
+    pub(crate) strip_path: bool,
 }
 
 impl From<&IngressRoute> for StoredRoute {
     fn from(route: &IngressRoute) -> Self {
         Self {
             host: route.host.clone(),
+            path: route.path.clone(),
             workload_id: route.workload_id.clone(),
             namespace: route.namespace.clone(),
             port: route.port,
+            redirect_host: route.redirect_host.clone(),
+            http_only: route.http_only,
+            allow_http: route.allow_http,
+            temporary_redirect: route.temporary_redirect,
+            noindex: route.noindex,
+            strip_path: route.strip_path,
         }
     }
 }
@@ -221,7 +277,7 @@ pub(crate) enum RouteWrite {
 }
 
 pub(crate) fn routes_query_sql() -> &'static str {
-    "SELECT host, workload_id, namespace, port, revision FROM ingress_routes WHERE revision = (SELECT MAX(revision) FROM ingress_routes) ORDER BY host"
+    "SELECT host, path, workload_id, namespace, port, redirect_host, http_only, allow_http, temporary_redirect, noindex, strip_path, revision FROM ingress_http_routes WHERE revision = (SELECT MAX(revision) FROM ingress_http_routes) ORDER BY host, path"
 }
 
 pub(crate) fn names_query_sql() -> &'static str {
@@ -334,23 +390,30 @@ pub(crate) fn route_transaction(
     let revision = i64::try_from(request.revision)
         .map_err(|_| "The ingress revision is invalid.".to_string())?;
     let mut routes = request.routes.iter().collect::<Vec<_>>();
-    routes.sort_by(|left, right| left.host.cmp(&right.host));
+    routes.sort_by(|left, right| (&left.host, &left.path).cmp(&(&right.host, &right.path)));
     let mut transaction = Vec::with_capacity(routes.len() + 1);
     for route in routes {
         transaction.push(json!([
-            "INSERT INTO ingress_routes (host, workload_id, namespace, port, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (host) DO UPDATE SET workload_id = excluded.workload_id, namespace = excluded.namespace, port = excluded.port, revision = excluded.revision, updated_at = excluded.updated_at WHERE excluded.revision >= ingress_routes.revision",
+            "INSERT INTO ingress_http_routes (host, path, workload_id, namespace, port, redirect_host, http_only, allow_http, temporary_redirect, noindex, strip_path, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (host, path) DO UPDATE SET workload_id = excluded.workload_id, namespace = excluded.namespace, port = excluded.port, redirect_host = excluded.redirect_host, http_only = excluded.http_only, allow_http = excluded.allow_http, temporary_redirect = excluded.temporary_redirect, noindex = excluded.noindex, strip_path = excluded.strip_path, revision = excluded.revision, updated_at = excluded.updated_at WHERE excluded.revision >= ingress_http_routes.revision",
             [
                 route.host,
+                route.path,
                 route.workload_id,
                 route.namespace,
                 route.port,
+                route.redirect_host,
+                i64::from(route.http_only),
+                i64::from(route.allow_http),
+                i64::from(route.temporary_redirect),
+                i64::from(route.noindex),
+                i64::from(route.strip_path),
                 revision,
                 now
             ]
         ]));
     }
     transaction.push(json!([
-        "DELETE FROM ingress_routes WHERE revision < ?",
+        "DELETE FROM ingress_http_routes WHERE revision < ?",
         [revision]
     ]));
     Ok(transaction)
@@ -393,16 +456,44 @@ pub(crate) fn parse_stored_routes(rows: &[Vec<Value>]) -> Result<StoredRoutes, S
     let mut stored = StoredRoutes::default();
     for row in rows {
         let text = |index: usize| row.get(index).and_then(Value::as_str).map(str::to_string);
-        let (Some(host), Some(workload_id), Some(namespace)) = (text(0), text(1), text(2)) else {
+        let flag = |index: usize| {
+            row.get(index)
+                .and_then(Value::as_u64)
+                .map(|value| value != 0)
+        };
+        let (
+            Some(host),
+            Some(path),
+            Some(workload_id),
+            Some(namespace),
+            Some(redirect_host),
+            Some(http_only),
+            Some(allow_http),
+            Some(temporary_redirect),
+            Some(noindex),
+            Some(strip_path),
+        ) = (
+            text(0),
+            text(1),
+            text(2),
+            text(3),
+            text(5),
+            flag(6),
+            flag(7),
+            flag(8),
+            flag(9),
+            flag(10),
+        )
+        else {
             return Err("Corrosion returned an invalid ingress route.".into());
         };
         let port = row
-            .get(3)
+            .get(4)
             .and_then(Value::as_u64)
             .and_then(|port| u32::try_from(port).ok())
             .ok_or("Corrosion returned an invalid ingress route.")?;
         let revision = row
-            .get(4)
+            .get(11)
             .and_then(Value::as_u64)
             .ok_or("Corrosion returned an invalid ingress route.")?;
         stored.revision = Some(
@@ -412,9 +503,16 @@ pub(crate) fn parse_stored_routes(rows: &[Vec<Value>]) -> Result<StoredRoutes, S
         );
         stored.routes.push(StoredRoute {
             host,
+            path,
             workload_id,
             namespace,
             port,
+            redirect_host,
+            http_only,
+            allow_http,
+            temporary_redirect,
+            noindex,
+            strip_path,
         });
     }
     Ok(stored)
@@ -493,14 +591,19 @@ fn static_response(status: u16, body: &str) -> Value {
 }
 
 /// Renders the complete Caddy JSON configuration. The output is deterministic:
-/// routes are sorted by host, and upstreams list this Node's endpoints first,
-/// then the others, each by address.
+/// routes are sorted by host and then longest path first, and upstreams list
+/// this Node's endpoints first, then the others, each by address.
 ///
+/// Port 80 answers ACME challenges first. A host with a loaded certificate is
+/// served on 443 and redirected there from 80 unless it allows HTTP; other
+/// hosts stay on 80.
 /// `reverse_proxy` passes the client's Host header through unchanged.
 pub(crate) fn render_caddy_config(
     routes: &[StoredRoute],
     endpoints: &[LiveEndpoint],
     local_node_ip: &str,
+    challenges: &[Challenge],
+    certificates: &[LoadedCertificate],
 ) -> Vec<u8> {
     let mut upstreams = BTreeMap::<(&str, &str), Vec<(bool, Ipv4Addr)>>::new();
     for endpoint in endpoints {
@@ -517,12 +620,44 @@ pub(crate) fn render_caddy_config(
         addresses.dedup_by(|right, left| right.1 == left.1);
     }
 
+    let secure = certificates
+        .iter()
+        .map(|certificate| certificate.host.as_str())
+        .collect::<HashSet<_>>();
+    // Per host, the longest path first, so the catch-all `""` route comes last.
     let mut sorted = routes.iter().collect::<Vec<_>>();
-    sorted.sort_by(|left, right| left.host.cmp(&right.host));
-    sorted.dedup_by(|right, left| right.host == left.host);
-    let mut rendered = sorted
-        .into_iter()
-        .map(|route| {
+    sorted.sort_by(|left, right| {
+        (&left.host, std::cmp::Reverse(left.path.len()), &left.path).cmp(&(
+            &right.host,
+            std::cmp::Reverse(right.path.len()),
+            &right.path,
+        ))
+    });
+    sorted.dedup_by(|right, left| right.host == left.host && right.path == left.path);
+    let redirect = |temporary: bool, location: String| {
+        json!({
+            "handler": "static_response",
+            "status_code": if temporary { 307 } else { 308 },
+            "headers": {"Location": [location]},
+        })
+    };
+    let mut hosts = BTreeMap::<&str, (&StoredRoute, Vec<Value>)>::new();
+    for route in sorted {
+        let mut matcher = json!({"host": [route.host]});
+        if !route.path.is_empty() {
+            matcher["path"] = json!([route.path, format!("{}/*", route.path)]);
+        }
+        let mut handle = Vec::new();
+        if route.redirect_host.is_empty() {
+            if route.noindex {
+                handle.push(json!({
+                    "handler": "headers",
+                    "response": {"set": {"X-Robots-Tag": ["noindex, nofollow"]}},
+                }));
+            }
+            if route.strip_path && !route.path.is_empty() {
+                handle.push(json!({"handler": "rewrite", "strip_path_prefix": route.path}));
+            }
             let dials = upstreams
                 .get(&(route.namespace.as_str(), route.workload_id.as_str()))
                 .map(|addresses| {
@@ -532,10 +667,11 @@ pub(crate) fn render_caddy_config(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let handler = if dials.is_empty() {
+            handle.push(if dials.is_empty() {
                 static_response(502, NO_UPSTREAM_BODY)
             } else {
-                json!({
+                let several = dials.len() > 1;
+                let mut proxy = json!({
                     "handler": "reverse_proxy",
                     "upstreams": dials,
                     "load_balancing": {
@@ -543,39 +679,121 @@ pub(crate) fn render_caddy_config(
                         "try_duration": "5s",
                         "try_interval": "250ms",
                     },
-                    "health_checks": {
-                        "passive": {"fail_duration": "30s", "max_fails": 1},
-                    },
-                })
+                });
+                // One failed request takes an upstream out for
+                // `fail_duration`, so the next request goes to another one. A
+                // single upstream has no other one: without the check, Caddy
+                // dials it again until `try_duration`, for example while its
+                // container restarts.
+                if several {
+                    proxy["health_checks"] =
+                        json!({"passive": {"fail_duration": "5s", "max_fails": 1}});
+                }
+                proxy
+            });
+        } else {
+            let scheme = if secure.contains(route.redirect_host.as_str()) {
+                "https"
+            } else {
+                "http"
             };
+            handle.push(redirect(
+                route.temporary_redirect,
+                format!("{scheme}://{}{{http.request.uri}}", route.redirect_host),
+            ));
+        }
+        hosts
+            .entry(route.host.as_str())
+            .or_insert_with(|| (route, Vec::new()))
+            .1
+            .push(json!({
+                "match": [matcher],
+                "handle": handle,
+                "terminal": true,
+            }));
+    }
+    let not_found = json!({
+        "handle": [static_response(404, NOT_FOUND_BODY)],
+        "terminal": true,
+    });
+
+    let mut challenges = challenges.iter().collect::<Vec<_>>();
+    challenges.sort();
+    let mut plain = challenges
+        .into_iter()
+        .map(|challenge| {
             json!({
-                "match": [{"host": [route.host]}],
-                "handle": [handler],
+                "match": [{
+                    "host": [challenge.host],
+                    "path": [format!("/.well-known/acme-challenge/{}", challenge.token)],
+                }],
+                "handle": [static_response(200, &challenge.key_authorization)],
                 "terminal": true,
             })
         })
         .collect::<Vec<_>>();
-    rendered.push(json!({
-        "handle": [static_response(404, NOT_FOUND_BODY)],
-        "terminal": true,
-    }));
+    // Validation gives every route of a host the same HTTP settings, so the
+    // first route speaks for the host.
+    for (host, (first, host_routes)) in &hosts {
+        if secure.contains(host) && !first.allow_http {
+            plain.push(json!({
+                "match": [{"host": [host]}],
+                "handle": [redirect(
+                    first.temporary_redirect,
+                    "https://{http.request.host}{http.request.uri}".into(),
+                )],
+                "terminal": true,
+            }));
+        } else {
+            plain.extend(host_routes.iter().cloned());
+        }
+    }
+    plain.push(not_found.clone());
+    let mut servers = json!({
+        "ingress": {
+            "listen": [":80"],
+            "automatic_https": {"disable": true},
+            "routes": plain,
+        },
+    });
+    let mut apps = json!({});
+    if !certificates.is_empty() {
+        let mut encrypted = hosts
+            .iter()
+            .filter(|(host, _)| secure.contains(*host))
+            .flat_map(|(_, (_, host_routes))| host_routes.iter().cloned())
+            .collect::<Vec<_>>();
+        encrypted.push(not_found);
+        servers["ingress_tls"] = json!({
+            "listen": [":443"],
+            "protocols": ["h1", "h2"],
+            "automatic_https": {"disable": true},
+            "tls_connection_policies": [{}],
+            "routes": encrypted,
+        });
+        let mut loaded = certificates.iter().collect::<Vec<_>>();
+        loaded.sort();
+        apps["tls"] = json!({
+            "certificates": {
+                "load_files": loaded
+                    .into_iter()
+                    .map(|certificate| json!({
+                        "certificate": certificate.certificate_file,
+                        "key": certificate.key_file,
+                        "tags": [certificate.fingerprint],
+                    }))
+                    .collect::<Vec<_>>(),
+            },
+        });
+    }
+    apps["http"] = json!({"servers": servers});
 
     let config = json!({
         "admin": {
             "listen": format!("unix/{ADMIN_SOCKET}"),
             "config": {"persist": false},
         },
-        "apps": {
-            "http": {
-                "servers": {
-                    "ingress": {
-                        "listen": [":80"],
-                        "automatic_https": {"disable": true},
-                        "routes": rendered,
-                    },
-                },
-            },
-        },
+        "apps": apps,
     });
     let mut output = serde_json::to_vec_pretty(&config).unwrap_or_default();
     output.push(b'\n');
@@ -584,7 +802,7 @@ pub(crate) fn render_caddy_config(
 
 /// The configuration Caddy starts with before the first render: no routes.
 pub(crate) fn bootstrap_config() -> Vec<u8> {
-    render_caddy_config(&[], &[], "")
+    render_caddy_config(&[], &[], "", &[], &[])
 }
 
 pub(crate) fn ingress_unit() -> String {
@@ -755,7 +973,7 @@ fn ensure_config_dir(root: &Path) -> Result<(), String> {
         .map_err(|_| "The ingress configuration directory could not be created.".to_string())
 }
 
-fn read_stored_routes(owner_node_ip: &str) -> Result<StoredRoutes, String> {
+pub(crate) fn read_stored_routes(owner_node_ip: &str) -> Result<StoredRoutes, String> {
     let query = |sql: &str| {
         crate::discovery::corrosion_api(
             owner_node_ip,
@@ -804,6 +1022,7 @@ pub(crate) fn reconcile(
             revision: request.revision,
             route_count: request.routes.len() as u64,
             name_count: request.names.len() as u64,
+            tls_enabled: false,
         });
     }
 
@@ -840,6 +1059,7 @@ pub(crate) fn reconcile(
         }
         wait_until_caddy_answers()?;
     }
+    crate::ingress_tls::apply(root, request)?;
     atomic_write(
         &state_file(root),
         format!("enabled {CADDY_VERSION}\n").as_bytes(),
@@ -853,6 +1073,7 @@ pub(crate) fn reconcile(
         revision: request.revision,
         route_count: request.routes.len() as u64,
         name_count: request.names.len() as u64,
+        tls_enabled: request.tls_enabled,
     })
 }
 
@@ -883,6 +1104,7 @@ pub(crate) fn remove(root: &Path) -> Result<(), String> {
         }
     }
     let _ = fs::remove_dir(root.join(INGRESS_CONFIG_DIR));
+    crate::ingress_tls::remove(root)?;
     if host {
         run_command(
             Command::new("systemctl").arg("daemon-reload"),
@@ -1034,16 +1256,51 @@ pub(crate) fn render_once(root: &Path, state: &mut RenderState) -> Result<Render
         ));
     }
     let owner = identity.owner_node_ip.as_str();
+    let query = |sql: &str| {
+        crate::discovery::corrosion_api(
+            owner,
+            "queries",
+            &serde_json::to_vec(sql).unwrap_or_default(),
+        )
+        .and_then(|output| parse_query_events(&output))
+    };
     let routes = read_stored_routes(owner)?;
-    let endpoints = crate::discovery::corrosion_api(
+    let endpoints = parse_live_endpoints(&query(endpoints_query_sql())?);
+    let (challenges, certificates) = match crate::ingress_tls::read_key(root) {
+        Some(key) => {
+            let challenges = crate::ingress_tls::parse_challenges(&query(
+                crate::ingress_tls::challenges_query_sql(),
+            )?);
+            let stored = crate::ingress_tls::parse_certificates(&query(
+                crate::ingress_tls::certificates_query_sql(),
+            )?);
+            let hosts = routes
+                .routes
+                .iter()
+                .filter(|route| !route.http_only)
+                .map(|route| route.host.as_str())
+                .collect::<HashSet<_>>();
+            let certificates = crate::ingress_tls::write_certificates(
+                root,
+                &key,
+                &stored,
+                &hosts,
+                crate::network::unix_seconds(),
+            )?;
+            (challenges, certificates)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    let config = render_caddy_config(
+        &routes.routes,
+        &endpoints,
         owner,
-        "queries",
-        &serde_json::to_vec(endpoints_query_sql()).unwrap_or_default(),
-    )
-    .and_then(|output| parse_query_events(&output))
-    .map(|rows| parse_live_endpoints(&rows))?;
-    let config = render_caddy_config(&routes.routes, &endpoints, owner);
-    apply_config(root, &config, state, load_into_caddy)
+        &challenges,
+        &certificates,
+    );
+    let outcome = apply_config(root, &config, state, load_into_caddy)?;
+    crate::ingress_tls::remove_stale(root, &certificates)?;
+    Ok(outcome)
 }
 
 /// Renders whenever `trigger` fires and every `RENDER_INTERVAL`, until shutdown.
@@ -1109,6 +1366,7 @@ mod tests {
             workload_id: workload_id.into(),
             namespace: "default".into(),
             port,
+            ..Default::default()
         }
     }
 
@@ -1119,6 +1377,7 @@ mod tests {
             revision,
             routes,
             names: vec![],
+            ..Default::default()
         }
     }
 
@@ -1151,7 +1410,14 @@ mod tests {
     }
 
     fn config(routes: &[StoredRoute], endpoints: &[LiveEndpoint]) -> Value {
-        serde_json::from_slice(&render_caddy_config(routes, endpoints, "10.240.0.2")).unwrap()
+        serde_json::from_slice(&render_caddy_config(
+            routes,
+            endpoints,
+            "10.240.0.2",
+            &[],
+            &[],
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -1208,7 +1474,7 @@ mod tests {
                 request(1, vec![route("192.168.1.10", "web", 3000)]),
             ),
             (
-                "duplicate hosts",
+                "duplicate host and path",
                 request(
                     1,
                     vec![
@@ -1281,27 +1547,55 @@ mod tests {
         for statement in &transaction[..2] {
             assert_eq!(
                 statement[0],
-                "INSERT INTO ingress_routes (host, workload_id, namespace, port, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (host) DO UPDATE SET workload_id = excluded.workload_id, namespace = excluded.namespace, port = excluded.port, revision = excluded.revision, updated_at = excluded.updated_at WHERE excluded.revision >= ingress_routes.revision"
+                "INSERT INTO ingress_http_routes (host, path, workload_id, namespace, port, redirect_host, http_only, allow_http, temporary_redirect, noindex, strip_path, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (host, path) DO UPDATE SET workload_id = excluded.workload_id, namespace = excluded.namespace, port = excluded.port, redirect_host = excluded.redirect_host, http_only = excluded.http_only, allow_http = excluded.allow_http, temporary_redirect = excluded.temporary_redirect, noindex = excluded.noindex, strip_path = excluded.strip_path, revision = excluded.revision, updated_at = excluded.updated_at WHERE excluded.revision >= ingress_http_routes.revision"
             );
         }
         assert_eq!(
             transaction[0][1],
-            json!(["a.example.com", "web", "default", 3000, 7, 1_700_000_000])
+            json!([
+                "a.example.com",
+                "",
+                "web",
+                "default",
+                3000,
+                "",
+                0,
+                0,
+                0,
+                0,
+                0,
+                7,
+                1_700_000_000
+            ])
         );
         assert_eq!(
             transaction[1][1],
-            json!(["b.example.com", "api", "default", 4000, 7, 1_700_000_000])
+            json!([
+                "b.example.com",
+                "",
+                "api",
+                "default",
+                4000,
+                "",
+                0,
+                0,
+                0,
+                0,
+                0,
+                7,
+                1_700_000_000
+            ])
         );
         assert_eq!(
             transaction[2],
-            json!(["DELETE FROM ingress_routes WHERE revision < ?", [7]])
+            json!(["DELETE FROM ingress_http_routes WHERE revision < ?", [7]])
         );
 
         // An empty route set clears every older route.
         assert_eq!(
             route_transaction(&self::request(8, vec![]), 1).unwrap(),
             vec![json!([
-                "DELETE FROM ingress_routes WHERE revision < ?",
+                "DELETE FROM ingress_http_routes WHERE revision < ?",
                 [8]
             ])]
         );
@@ -1393,6 +1687,30 @@ mod tests {
             .is_ok()
         );
 
+        // A stack service name may hold `_` inside; default names may not.
+        let in_namespace = |namespace: &str, service: &str| WorkloadName {
+            namespace: namespace.into(),
+            ..name(service, "uuid-api")
+        };
+        for (namespace, service, accepted) in [
+            ("shop", "rallly_db", true),
+            ("shop", "a_b_c", true),
+            ("shop", "_db", false),
+            ("shop", "db_", false),
+            ("shop", "db_-x", true),
+            ("shop", "db.x", false),
+            ("default", "rallly_db", false),
+            ("cluster", "rallly_db", false),
+            ("nodes", "rallly_db", false),
+            ("sh_op", "db", false),
+        ] {
+            assert_eq!(
+                validate_request(&named(1, vec![in_namespace(namespace, service)])).is_ok(),
+                accepted,
+                "{service}.{namespace}"
+            );
+        }
+
         let too_many = (0..=MAX_NAMES)
             .map(|index| name(&format!("app-{index}"), "uuid-api"))
             .collect::<Vec<_>>();
@@ -1479,9 +1797,9 @@ mod tests {
 
     #[test]
     fn query_events_parse_rows_and_reject_errors_or_truncation() {
-        let output = br#"{"columns":["host","workload_id","namespace","port","revision"]}
-{"row":[1,["a.example.com","web","default",3000,7]]}
-{"row":[2,["b.example.com","api","default",4000,7]]}
+        let output = br#"{"columns":["host","path","workload_id","namespace","port","redirect_host","http_only","allow_http","temporary_redirect","noindex","strip_path","revision"]}
+{"row":[1,["a.example.com","","web","default",3000,"",0,0,0,0,0,7]]}
+{"row":[2,["b.example.com","","api","default",4000,"",0,0,0,0,0,7]]}
 {"eoq":{"time":0.001}}
 "#;
         let rows = parse_query_events(output).unwrap();
@@ -1503,7 +1821,7 @@ mod tests {
 
         assert!(parse_query_events(b"{\"columns\":[]}\n{\"row\":[1,[\"a\"]]}\n").is_err());
         assert!(
-            parse_query_events(b"{\"error\":\"no such table: ingress_routes\"}\n")
+            parse_query_events(b"{\"error\":\"no such table: ingress_http_routes\"}\n")
                 .unwrap_err()
                 .contains("no such table")
         );
@@ -1568,8 +1886,22 @@ mod tests {
         assert!(sql.contains("namespace != 'nodes'"));
         assert!(
             routes_query_sql()
-                .contains("WHERE revision = (SELECT MAX(revision) FROM ingress_routes)")
+                .contains("WHERE revision = (SELECT MAX(revision) FROM ingress_http_routes)")
         );
+    }
+
+    #[test]
+    fn a_single_upstream_has_no_passive_health_check() {
+        let rendered = config(
+            &[stored("app.example.com", "web", 3000)],
+            &[endpoint("web", "10.240.0.2", "100.64.0.8")],
+        );
+
+        let proxy = &rendered["apps"]["http"]["servers"]["ingress"]["routes"][0]["handle"][0];
+        assert_eq!(proxy["upstreams"], json!([{"dial": "100.64.0.8:3000"}]));
+        // Caddy dials it again until `try_duration`, for example while its
+        // container restarts.
+        assert!(proxy.get("health_checks").is_none());
     }
 
     #[test]
@@ -1610,12 +1942,13 @@ mod tests {
         );
         assert_eq!(
             proxy["health_checks"],
-            json!({"passive": {"fail_duration": "30s", "max_fails": 1}})
+            json!({"passive": {"fail_duration": "5s", "max_fails": 1}})
         );
         // The client Host header is passed through: no header rewrite.
         assert!(proxy.get("headers").is_none());
+
         assert!(
-            !String::from_utf8(render_caddy_config(&[], &[], ""))
+            !String::from_utf8(render_caddy_config(&[], &[], "", &[], &[]))
                 .unwrap()
                 .contains("Host")
         );
@@ -1662,10 +1995,16 @@ mod tests {
         let mut shuffled_endpoints = endpoints.clone();
         shuffled_endpoints.rotate_left(1);
 
-        let first = render_caddy_config(&routes, &endpoints, "10.240.0.2");
+        let first = render_caddy_config(&routes, &endpoints, "10.240.0.2", &[], &[]);
         assert_eq!(
             first,
-            render_caddy_config(&shuffled_routes, &shuffled_endpoints, "10.240.0.2")
+            render_caddy_config(
+                &shuffled_routes,
+                &shuffled_endpoints,
+                "10.240.0.2",
+                &[],
+                &[]
+            )
         );
         let rendered: Value = serde_json::from_slice(&first).unwrap();
         let hosts = rendered["apps"]["http"]["servers"]["ingress"]["routes"]
@@ -1696,7 +2035,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(INGRESS_CONFIG_FILE);
         let mut state = RenderState::default();
-        let first = render_caddy_config(&[stored("a.example.com", "web", 80)], &[], "");
+        let first = render_caddy_config(&[stored("a.example.com", "web", 80)], &[], "", &[], &[]);
 
         // Caddy is down: the file is written and the load stays pending.
         assert_eq!(
@@ -1739,7 +2078,7 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
 
         // A changed configuration is written and loaded.
-        let second = render_caddy_config(&[stored("b.example.com", "web", 80)], &[], "");
+        let second = render_caddy_config(&[stored("b.example.com", "web", 80)], &[], "", &[], &[]);
         assert_eq!(
             apply_config(temp.path(), &second, &mut state, |_| Ok(
                 LoadOutcome::Loaded
@@ -1864,6 +2203,7 @@ mod tests {
                 revision: 3,
                 route_count: 1,
                 name_count: 0,
+                tls_enabled: false,
             }
         );
         assert!(enabled(root));
@@ -1886,7 +2226,7 @@ mod tests {
         assert!(
             fs::read_to_string(root.join("etc/corrosion/schemas/coolify.sql"))
                 .unwrap()
-                .contains("CREATE TABLE IF NOT EXISTS ingress_routes")
+                .contains("CREATE TABLE IF NOT EXISTS ingress_http_routes")
         );
 
         // A rendered configuration survives a repeated enable.
@@ -1913,6 +2253,7 @@ mod tests {
                     revision: 3,
                     route_count: 1,
                     name_count: 1,
+                    tls_enabled: false,
                 }
             );
             assert!(!enabled(root));

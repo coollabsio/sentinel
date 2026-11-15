@@ -1,12 +1,23 @@
+use sentinel_protocol::CAPABILITY_WORKLOAD_ROLLING_DEPLOY;
 use sentinel_protocol::control::v1::Hello;
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
+    BUILD_CAPABILITIES, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RESOURCES,
-    NETWORK_CAPABILITIES, PROTOCOL_MAX, PROTOCOL_MIN, intersect_capabilities, select_protocol,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_HEALTHCHECK, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_WORKLOAD_RESOURCES, CAPABILITY_WORKLOAD_SECRETS, CAPABILITY_WORKLOAD_SECRETS_OWNER,
+    NETWORK_CAPABILITIES, PROTOCOL_MAX, PROTOCOL_MIN, VOLUME_CAPABILITIES, intersect_capabilities,
+    select_protocol,
 };
 
+use sentinel_protocol::EXEC_CAPABILITIES;
+
+use sentinel_protocol::DATABASE_CAPABILITIES;
+use sentinel_protocol::STACK_CAPABILITIES;
+
 use crate::CredentialClaims;
+
+const MAX_HELLO_FIELD_BYTES: usize = 128;
+const MAX_HELLO_CAPABILITIES: usize = 256;
 
 pub struct Negotiated {
     pub protocol_version: u32,
@@ -17,7 +28,10 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
     if hello.server_id.is_empty()
         || hello.server_id != claims.subject
         || hello.sentinel_version.is_empty()
+        || hello.sentinel_version.len() > MAX_HELLO_FIELD_BYTES
         || hello.boot_id.is_empty()
+        || hello.boot_id.len() > MAX_HELLO_FIELD_BYTES
+        || hello.capabilities.len() > MAX_HELLO_CAPABILITIES
     {
         return Err("invalid identity");
     }
@@ -42,12 +56,21 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
         CAPABILITY_WORKLOAD_DEPLOY,
         CAPABILITY_WORKLOAD_RESOURCES,
         CAPABILITY_WORKLOAD_LIFECYCLE,
+        CAPABILITY_WORKLOAD_HEALTHCHECK,
+        CAPABILITY_WORKLOAD_SECRETS,
+        CAPABILITY_WORKLOAD_SECRETS_OWNER,
+        CAPABILITY_WORKLOAD_ROLLING_DEPLOY,
         CAPABILITY_LOGS_READ,
         CAPABILITY_CONTAINER_LOGS,
         CAPABILITY_TRUST_BUNDLE_UPDATE,
     ]
     .into_iter()
     .chain(NETWORK_CAPABILITIES)
+    .chain(BUILD_CAPABILITIES)
+    .chain(VOLUME_CAPABILITIES)
+    .chain(DATABASE_CAPABILITIES)
+    .chain(STACK_CAPABILITIES)
+    .chain(EXEC_CAPABILITIES)
     .collect::<Vec<_>>();
     let capabilities =
         intersect_capabilities(&claims.capabilities, &hello.capabilities, &supported);

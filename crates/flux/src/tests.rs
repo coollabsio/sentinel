@@ -701,6 +701,258 @@ async fn workload_deploy_route_rejects_an_invalid_pull_policy() {
 }
 
 #[tokio::test]
+async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_supports_them() {
+    use base64::Engine;
+
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![
+                sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_DNS_SEARCH.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_FILES.into(),
+            ],
+        )
+        .await;
+    let (old_sender, _old_receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-old",
+            "connection-2",
+            old_sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let encoded = base64::engine::general_purpose::STANDARD.encode(b"listen 80;");
+    let body = |server_id: &str, files: serde_json::Value| {
+        serde_json::json!({
+            "server_id": server_id,
+            "command_id": "deploy-1",
+            "name": "coolify-p1test-main",
+            "image": "docker.io/library/nginx:latest",
+            "restart_policy": "no",
+            "dns_search": ["shop.coolify.internal"],
+            "files": files,
+        })
+    };
+    let post = |body: serde_json::Value| {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/workload.deploy"))
+            .bearer_auth("internal-secret")
+            .json(&body)
+            .send()
+    };
+
+    // A Sentinel without the capabilities would drop the fields.
+    let response = post(body(
+        "server-old",
+        serde_json::json!([{"path": "/etc/nginx.conf", "content_base64": encoded}]),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let response = post(body(
+        "server-1",
+        serde_json::json!([{"path": "/etc/nginx.conf", "content_base64": "not base64!"}]),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let too_large = "A".repeat(1_398_108);
+    let response = post(body(
+        "server-1",
+        serde_json::json!([{"path": "/big", "content_base64": too_large}]),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Four files of 1 MiB fit in the body limit.
+    let mib = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 1024 * 1024]);
+    let mut files: Vec<_> = (0..4)
+        .map(|index| serde_json::json!({"path": format!("/f{index}"), "content_base64": mib}))
+        .collect();
+    files.push(serde_json::json!({
+        "path": "/etc/nginx.conf",
+        "content_base64": encoded,
+        "mode": "0600",
+    }));
+    files.push(serde_json::json!({"path": "/data", "directory": true}));
+    let mut request = tokio::spawn(post(body("server-1", serde_json::Value::Array(files))));
+
+    let message = tokio::select! {
+        message = receiver.recv() => message.unwrap(),
+        response = &mut request => panic!("no dispatch: {:?}", response.unwrap().unwrap().text().await),
+    };
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    let Some(sentinel_protocol::control::v1::command::Payload::WorkloadDeploy(deploy)) =
+        command.payload
+    else {
+        panic!("expected a deploy");
+    };
+    assert_eq!(deploy.dns_search, ["shop.coolify.internal"]);
+    assert_eq!(deploy.files.len(), 6);
+    assert_eq!(deploy.files[0].content.len(), 1024 * 1024);
+    assert_eq!(deploy.files[4].path, "/etc/nginx.conf");
+    assert_eq!(deploy.files[4].content, b"listen 80;");
+    assert_eq!(deploy.files[4].mode, "0600");
+    assert!(!deploy.files[4].directory);
+    assert!(deploy.files[5].directory);
+    assert!(deploy.files[5].content.is_empty());
+    // The debug output never holds file contents.
+    assert!(!format!("{deploy:?}").contains("listen"));
+
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: "deploy-1:result".into(),
+                command_id: "deploy-1".into(),
+                status: sentinel_protocol::control::v1::CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: now_millis(),
+                payload: Some(
+                    sentinel_protocol::control::v1::command_result::Payload::WorkloadDeploy(
+                        sentinel_protocol::control::v1::WorkloadDeployResult {
+                            runtime_id: "0123abcd".into(),
+                            name: "coolify-p1test-main".into(),
+                            image: "docker.io/library/nginx:latest".into(),
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    server.abort();
+}
+
+#[tokio::test]
+async fn workload_deploy_route_sends_secret_owners_only_to_a_sentinel_that_supports_them() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![
+                sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_SECRETS.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_SECRETS_OWNER.into(),
+            ],
+        )
+        .await;
+    let (old_sender, _old_receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-old",
+            "connection-2",
+            old_sender,
+            1,
+            vec![
+                sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_SECRETS.into(),
+            ],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let body = |server_id: &str, secrets: serde_json::Value| {
+        serde_json::json!({
+            "server_id": server_id,
+            "command_id": "deploy-1",
+            "name": "coolify-p1test-main",
+            "image": "docker.io/library/nginx:latest",
+            "restart_policy": "no",
+            "secrets": secrets,
+        })
+    };
+    let post = |body: serde_json::Value| {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/workload.deploy"))
+            .bearer_auth("internal-secret")
+            .json(&body)
+            .send()
+    };
+
+    let owned = serde_json::json!({
+        "db_password": {"value": "hunter2", "uid": 1000, "gid": 1001, "mode": 256},
+        "api_key": "plain",
+        "token": {"value": "t", "uid": null},
+    });
+    let response = post(body("server-old", owned.clone())).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let response = post(body(
+        "server-1",
+        serde_json::json!({"db_password": {"value": "x", "mode": -1}}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+    let request = tokio::spawn(post(body("server-1", owned)));
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    let Some(sentinel_protocol::control::v1::command::Payload::WorkloadDeploy(deploy)) =
+        command.payload
+    else {
+        panic!("expected a deploy");
+    };
+    let secret =
+        |key: &str, value: &str, uid, gid, mode| sentinel_protocol::control::v1::WorkloadSecret {
+            key: key.into(),
+            value: value.into(),
+            uid,
+            gid,
+            mode,
+        };
+    assert_eq!(
+        deploy.secrets,
+        [
+            secret("api_key", "plain", None, None, None),
+            secret(
+                "db_password",
+                "hunter2",
+                Some(1000),
+                Some(1001),
+                Some(0o400)
+            ),
+            secret("token", "t", None, None, None),
+        ]
+    );
+    request.abort();
+    server.abort();
+}
+
+#[tokio::test]
 async fn workload_deploy_route_returns_the_sentinel_failure_message() {
     let registry = ConnectionRegistry::default();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
@@ -1190,12 +1442,14 @@ async fn ingress_reconcile_route_forwards_routes_and_names_and_returns_the_ingre
                     workload_id: "web".into(),
                     namespace: "default".into(),
                     port: 3000,
+                    ..Default::default()
                 },
                 IngressRoute {
                     host: "api.example.com".into(),
                     workload_id: "api".into(),
                     namespace: "default".into(),
                     port: 8080,
+                    ..Default::default()
                 },
             ],
             names: vec![WorkloadName {
@@ -1203,6 +1457,7 @@ async fn ingress_reconcile_route_forwards_routes_and_names_and_returns_the_ingre
                 workload_id: "web".into(),
                 namespace: "default".into(),
             }],
+            ..Default::default()
         }))
     );
     registry
@@ -1221,6 +1476,7 @@ async fn ingress_reconcile_route_forwards_routes_and_names_and_returns_the_ingre
                         revision: 7,
                         route_count: 2,
                         name_count: 1,
+                        tls_enabled: false,
                     },
                 )),
             },
@@ -1240,6 +1496,7 @@ async fn ingress_reconcile_route_forwards_routes_and_names_and_returns_the_ingre
             "revision": 7,
             "route_count": 2,
             "name_count": 1,
+            "tls_enabled": false,
         })
     );
     server.abort();
@@ -1656,4 +1913,88 @@ fn negotiates_the_container_logs_capability_when_granted() {
             .capabilities
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn firewall_reconcile_route_passes_stack_rules_and_published_ports_to_sentinel() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_FIREWALL_RECONCILE.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let _request = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!(
+                "http://{address}/v1/commands/network.firewall.reconcile"
+            ))
+            .bearer_auth("internal-secret")
+            .json(&serde_json::json!({
+                "server_id": "server-1",
+                "command_id": "firewall-1",
+                "revision": 4,
+                "wireguard_port": 51820,
+                "cluster_cidr": "10.240.0.0/24",
+                "local_node_ip": "10.240.0.2",
+                "wireguard_interface": "coolify0",
+                "workload_cidrs": ["100.64.0.0/24"],
+                "stack_rules": [{"source_ip": "100.64.0.2", "destination_ip": "100.64.0.3"}],
+                "published_ports": [
+                    {"protocol": "tcp", "host_port": 22222, "destination_ip": "100.64.0.3", "container_port": 22, "source_cidrs": ["203.0.113.0/24"]},
+                    {"protocol": "udp", "host_port": 5353, "destination_ip": "100.64.0.2", "container_port": 5353},
+                ],
+            }))
+            .send(),
+    );
+
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    let Some(sentinel_protocol::control::v1::command::Payload::FirewallReconcile(firewall)) =
+        command.payload
+    else {
+        panic!("expected a firewall reconcile");
+    };
+    assert_eq!(
+        firewall.stack_rules,
+        [sentinel_protocol::control::v1::FirewallStackRule {
+            source_ip: "100.64.0.2".into(),
+            destination_ip: "100.64.0.3".into(),
+        }]
+    );
+    assert_eq!(
+        firewall.published_ports,
+        [
+            sentinel_protocol::control::v1::FirewallPublishedPort {
+                protocol: "tcp".into(),
+                host_port: 22222,
+                destination_ip: "100.64.0.3".into(),
+                container_port: 22,
+                source_cidrs: vec!["203.0.113.0/24".into()],
+            },
+            sentinel_protocol::control::v1::FirewallPublishedPort {
+                protocol: "udp".into(),
+                host_port: 5353,
+                destination_ip: "100.64.0.2".into(),
+                container_port: 5353,
+                source_cidrs: vec![],
+            },
+        ]
+    );
+    server.abort();
 }

@@ -1,8 +1,9 @@
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use sentinel_protocol::control::v1::{
     ClusterLeaveRequest, ClusterLeaveResult, CorrosionInspectResult, CorrosionReconcileRequest,
@@ -12,18 +13,28 @@ use sentinel_protocol::control::v1::{
 };
 use sha2::{Digest, Sha256};
 
-const COOLIFY_NFT_TABLE: &str = "coolify_cluster";
+pub(crate) const COOLIFY_NFT_TABLE: &str = "coolify_cluster";
+const MESH_NAT_CHAIN: &str = "mesh_nat";
 const COOLIFY_NFT_BRIDGE_TABLE: &str = "coolify_cluster_bridge";
+/// The published ports (decision 0016). It exists only while a port is published.
+const COOLIFY_NFT_NAT_TABLE: &str = "coolify_cluster_nat";
 const BRIDGE_SYSCTL_FILE: &str = "etc/sysctl.d/90-coolify-workload-firewall.conf";
 pub(crate) const CORROSION_VERSION: &str = "v1.0.0";
+/// SHA-512 of the Corrosion v1.0.0 release archives. Change them together with `CORROSION_VERSION`.
+const CORROSION_SHA512_X86_64: &str = "d8303bd383683f990162956d69fdb89d85bcbe39df5f6d3e3b74d21237d691a764782448d19b3196db97a45b0b0ac7b2ab87fc460aa0de206cc7c7954dd074c5";
+const CORROSION_SHA512_AARCH64: &str = "23f55e40f71c3fc884f6f58eb8ebc22b5fc00511f370ce0611cec69bc3578edc5009f754b19ee96a2e68fe88fb38a062837e01a366ec0bb32dceb3076e7df6c6";
 /// The Node WireGuard IP that owns this Node's discovery rows and serves its Corrosion API.
 pub(crate) const CORROSION_OWNER_FILE: &str = "etc/corrosion/coolify-owner";
+/// The reverse zones of the discovery DNS, one name on each line. The discovery
+/// DNS reads the file next to the Corrosion configuration.
+const DISCOVERY_REVERSE_ZONES_FILE: &str = "etc/corrosion/coolify-reverse-zones";
 /// The Node DNS label published as `<name>.nodes.coolify.internal`.
 pub(crate) const CORROSION_NODE_NAME_FILE: &str = "etc/corrosion/coolify-node-name";
 
 pub(crate) fn validate_interface(value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 15
+        || value.starts_with(['-', '.'])
         || !value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
@@ -74,29 +85,20 @@ pub(crate) fn leave_cluster(
                 tracing::warn!(error = %message, "could not withdraw this Node's discovery endpoints before leaving the cluster");
             }
         }
-        let _ = Command::new("resolvectl")
-            .args(["revert", &request.interface])
-            .status();
+        run_best_effort(Command::new("resolvectl").args(["revert", &request.interface]));
         for unit in ["coolify-discovery-dns.service", "corrosion.service"] {
-            let _ = Command::new("systemctl")
-                .args(["disable", "--now", unit])
-                .status();
+            run_best_effort(Command::new("systemctl").args(["disable", "--now", unit]));
         }
-        let _ = Command::new("wg-quick")
-            .args(["down", &request.interface])
-            .status();
-        let _ = Command::new("nft")
-            .args(["delete", "table", "inet", COOLIFY_NFT_TABLE])
-            .status();
-        let _ = Command::new("nft")
-            .args(["delete", "table", "bridge", COOLIFY_NFT_BRIDGE_TABLE])
-            .status();
-        for cidr in &request.workload_cidrs {
-            let _ = Command::new("iptables")
-                .args(["-t", "nat", "-D", "POSTROUTING"])
-                .args(mesh_nat_rule_arguments(&request.interface, cidr))
-                .status();
-        }
+        run_best_effort(Command::new("wg-quick").args(["down", &request.interface]));
+        run_best_effort(Command::new("nft").args(["delete", "table", "inet", COOLIFY_NFT_TABLE]));
+        run_best_effort(Command::new("nft").args([
+            "delete",
+            "table",
+            "bridge",
+            COOLIFY_NFT_BRIDGE_TABLE,
+        ]));
+        run_best_effort(Command::new("nft").args(["delete", "table", "ip", COOLIFY_NFT_NAT_TABLE]));
+        remove_legacy_mesh_nat(&request.interface, &request.workload_cidrs);
     }
 
     let managed_files = [
@@ -113,6 +115,7 @@ pub(crate) fn leave_cluster(
         root.join("etc/corrosion/schemas/coolify.sql"),
         root.join(CORROSION_OWNER_FILE),
         root.join(CORROSION_NODE_NAME_FILE),
+        root.join(DISCOVERY_REVERSE_ZONES_FILE),
         root.join("etc/corrosion/coolify-cluster-id"),
         root.join("etc/corrosion/coolify-peer-count"),
         root.join("etc/systemd/system/corrosion.service"),
@@ -161,7 +164,7 @@ fn valid_ipv4_cidr(value: &str) -> bool {
         && prefix.parse::<u8>().is_ok_and(|prefix| prefix <= 32)
 }
 
-fn ipv4_in_cidr(address: &str, cidr: &str) -> bool {
+pub(crate) fn ipv4_in_cidr(address: &str, cidr: &str) -> bool {
     let Ok(address) = address.parse::<std::net::Ipv4Addr>() else {
         return false;
     };
@@ -188,15 +191,20 @@ fn ipv4_in_cidr(address: &str, cidr: &str) -> bool {
 pub(crate) fn validate_wireguard(request: &WireguardReconcileRequest) -> Result<(), String> {
     validate_interface(&request.interface)?;
     if request.listen_port == 0
+        || request.listen_port > 65_535
         || request.revision == 0
         || !request.address.ends_with("/32")
+        || !valid_ipv4_cidr(&request.address)
         || request.peers.len() > 99
+        || (!request.flux_probe_host.is_empty()
+            && (!safe_config_value(&request.flux_probe_host)
+                || request.flux_probe_host.starts_with('-')))
     {
         return Err("The WireGuard configuration is invalid.".into());
     }
     for peer in &request.peers {
-        if peer.public_key.is_empty()
-            || peer.endpoint.is_empty()
+        if !safe_config_value(&peer.public_key)
+            || !safe_config_value(&peer.endpoint)
             || peer.allowed_ips.is_empty()
             || peer.allowed_ips.len() > 128
             || peer
@@ -209,6 +217,16 @@ pub(crate) fn validate_wireguard(request: &WireguardReconcileRequest) -> Result<
         }
     }
     Ok(())
+}
+
+/// A single-line `wg-quick` value: no whitespace or control characters, so a
+/// value can never start another configuration line.
+fn safe_config_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
 }
 
 pub(crate) fn render_wireguard(
@@ -243,6 +261,151 @@ fn render_peer(peer: &WireguardPeer) -> String {
     )
 }
 
+/// The cluster registry port (`sentinel_protocol::REGISTRY_HOST`).
+const REGISTRY_PORT: u16 = 5443;
+/// The Corrosion gossip and API ports (`render_corrosion`).
+const CORROSION_GOSSIP_PORT: u32 = 8787;
+const CORROSION_API_PORT: u32 = 8080;
+/// The default `PORT` of the Sentinel API (`sentinel_config`).
+const SENTINEL_API_PORT: u32 = 8888;
+const MAX_PUBLISHED_PORTS: usize = 1000;
+const MAX_PUBLISHED_PORT_SOURCES: usize = 64;
+
+/// A port that the Node uses itself. The DNAT of a published port matches
+/// every local address, so it would take the port from the local listener.
+fn reserved_host_port(port: u32, wireguard_port: u32) -> bool {
+    port == wireguard_port
+        || [
+            53,
+            80,
+            443,
+            CORROSION_GOSSIP_PORT,
+            CORROSION_API_PORT,
+            u32::from(REGISTRY_PORT),
+            SENTINEL_API_PORT,
+        ]
+        .contains(&port)
+        || u16::try_from(port).is_ok_and(|port| crate::volume_transfer::PORTS.contains(&port))
+}
+
+/// A published port of the request, validated (decision 0016).
+struct PublishedPort<'a> {
+    protocol: &'a str,
+    host_port: u32,
+    destination_ip: &'a str,
+    container_port: u32,
+    /// Network addresses with their prefix, sorted and unique. Empty allows
+    /// every source.
+    source_cidrs: Vec<String>,
+}
+
+/// The CIDR with the host bits cleared.
+fn ipv4_network(cidr: &str) -> Option<String> {
+    let (address, prefix) = cidr.split_once('/')?;
+    let address = address.parse::<std::net::Ipv4Addr>().ok()?;
+    let prefix = prefix.parse::<u32>().ok().filter(|prefix| *prefix <= 32)?;
+    let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+    Some(format!(
+        "{}/{prefix}",
+        std::net::Ipv4Addr::from(u32::from(address) & mask)
+    ))
+}
+
+fn published_ports(request: &FirewallReconcileRequest) -> Result<Vec<PublishedPort<'_>>, String> {
+    if request.published_ports.len() > MAX_PUBLISHED_PORTS {
+        return Err("The firewall published ports are invalid.".into());
+    }
+    let mut ports = Vec::with_capacity(request.published_ports.len());
+    for port in &request.published_ports {
+        let valid = matches!(port.protocol.as_str(), "tcp" | "udp")
+            && (1..=65_535).contains(&port.host_port)
+            && (1..=65_535).contains(&port.container_port)
+            && port.source_cidrs.len() <= MAX_PUBLISHED_PORT_SOURCES
+            && port.destination_ip.parse::<std::net::Ipv4Addr>().is_ok()
+            && request
+                .workload_cidrs
+                .iter()
+                .any(|cidr| ipv4_in_cidr(&port.destination_ip, cidr));
+        let source_cidrs = port
+            .source_cidrs
+            .iter()
+            .map(|cidr| ipv4_network(cidr))
+            .collect::<Option<std::collections::BTreeSet<_>>>();
+        let (true, Some(source_cidrs)) = (valid, source_cidrs) else {
+            return Err("The firewall published ports are invalid.".into());
+        };
+        if reserved_host_port(port.host_port, request.wireguard_port) {
+            return Err(format!(
+                "The host port {} is reserved for the Node.",
+                port.host_port
+            ));
+        }
+        ports.push(PublishedPort {
+            protocol: &port.protocol,
+            host_port: port.host_port,
+            destination_ip: &port.destination_ip,
+            container_port: port.container_port,
+            source_cidrs: source_cidrs.into_iter().collect(),
+        });
+    }
+    ports.sort_unstable_by_key(|port| (port.protocol, port.host_port));
+    if ports
+        .windows(2)
+        .any(|pair| (pair[0].protocol, pair[0].host_port) == (pair[1].protocol, pair[1].host_port))
+    {
+        return Err("The firewall published ports must be unique.".into());
+    }
+    Ok(ports)
+}
+
+/// The NAT table of the published ports, or nothing without one.
+///
+/// A connection to any local address of the Node is translated to the
+/// workload. Connections from the Node itself are translated in output too,
+/// without the source allow-list: root on the Node can reach the workload
+/// anyway. Loopback is left out, because a packet from 127.0.0.1 cannot be
+/// routed to a workload. A translated connection that leaves through WireGuard
+/// is masqueraded, so the other Node accepts it from this Node's mesh address
+/// and its reply comes back here to be translated. One from a workload is
+/// masqueraded too, so that a reply on the same bridge does not bypass the
+/// translation. The postrouting chain runs before the mesh NAT chain, which
+/// would bind the workload address first.
+fn render_published_ports(
+    ports: &[PublishedPort<'_>],
+    workload_networks: &str,
+    wireguard_interface: &str,
+) -> String {
+    if ports.is_empty() {
+        return String::new();
+    }
+    let mut prerouting = String::new();
+    let mut output = String::new();
+    for port in ports {
+        let matches = format!("{} dport {}", port.protocol, port.host_port);
+        let sources = if port.source_cidrs.is_empty() {
+            String::new()
+        } else {
+            format!(" ip saddr {{ {} }}", port.source_cidrs.join(", "))
+        };
+        let translation = format!("dnat to {}:{}", port.destination_ip, port.container_port);
+        prerouting.push_str(&format!(
+            " fib daddr type local {matches}{sources} {translation};"
+        ));
+        output.push_str(&format!(
+            " ip daddr != 127.0.0.0/8 fib daddr type local {matches} {translation};"
+        ));
+    }
+    format!(
+        "table ip {COOLIFY_NFT_NAT_TABLE} {{
+ set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {workload_networks} }} }}
+ chain prerouting {{ type nat hook prerouting priority dstnat; policy accept;{prerouting} }}
+ chain output {{ type nat hook output priority dstnat; policy accept;{output} }}
+ chain postrouting {{ type nat hook postrouting priority srcnat - 10; policy accept; ct status dnat oifname \"{wireguard_interface}\" masquerade; ct status dnat ip saddr @workload_networks masquerade; }}
+}}
+"
+    )
+}
+
 pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<String, String> {
     if request.revision == 0
         || request.wireguard_port == 0
@@ -255,8 +418,22 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
             .workload_cidrs
             .iter()
             .any(|cidr| !valid_ipv4_cidr(cidr))
+        || (!request.registry_ip.is_empty()
+            && !ipv4_in_cidr(&request.registry_ip, &request.cluster_cidr))
         || request.rules.len() > 100_000
         || request.ingress_rules.len() > 100_000
+        || request.stack_rules.len() > 100_000
+        || request.stack_rules.iter().any(|rule| {
+            [&rule.source_ip, &rule.destination_ip]
+                .into_iter()
+                .any(|ip| {
+                    ip.parse::<std::net::Ipv4Addr>().is_err()
+                        || !request
+                            .workload_cidrs
+                            .iter()
+                            .any(|cidr| ipv4_in_cidr(ip, cidr))
+                })
+        })
         || request.rules.iter().any(|rule| {
             rule.source_ip.parse::<std::net::Ipv4Addr>().is_err()
                 || rule.destination_ip.parse::<std::net::Ipv4Addr>().is_err()
@@ -288,6 +465,44 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
     {
         return Err("The firewall configuration is invalid.".into());
     }
+    let mut stack_rules = request
+        .stack_rules
+        .iter()
+        .map(|rule| (rule.source_ip.as_str(), rule.destination_ip.as_str()))
+        .collect::<Vec<_>>();
+    stack_rules.sort_unstable();
+    if stack_rules.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("The firewall stack rules must be unique.".into());
+    }
+    let published_ports = published_ports(request)?;
+    // The translated destinations: one this Node translated, or one another
+    // Node translated and masqueraded from its mesh address.
+    let published_destinations = published_ports
+        .iter()
+        .map(|port| (port.destination_ip, port.protocol, port.container_port))
+        .collect::<std::collections::BTreeSet<_>>();
+    let forward_published_rules = published_destinations
+        .iter()
+        .map(|(destination, protocol, port)| {
+            format!(
+                "ct status dnat ip daddr {destination} {protocol} dport {port} accept; iifname \"{}\" ip saddr {} ip daddr {destination} {protocol} dport {port} accept; ",
+                request.wireguard_interface, request.cluster_cidr
+            )
+        })
+        .collect::<String>();
+    let output_published_rules = published_destinations
+        .iter()
+        .map(|(destination, protocol, port)| {
+            format!("ct status dnat ip daddr {destination} {protocol} dport {port} accept; ")
+        })
+        .collect::<String>();
+
+    // Both ends are workloads, so the rules belong in forward and in the
+    // bridge chain (same-Node traffic), never in output.
+    let stack_allow_rules = stack_rules
+        .iter()
+        .map(|(source, destination)| format!("ip saddr {source} ip daddr {destination} accept; "))
+        .collect::<String>();
 
     let mut workload_cidrs = request.workload_cidrs.clone();
     workload_cidrs.sort();
@@ -393,27 +608,52 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
         .join(" ");
 
     let local_node_ip = &request.local_node_ip;
+    // Node hosts reach the cluster registry over the mesh. The input rule
+    // matches only on the registry Node; the source must be a Node address.
+    let (input_registry_rule, output_registry_rule) = if request.registry_ip.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (
+            format!(
+                "ip saddr {} ip daddr {} tcp dport {REGISTRY_PORT} accept; ",
+                request.cluster_cidr, request.registry_ip
+            ),
+            format!(
+                "ip daddr {} tcp dport {REGISTRY_PORT} accept; ",
+                request.registry_ip
+            ),
+        )
+    };
 
+    // Netavark masquerades everything that leaves a workload network, in a nat
+    // chain of its own table. A verdict in another chain cannot stop that
+    // chain; only an earlier NAT binding can, because the kernel ends NAT
+    // evaluation at the first binding. The mesh NAT chain runs first and binds
+    // the source of workload-to-workload traffic to itself, so the firewall of
+    // the destination Node sees the workload address.
     Ok(format!(
         "table inet {COOLIFY_NFT_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
- chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; ip saddr {} udp dport 8787 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} udp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 8080 accept; ip saddr {} drop; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
- chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} {forward_ingress_rules} ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; ip saddr != @workload_networks ip daddr @workload_networks drop; }}
- chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; ip daddr {local_node_ip} udp dport 53 accept; ip daddr {local_node_ip} tcp dport 53 accept; ip daddr {local_node_ip} tcp dport 8080 accept; {output_allow_rules} {output_ingress_rules} ip daddr {} drop; ip daddr @workload_networks drop; }}
+ chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; ip saddr {} udp dport 8787 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} udp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 8080 accept; {input_registry_rule}ip saddr {} drop; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
+ chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} {stack_allow_rules}{forward_ingress_rules} {forward_published_rules}ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; ip saddr != @workload_networks ip daddr @workload_networks drop; }}
+ chain {MESH_NAT_CHAIN} {{ type nat hook postrouting priority srcnat - 5; policy accept; oifname \"{}\" ip saddr @workload_networks ip daddr @workload_networks snat ip to ip saddr; }}
+ chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; ip daddr {local_node_ip} udp dport 53 accept; ip daddr {local_node_ip} tcp dport 53 accept; ip daddr {local_node_ip} tcp dport 8080 accept; {output_allow_rules} {output_ingress_rules} {output_registry_rule}{output_published_rules}ip daddr {} drop; ip daddr @workload_networks drop; }}
 }}
 table bridge {COOLIFY_NFT_BRIDGE_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
- chain forward {{ type filter hook forward priority -200; policy accept; meta protocol != ip accept; ct state established,related accept; {bridge_allow_rules} ip saddr @workload_networks ip daddr @workload_networks drop; }}
+ chain forward {{ type filter hook forward priority -200; policy accept; meta protocol != ip accept; ct state established,related accept; {bridge_allow_rules} {stack_allow_rules}ip saddr @workload_networks ip daddr @workload_networks drop; }}
 }}
-",
+{}",
         request.wireguard_port,
         request.cluster_cidr,
         request.cluster_cidr,
         request.wireguard_interface,
         request.cluster_cidr,
         request.cluster_cidr,
+        request.wireguard_interface,
         request.cluster_cidr,
-        request.cluster_cidr
+        request.cluster_cidr,
+        render_published_ports(&published_ports, &elements, &request.wireguard_interface)
     ))
 }
 
@@ -464,6 +704,12 @@ pub(crate) fn valid_discovery_label(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
         && !value.starts_with('-')
         && !value.ends_with('-')
+}
+
+/// A name of a stack service: a discovery label that may also hold `_`, not
+/// first or last, as Compose service names do (decision 0023).
+pub(crate) fn valid_stack_service_name(value: &str) -> bool {
+    valid_discovery_label(&value.replace('_', "-"))
 }
 
 pub(crate) fn ensure_key(root: &Path, interface: &str) -> Result<String, String> {
@@ -535,7 +781,12 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()
         .map_err(|_| "The staged file could not be written.")?;
     fs::set_permissions(&staged, fs::Permissions::from_mode(mode))
         .map_err(|_| "The staged file permissions could not be set.")?;
-    fs::rename(staged, path).map_err(|_| "The staged file could not be activated.".to_string())
+    fs::rename(staged, path).map_err(|_| "The staged file could not be activated.".to_string())?;
+    // Persist the rename itself, so a crash cannot bring back the old file.
+    if let Ok(directory) = fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
 }
 
 pub(crate) fn hash(contents: &[u8]) -> String {
@@ -742,6 +993,7 @@ pub(crate) fn reconcile_wireguard(
     atomic_write(&staged_path, config.as_bytes(), 0o600)?;
     if root == Path::new("/") {
         activate_wireguard(
+            root,
             request,
             &staged_path,
             &config_path,
@@ -804,7 +1056,32 @@ fn rollback_start_arguments(unit: &str) -> [&str; 3] {
     ["start", "--wait", unit]
 }
 
+/// Arms a transient rollback that runs `script` after 60 seconds unless its
+/// timer is stopped. A unit with the same name left by an earlier attempt (a
+/// failed rollback, or a crash before the timer was stopped) would make
+/// `systemd-run` fail on every later attempt, so it is cleared first, and
+/// `--collect` keeps a failed rollback from staying loaded.
+fn arm_rollback(unit: &str, script: &str, error: &str) -> Result<(), String> {
+    let service = format!("{unit}.service");
+    let timer = format!("{unit}.timer");
+    run_best_effort(Command::new("systemctl").args(["stop", &timer]));
+    run_best_effort(Command::new("systemctl").args(["reset-failed", &service, &timer]));
+    run(
+        Command::new("systemd-run").args([
+            "--unit",
+            unit,
+            "--collect",
+            "--on-active=60s",
+            "/bin/sh",
+            "-c",
+            script,
+        ]),
+        error,
+    )
+}
+
 fn activate_wireguard(
+    root: &Path,
     request: &WireguardReconcileRequest,
     staged_path: &Path,
     config_path: &Path,
@@ -831,22 +1108,14 @@ fn activate_wireguard(
             config_path.display()
         )
     };
-    run(
-        Command::new("systemd-run").args([
-            "--unit",
-            &rollback_unit,
-            "--on-active=60s",
-            "/bin/sh",
-            "-c",
-            &rollback_command,
-        ]),
+    arm_rollback(
+        &rollback_unit,
+        &rollback_command,
         "The WireGuard rollback could not be armed.",
     )?;
     fs::rename(staged_path, config_path)
         .map_err(|_| "The staged WireGuard configuration could not be activated.")?;
-    let _ = Command::new("wg-quick")
-        .args(["down", &request.interface])
-        .status();
+    run_best_effort(Command::new("wg-quick").args(["down", &request.interface]));
     let healthy = run(
         Command::new("wg-quick").args(["up", &request.interface]),
         "WireGuard activation failed.",
@@ -868,7 +1137,7 @@ fn activate_wireguard(
             .iter()
             .flat_map(|peer| peer.allowed_ips.iter().map(String::as_str))
             .collect::<Vec<_>>();
-        configure_discovery_resolver(&request.interface, &request.address, &peer_addresses)
+        configure_discovery_resolver(root, &request.interface, &request.address, &peer_addresses)
     });
     if healthy.is_err() {
         let rollback_service = format!("{rollback_unit}.service");
@@ -882,7 +1151,12 @@ fn activate_wireguard(
                 .iter()
                 .flat_map(|peer| peer.allowed_ips.iter().map(String::as_str))
                 .collect::<Vec<_>>();
-            configure_discovery_resolver(&request.interface, &request.address, &peer_addresses)
+            configure_discovery_resolver(
+                root,
+                &request.interface,
+                &request.address,
+                &peer_addresses,
+            )
         });
         let _ = Command::new("systemctl")
             .args(["stop", &format!("{rollback_unit}.timer")])
@@ -906,10 +1180,15 @@ pub(crate) fn reconcile_firewall(
     let configuration_hash = hash(snapshot.as_bytes());
     let state_file = state_path(root, "firewall.state");
     let prior = read_state_file(&state_file);
+    // The tables can disappear without Sentinel (a firewall service reload,
+    // `nft flush ruleset`), so an unchanged revision is only a no-op while
+    // they are still loaded.
     if prior
         .as_ref()
         .is_some_and(|state| state.0 == request.revision && state.1 == configuration_hash)
+        && firewall_current(root)
     {
+        refresh_discovery_resolver(root)?;
         return Ok(FirewallReconcileResult {
             state: Some(firewall_state(request.revision, configuration_hash, false)),
             changed: false,
@@ -920,6 +1199,9 @@ pub(crate) fn reconcile_firewall(
     atomic_write(&snapshot_path, snapshot.as_bytes(), 0o600)?;
     if root == Path::new("/") {
         activate_firewall(root, &snapshot, request)?;
+        // The new table has no volume transfer rules.
+        crate::volume_transfer::restore_firewall();
+        refresh_discovery_resolver(root)?;
     }
     atomic_write(
         &state_file,
@@ -933,9 +1215,12 @@ pub(crate) fn reconcile_firewall(
     })
 }
 
+/// Replaces the Coolify tables in one transaction. The NAT table is declared
+/// before it is deleted, so the delete succeeds whether it exists or not, and
+/// a snapshot without published ports removes it.
 fn nft_transaction(snapshot: &str, inet_table_exists: bool, bridge_table_exists: bool) -> String {
     format!(
-        "{}{}{}",
+        "{}{}table ip {COOLIFY_NFT_NAT_TABLE}\ndelete table ip {COOLIFY_NFT_NAT_TABLE}\n{}",
         if inet_table_exists {
             format!("delete table inet {COOLIFY_NFT_TABLE}\n")
         } else {
@@ -964,12 +1249,19 @@ fn activate_firewall(
         .args(["list", "table", "bridge", COOLIFY_NFT_BRIDGE_TABLE])
         .output()
         .map_err(|_| "nftables is unavailable.")?;
+    let current_nat = Command::new("nft")
+        .args(["list", "table", "ip", COOLIFY_NFT_NAT_TABLE])
+        .output()
+        .map_err(|_| "nftables is unavailable.")?;
     let inet_table_exists = current_inet.status.success();
     let bridge_table_exists = current_bridge.status.success();
     let last_good = state_path(root, "firewall.last-good.nft");
     if inet_table_exists || bridge_table_exists {
         let mut last_good_snapshot = current_inet.stdout;
         last_good_snapshot.extend_from_slice(&current_bridge.stdout);
+        if current_nat.status.success() {
+            last_good_snapshot.extend_from_slice(&current_nat.stdout);
+        }
         atomic_write(&last_good, &last_good_snapshot, 0o600)?;
     }
     let transaction_path = state_path(root, "firewall.transaction.nft");
@@ -985,22 +1277,16 @@ fn activate_firewall(
         "The firewall configuration is invalid.",
     )?;
     let delete_tables = format!(
-        "nft delete table inet {COOLIFY_NFT_TABLE} >/dev/null 2>&1 || true; nft delete table bridge {COOLIFY_NFT_BRIDGE_TABLE} >/dev/null 2>&1 || true"
+        "nft delete table inet {COOLIFY_NFT_TABLE} >/dev/null 2>&1 || true; nft delete table bridge {COOLIFY_NFT_BRIDGE_TABLE} >/dev/null 2>&1 || true; nft delete table ip {COOLIFY_NFT_NAT_TABLE} >/dev/null 2>&1 || true"
     );
     let rollback = if inet_table_exists || bridge_table_exists {
         format!("{delete_tables}; nft --file '{}'", last_good.display())
     } else {
         delete_tables
     };
-    run(
-        Command::new("systemd-run").args([
-            "--unit",
-            "coolify-firewall-rollback",
-            "--on-active=60s",
-            "/bin/sh",
-            "-c",
-            &rollback,
-        ]),
+    arm_rollback(
+        "coolify-firewall-rollback",
+        &rollback,
         "The firewall rollback could not be armed.",
     )?;
     let activated = run(
@@ -1028,8 +1314,7 @@ fn activate_firewall(
                 "Flux connectivity validation failed.",
             )
         }
-    })
-    .and_then(|_| configure_mesh_nat(&request.wireguard_interface, &request.workload_cidrs));
+    });
     if let Err(error) = activated {
         let rollback = run(
             Command::new("systemctl").args(rollback_start_arguments(
@@ -1049,7 +1334,9 @@ fn activate_firewall(
         Command::new("systemctl").args(["stop", "coolify-firewall-rollback.timer"]),
         "The firewall rollback could not be cancelled.",
     )?;
-    atomic_write(&last_good, snapshot.as_bytes(), 0o600)
+    atomic_write(&last_good, snapshot.as_bytes(), 0o600)?;
+    remove_legacy_mesh_nat(&request.wireguard_interface, &request.workload_cidrs);
+    Ok(())
 }
 
 /// Writes the persistent forwarding settings and loads them. `br_netfilter` is
@@ -1074,30 +1361,23 @@ fn load_bridge_sysctls(root: &Path) -> Result<(), String> {
     )
 }
 
-fn configure_mesh_nat(interface: &str, workload_cidrs: &[String]) -> Result<(), String> {
+/// Removes the iptables exemption of older Sentinel versions. It had no effect
+/// on Netavark's nftables rules.
+fn remove_legacy_mesh_nat(interface: &str, workload_cidrs: &[String]) {
     for cidr in workload_cidrs {
-        let rule = mesh_nat_rule_arguments(interface, cidr);
-        let exists = Command::new("iptables")
-            .args(["-t", "nat", "-C", "POSTROUTING"])
-            .args(rule)
-            .status()
-            .map_err(|_| "iptables is unavailable.")?
-            .success();
-        if !exists {
-            run(
-                Command::new("iptables")
-                    .args(["-t", "nat", "-I", "POSTROUTING", "1"])
-                    .args(rule),
-                "The workload mesh NAT exemption could not be activated.",
-            )?;
-        }
+        run_best_effort(Command::new("iptables").args([
+            "-t",
+            "nat",
+            "-D",
+            "POSTROUTING",
+            "-s",
+            cidr,
+            "-o",
+            interface,
+            "-j",
+            "RETURN",
+        ]));
     }
-
-    Ok(())
-}
-
-fn mesh_nat_rule_arguments<'a>(interface: &'a str, cidr: &'a str) -> [&'a str; 6] {
-    ["-s", cidr, "-o", interface, "-j", "RETURN"]
 }
 
 pub(crate) fn inspect_firewall(
@@ -1112,13 +1392,41 @@ pub(crate) fn inspect_firewall(
         configuration_hash: state
             .as_ref()
             .map_or_else(String::new, |state| state.1.clone()),
-        drifted: !tables_active
+        // The reverse zones follow the workload subnets, so the firewall
+        // reconcile repairs them.
+        drifted: !firewall_current(root)
+            || !stale_discovery_resolvers(root).is_empty()
             || state
                 .as_ref()
                 .is_none_or(|state| state.0 != expected_revision || state.1 != expected_hash),
         table: COOLIFY_NFT_TABLE.into(),
         ingress_enforced: tables_active,
     }
+}
+
+/// The tables are loaded and have the mesh NAT chain, and the NAT table of
+/// the published ports is loaded exactly when the applied snapshot has one. A
+/// table that an older Sentinel loaded has no mesh NAT chain; it counts as
+/// drifted, so that Coolify applies the firewall again.
+fn firewall_current(root: &Path) -> bool {
+    let succeeds = |arguments: &[&str]| {
+        Command::new("nft")
+            .args(arguments)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    firewall_tables_active(root)
+        && (root != Path::new("/")
+            || (succeeds(&["list", "chain", "inet", COOLIFY_NFT_TABLE, MESH_NAT_CHAIN])
+                && succeeds(&["list", "table", "ip", COOLIFY_NFT_NAT_TABLE])
+                    == snapshot_publishes_ports(root)))
+}
+
+fn snapshot_publishes_ports(root: &Path) -> bool {
+    fs::read_to_string(state_path(root, "firewall.nft"))
+        .is_ok_and(|snapshot| snapshot.contains(&format!("table ip {COOLIFY_NFT_NAT_TABLE} {{")))
 }
 
 fn firewall_tables_active(root: &Path) -> bool {
@@ -1330,6 +1638,21 @@ pub(crate) fn reconcile_corrosion(
     request: &CorrosionReconcileRequest,
 ) -> Result<CorrosionReconcileResult, String> {
     let changes = write_corrosion_files(root, request)?;
+    let result = apply_corrosion(root, request, changes);
+    if result.is_err() && root == Path::new("/") {
+        // The files are already written, so a retry would see no change and
+        // skip the restart and the cluster ID. Dropping the cluster ID marker
+        // makes the next attempt apply both again.
+        let _ = fs::remove_file(root.join("etc/corrosion/coolify-cluster-id"));
+    }
+    result
+}
+
+fn apply_corrosion(
+    root: &Path,
+    request: &CorrosionReconcileRequest,
+    changes: CorrosionChanges,
+) -> Result<CorrosionReconcileResult, String> {
     let host = root == Path::new("/");
     let steps = if host {
         install_corrosion(request.version.as_str())?;
@@ -1569,10 +1892,59 @@ fn set_corrosion_cluster_id(cluster_id: u16) -> Result<(), String> {
     Err(last_error)
 }
 
+/// The reverse zones that the discovery DNS answers: the mesh addresses of this
+/// Node and its peers, and the workload subnets of the cluster. systemd-resolved
+/// routes exactly these zones to the discovery DNS, and the discovery DNS
+/// forwards every other reverse name, so a forward never comes back.
+fn discovery_reverse_zones(
+    address: &str,
+    peer_addresses: &[&str],
+    workload_cidrs: &[String],
+) -> Vec<String> {
+    let mut zones = peer_addresses
+        .iter()
+        .copied()
+        .chain(std::iter::once(address))
+        .chain(workload_cidrs.iter().map(String::as_str))
+        .flat_map(reverse_dns_zones)
+        .collect::<Vec<_>>();
+    zones.sort();
+    zones.dedup();
+    zones
+}
+
+/// The `in-addr.arpa` zones that cover a CIDR and nothing else. A prefix
+/// inside an octet gives one zone for each value of that octet, at most 128.
+fn reverse_dns_zones(cidr: &str) -> Vec<String> {
+    let (address, prefix) = cidr.split_once('/').unwrap_or((cidr, "32"));
+    let (Ok(address), Ok(prefix)) = (address.parse::<std::net::Ipv4Addr>(), prefix.parse::<u32>())
+    else {
+        return Vec::new();
+    };
+    if !(1..=32).contains(&prefix) {
+        return Vec::new();
+    }
+    let labels = prefix.div_ceil(8);
+    let zone_bits = labels * 8;
+    let network = u32::from(address) & (u32::MAX << (32 - prefix));
+    (0..1_u32 << (zone_bits - prefix))
+        .map(|index| {
+            let octets = std::net::Ipv4Addr::from(network | (index << (32 - zone_bits))).octets();
+            let name = octets[..labels as usize]
+                .iter()
+                .rev()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(".");
+            format!("{name}.in-addr.arpa")
+        })
+        .collect()
+}
+
 fn discovery_resolver_commands(
     interface: &str,
     address: &str,
-    peer_addresses: &[&str],
+    reverse_zones: &[String],
 ) -> Result<Vec<Vec<String>>, String> {
     validate_interface(interface)?;
     let bind_address = address.strip_suffix("/32").unwrap_or(address);
@@ -1583,63 +1955,101 @@ fn discovery_resolver_commands(
         .ok_or("The discovery DNS address is invalid.")?
         .to_string();
 
-    let mut reverse_zones = peer_addresses
-        .iter()
-        .copied()
-        .chain(std::iter::once(bind_address.as_str()))
-        .filter_map(reverse_dns_zone)
-        .collect::<Vec<_>>();
-    reverse_zones.sort();
-    reverse_zones.dedup();
-
     Ok(vec![
         vec!["dns".into(), interface.into(), bind_address],
-        std::iter::once("domain".into())
-            .chain(std::iter::once(interface.into()))
-            .chain(std::iter::once("~coolify.internal".into()))
-            .chain(reverse_zones)
+        ["domain", interface, "~coolify.internal"]
+            .into_iter()
+            .map(String::from)
+            .chain(reverse_zones.iter().map(|zone| format!("~{zone}")))
             .collect(),
     ])
 }
 
-fn reverse_dns_zone(cidr: &str) -> Option<String> {
-    let (address, prefix) = cidr.split_once('/').unwrap_or((cidr, "32"));
-    let address = address.parse::<std::net::Ipv4Addr>().ok()?;
-    let prefix = prefix.parse::<u8>().ok()?;
-    let octets = address.octets();
-    match prefix {
-        8 => Some(format!("~{}.in-addr.arpa", octets[0])),
-        16 => Some(format!("~{}.{}.in-addr.arpa", octets[1], octets[0])),
-        24 => Some(format!(
-            "~{}.{}.{}.in-addr.arpa",
-            octets[2], octets[1], octets[0]
-        )),
-        32 => Some(format!(
-            "~{}.{}.{}.{}.in-addr.arpa",
-            octets[3], octets[2], octets[1], octets[0]
-        )),
-        _ => None,
-    }
+/// The reverse zones for the applied network: the workload subnets come from
+/// the firewall snapshot, because the WireGuard configuration has only the
+/// subnets of the peers.
+fn applied_reverse_zones(root: &Path, address: &str, peer_addresses: &[&str]) -> Vec<String> {
+    let workload_cidrs = fs::read_to_string(state_path(root, "firewall.last-good.nft"))
+        .ok()
+        .and_then(|snapshot| parse_firewall_snapshot(&snapshot))
+        .map(|firewall| firewall.workload_cidrs)
+        .unwrap_or_default();
+    discovery_reverse_zones(address, peer_addresses, &workload_cidrs)
 }
 
+fn reverse_zones_file(zones: &[String]) -> String {
+    zones.iter().map(|zone| format!("{zone}\n")).collect()
+}
+
+/// Points systemd-resolved at the discovery DNS for the internal zone and the
+/// cluster reverse zones, and gives the discovery DNS the same reverse zones.
+/// While the routing changes, the discovery DNS keeps the zones of both the
+/// old and the new routing, so it never forwards a name that is routed to it.
 fn configure_discovery_resolver(
+    root: &Path,
     interface: &str,
     address: &str,
     peer_addresses: &[&str],
 ) -> Result<(), String> {
-    for arguments in discovery_resolver_commands(interface, address, peer_addresses)? {
+    let zones = applied_reverse_zones(root, address, peer_addresses);
+    let commands = discovery_resolver_commands(interface, address, &zones)?;
+    let zones_path = root.join(DISCOVERY_REVERSE_ZONES_FILE);
+    if let Ok(routed) = fs::read_to_string(&zones_path) {
+        let mut both = routed.lines().map(str::to_string).collect::<Vec<_>>();
+        both.extend(zones.iter().cloned());
+        both.sort();
+        both.dedup();
+        write_if_changed(&zones_path, reverse_zones_file(&both).as_bytes(), 0o644)?;
+    }
+    for arguments in commands {
         run(
             Command::new("resolvectl").args(arguments),
             "The Coolify discovery resolver could not be configured.",
         )?;
     }
+    write_if_changed(&zones_path, reverse_zones_file(&zones).as_bytes(), 0o644)?;
 
+    Ok(())
+}
+
+/// The applied WireGuard links whose reverse zones are not the zones that the
+/// discovery DNS has: the workload subnets changed, or an older Sentinel
+/// configured the resolver.
+fn stale_discovery_resolvers(root: &Path) -> Vec<AppliedWireguard> {
+    if root != Path::new("/") {
+        return Vec::new();
+    }
+    let current = fs::read_to_string(root.join(DISCOVERY_REVERSE_ZONES_FILE)).ok();
+    read_applied_network(root)
+        .wireguard
+        .into_iter()
+        .filter(|wireguard| {
+            let peers = wireguard
+                .peer_addresses
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let zones = applied_reverse_zones(root, &wireguard.address, &peers);
+            current.as_deref() != Some(reverse_zones_file(&zones).as_str())
+        })
+        .collect()
+}
+
+fn refresh_discovery_resolver(root: &Path) -> Result<(), String> {
+    for wireguard in stale_discovery_resolvers(root) {
+        let peers = wireguard
+            .peer_addresses
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        configure_discovery_resolver(root, &wireguard.interface, &wireguard.address, &peers)?;
+    }
     Ok(())
 }
 
 /// The Corrosion schema that Sentinel installs on every cluster Node.
 pub fn corrosion_schema() -> &'static str {
-    "CREATE TABLE IF NOT EXISTS workload_endpoints (workload_id TEXT NOT NULL, namespace TEXT NOT NULL, owner_node_ip TEXT NOT NULL, container_ip TEXT NOT NULL, state TEXT NOT NULL DEFAULT '', health TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (namespace, workload_id, owner_node_ip, container_ip));\nCREATE TABLE IF NOT EXISTS ingress_routes (host TEXT NOT NULL PRIMARY KEY, workload_id TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);\nCREATE TABLE IF NOT EXISTS workload_names (namespace TEXT NOT NULL, name TEXT NOT NULL, workload_id TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (namespace, name));\n"
+    "CREATE TABLE IF NOT EXISTS workload_endpoints (workload_id TEXT NOT NULL, namespace TEXT NOT NULL, owner_node_ip TEXT NOT NULL, container_ip TEXT NOT NULL, state TEXT NOT NULL DEFAULT '', health TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (namespace, workload_id, owner_node_ip, container_ip));\nCREATE TABLE IF NOT EXISTS ingress_routes (host TEXT NOT NULL PRIMARY KEY, workload_id TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);\nCREATE TABLE IF NOT EXISTS ingress_http_routes (host TEXT NOT NULL, path TEXT NOT NULL DEFAULT '', workload_id TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, redirect_host TEXT NOT NULL DEFAULT '', http_only INTEGER NOT NULL DEFAULT 0, allow_http INTEGER NOT NULL DEFAULT 0, temporary_redirect INTEGER NOT NULL DEFAULT 0, noindex INTEGER NOT NULL DEFAULT 0, strip_path INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (host, path));\nCREATE TABLE IF NOT EXISTS workload_names (namespace TEXT NOT NULL, name TEXT NOT NULL, workload_id TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (namespace, name));\nCREATE TABLE IF NOT EXISTS tls_certificates (host TEXT NOT NULL PRIMARY KEY, certificate_pem TEXT NOT NULL DEFAULT '', key_sealed TEXT NOT NULL DEFAULT '', not_after INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', next_attempt_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);\nCREATE TABLE IF NOT EXISTS acme_challenges (token TEXT NOT NULL PRIMARY KEY, host TEXT NOT NULL DEFAULT '', key_authorization TEXT NOT NULL DEFAULT '', expires_at INTEGER NOT NULL DEFAULT 0);\nCREATE TABLE IF NOT EXISTS acme_accounts (directory_url TEXT NOT NULL PRIMARY KEY, credentials_sealed TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL DEFAULT 0);\n"
 }
 
 /// Brings the installed Corrosion schema file up to date. A changed file is
@@ -1671,7 +2081,7 @@ pub(crate) fn ensure_corrosion_schema(root: &Path) -> Result<bool, String> {
     }
     let owner = fs::read_to_string(root.join(CORROSION_OWNER_FILE))
         .map_err(|_| "The Corrosion owner address could not be read.".to_string())?;
-    let probe = serde_json::to_vec("SELECT COUNT(*) FROM ingress_routes").unwrap_or_default();
+    let probe = serde_json::to_vec("SELECT COUNT(*) FROM ingress_http_routes").unwrap_or_default();
     let mut last_error = String::new();
     for _ in 0..30 {
         match crate::discovery::corrosion_api(owner.trim(), "queries", &probe)
@@ -1711,6 +2121,14 @@ fn corrosion_download(version: &str, architecture: &str) -> Result<String, Strin
     ))
 }
 
+fn corrosion_checksum(architecture: &str) -> Result<&'static str, String> {
+    match architecture.trim() {
+        "x86_64" => Ok(CORROSION_SHA512_X86_64),
+        "aarch64" => Ok(CORROSION_SHA512_AARCH64),
+        _ => Err("The host architecture is not supported by Corrosion.".into()),
+    }
+}
+
 fn install_corrosion(version: &str) -> Result<(), String> {
     if fs::read_to_string("/usr/local/bin/corrosion.version")
         .ok()
@@ -1723,27 +2141,45 @@ fn install_corrosion(version: &str) -> Result<(), String> {
         .arg("-m")
         .output()
         .map_err(|_| "The host architecture could not be detected.")?;
-    let url = corrosion_download(version, &String::from_utf8_lossy(&architecture.stdout))?;
+    let architecture = String::from_utf8_lossy(&architecture.stdout);
+    let url = corrosion_download(version, &architecture)?;
+    let checksum = corrosion_checksum(&architecture)?;
     let directory = PathBuf::from(format!(
         "/var/lib/coolify/downloads/corrosion-{}",
         std::process::id()
     ));
+    let _ = fs::remove_dir_all(&directory);
     fs::create_dir_all(&directory)
         .map_err(|_| "The Corrosion download directory could not be created.")?;
+    let installed = download_corrosion(&directory, &url, checksum, version);
+    let _ = fs::remove_dir_all(&directory);
+    installed?;
+    ensure_corrosion_user()
+}
+
+fn download_corrosion(
+    directory: &Path,
+    url: &str,
+    checksum: &str,
+    version: &str,
+) -> Result<(), String> {
     let archive = directory.join("corrosion.tar.gz");
     run(
         Command::new("curl")
             .args(["-fsSL", "--retry", "3", "--max-time", "120", "-o"])
             .arg(&archive)
-            .arg(&url),
+            .arg(url),
         "Corrosion could not be downloaded.",
     )?;
+    if crate::ingress::sha512_file(&archive)? != checksum {
+        return Err("The Corrosion download checksum does not match.".into());
+    }
     run(
         Command::new("tar")
             .arg("-xzf")
             .arg(&archive)
             .arg("-C")
-            .arg(&directory),
+            .arg(directory),
         "Corrosion could not be extracted.",
     )?;
     run(
@@ -1757,7 +2193,10 @@ fn install_corrosion(version: &str) -> Result<(), String> {
         Path::new("/usr/local/bin/corrosion.version"),
         format!("{version}\n").as_bytes(),
         0o644,
-    )?;
+    )
+}
+
+fn ensure_corrosion_user() -> Result<(), String> {
     if !Command::new("id")
         .args(["-u", "corrosion"])
         .status()
@@ -1775,7 +2214,6 @@ fn install_corrosion(version: &str) -> Result<(), String> {
             "The Corrosion service user could not be created.",
         )?;
     }
-    let _ = fs::remove_dir_all(directory);
     Ok(())
 }
 
@@ -1799,8 +2237,68 @@ fn ensure_discovery_dns_user() -> Result<(), String> {
     )
 }
 
+/// Upper bound for one host command run through [`run`]. It only stops a hung
+/// tool from blocking the command executor forever; the slowest legitimate
+/// command is a retried download with its own `--max-time`.
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Like [`Command::output`], but kills the process when it runs longer than
+/// `timeout` and returns a `TimedOut` error.
+pub(crate) fn output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Output> {
+    fn drain(stream: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut output);
+            }
+            output
+        })
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the command timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// Runs a best-effort cleanup command whose result does not matter.
+fn run_best_effort(command: &mut Command) {
+    let _ = output_with_timeout(command, COMMAND_TIMEOUT);
+}
+
 pub(crate) fn run(command: &mut Command, fallback: &str) -> Result<(), String> {
-    let output = command.output().map_err(|_| fallback.to_string())?;
+    let output = output_with_timeout(command, COMMAND_TIMEOUT).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            format!("{fallback} The command timed out.")
+        } else {
+            fallback.to_string()
+        }
+    })?;
     if output.status.success() {
         return Ok(());
     }
@@ -1890,21 +2388,14 @@ pub(crate) enum RestoreStep {
     RefreshCorrosionUnits,
     RestartCorrosion,
     StartDiscoveryDns,
-    MeshNat {
-        interface: String,
-        workload_cidrs: Vec<String>,
-    },
     RefreshIngressUnit,
     StartIngress,
 }
 
-/// Network restore steps, split around the workload restart: the mesh NAT
-/// exemption goes last so it is inserted ahead of the rules Netavark adds when
-/// the workloads start.
+/// Network restore steps. All of them run before the workloads restart.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct RestorePlan {
     pub(crate) before_workloads: Vec<RestoreStep>,
-    pub(crate) after_workloads: Vec<RestoreStep>,
 }
 
 pub(crate) fn read_applied_network(root: &Path) -> AppliedNetwork {
@@ -2100,7 +2591,7 @@ pub(crate) fn observe_live_network(root: &Path, applied: &AppliedNetwork) -> Liv
 
 pub(crate) fn restore_plan(applied: &AppliedNetwork, live: &LiveNetwork) -> RestorePlan {
     let mut plan = RestorePlan::default();
-    if let Some(firewall) = &applied.firewall {
+    if applied.firewall.is_some() {
         plan.before_workloads.push(RestoreStep::BridgeSysctls);
         if !(live.inet_table_exists && live.bridge_table_exists) {
             plan.before_workloads.push(RestoreStep::LoadFirewall {
@@ -2108,10 +2599,6 @@ pub(crate) fn restore_plan(applied: &AppliedNetwork, live: &LiveNetwork) -> Rest
                 bridge_table_exists: live.bridge_table_exists,
             });
         }
-        plan.after_workloads.push(RestoreStep::MeshNat {
-            interface: firewall.wireguard_interface.clone(),
-            workload_cidrs: firewall.workload_cidrs.clone(),
-        });
     }
     let mut link_restored = false;
     for wireguard in &applied.wireguard {
@@ -2168,7 +2655,8 @@ pub(crate) fn apply_restore_step(root: &Path, step: &RestoreStep) -> Result<(), 
         RestoreStep::LoadFirewall {
             inet_table_exists,
             bridge_table_exists,
-        } => restore_firewall_tables(root, *inet_table_exists, *bridge_table_exists),
+        } => restore_firewall_tables(root, *inet_table_exists, *bridge_table_exists)
+            .inspect(|()| crate::volume_transfer::restore_firewall()),
         RestoreStep::WireguardUp { interface, address } => {
             restore_wireguard_link(interface, address)
         }
@@ -2181,7 +2669,7 @@ pub(crate) fn apply_restore_step(root: &Path, step: &RestoreStep) -> Result<(), 
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            configure_discovery_resolver(interface, address, &peers)
+            configure_discovery_resolver(root, interface, address, &peers)
         }
         RestoreStep::RefreshCorrosionUnits => refresh_corrosion_units(root),
         RestoreStep::RestartCorrosion => {
@@ -2202,10 +2690,6 @@ pub(crate) fn apply_restore_step(root: &Path, step: &RestoreStep) -> Result<(), 
                 "The Coolify discovery DNS service could not start.",
             )
         }
-        RestoreStep::MeshNat {
-            interface,
-            workload_cidrs,
-        } => configure_mesh_nat(interface, workload_cidrs),
         RestoreStep::RefreshIngressUnit => Ok(()),
         RestoreStep::StartIngress => {
             let _ = Command::new("systemctl")
@@ -2333,7 +2817,9 @@ fn read_state_file(path: &Path) -> Option<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_protocol::control::v1::{FirewallIngressRule, FirewallRule, WireguardPeer};
+    use sentinel_protocol::control::v1::{
+        FirewallIngressRule, FirewallPublishedPort, FirewallRule, FirewallStackRule, WireguardPeer,
+    };
 
     #[test]
     fn renders_deterministic_full_mesh_without_peer_secrets() {
@@ -2385,6 +2871,9 @@ mod tests {
             wireguard_interface: "coolify0".into(),
             workload_cidrs: vec!["100.64.0.0/24".into(), "100.64.1.0/24".into()],
             flux_probe_host: "10.240.0.1".into(),
+            registry_ip: String::new(),
+            stack_rules: vec![],
+            published_ports: vec![],
         })
         .unwrap();
         assert!(rendered.contains("table inet coolify_cluster"));
@@ -2580,12 +3069,12 @@ mod tests {
 
     #[test]
     fn discovery_resolver_configuration_tracks_a_recreated_wireguard_link() {
-        let commands = discovery_resolver_commands(
-            "mesh0",
+        let zones = discovery_reverse_zones(
             "10.0.0.130/32",
             &["10.0.0.129/32", "10.0.0.131/32", "100.64.1.0/24"],
-        )
-        .unwrap();
+            &[],
+        );
+        let commands = discovery_resolver_commands("mesh0", "10.0.0.130/32", &zones).unwrap();
 
         assert_eq!(
             commands,
@@ -2612,14 +3101,20 @@ mod tests {
         );
     }
 
-    /// A packet as the inet table sees it.
+    /// A packet as a table sees it.
+    #[derive(Default)]
     struct Packet<'a> {
         iifname: &'a str,
+        oifname: &'a str,
         saddr: &'a str,
         daddr: &'a str,
         protocol: &'a str,
         dport: u32,
         established: bool,
+        /// `ct status dnat`: an earlier prerouting or output chain translated it.
+        dnat: bool,
+        /// `fib daddr type local`: the destination is an address of this Node.
+        local_daddr: bool,
     }
 
     /// Evaluates one chain of the rendered `table inet` against a packet, for
@@ -2629,9 +3124,34 @@ mod tests {
         chain: &str,
         workload_cidrs: &[&str],
         packet: &Packet,
-    ) -> &'static str {
+    ) -> String {
         let inet = rendered.split("table bridge").next().unwrap();
-        let body = inet
+        evaluate_table_chain(inet, chain, workload_cidrs, packet)
+    }
+
+    /// Evaluates one chain of the rendered `table ip coolify_cluster_nat`.
+    /// Returns the verdict, such as `dnat to 100.64.0.5:22`, or `accept`
+    /// when nothing translates the packet.
+    fn evaluate_nat_chain(
+        rendered: &str,
+        chain: &str,
+        workload_cidrs: &[&str],
+        packet: &Packet,
+    ) -> String {
+        let nat = rendered
+            .split_once("table ip coolify_cluster_nat {")
+            .expect("the NAT table must be rendered")
+            .1;
+        evaluate_table_chain(nat, chain, workload_cidrs, packet)
+    }
+
+    fn evaluate_table_chain(
+        table: &str,
+        chain: &str,
+        workload_cidrs: &[&str],
+        packet: &Packet,
+    ) -> String {
+        let body = table
             .split_once(&format!("chain {chain} {{"))
             .unwrap()
             .1
@@ -2664,15 +3184,46 @@ mod tests {
                 let negated = tokens.get(index + 2) == Some(&"!=");
                 let value_at = if negated { index + 3 } else { index + 2 };
                 match tokens[index] {
+                    "ct" if tokens[index + 1] == "status" => {
+                        matched = packet.dnat;
+                        index += 3;
+                    }
                     "ct" => {
                         matched = packet.established;
                         index += 3;
                     }
-                    "iifname" => {
+                    "fib" => {
+                        assert_eq!(tokens[index + 1..index + 4], ["daddr", "type", "local"]);
+                        matched = packet.local_daddr;
+                        index += 4;
+                    }
+                    "iifname" | "oifname" => {
                         let negated = tokens[index + 1] == "!=";
                         let value = tokens[index + if negated { 2 } else { 1 }].trim_matches('"');
-                        matched = (value == packet.iifname) != negated;
+                        let interface = if tokens[index] == "iifname" {
+                            packet.iifname
+                        } else {
+                            packet.oifname
+                        };
+                        matched = (value == interface) != negated;
                         index += if negated { 3 } else { 2 };
+                    }
+                    "ip" if tokens[value_at] == "{" => {
+                        let address = if tokens[index + 1] == "saddr" {
+                            packet.saddr
+                        } else {
+                            packet.daddr
+                        };
+                        let end = value_at
+                            + tokens[value_at..]
+                                .iter()
+                                .position(|token| *token == "}")
+                                .unwrap();
+                        matched = tokens[value_at + 1..end]
+                            .iter()
+                            .any(|value| in_set(value.trim_end_matches(','), address))
+                            != negated;
+                        index = end + 1;
                     }
                     "ip" if tokens[index + 1] == "protocol" => {
                         matched = packet.protocol == tokens[index + 2];
@@ -2693,13 +3244,14 @@ mod tests {
                             && tokens[index + 2].parse::<u32>().unwrap() == packet.dport;
                         index += 3;
                     }
-                    "accept" => {
-                        verdict = Some("accept");
+                    "accept" | "drop" | "masquerade" => {
+                        verdict = Some(tokens[index].to_string());
                         index += 1;
                     }
-                    "drop" => {
-                        verdict = Some("drop");
-                        index += 1;
+                    "dnat" => {
+                        assert_eq!(tokens[index + 1], "to");
+                        verdict = Some(format!("dnat to {}", tokens[index + 2]));
+                        index += 3;
                     }
                     other => panic!("unsupported nft token {other} in {statement}"),
                 }
@@ -2708,7 +3260,99 @@ mod tests {
                 return verdict;
             }
         }
-        "accept"
+        "accept".into()
+    }
+
+    #[test]
+    fn stack_rules_allow_every_port_between_two_workloads_before_the_drops() {
+        let workload_cidrs = ["100.64.0.0/24", "100.64.1.0/24"];
+        let stack_rule = |source: &str, destination: &str| FirewallStackRule {
+            source_ip: source.into(),
+            destination_ip: destination.into(),
+        };
+        let request = |stack_rules| FirewallReconcileRequest {
+            stack_rules,
+            ..firewall_request()
+        };
+        let rendered = render_firewall(&request(vec![
+            stack_rule("100.64.1.3", "100.64.0.2"),
+            stack_rule("100.64.0.2", "100.64.1.3"),
+        ]))
+        .unwrap();
+        let packet = |saddr, daddr, protocol, dport| Packet {
+            iifname: "podman1",
+            saddr,
+            daddr,
+            protocol,
+            dport,
+            established: false,
+            ..Default::default()
+        };
+
+        for (protocol, port) in [("tcp", 5432), ("udp", 9999), ("icmp", 0)] {
+            assert_eq!(
+                evaluate_chain(
+                    &rendered,
+                    "forward",
+                    &workload_cidrs,
+                    &packet("100.64.0.2", "100.64.1.3", protocol, port)
+                ),
+                "accept"
+            );
+        }
+        // Only the listed pairs: another workload stays dropped.
+        assert_eq!(
+            evaluate_chain(
+                &rendered,
+                "forward",
+                &workload_cidrs,
+                &packet("100.64.0.9", "100.64.1.3", "tcp", 5432)
+            ),
+            "drop"
+        );
+        // Same-Node traffic passes the bridge chain, before its drop.
+        let bridge = rendered.split("table bridge").nth(1).unwrap();
+        let allow = bridge
+            .find("ip saddr 100.64.0.2 ip daddr 100.64.1.3 accept;")
+            .unwrap();
+        assert!(
+            allow
+                < bridge
+                    .find("ip saddr @workload_networks ip daddr @workload_networks drop")
+                    .unwrap()
+        );
+        assert!(bridge.contains("ip saddr 100.64.1.3 ip daddr 100.64.0.2 accept;"));
+        // Workloads never send from the host.
+        let output = rendered.split("chain output").nth(1).unwrap();
+        assert!(
+            !output
+                .split("}\n")
+                .next()
+                .unwrap()
+                .contains("100.64.1.3 ip daddr")
+        );
+        // Without stack rules the ruleset is unchanged.
+        assert_eq!(
+            render_firewall(&request(Vec::new())).unwrap(),
+            render_firewall(&firewall_request()).unwrap()
+        );
+
+        for invalid in [
+            vec![
+                stack_rule("100.64.0.2", "100.64.1.3"),
+                stack_rule("100.64.0.2", "100.64.1.3"),
+            ],
+            vec![stack_rule("10.240.0.2", "100.64.1.3")],
+            vec![stack_rule("100.64.0.2", "192.0.2.1")],
+            vec![stack_rule("100.64.0.2", "100.64.1.3 accept")],
+            vec![stack_rule("", "100.64.1.3")],
+        ] {
+            assert!(render_firewall(&request(invalid)).is_err());
+        }
+        let many = (0..=100_000u32)
+            .map(|index| stack_rule("100.64.0.2", &format!("100.64.1.{}", index % 256)))
+            .collect();
+        assert!(render_firewall(&request(many)).is_err());
     }
 
     #[test]
@@ -2742,6 +3386,7 @@ mod tests {
             protocol: "tcp",
             dport,
             established: false,
+            ..Default::default()
         };
 
         // (a) Caddy on Node A reaches its own workload: host output through the
@@ -2759,6 +3404,7 @@ mod tests {
             protocol: "tcp",
             dport: 40000,
             established: true,
+            ..Default::default()
         };
         assert_eq!(
             evaluate_chain(&node_a, "input", &workload_cidrs, &reply),
@@ -2783,6 +3429,7 @@ mod tests {
             protocol: "tcp",
             dport: 40000,
             established: true,
+            ..Default::default()
         };
         assert_eq!(
             evaluate_chain(&node_a, "forward", &workload_cidrs, &remote_reply),
@@ -2883,6 +3530,9 @@ mod tests {
             flux_probe_host: String::new(),
             workload_cidrs: vec!["100.64.0.0/24".into()],
             ingress_rules: vec![],
+            registry_ip: String::new(),
+            stack_rules: vec![],
+            published_ports: vec![],
         };
         let first = reconcile_firewall(temp.path(), &request).unwrap();
         let second = reconcile_firewall(temp.path(), &request).unwrap();
@@ -2906,10 +3556,379 @@ mod tests {
 
     #[test]
     fn workload_mesh_nat_bypasses_netavark_masquerading() {
+        assert!(render_firewall(&firewall_request()).unwrap().contains(
+            "chain mesh_nat { type nat hook postrouting priority srcnat - 5; policy accept; oifname \"coolify0\" ip saddr @workload_networks ip daddr @workload_networks snat ip to ip saddr; }"
+        ));
+    }
+
+    fn published_port(
+        protocol: &str,
+        host_port: u32,
+        destination_ip: &str,
+        container_port: u32,
+        source_cidrs: &[&str],
+    ) -> FirewallPublishedPort {
+        FirewallPublishedPort {
+            protocol: protocol.into(),
+            host_port,
+            destination_ip: destination_ip.into(),
+            container_port,
+            source_cidrs: source_cidrs.iter().map(|cidr| cidr.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn published_ports_reach_a_workload_on_this_and_on_another_node() {
+        let workload_cidrs = ["100.64.0.0/24", "100.64.1.0/24"];
+        // Coolify sends the same published ports to every Node. Node A
+        // (10.240.0.2) runs 100.64.0.0/24, Node B (10.240.0.3) 100.64.1.0/24.
+        let request = |local_node_ip: &str| FirewallReconcileRequest {
+            local_node_ip: local_node_ip.into(),
+            workload_cidrs: workload_cidrs.iter().map(|cidr| cidr.to_string()).collect(),
+            published_ports: vec![
+                published_port("udp", 5353, "100.64.1.7", 53, &[]),
+                published_port(
+                    "tcp",
+                    22222,
+                    "100.64.0.5",
+                    22,
+                    &["203.0.113.77/24", "198.51.100.7/32", "203.0.113.0/24"],
+                ),
+            ],
+            ..firewall_request()
+        };
+        let node_a = render_firewall(&request("10.240.0.2")).unwrap();
+        let node_b = render_firewall(&request("10.240.0.3")).unwrap();
+
         assert_eq!(
-            mesh_nat_rule_arguments("coolify0", "100.64.0.0/24"),
-            ["-s", "100.64.0.0/24", "-o", "coolify0", "-j", "RETURN",]
+            node_a.split_once("table ip coolify_cluster_nat").unwrap().1,
+            " {
+ set workload_networks { type ipv4_addr; flags interval; elements = { 100.64.0.0/24, 100.64.1.0/24 } }
+ chain prerouting { type nat hook prerouting priority dstnat; policy accept; fib daddr type local tcp dport 22222 ip saddr { 198.51.100.7/32, 203.0.113.0/24 } dnat to 100.64.0.5:22; fib daddr type local udp dport 5353 dnat to 100.64.1.7:53; }
+ chain output { type nat hook output priority dstnat; policy accept; ip daddr != 127.0.0.0/8 fib daddr type local tcp dport 22222 dnat to 100.64.0.5:22; ip daddr != 127.0.0.0/8 fib daddr type local udp dport 5353 dnat to 100.64.1.7:53; }
+ chain postrouting { type nat hook postrouting priority srcnat - 10; policy accept; ct status dnat oifname \"coolify0\" masquerade; ct status dnat ip saddr @workload_networks masquerade; }
+}
+"
         );
+        assert!(node_a.contains(
+            "ct status dnat ip daddr 100.64.0.5 tcp dport 22 accept; iifname \"coolify0\" ip saddr 10.240.0.0/24 ip daddr 100.64.0.5 tcp dport 22 accept; ct status dnat ip daddr 100.64.1.7 udp dport 53 accept; iifname \"coolify0\" ip saddr 10.240.0.0/24 ip daddr 100.64.1.7 udp dport 53 accept; ip saddr @workload_networks ip daddr @workload_networks drop;"
+        ));
+        assert!(node_a.contains(
+            "ct status dnat ip daddr 100.64.0.5 tcp dport 22 accept; ct status dnat ip daddr 100.64.1.7 udp dport 53 accept; ip daddr 10.240.0.0/24 drop;"
+        ));
+
+        let to_node_a = |saddr, protocol, dport| Packet {
+            iifname: "eth0",
+            saddr,
+            daddr: "192.0.2.10",
+            protocol,
+            dport,
+            local_daddr: true,
+            ..Default::default()
+        };
+
+        // A local workload: Node A translates and forwards it to the bridge
+        // without masquerading, so the workload sees the client address.
+        assert_eq!(
+            evaluate_nat_chain(
+                &node_a,
+                "prerouting",
+                &workload_cidrs,
+                &to_node_a("203.0.113.9", "tcp", 22222)
+            ),
+            "dnat to 100.64.0.5:22"
+        );
+        let translated = Packet {
+            iifname: "eth0",
+            oifname: "podman1",
+            saddr: "203.0.113.9",
+            daddr: "100.64.0.5",
+            protocol: "tcp",
+            dport: 22,
+            dnat: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_chain(&node_a, "forward", &workload_cidrs, &translated),
+            "accept"
+        );
+        assert_eq!(
+            evaluate_nat_chain(&node_a, "postrouting", &workload_cidrs, &translated),
+            "accept"
+        );
+        // The allow-list holds: another source is not translated, and the
+        // workload port itself stays closed.
+        assert_eq!(
+            evaluate_nat_chain(
+                &node_a,
+                "prerouting",
+                &workload_cidrs,
+                &to_node_a("192.0.2.99", "tcp", 22222)
+            ),
+            "accept"
+        );
+        assert_eq!(
+            evaluate_nat_chain(
+                &node_a,
+                "prerouting",
+                &workload_cidrs,
+                &to_node_a("203.0.113.9", "udp", 22222)
+            ),
+            "accept"
+        );
+        let direct = Packet {
+            dnat: false,
+            ..translated
+        };
+        assert_eq!(
+            evaluate_chain(&node_a, "forward", &workload_cidrs, &direct),
+            "drop"
+        );
+
+        // A workload on Node B: Node A translates it and masquerades it over
+        // WireGuard; Node B accepts it from Node A's mesh address.
+        assert_eq!(
+            evaluate_nat_chain(
+                &node_a,
+                "prerouting",
+                &workload_cidrs,
+                &to_node_a("192.0.2.99", "udp", 5353)
+            ),
+            "dnat to 100.64.1.7:53"
+        );
+        let remote = Packet {
+            iifname: "eth0",
+            oifname: "coolify0",
+            saddr: "192.0.2.99",
+            daddr: "100.64.1.7",
+            protocol: "udp",
+            dport: 53,
+            dnat: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_chain(&node_a, "forward", &workload_cidrs, &remote),
+            "accept"
+        );
+        assert_eq!(
+            evaluate_nat_chain(&node_a, "postrouting", &workload_cidrs, &remote),
+            "masquerade"
+        );
+        let on_node_b = Packet {
+            iifname: "coolify0",
+            oifname: "podman1",
+            saddr: "10.240.0.2",
+            daddr: "100.64.1.7",
+            protocol: "udp",
+            dport: 53,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_chain(&node_b, "forward", &workload_cidrs, &on_node_b),
+            "accept"
+        );
+        // Only the published destination port: a Node cannot reach another port.
+        assert_eq!(
+            evaluate_chain(
+                &node_b,
+                "forward",
+                &workload_cidrs,
+                &Packet {
+                    dport: 54,
+                    ..on_node_b
+                }
+            ),
+            "drop"
+        );
+
+        // From Node A itself: translated in output, but not from loopback.
+        let from_node = |daddr| Packet {
+            saddr: "192.0.2.10",
+            daddr,
+            protocol: "tcp",
+            dport: 22222,
+            local_daddr: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_nat_chain(&node_a, "output", &workload_cidrs, &from_node("192.0.2.10")),
+            "dnat to 100.64.0.5:22"
+        );
+        assert_eq!(
+            evaluate_nat_chain(&node_a, "output", &workload_cidrs, &from_node("127.0.0.1")),
+            "accept"
+        );
+        let local_output = |dnat| Packet {
+            saddr: "192.0.2.10",
+            daddr: "100.64.0.5",
+            protocol: "tcp",
+            dport: 22,
+            dnat,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_chain(&node_a, "output", &workload_cidrs, &local_output(true)),
+            "accept"
+        );
+        assert_eq!(
+            evaluate_chain(&node_a, "output", &workload_cidrs, &local_output(false)),
+            "drop"
+        );
+
+        // From a workload to a Node address: masqueraded, so the reply of a
+        // workload on the same bridge returns through the translation.
+        let from_workload = Packet {
+            iifname: "podman1",
+            oifname: "podman1",
+            saddr: "100.64.0.9",
+            daddr: "100.64.1.7",
+            protocol: "udp",
+            dport: 53,
+            dnat: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_chain(&node_a, "forward", &workload_cidrs, &from_workload),
+            "accept"
+        );
+        assert_eq!(
+            evaluate_nat_chain(&node_a, "postrouting", &workload_cidrs, &from_workload),
+            "masquerade"
+        );
+    }
+
+    #[test]
+    fn without_published_ports_the_transaction_removes_the_nat_table() {
+        let without = render_firewall(&firewall_request()).unwrap();
+        assert!(!without.contains("coolify_cluster_nat"));
+        assert!(!without.contains("ct status dnat"));
+        let transaction = nft_transaction(&without, true, true);
+        assert_eq!(
+            transaction,
+            format!(
+                "delete table inet coolify_cluster\ndelete table bridge coolify_cluster_bridge\ntable ip coolify_cluster_nat\ndelete table ip coolify_cluster_nat\n{without}"
+            )
+        );
+        // With published ports the old table goes before the new one loads.
+        let with = render_firewall(&FirewallReconcileRequest {
+            published_ports: vec![published_port("tcp", 5432, "100.64.0.5", 5432, &[])],
+            ..firewall_request()
+        })
+        .unwrap();
+        let transaction = nft_transaction(&with, false, false);
+        assert!(
+            transaction
+                .find("delete table ip coolify_cluster_nat")
+                .unwrap()
+                < transaction.find("table ip coolify_cluster_nat {").unwrap()
+        );
+    }
+
+    #[test]
+    fn published_ports_change_the_applied_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let without = reconcile_firewall(temp.path(), &firewall_request()).unwrap();
+        assert!(!snapshot_publishes_ports(temp.path()));
+        let request = FirewallReconcileRequest {
+            published_ports: vec![published_port("tcp", 5432, "100.64.0.5", 5432, &[])],
+            ..firewall_request()
+        };
+        let with = reconcile_firewall(temp.path(), &request).unwrap();
+        assert!(with.changed);
+        assert!(snapshot_publishes_ports(temp.path()));
+        let old_hash = without.state.unwrap().configuration_hash;
+        assert_ne!(with.state.unwrap().configuration_hash, old_hash);
+        assert!(inspect_firewall(temp.path(), request.revision, &old_hash).drifted);
+    }
+
+    #[test]
+    fn published_ports_reject_invalid_and_reserved_ports() {
+        let request = |published_ports| FirewallReconcileRequest {
+            published_ports,
+            ..firewall_request()
+        };
+        let valid = |port| render_firewall(&request(vec![port])).is_ok();
+        let tcp = |host_port| published_port("tcp", host_port, "100.64.0.5", 22, &[]);
+
+        for invalid in [
+            published_port("sctp", 5432, "100.64.0.5", 5432, &[]),
+            published_port("TCP", 5432, "100.64.0.5", 5432, &[]),
+            published_port("", 5432, "100.64.0.5", 5432, &[]),
+            tcp(0),
+            tcp(65_536),
+            published_port("tcp", 5432, "100.64.0.5", 0, &[]),
+            published_port("tcp", 5432, "100.64.0.5", 65_536, &[]),
+            published_port("tcp", 5432, "192.0.2.1", 5432, &[]),
+            published_port("tcp", 5432, "10.240.0.2", 5432, &[]),
+            published_port("tcp", 5432, "100.64.0.5 accept", 5432, &[]),
+            published_port("tcp", 5432, "", 5432, &[]),
+            published_port("tcp", 5432, "100.64.0.5", 5432, &["203.0.113.0/33"]),
+            published_port("tcp", 5432, "100.64.0.5", 5432, &["203.0.113.9"]),
+            published_port("tcp", 5432, "100.64.0.5", 5432, &["2001:db8::/32"]),
+            published_port("tcp", 5432, "100.64.0.5", 5432, &["0.0.0.0/0 } accept"]),
+        ] {
+            assert!(!valid(invalid));
+        }
+        for reserved in [51_820, 53, 80, 443, 8787, 8080, 5443, 8888, 7800, 7899] {
+            assert_eq!(
+                render_firewall(&request(vec![tcp(reserved)])).unwrap_err(),
+                format!("The host port {reserved} is reserved for the Node.")
+            );
+            assert!(!valid(published_port(
+                "udp",
+                reserved,
+                "100.64.0.5",
+                22,
+                &[]
+            )));
+        }
+        // The WireGuard port of the request, not a default.
+        assert!(
+            render_firewall(&FirewallReconcileRequest {
+                wireguard_port: 51_999,
+                ..request(vec![tcp(51_999)])
+            })
+            .is_err()
+        );
+        for allowed in [1, 22, 7799, 7900, 51_821, 65_535] {
+            assert!(valid(tcp(allowed)));
+        }
+
+        // Unique by protocol and host port.
+        assert_eq!(
+            render_firewall(&request(vec![
+                tcp(5432),
+                published_port("tcp", 5432, "100.64.1.9", 5432, &[]),
+            ]))
+            .unwrap_err(),
+            "The firewall published ports must be unique."
+        );
+        assert!(
+            render_firewall(&request(vec![
+                tcp(5432),
+                published_port("udp", 5432, "100.64.0.5", 22, &[]),
+            ]))
+            .is_ok()
+        );
+
+        let sources = |count: u32| {
+            (0..count)
+                .map(|index| format!("203.0.{}.0/24", index))
+                .collect::<Vec<_>>()
+        };
+        let with_sources = |cidrs: Vec<String>| FirewallPublishedPort {
+            source_cidrs: cidrs,
+            ..tcp(5432)
+        };
+        assert!(valid(with_sources(sources(64))));
+        assert!(!valid(with_sources(sources(65))));
+        let ports = |count: u32| {
+            (1..=count)
+                .map(|index| tcp(10_000 + index))
+                .collect::<Vec<_>>()
+        };
+        assert!(render_firewall(&request(ports(1000))).is_ok());
+        assert!(render_firewall(&request(ports(1001))).is_err());
     }
 
     #[test]
@@ -3298,6 +4317,9 @@ mod tests {
             flux_probe_host: String::new(),
             workload_cidrs: vec!["100.64.1.0/24".into(), "100.64.0.0/24".into()],
             ingress_rules: vec![],
+            registry_ip: String::new(),
+            stack_rules: vec![],
+            published_ports: vec![],
         }
     }
 
@@ -3432,15 +4454,8 @@ mod tests {
                 RestoreStep::StartDiscoveryDns,
             ]
         );
-        assert_eq!(
-            plan.after_workloads,
-            vec![RestoreStep::MeshNat {
-                interface: "coolify0".into(),
-                workload_cidrs: vec!["100.64.0.0/24".into(), "100.64.1.0/24".into()],
-            }]
-        );
         // A test root never runs host commands, so every step succeeds.
-        for step in plan.before_workloads.iter().chain(&plan.after_workloads) {
+        for step in &plan.before_workloads {
             apply_restore_step(temp.path(), step).unwrap();
         }
     }
@@ -3464,7 +4479,6 @@ mod tests {
                 RestoreStep::StartDiscoveryDns,
             ]
         );
-        assert_eq!(plan.after_workloads.len(), 1);
 
         // Only one firewall table missing still reloads, replacing the other.
         let plan = restore_plan(
@@ -3600,7 +4614,7 @@ mod tests {
 
     #[test]
     fn corrosion_schema_declares_the_ingress_route_table_and_is_rewritten_when_outdated() {
-        assert!(corrosion_schema().contains("CREATE TABLE IF NOT EXISTS ingress_routes (host TEXT NOT NULL PRIMARY KEY, workload_id TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);"));
+        assert!(corrosion_schema().contains("CREATE TABLE IF NOT EXISTS ingress_http_routes (host TEXT NOT NULL, path TEXT NOT NULL DEFAULT '', workload_id TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, redirect_host TEXT NOT NULL DEFAULT '', http_only INTEGER NOT NULL DEFAULT 0, allow_http INTEGER NOT NULL DEFAULT 0, temporary_redirect INTEGER NOT NULL DEFAULT 0, noindex INTEGER NOT NULL DEFAULT 0, strip_path INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (host, path));"));
         assert!(corrosion_schema().starts_with("CREATE TABLE IF NOT EXISTS workload_endpoints"));
 
         let temp = tempfile::tempdir().unwrap();

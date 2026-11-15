@@ -1,8 +1,12 @@
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use tonic::transport::{Identity, ServerTlsConfig};
+
+/// Closes connections that do not finish the TLS handshake in time.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsConfigurationError {
@@ -70,10 +74,11 @@ pub fn load_server_tls(
         .keys_match()
         .map_err(|_| TlsConfigurationError::CertificateKeyMismatch)?;
 
-    Ok(Some(ServerTlsConfig::new().identity(Identity::from_pem(
-        certificate,
-        private_key_pem,
-    ))))
+    Ok(Some(
+        ServerTlsConfig::new()
+            .identity(Identity::from_pem(certificate, private_key_pem))
+            .timeout(TLS_HANDSHAKE_TIMEOUT),
+    ))
 }
 
 fn install_crypto_provider() {

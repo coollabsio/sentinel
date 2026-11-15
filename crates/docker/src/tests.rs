@@ -1,4 +1,6 @@
-use super::{container_disk_from_summary, volume_sizes_from_items};
+use super::{
+    container_disk_from_summary, has_volume_usage, only_volume_disk_usage, volume_sizes_from_items,
+};
 use bollard::models::{ContainerSummary, ContainerSummaryStateEnum, HealthStatusEnum, MountPoint};
 
 // A `size: true` list yields the raw Docker id, but the disk series must be
@@ -110,4 +112,42 @@ fn volume_sizes_skip_unavailable_and_malformed_items() {
     let sizes = volume_sizes_from_items(&items);
     assert_eq!(sizes.len(), 1);
     assert_eq!(sizes["/var/lib/docker/volumes/db/_data"], 4096);
+}
+
+fn request_to(uri: &str) -> String {
+    let mut request =
+        bollard::BollardRequest::new(bollard::body_stream(futures_util::stream::empty()));
+    *request.uri_mut() = uri.parse().unwrap();
+    only_volume_disk_usage(request).uri().to_string()
+}
+
+// Without `type=volume`, every `/system/df` call also makes dockerd size all
+// images, layers, containers, and the build cache (coollabsio/coolify#12518).
+#[test]
+fn system_df_requests_only_volume_usage() {
+    assert_eq!(
+        request_to("http://localhost/v1.53/system/df?verbose=true"),
+        "http://localhost/v1.53/system/df?verbose=true&type=volume"
+    );
+    assert_eq!(
+        request_to("http://localhost/v1.53/system/df"),
+        "http://localhost/v1.53/system/df?type=volume"
+    );
+    assert_eq!(
+        request_to("http://localhost/v1.53/containers/json?all=true&size=true"),
+        "http://localhost/v1.53/containers/json?all=true&size=true"
+    );
+}
+
+// Docker 27 (API 1.46) answers `/system/df` in the old shape, which bollard
+// cannot parse, so Sentinel must not ask it to walk the volumes.
+#[test]
+fn volume_usage_needs_api_1_52() {
+    assert!(has_volume_usage(Some("1.52")));
+    assert!(has_volume_usage(Some("1.56")));
+    assert!(has_volume_usage(Some("2.0")));
+    assert!(!has_volume_usage(Some("1.46")));
+    assert!(!has_volume_usage(Some("1.9")));
+    assert!(!has_volume_usage(Some("garbage")));
+    assert!(!has_volume_usage(None));
 }

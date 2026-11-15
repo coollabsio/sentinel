@@ -4,11 +4,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config::ControlTlsConfig;
 use reqwest::StatusCode;
+use sentinel_protocol::CAPABILITY_WORKLOAD_ROLLING_DEPLOY;
+use sentinel_protocol::DATABASE_CAPABILITIES;
+use sentinel_protocol::STACK_CAPABILITIES;
 use sentinel_protocol::{
-    CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
+    BUILD_CAPABILITIES, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RESOURCES,
-    NETWORK_CAPABILITIES, PROTOCOL_MAX, PROTOCOL_MIN, select_protocol,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_HEALTHCHECK, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_WORKLOAD_RESOURCES, CAPABILITY_WORKLOAD_SECRETS, CAPABILITY_WORKLOAD_SECRETS_OWNER,
+    EXEC_CAPABILITIES, NETWORK_CAPABILITIES, PROTOCOL_MAX, PROTOCOL_MIN, VOLUME_CAPABILITIES,
+    select_protocol,
 };
 use serde::{Deserialize, Serialize};
 use store::CommandJournal;
@@ -25,6 +30,10 @@ const DEFAULT_RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_secs(60);
 const AUTHENTICATION_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
 const UNSUPPORTED_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
 const MAX_TEMPORARY_RETRY_SECONDS: u64 = 60;
+/// A Flux connection that ends sooner without an error (for example a
+/// credential that expires at once because the Node clock is ahead) counts as
+/// a failed attempt, so reconnects back off instead of running every second.
+const MIN_STABLE_CONNECTION: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignmentErrorKind {
@@ -236,12 +245,21 @@ impl AssignmentClient {
                 CAPABILITY_WORKLOAD_DEPLOY,
                 CAPABILITY_WORKLOAD_RESOURCES,
                 CAPABILITY_WORKLOAD_LIFECYCLE,
+                CAPABILITY_WORKLOAD_HEALTHCHECK,
+                CAPABILITY_WORKLOAD_SECRETS,
+                CAPABILITY_WORKLOAD_SECRETS_OWNER,
+                CAPABILITY_WORKLOAD_ROLLING_DEPLOY,
                 CAPABILITY_LOGS_READ,
                 CAPABILITY_CONTAINER_LOGS,
                 CAPABILITY_TRUST_BUNDLE_UPDATE,
             ]
             .into_iter()
             .chain(NETWORK_CAPABILITIES)
+            .chain(BUILD_CAPABILITIES)
+            .chain(VOLUME_CAPABILITIES)
+            .chain(DATABASE_CAPABILITIES)
+            .chain(STACK_CAPABILITIES)
+            .chain(EXEC_CAPABILITIES)
             .collect(),
             trust_bundle_version: crate::trust::installed_version(&self.control_tls),
         };
@@ -313,6 +331,25 @@ impl AssignmentClient {
             .with_ingress_trigger(ingress_trigger.clone())
             .with_control_tls(self.control_tls.clone()),
         ));
+        // Read-only commands run beside the serial lane (see connection.rs).
+        // They share the journal, which serializes its own writes.
+        let read_executor = Arc::new(tokio::sync::Mutex::new(
+            crate::commands::CommandExecutor::with_journal(
+                &self.sentinel_version,
+                self.command_journal.clone(),
+            ),
+        ));
+        // Volume transfers keep their state in memory; daemons and firewall
+        // elements of an earlier Sentinel process have no owner any more. Git
+        // credentials of builds that an earlier process started get a watcher.
+        let _ = tokio::task::spawn_blocking(|| {
+            crate::volume_transfer::remove_leftovers(std::path::Path::new("/"));
+            crate::builder::remove_build_inputs_after_builds(
+                std::path::Path::new("/"),
+                std::path::Path::new("podman"),
+            );
+        })
+        .await;
         // Restores the approved cluster network and stopped workloads once per
         // boot. It needs neither Coolify nor Flux; commands that arrive while it
         // runs wait for the command executor it holds.
@@ -335,6 +372,12 @@ impl AssignmentClient {
         let ingress_renderer = tokio::spawn(crate::ingress::run(
             std::path::PathBuf::from("/"),
             ingress_trigger,
+            shutdown.clone(),
+        ));
+        // Orders and renews ingress certificates on the issuer Node, also
+        // while Coolify is unavailable.
+        let certificate_issuer = tokio::spawn(crate::acme::run(
+            std::path::PathBuf::from("/"),
             shutdown.clone(),
         ));
 
@@ -364,18 +407,35 @@ impl AssignmentClient {
                 Ok(AssignmentOutcome::Enabled(assignment)) => {
                     temporary_attempt = 0;
                     let status = PollStatus::Enabled;
+                    let connected_at = std::time::Instant::now();
                     let retry_after = match crate::connection::connect(
                         &assignment,
                         &self.sentinel_version,
                         self.control_tls.clone(),
                         shutdown.clone(),
                         command_executor.clone(),
+                        read_executor.clone(),
                     )
                     .await
                     {
-                        Ok(()) => {
+                        Ok(()) if connected_at.elapsed() >= MIN_STABLE_CONNECTION => {
                             connection_attempt = 0;
                             Duration::from_secs(1)
+                        }
+                        Ok(()) => {
+                            let retry_after = retry_delay(
+                                &AssignmentError::Temporary,
+                                connection_attempt,
+                                jitter_seed(),
+                            );
+                            if !*shutdown.borrow() {
+                                tracing::warn!(
+                                    retry_after_seconds = retry_after.as_secs(),
+                                    "Sentinel Flux connection ended soon after it started; check the Node clock if this repeats"
+                                );
+                            }
+                            connection_attempt = connection_attempt.saturating_add(1);
+                            retry_after
                         }
                         Err(error) => {
                             let retry_after = retry_delay(
@@ -421,6 +481,7 @@ impl AssignmentClient {
         boot_restore.abort();
         discovery_publisher.abort();
         ingress_renderer.abort();
+        certificate_issuer.abort();
         tracing::info!("Sentinel control assignment polling stopped");
     }
 }

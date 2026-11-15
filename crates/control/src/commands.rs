@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use prost::Message;
 use sentinel_protocol::control::v1::command::Payload;
@@ -8,8 +9,12 @@ use sentinel_protocol::control::v1::{
     ClusterLeaveResult, Command, CommandError, CommandResult, CommandStatus, ContainerListResult,
     ContainerObservation, ContainerPort, LogSource, LogsReadResult, SystemInfoResult,
     SystemPingResult, TrustBundleUpdateResult, WireguardInspectResult, WireguardKeyEnsureResult,
-    WorkloadDeployRequest, WorkloadDeployResult, WorkloadLifecycleAction, WorkloadLifecycleRequest,
-    WorkloadLifecycleResult,
+    WorkloadDeployRequest, WorkloadDeployResult, WorkloadHealthCheck, WorkloadLifecycleAction,
+    WorkloadLifecycleRequest, WorkloadLifecycleResult,
+};
+use sentinel_protocol::{
+    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_LOAD,
+    CAPABILITY_REGISTRY_INSPECT, CAPABILITY_REGISTRY_RECONCILE, REGISTRY_HOST,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -19,9 +24,23 @@ use sentinel_protocol::{
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
     CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
 };
+use sentinel_protocol::{CAPABILITY_DATABASE_DUMP, CAPABILITY_DATABASE_RESTORE};
+use sentinel_protocol::{
+    CAPABILITY_VOLUME_BACKUP, CAPABILITY_VOLUME_DELETE, CAPABILITY_VOLUME_RECEIVE,
+    CAPABILITY_VOLUME_RESTORE, CAPABILITY_VOLUME_SERVE,
+};
+use sentinel_protocol::{CAPABILITY_WORKLOAD_EXEC, CAPABILITY_WORKLOAD_TERMINAL};
 use store::{CommandJournal, CommandLookup, CommandStart};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 use tokio::sync::Notify;
+
+use crate::network::output_with_timeout;
+
+/// Pulls of large images can take long; this only stops a stalled pull or
+/// runtime from holding the command executor forever.
+pub(crate) const PODMAN_DEPLOY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const PODMAN_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+pub(crate) const PODMAN_QUERY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 pub(crate) const CONTAINER_RUNTIMES: [&str; 2] = ["podman", "docker"];
 
@@ -127,10 +146,25 @@ impl CommandExecutor {
         let request = journal_request(&command);
         // logs.read and container.logs are read-only, frequently polled
         // commands. Their results are never replayed, so they are not
-        // journaled; a repeated ID reads again.
+        // journaled; a repeated ID reads again. volume.serve and
+        // volume.receive are idempotent per transfer and carry the transfer
+        // secret, which must not be stored. registry.inspect is a read-only report.
+        // volume.backup, volume.restore, database.dump, and database.restore
+        // carry presigned S3 URLs.
+        // workload.exec and workload.terminal carry commands and sessions.
         let journaled = !matches!(
             command.command_type.as_str(),
-            CAPABILITY_LOGS_READ | CAPABILITY_CONTAINER_LOGS
+            CAPABILITY_LOGS_READ
+                | CAPABILITY_CONTAINER_LOGS
+                | CAPABILITY_VOLUME_SERVE
+                | CAPABILITY_VOLUME_RECEIVE
+                | CAPABILITY_REGISTRY_INSPECT
+                | CAPABILITY_VOLUME_BACKUP
+                | CAPABILITY_VOLUME_RESTORE
+                | CAPABILITY_DATABASE_DUMP
+                | CAPABILITY_DATABASE_RESTORE
+                | CAPABILITY_WORKLOAD_EXEC
+                | CAPABILITY_WORKLOAD_TERMINAL
         );
         let lookup = if journaled {
             self.journal.lookup(&command.command_id, &request)
@@ -204,7 +238,7 @@ impl CommandExecutor {
                 crate::network::validate_cluster_leave(request).is_ok()
             }
             (CAPABILITY_WORKLOAD_DEPLOY, Some(Payload::WorkloadDeploy(request))) => {
-                podman_deploy_args(request).is_ok()
+                podman_deploy_args(Path::new("/"), request).is_ok()
             }
             (CAPABILITY_WORKLOAD_LIFECYCLE, Some(Payload::WorkloadLifecycle(request))) => {
                 podman_lifecycle_args(request).is_ok()
@@ -234,6 +268,46 @@ impl CommandExecutor {
             (CAPABILITY_INGRESS_RECONCILE, Some(Payload::IngressReconcile(request))) => {
                 crate::ingress::validate_routes(request).is_ok()
             }
+            (CAPABILITY_IMAGE_BUILD, Some(Payload::ImageBuild(request))) => {
+                crate::builder::validate_build(request).is_ok()
+            }
+            (CAPABILITY_BUILDER_RECONCILE, Some(Payload::BuilderReconcile(request))) => {
+                crate::builder::validate_reconcile(request).is_ok()
+            }
+            (CAPABILITY_REGISTRY_RECONCILE, Some(Payload::RegistryReconcile(request))) => {
+                crate::registry::validate(request).is_ok()
+            }
+            (CAPABILITY_REGISTRY_INSPECT, Some(Payload::RegistryInspect(_))) => true,
+            (CAPABILITY_IMAGE_LOAD, Some(Payload::ImageLoad(request))) => {
+                crate::builder::validate_load(request).is_ok()
+            }
+            (CAPABILITY_VOLUME_DELETE, Some(Payload::VolumeDelete(request))) => {
+                crate::volumes::validate_delete(request).is_ok()
+            }
+            (CAPABILITY_VOLUME_SERVE, Some(Payload::VolumeServe(request))) => {
+                crate::volume_transfer::validate_serve(request).is_ok()
+            }
+            (CAPABILITY_VOLUME_RECEIVE, Some(Payload::VolumeReceive(request))) => {
+                crate::volume_transfer::validate_receive(request).is_ok()
+            }
+            (CAPABILITY_VOLUME_BACKUP, Some(Payload::VolumeBackup(request))) => {
+                crate::volume_backup::validate_backup(request).is_ok()
+            }
+            (CAPABILITY_VOLUME_RESTORE, Some(Payload::VolumeRestore(request))) => {
+                crate::volume_backup::validate_restore(request).is_ok()
+            }
+            (CAPABILITY_DATABASE_DUMP, Some(Payload::DatabaseDump(request))) => {
+                crate::database_dump::validate_dump(request).is_ok()
+            }
+            (CAPABILITY_DATABASE_RESTORE, Some(Payload::DatabaseRestore(request))) => {
+                crate::database_dump::validate_restore(request).is_ok()
+            }
+            (CAPABILITY_WORKLOAD_EXEC, Some(Payload::WorkloadExec(request))) => {
+                crate::exec::validate(request).is_ok()
+            }
+            (CAPABILITY_WORKLOAD_TERMINAL, Some(Payload::WorkloadTerminal(request))) => {
+                crate::terminal::validate(request).is_ok()
+            }
             _ => false,
         };
         let accepted = !(command.command_id.is_empty()
@@ -256,6 +330,20 @@ impl CommandExecutor {
                     | CAPABILITY_CORROSION_INSPECT
                     | CAPABILITY_CORROSION_RECONCILE
                     | CAPABILITY_INGRESS_RECONCILE
+                    | CAPABILITY_IMAGE_BUILD
+                    | CAPABILITY_BUILDER_RECONCILE
+                    | CAPABILITY_REGISTRY_RECONCILE
+                    | CAPABILITY_REGISTRY_INSPECT
+                    | CAPABILITY_IMAGE_LOAD
+                    | CAPABILITY_VOLUME_DELETE
+                    | CAPABILITY_VOLUME_SERVE
+                    | CAPABILITY_VOLUME_RECEIVE
+                    | CAPABILITY_VOLUME_BACKUP
+                    | CAPABILITY_VOLUME_RESTORE
+                    | CAPABILITY_DATABASE_DUMP
+                    | CAPABILITY_DATABASE_RESTORE
+                    | CAPABILITY_WORKLOAD_EXEC
+                    | CAPABILITY_WORKLOAD_TERMINAL
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
@@ -353,14 +441,19 @@ impl CommandExecutor {
                 ))),
             }
         } else if let Some(Payload::ContainerList(_)) = command.payload {
-            match container_list() {
-                Ok(containers) => CommandResult {
+            match container_list().and_then(|containers| {
+                crate::volumes::list(&self.podman).map(|volumes| (containers, volumes))
+            }) {
+                Ok((containers, volumes)) => CommandResult {
                     event_id: format!("{}:result", command.command_id),
                     command_id: command.command_id.clone(),
                     status: CommandStatus::Succeeded.into(),
                     observed_at_unix_ms: now_millis(),
                     payload: Some(command_result::Payload::ContainerList(
-                        ContainerListResult { containers },
+                        ContainerListResult {
+                            containers,
+                            volumes,
+                        },
                     )),
                 },
                 Err(message) => failed(&command.command_id, "container_list_failed", message),
@@ -513,6 +606,123 @@ impl CommandExecutor {
                 ),
                 Err(message) => failed(&command.command_id, "ingress_reconcile_failed", &message),
             }
+        } else if let Some(Payload::ImageBuild(request)) = command.payload {
+            match crate::builder::start(&self.network_root, &self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::ImageBuild(result),
+                ),
+                Err(message) => failed(&command.command_id, "image_build_failed", &message),
+            }
+        } else if let Some(Payload::BuilderReconcile(request)) = command.payload {
+            match crate::builder::reconcile(&self.network_root, &self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::BuilderReconcile(result),
+                ),
+                Err(message) => failed(&command.command_id, "builder_reconcile_failed", &message),
+            }
+        } else if let Some(Payload::ImageLoad(request)) = command.payload {
+            match crate::builder::load(&self.network_root, &self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::ImageLoad(result),
+                ),
+                Err(message) => failed(&command.command_id, "image_load_failed", &message),
+            }
+        } else if let Some(Payload::RegistryInspect(_)) = command.payload {
+            succeeded(
+                &command.command_id,
+                command_result::Payload::RegistryInspect(crate::registry_inspect::inspect(
+                    &self.network_root,
+                    &self.podman,
+                )),
+            )
+        } else if let Some(Payload::RegistryReconcile(request)) = command.payload {
+            let result = crate::registry::reconcile(&self.network_root, &self.podman, &request);
+            // The registry Node publishes `registry.cluster.coolify.internal`.
+            if let Some(trigger) = &self.discovery_trigger {
+                trigger.notify_one();
+            }
+            match result {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::RegistryReconcile(result),
+                ),
+                Err(message) => failed(&command.command_id, "registry_reconcile_failed", &message),
+            }
+        } else if let Some(Payload::VolumeDelete(request)) = command.payload {
+            match crate::volumes::delete(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::VolumeDelete(result),
+                ),
+                Err(message) => failed(&command.command_id, "volume_delete_failed", &message),
+            }
+        } else if let Some(Payload::VolumeServe(request)) = command.payload {
+            match crate::volume_transfer::serve(&self.network_root, &self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::VolumeServe(result),
+                ),
+                Err(message) => failed(&command.command_id, "volume_serve_failed", &message),
+            }
+        } else if let Some(Payload::VolumeReceive(request)) = command.payload {
+            match crate::volume_transfer::receive(&self.network_root, &self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::VolumeReceive(result),
+                ),
+                Err(message) => failed(&command.command_id, "volume_receive_failed", &message),
+            }
+        } else if let Some(Payload::VolumeBackup(request)) = command.payload {
+            match crate::volume_backup::backup(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::VolumeBackup(result),
+                ),
+                Err(message) => failed(&command.command_id, "volume_backup_failed", &message),
+            }
+        } else if let Some(Payload::DatabaseDump(request)) = command.payload {
+            match crate::database_dump::dump(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::DatabaseDump(result),
+                ),
+                Err(message) => failed(&command.command_id, "database_dump_failed", &message),
+            }
+        } else if let Some(Payload::DatabaseRestore(request)) = command.payload {
+            match crate::database_dump::restore(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::DatabaseRestore(result),
+                ),
+                Err(message) => failed(&command.command_id, "database_restore_failed", &message),
+            }
+        } else if let Some(Payload::VolumeRestore(request)) = command.payload {
+            match crate::volume_backup::restore(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::VolumeRestore(result),
+                ),
+                Err(message) => failed(&command.command_id, "volume_restore_failed", &message),
+            }
+        } else if let Some(Payload::WorkloadExec(request)) = command.payload {
+            match crate::exec::exec(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::WorkloadExec(result),
+                ),
+                Err(message) => failed(&command.command_id, "workload_exec_failed", &message),
+            }
+        } else if let Some(Payload::WorkloadTerminal(request)) = command.payload {
+            match crate::terminal::open(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::WorkloadTerminal(result),
+                ),
+                Err(message) => failed(&command.command_id, "workload_terminal_failed", &message),
+            }
         } else {
             failed(
                 &command.command_id,
@@ -592,10 +802,12 @@ fn workload_lifecycle(
     } else {
         None
     };
-    let output = std::process::Command::new(podman)
-        .args(arguments)
-        .output()
-        .map_err(|_| "Podman is unavailable.".to_string());
+    // Podman needs the stop timeout plus the time to remove the container.
+    let timeout = PODMAN_LIFECYCLE_TIMEOUT.max(Duration::from_secs(
+        u64::from(stop_timeout_seconds(request)?) + 60,
+    ));
+    let output = output_with_timeout(std::process::Command::new(podman).args(arguments), timeout)
+        .map_err(podman_error);
     let failure = match output {
         Ok(output) if output.status.success() => None,
         Ok(output) => {
@@ -619,11 +831,26 @@ fn workload_lifecycle(
     if !stopping {
         crate::restore::clear_stopped(root, &request.name)?;
     }
+    if request.action == WorkloadLifecycleAction::Remove as i32 {
+        crate::secrets::delete_all(podman, &request.name)?;
+        crate::files::remove(root, &request.name)?;
+    }
 
     Ok(WorkloadLifecycleResult {
         name: request.name.clone(),
         action: request.action,
     })
+}
+
+const DEFAULT_STOP_TIMEOUT_SECONDS: u32 = 10;
+const MAX_STOP_TIMEOUT_SECONDS: u32 = 600;
+
+fn stop_timeout_seconds(request: &WorkloadLifecycleRequest) -> Result<u32, String> {
+    match request.stop_timeout_seconds {
+        None => Ok(DEFAULT_STOP_TIMEOUT_SECONDS),
+        Some(seconds) if (1..=MAX_STOP_TIMEOUT_SECONDS).contains(&seconds) => Ok(seconds),
+        Some(_) => Err("The stop timeout must be 1 to 600 seconds.".into()),
+    }
 }
 
 pub(crate) fn podman_lifecycle_args(
@@ -634,13 +861,14 @@ pub(crate) fn podman_lifecycle_args(
     }
 
     let name = request.name.clone();
+    let stop_timeout = stop_timeout_seconds(request)?.to_string();
     match WorkloadLifecycleAction::try_from(request.action).ok() {
         Some(WorkloadLifecycleAction::Start) => Ok(vec!["start".into(), name]),
         Some(WorkloadLifecycleAction::Stop) => {
-            Ok(vec!["stop".into(), "--time".into(), "10".into(), name])
+            Ok(vec!["stop".into(), "--time".into(), stop_timeout, name])
         }
         Some(WorkloadLifecycleAction::Restart) => {
-            Ok(vec!["restart".into(), "--time".into(), "10".into(), name])
+            Ok(vec!["restart".into(), "--time".into(), stop_timeout, name])
         }
         Some(WorkloadLifecycleAction::Remove) => Ok(vec!["rm".into(), "--force".into(), name]),
         _ => Err("The workload lifecycle action is invalid.".into()),
@@ -665,14 +893,53 @@ fn workload_deploy(
     podman: &Path,
     request: &WorkloadDeployRequest,
 ) -> Result<WorkloadDeployResult, String> {
-    let arguments = podman_deploy_args(request)?;
+    let mut deploy = podman_deploy_args(root, request)?;
+    let auth = crate::registry::pull_auth_path(root);
+    // Lives until `podman run` has pulled the image; dropping it deletes the file.
+    let mut _login = None;
+    if request.image.starts_with(&format!("{REGISTRY_HOST}/")) && auth.exists() {
+        deploy
+            .arguments
+            .splice(1..1, ["--authfile".to_string(), auth.display().to_string()]);
+    } else if !request.registry_username.is_empty() {
+        let login = TemporaryAuthFile::write(
+            root,
+            &request.name,
+            &crate::registry::login_auth_file(
+                &crate::registry::image_registry_host(&request.image),
+                &request.registry_username,
+                &request.registry_password,
+            ),
+        )?;
+        deploy.arguments.splice(
+            1..1,
+            ["--authfile".to_string(), login.0.display().to_string()],
+        );
+        _login = Some(login);
+    }
     if !request.network_name.is_empty() {
         ensure_workload_network(podman, &request.network_name, &request.network_subnet)?;
     }
-    let output = std::process::Command::new(podman)
-        .args(arguments)
-        .output()
-        .map_err(|_| "Podman is unavailable.".to_string())?;
+    // `podman run` would create a missing volume itself, without the Coolify labels.
+    crate::volumes::ensure_volumes(
+        podman,
+        request
+            .mounts
+            .iter()
+            .map(|mount| mount.volume_name.as_str()),
+    )?;
+    crate::secrets::create(podman, request)?;
+    crate::files::write(root, request)?;
+    let mut command = std::process::Command::new(podman);
+    command
+        .args(deploy.arguments)
+        .env_clear()
+        .envs(std::env::vars_os().filter(|(name, _)| {
+            name.to_str()
+                .is_some_and(|name| podman_runtime_variable(name) && name != "NOTIFY_SOCKET")
+        }))
+        .envs(deploy.environment);
+    let output = output_with_timeout(&mut command, PODMAN_DEPLOY_TIMEOUT).map_err(podman_error)?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if message.is_empty() {
@@ -687,6 +954,11 @@ fn workload_deploy(
     }
     // A deploy means "run": the workload must come back after a reboot.
     crate::restore::clear_stopped(root, &request.name)?;
+    // The new container runs, so the secrets of older revisions are unused. A
+    // failure leaves them until the next deploy or remove.
+    if let Err(error) = crate::secrets::delete_unused(podman, request) {
+        tracing::warn!(%error, container = %request.name, "could not delete unused workload secrets");
+    }
     Ok(WorkloadDeployResult {
         runtime_id,
         name: request.name.clone(),
@@ -695,25 +967,28 @@ fn workload_deploy(
 }
 
 fn ensure_workload_network(podman: &Path, name: &str, subnet: &str) -> Result<(), String> {
-    let inspected = std::process::Command::new(podman)
-        .args(["network", "inspect", name])
-        .output()
-        .map_err(|_| "Podman is unavailable.".to_string())?;
+    let inspected = output_with_timeout(
+        std::process::Command::new(podman).args(["network", "inspect", name]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .map_err(podman_error)?;
     if inspected.status.success() {
         return network_inspect_has_subnet(&inspected.stdout, subnet)
             .then_some(())
             .ok_or_else(|| "The existing workload network uses a different subnet.".to_string());
     }
-    let created = std::process::Command::new(podman)
-        .args(["network", "create", "--subnet", subnet, name])
-        .output()
-        .map_err(|_| "Podman is unavailable.".to_string())?;
+    let created = output_with_timeout(
+        std::process::Command::new(podman).args(["network", "create", "--subnet", subnet, name]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .map_err(podman_error)?;
     if created.status.success() {
         return Ok(());
     }
-    let raced = std::process::Command::new(podman)
-        .args(["network", "inspect", name])
-        .output();
+    let raced = output_with_timeout(
+        std::process::Command::new(podman).args(["network", "inspect", name]),
+        PODMAN_QUERY_TIMEOUT,
+    );
     if raced.is_ok_and(|output| {
         output.status.success() && network_inspect_has_subnet(&output.stdout, subnet)
     }) {
@@ -789,11 +1064,170 @@ pub(crate) fn container_mac_address(address: std::net::Ipv4Addr) -> String {
     format!("02:42:{a:02x}:{b:02x}:{c:02x}:{d:02x}")
 }
 
-pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<String>, String> {
+/// A `podman run` invocation. Workload environment values travel in the
+/// child's process environment, not in its argument list, because
+/// `/proc/<pid>/cmdline` is readable by every local user.
+#[derive(Debug)]
+pub(crate) struct PodmanDeploy {
+    pub(crate) arguments: Vec<String>,
+    pub(crate) environment: Vec<(String, String)>,
+}
+
+/// Environment variables that Podman or its helpers read themselves. Sentinel
+/// passes these from its own environment to Podman. A workload variable with
+/// such a name stays in the argument list, so it cannot change how Podman runs.
+pub(crate) fn podman_runtime_variable(name: &str) -> bool {
+    const NAMES: [&str; 18] = [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TZ",
+        "TMPDIR",
+        "NOTIFY_SOCKET",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "REGISTRY_AUTH_FILE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "STORAGE_DRIVER",
+        "STORAGE_OPTS",
+        "GODEBUG",
+        "GOMAXPROCS",
+        "GOMEMLIMIT",
+    ];
+    const PREFIXES: [&str; 10] = [
+        "LC_",
+        "XDG_",
+        "CONTAINERS_",
+        "CONTAINER_",
+        "PODMAN_",
+        "BUILDAH_",
+        "DOCKER_",
+        "NETAVARK_",
+        "AARDVARK_",
+        "_",
+    ];
+    let upper = name.to_ascii_uppercase();
+    NAMES.contains(&name)
+        || PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        || matches!(
+            upper.as_str(),
+            "HTTP_PROXY" | "HTTPS_PROXY" | "NO_PROXY" | "ALL_PROXY" | "FTP_PROXY"
+        )
+}
+
+/// The `podman run` flags of a health check. Podman runs a command that is not
+/// a JSON array with `/bin/sh -c`, like the `CMD-SHELL` form of `HEALTHCHECK`,
+/// and a JSON array of arguments without a shell, like the `CMD` form, for
+/// images that have no shell.
+pub(crate) fn podman_health_args(check: &WorkloadHealthCheck) -> Result<Vec<String>, String> {
+    let command = health_command(check.command.trim())
+        .ok_or_else(|| "The health check command is invalid.".to_string())?;
+    let seconds = |value: u32, minimum: u32| (minimum..=3_600).contains(&value);
+    if !seconds(check.interval_seconds, 1)
+        || !seconds(check.timeout_seconds, 1)
+        || !seconds(check.start_period_seconds, 0)
+        || !(1..=100).contains(&check.retries)
+    {
+        return Err("The health check timing is invalid.".into());
+    }
+    Ok(vec![
+        "--health-cmd".into(),
+        command,
+        "--health-interval".into(),
+        format!("{}s", check.interval_seconds),
+        "--health-timeout".into(),
+        format!("{}s", check.timeout_seconds),
+        "--health-retries".into(),
+        check.retries.to_string(),
+        "--health-start-period".into(),
+        format!("{}s", check.start_period_seconds),
+    ])
+}
+
+/// A shell command, or a JSON array of at most 64 non-empty arguments without
+/// NUL, written back in a canonical form so Podman reads it as the exec form.
+fn health_command(command: &str) -> Option<String> {
+    if command.is_empty() || command.len() > 4_096 || command.contains(['\0', '\n', '\r']) {
+        return None;
+    }
+    if !command.starts_with('[') {
+        return Some(command.to_string());
+    }
+    let arguments: Vec<String> = serde_json::from_str(command).ok()?;
+    if arguments.is_empty()
+        || arguments.len() > 64
+        || arguments
+            .iter()
+            .any(|argument| argument.is_empty() || argument.contains('\0'))
+    {
+        return None;
+    }
+    serde_json::to_string(&arguments).ok()
+}
+
+/// The registry login of one deploy on the host `/run` (tmpfs), 0600 in a 0700
+/// directory of root, so it never reaches the disk. Dropping it deletes it.
+struct TemporaryAuthFile(PathBuf);
+
+const REGISTRY_LOGIN_DIR: &str = "run/coolify-registry-login";
+
+impl TemporaryAuthFile {
+    fn write(root: &Path, name: &str, contents: &[u8]) -> Result<Self, String> {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+        let error = || "The registry login could not be written.".to_string();
+        let dir = root.join(REGISTRY_LOGIN_DIR);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|_| error())?;
+        let path = dir.join(format!("{name}.json"));
+        let _ = std::fs::remove_file(&path);
+        let file = Self(path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&file.0)
+            .and_then(|mut handle| handle.write_all(contents))
+            .map_err(|_| error())?;
+        Ok(file)
+    }
+}
+
+impl Drop for TemporaryAuthFile {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(%error, "could not remove a registry login file"),
+        }
+    }
+}
+
+/// `root` is the host root under which the workload files of the request live.
+pub(crate) fn podman_deploy_args(
+    root: &Path,
+    request: &WorkloadDeployRequest,
+) -> Result<PodmanDeploy, String> {
     if !valid_container_name(&request.name) {
         return Err("The container name is invalid.".into());
     }
+    if crate::registry::validate_login(&request.registry_username, &request.registry_password)?
+        && (request.image.starts_with(&format!("{REGISTRY_HOST}/"))
+            || request
+                .image
+                .starts_with(crate::builder::LOCAL_IMAGE_PREFIX))
+    {
+        return Err("A registry login is not used for a cluster image.".into());
+    }
     if request.image.is_empty()
+        || request.image.starts_with('-')
         || request.image.len() > 2_048
         || !request
             .image
@@ -865,6 +1299,17 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
     if !request.dns_server.is_empty() {
         args.extend(["--dns".into(), request.dns_server.clone()]);
     }
+    if request.dns_search.len() > MAX_DNS_SEARCH_DOMAINS
+        || !request
+            .dns_search
+            .iter()
+            .all(|domain| valid_dns_search_domain(domain))
+    {
+        return Err("The workload DNS search domains are invalid.".into());
+    }
+    for domain in &request.dns_search {
+        args.extend(["--dns-search".into(), domain.clone()]);
+    }
     if let Some(cpu_limit) = request.cpu_limit {
         args.extend(["--cpus".into(), cpu_limit.to_string()]);
     }
@@ -881,14 +1326,25 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
             format!("{memory_reservation_bytes}b"),
         ]);
     }
+    if let Some(check) = &request.health_check {
+        args.extend(podman_health_args(check)?);
+    }
+    let mut environment = Vec::new();
     for variable in &request.environment {
         let key = &variable.key;
         let value = &variable.value;
-        // Podman accepts any name and value; only `=` in a name and null bytes cannot be passed as `--env KEY=VALUE`.
+        // Podman accepts any name and value; only `=` in a name and null bytes can be passed neither as `--env KEY=VALUE` nor in a process environment.
         if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
             return Err("An environment variable is invalid.".into());
         }
-        args.extend(["--env".into(), format!("{key}={value}")]);
+        // `--env KEY` reads the value from Podman's environment. A `*` in the
+        // name is a Podman wildcard import, so such names stay inline.
+        if key.contains('*') || podman_runtime_variable(key) {
+            args.extend(["--env".into(), format!("{key}={value}")]);
+        } else {
+            args.extend(["--env".into(), key.clone()]);
+            environment.push((key.clone(), value.clone()));
+        }
     }
     for label in &request.labels {
         let key = &label.key;
@@ -934,16 +1390,48 @@ pub(crate) fn podman_deploy_args(request: &WorkloadDeployRequest) -> Result<Vec<
     {
         return Err("A command argument is invalid.".into());
     }
+    args.extend(crate::volumes::mount_args(&request.mounts)?);
+    args.extend(crate::secrets::mount_args(request)?);
+    args.extend(crate::files::mount_args(root, request)?);
     args.push(request.image.clone());
     args.extend(request.command.clone());
-    Ok(args)
+    Ok(PodmanDeploy {
+        arguments: args,
+        environment,
+    })
+}
+
+const MAX_DNS_SEARCH_DOMAINS: usize = 6;
+const DNS_SEARCH_ZONE: &str = ".coolify.internal";
+
+/// A lowercase DNS name with at least one label before `.coolify.internal`.
+pub(crate) fn valid_dns_search_domain(domain: &str) -> bool {
+    domain.len() <= 253
+        && domain.strip_suffix(DNS_SEARCH_ZONE).is_some_and(|labels| {
+            !labels.is_empty()
+                && labels.split('.').all(|label| {
+                    (1..=63).contains(&label.len())
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                })
+        })
 }
 
 fn container_list() -> Result<Vec<ContainerObservation>, &'static str> {
-    let output = std::process::Command::new("podman")
-        .args(["ps", "--all", "--no-trunc", "--format", "json"])
-        .output()
-        .map_err(|_| "Podman is unavailable.")?;
+    let output = output_with_timeout(
+        std::process::Command::new("podman").args([
+            "ps",
+            "--all",
+            "--no-trunc",
+            "--format",
+            "json",
+        ]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .map_err(|_| "Podman is unavailable or did not answer.")?;
     if !output.status.success() {
         return Err("Podman could not list containers.");
     }
@@ -1003,7 +1491,7 @@ pub(crate) fn parse_podman_containers(
                 name: name.into(),
                 image: image.into(),
                 state: state.into(),
-                health_status: string_field(value, &["Health", "HealthStatus"]).map(str::to_string),
+                health_status: container_health(value),
                 restart_count: value
                     .get("Restarts")
                     .and_then(serde_json::Value::as_u64)
@@ -1012,9 +1500,42 @@ pub(crate) fn parse_podman_containers(
                 labels,
                 created_at_unix_ms: unix_millis(value, &["Created"]),
                 started_at_unix_ms: unix_millis(value, &["StartedAt"]),
+                exit_code: container_exit_code(value, state),
             })
         })
         .collect()
+}
+
+/// `podman ps --format json` puts the health check state in `Status`: empty
+/// without a check, else `starting`, `healthy`, or `unhealthy`. Podman builds
+/// the "Up 5 seconds (healthy)" text of the table output from it.
+/// Podman 6 has no `Health` field in `podman ps --format json`; the health is only the
+/// suffix of `Status`, as in "Up 3 minutes (healthy)".
+fn container_health(value: &serde_json::Value) -> Option<String> {
+    ["Health", "HealthStatus", "Status"]
+        .iter()
+        .find_map(|name| {
+            let field = value.get(*name)?.as_str()?.trim().to_ascii_lowercase();
+            let health = match field
+                .strip_suffix(')')
+                .and_then(|rest| rest.rsplit_once('('))
+            {
+                Some((_, suffix)) => suffix.trim_start_matches("health:").trim().to_string(),
+                None => field,
+            };
+            matches!(health.as_str(), "starting" | "healthy" | "unhealthy").then_some(health)
+        })
+}
+
+/// Podman reports `ExitCode` 0 for a container that never exited, so the code
+/// counts only for a container that is not running.
+fn container_exit_code(value: &serde_json::Value, state: &str) -> Option<i32> {
+    let exited = matches!(state, "exited" | "stopped")
+        || value.get("Exited").and_then(serde_json::Value::as_bool) == Some(true);
+    exited
+        .then(|| value.get("ExitCode")?.as_i64())
+        .flatten()
+        .and_then(|code| i32::try_from(code).ok())
 }
 
 fn string_field<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
@@ -1096,14 +1617,20 @@ fn system_info(sentinel_version: &str, system: &mut System) -> SystemInfoResult 
         load_average_one: Some(load.one),
         load_average_five: Some(load.five),
         load_average_fifteen: Some(load.fifteen),
+        ingress_certificates: crate::ingress_tls::issuer_statuses(std::path::Path::new("/")),
     }
 }
 
 fn container_runtime() -> (Option<String>, Option<String>) {
     for runtime in CONTAINER_RUNTIMES {
-        let output = std::process::Command::new(runtime)
-            .args(["version", "--format", "{{.Server.Version}}"])
-            .output();
+        let output = output_with_timeout(
+            std::process::Command::new(runtime).args([
+                "version",
+                "--format",
+                "{{.Server.Version}}",
+            ]),
+            Duration::from_secs(30),
+        );
         if let Ok(output) = output
             && output.status.success()
         {
@@ -1115,6 +1642,18 @@ fn container_runtime() -> (Option<String>, Option<String>) {
     }
 
     (None, None)
+}
+
+fn podman_error(error: std::io::Error) -> String {
+    podman_failure(&error)
+}
+
+pub(crate) fn podman_failure(error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        "Podman did not finish in time.".into()
+    } else {
+        "Podman is unavailable.".into()
+    }
 }
 
 fn failed(command_id: &str, code: &str, message: &str) -> CommandResult {

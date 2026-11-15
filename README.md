@@ -2,14 +2,14 @@
 
 An API for gathering Linux server / Docker Engine metrics.
 
-> This will be used in [coolify.io](https://coolify.io).
+> It is used in [coolify.io](https://coolify.io).
 
 ## Features
 
-- Real-time system metrics collection (CPU, Memory)
-- Docker container metrics tracking
-- Historical metrics storage with SQLite
-- REST API for querying metrics
+- Host metrics: CPU, memory, load average, network, and disk usage
+- Docker container metrics: CPU, memory, network, and disk (volume and bind mount sizes)
+- Historical metrics storage in SQLite, with history queries bucketed to a requested resolution
+- REST API for querying current and historical metrics (described in [openapi.json](./openapi.json))
 - Configurable data retention
 - Push metrics to external endpoints
 - Debug mode with verbose logging and a database statistics endpoint
@@ -19,8 +19,8 @@ An API for gathering Linux server / Docker Engine metrics.
 
 ### Prerequisites
 
-- Rust 1.97 or higher (for development)
-- Docker (for container metrics)
+- Rust 1.97 or higher (for development; pinned in `rust-toolchain.toml`)
+- Docker Engine, or Podman with its Docker-compatible socket (for container metrics)
 - Linux environment (production deployment)
 
 ### Installation
@@ -30,9 +30,12 @@ An API for gathering Linux server / Docker Engine metrics.
 ```bash
 docker run -d \
   -p 8888:8888 \
-  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -v sentinel-data:/app/db \
+  -e BIND_ADDRESS=:: \
   -e TOKEN=your-secret-token \
   -e PUSH_ENDPOINT=https://coolify.example.com \
+  -e COLLECTOR_ENABLED=true \
   ghcr.io/coollabsio/sentinel:latest
 ```
 
@@ -55,7 +58,12 @@ cargo install cargo-watch
 
 # Run with hot reload
 TOKEN=your-secret-token cargo watch -x run
+
+# Or use the just recipe: it disables push and watches only the source trees
+just dev
 ```
+
+In development mode, the SQLite database is written to `./db/` instead of `/app/db/`. Set `DATA_DIR` to use a different directory.
 
 ## Configuration
 
@@ -66,12 +74,13 @@ Sentinel is configured using environment variables:
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `TOKEN` | Authentication token for API access | `your-secret-token` |
-| `PUSH_ENDPOINT` | Coolify base URL that receives Sentinel pushes | `https://coolify.example.com` |
+| `PUSH_ENDPOINT` | Coolify base URL that receives Sentinel pushes. Sentinel appends `/api/v1/sentinel/push` | `https://coolify.example.com` |
 
 ### Optional Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `PUSH_ENABLED` | `true` | Enable/disable the push service |
 | `PUSH_INTERVAL_SECONDS` | 60 | Interval for pushing metrics |
 | `COLLECTOR_ENABLED` | `false` | Enable/disable metrics collection |
 | `COLLECTOR_REFRESH_RATE_SECONDS` | 5 | Metrics collection interval |
@@ -81,6 +90,7 @@ Sentinel is configured using environment variables:
 | `STORAGE_VOLUMES_ENABLED` | `true` | Enable/disable per-container volume and bind mount sizes |
 | `STORAGE_VOLUMES_REFRESH_RATE_SECONDS` | 900 | Interval for the expensive volume walk (kept separate so it can't hammer host I/O) |
 | `HOST_MOUNT_PREFIX` | *(empty)* | Path prefix under which host paths are mounted into Sentinel's container. When set, bind mount sources are `du`-walked under it; when empty, bind mounts are not sized |
+| `DATA_DIR` | `/app/db` (`./db` in development) | Directory of the SQLite databases (`metrics.sqlite`, `commands.sqlite`, `analytics.sqlite`). Set it when Sentinel runs on the host without the container mount |
 | `DOCKER_HOST` | `/var/run/docker.sock` | Docker Engine API socket; `unix://` URLs and bare paths only — e.g. `unix:///run/user/1000/podman/podman.sock` for rootless Podman |
 | `DEBUG` | `false` | Enable verbose logging, `human_friendly_time` fields, and the `/api/stats` route |
 | `PORT` | `8888` | HTTP server port |
@@ -91,6 +101,7 @@ Sentinel is configured using environment variables:
 | `LOG_ARCHIVE_MAX_FILE_MB` | 10 | Size at which an archive file is rotated to `.log.1` (one rotated file is kept) |
 | `LOG_ARCHIVE_MAX_TOTAL_MB` | 1024 | Total archive size; the oldest files are deleted above it |
 | `LOG_ARCHIVE_RETENTION_DAYS` | 7 | Archive files not written for this many days are deleted |
+| `BIND_ADDRESS` | `127.0.0.1` | IP address the HTTP server listens on. The default accepts only connections from inside the container. Set `::` (all interfaces, IPv4 and IPv6) when you publish the port or call the API from another container |
 
 #### Traffic Analytics Variables
 
@@ -117,13 +128,14 @@ Inert unless Sentinel is built with the `traffic` Cargo feature. See [Traffic An
 
 In development mode (`cargo run`/`cargo build` debug profile, or `SENTINEL_DEVELOPMENT=1`), `PUSH_ENDPOINT` defaults to `http://localhost:8000`.
 
-> **Storage collection & host paths.** Disk stats only cover filesystems Sentinel's container can see. **Named volumes** are sized by the Docker daemon (`/system/df`), so they need no host mounts (volumes of drivers other than `local` count as `0`). **Bind mounts** count as `0` unless you mount their host paths (read-only is fine) and point `HOST_MOUNT_PREFIX` at them (e.g. `/host`); a missing path then logs one warning. Large trees (`/`, `/var`, home dirs) are walked every cycle and can be slow; the walk is capped, or set `STORAGE_VOLUMES_ENABLED=false` to skip all volume sizing.
+> **Storage collection & host paths.** Disk stats only cover filesystems Sentinel's container can see. **Named volumes** are sized by the Docker daemon (`/system/df?type=volume`), so they need no host mounts (volumes of drivers other than `local` count as `0`). Docker Engine API versions older than 1.52 (Docker 29) answer in a format that Sentinel cannot read, so on those daemons volumes count as `0` and Sentinel does not call `/system/df`. **Bind mounts** count as `0` unless you mount their host paths (read-only is fine) and point `HOST_MOUNT_PREFIX` at them (e.g. `/host`); a missing path then logs one warning. Large trees (`/`, `/var`, home dirs) are walked every cycle and can be slow; the walk is capped, or set `STORAGE_VOLUMES_ENABLED=false` to skip all volume sizing.
 
 ### Example Configuration
 
 ```bash
 export TOKEN=your-secret-token
 export PUSH_ENDPOINT=https://coolify.example.com
+export COLLECTOR_ENABLED=true
 export COLLECTOR_REFRESH_RATE_SECONDS=30
 export COLLECTOR_RETENTION_PERIOD_DAYS=14
 export DEBUG=false
@@ -137,14 +149,33 @@ Sentinel provides a comprehensive REST API for retrieving system and Docker cont
 
 ### Quick API Overview
 
+Public:
+
 - `GET /api/health` - Health check
-- `GET /api/version` - Get service version
-- `GET /api/cpu/current` - Current CPU usage
-- `GET /api/cpu/history` - Historical CPU data
-- `GET /api/memory/current` - Current memory usage
-- `GET /api/memory/history` - Historical memory data
-- `GET /api/container/:id/cpu/history` - Container CPU history
-- `GET /api/container/:id/memory/history` - Container memory history
+- `GET /api/version` - Service version
+
+Host metrics:
+
+- `GET /api/cpu/current`, `GET /api/cpu/history` - CPU usage
+- `GET /api/memory/current`, `GET /api/memory/history` - Memory usage
+- `GET /api/load/current`, `GET /api/load/history` - Load average
+- `GET /api/network/current`, `GET /api/network/history` - Network throughput
+- `GET /api/disk/current`, `GET /api/disk/history` - Disk usage per mount
+- `GET /api/summary` - Latest host CPU, memory, disk, network, load, uptime, and swap in one response
+
+Containers:
+
+- `GET /api/containers/current` - Current stats for all containers
+- `GET /api/container/{containerId}/cpu/history` - Container CPU history
+- `GET /api/container/{containerId}/memory/history` - Container memory history
+- `GET /api/container/{containerId}/network/history` - Container network history
+- `GET /api/container/{containerId}/disk/current`, `GET /api/container/{containerId}/disk/history` - Container volume and bind mount sizes
+
+Other:
+
+- `GET /api/push-status` - State of the last push to Coolify
+- `GET /api/stats` - Database statistics (only when `DEBUG=true`)
+- `GET /api/traffic/...`, `/api/app/{uuid}/traffic/...`, `/api/resource/{uuid}/traffic/...` - Traffic analytics (only with the `traffic` feature; see [Traffic Analytics](#traffic-analytics))
 
 ### Authentication
 
@@ -184,9 +215,14 @@ Sentinel follows a service-oriented architecture with these components:
 ### Core Services
 
 1. **API Server** (`crates/api/`) - Axum-based HTTP server exposing metrics endpoints
-2. **Collector Service** (`crates/collector/`) - Periodically collects system and Docker metrics
-3. **Push Service** (`crates/push/`) - Sends metrics to external endpoints
+2. **Collector Service** (`crates/collector/`) - Periodically collects host, container, and storage metrics
+3. **Push Service** (`crates/push/`) - Sends container states and metrics to Coolify
 4. **Database Layer** (`crates/store/`) - SQLite storage (rusqlite, bundled) with automatic cleanup
+5. **Docker Client** (`crates/docker/`) - bollard-based Docker Engine client with cgroup v1/v2 fallback
+6. **Configuration** (`crates/config/`) - Environment-variable configuration and validation
+7. **Traffic Analytics** (`crates/traffic/`) - Optional access-log tailer and rollup engine (`traffic` feature)
+
+`src/main.rs` starts all services on one Tokio `JoinSet`. A shutdown signal gives the services a 5-second window to stop. If one service fails (for example, the port is already in use), the process exits with a non-zero code.
 
 ### Data Flow
 
@@ -194,7 +230,9 @@ Sentinel follows a service-oriented architecture with these components:
 Docker Engine ──┐
                 ├──> Collector Service ──> SQLite Database ──> API Server ──> Clients
 System Stats ───┘                              │
-                                               └──> Push Service ──> External Endpoint
+                                               └──> Push Service ──> Coolify
+
+Proxy access log ──> Traffic Analytics ──> SQLite rollups ──> API Server   (optional)
 ```
 
 ## Development
@@ -210,18 +248,28 @@ sentinel/
 │   ├── push/         # Push service
 │   ├── store/        # Database layer (rusqlite)
 │   ├── config/       # Configuration management
-│   └── docker/       # Docker Engine client (bollard)
+│   ├── docker/       # Docker Engine client (bollard)
+│   ├── traffic/      # Traffic analytics (feature-gated)
+│   └── sentinel-bench/ # HTTP load and latency benchmark harness
+├── tests/             # Integration tests (startup, parity)
+├── scripts/           # Coolify development helpers (coolify-dev.sh)
+├── docs/              # Design specs and benchmark results
 ├── Cargo.toml         # Workspace manifest
-├── Dockerfile          # Docker build configuration
-├── API.md              # API documentation
-└── openapi.json        # OpenAPI spec, generated from route annotations
+├── justfile           # Development recipes (dev, openapi)
+├── Dockerfile         # Docker build configuration
+├── API.md             # API documentation
+├── BENCHMARK.md       # How to benchmark Sentinel
+└── openapi.json       # OpenAPI spec, generated from route annotations
 ```
 
 ### Building
 
 ```bash
-# Build binary
+# Build binary (add --features traffic for traffic analytics)
 cargo build --release
+
+# Regenerate openapi.json after you change a route
+just openapi
 
 # Build Docker image
 docker build -t sentinel .
@@ -282,8 +330,6 @@ Key dependencies used in the project:
 ### Docker Compose Example
 
 ```yaml
-version: '3.8'
-
 services:
   sentinel:
     image: ghcr.io/coollabsio/sentinel:latest
@@ -293,6 +339,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - sentinel-data:/app/db
     environment:
+      BIND_ADDRESS: "::"
       TOKEN: ${SENTINEL_TOKEN}
       PUSH_ENDPOINT: ${PUSH_ENDPOINT}
       COLLECTOR_ENABLED: "true"
@@ -302,27 +349,6 @@ services:
 
 volumes:
   sentinel-data:
-```
-
-### Systemd Service Example
-
-```ini
-[Unit]
-Description=Sentinel Metrics Service
-After=network.target docker.service
-Requires=docker.service
-
-[Service]
-Type=simple
-User=sentinel
-Environment="TOKEN=your-secret-token"
-Environment="PUSH_ENDPOINT=https://coolify.example.com"
-ExecStart=/usr/local/bin/sentinel
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
 ```
 
 ## Monitoring and Debugging
@@ -359,5 +385,5 @@ See [LICENSE](./LICENSE) file for details.
 ## Support
 
 For issues and questions:
-- GitHub Issues: https://github.com/coollabsio/sentinel/issues
-- Coolify Discord: https://discord.gg/coolify
+- GitHub Issues: <https://github.com/coollabsio/sentinel/issues>
+- Coolify Discord: <https://discord.gg/coolify>
