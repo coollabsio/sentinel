@@ -86,22 +86,13 @@ impl StorageCollector {
 
     /// One `size: true` container list gives every container's writable-layer
     /// size and mount sources. When volume sizing is enabled, named volumes are
-    /// sized by the Docker daemon (`/system/df`), so Sentinel needs no host
-    /// mounts. Bind mounts are `du`-walked (sequentially, to bound I/O) only
-    /// when `HOST_MOUNT_PREFIX` says where the host paths are mounted.
+    /// sized by the Docker daemon (`/system/df?type=volume`), so Sentinel needs
+    /// no host mounts. Bind mounts are `du`-walked (sequentially, to bound I/O)
+    /// only when `HOST_MOUNT_PREFIX` says where the host paths are mounted.
     async fn collect_container_storage(&self, time: i64) {
         let volumes_enabled = self.config.storage_volumes_enabled;
-        let usage = if volumes_enabled {
-            self.docker.disk_usage().await
-        } else {
-            // Skip the daemon's volume walk when volume sizing is off.
-            self.docker
-                .list_container_sizes()
-                .await
-                .map(|c| (c, HashMap::new()))
-        };
-        let (containers, volume_sizes) = match usage {
-            Ok(u) => u,
+        let containers = match self.docker.list_container_sizes().await {
+            Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to list container sizes");
                 return;
@@ -110,6 +101,17 @@ impl StorageCollector {
         if containers.is_empty() {
             return;
         }
+        let volume_sizes = if volumes_enabled {
+            match self.docker.volume_sizes().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to get volume sizes");
+                    return;
+                }
+            }
+        } else {
+            HashMap::new()
+        };
 
         let store = self.store.clone();
         let prefix = self.config.host_mount_prefix.clone();

@@ -10,10 +10,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-use bollard::Docker;
 use bollard::query_parameters::{
     DataUsageOptions, InspectContainerOptions, ListContainersOptions, StatsOptions,
 };
+use bollard::{BollardRequest, Docker};
 use futures_util::StreamExt;
 use inspect_cache::InspectCache;
 
@@ -59,7 +59,8 @@ pub struct DockerClient {
 impl DockerClient {
     pub fn new() -> Result<Self, DockerError> {
         let inner =
-            Docker::connect_with_unix(&socket_path(), TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)?;
+            Docker::connect_with_unix(&socket_path(), TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)?
+                .with_request_modifier(only_volume_disk_usage);
         Ok(Self {
             inner,
             inspect_cache: Arc::default(),
@@ -106,30 +107,23 @@ impl DockerClient {
         Ok(raw.into_iter().map(container_disk_from_summary).collect())
     }
 
-    /// Like [`Self::list_container_sizes`], plus the size of every named volume
-    /// keyed by host mountpoint (the same path a container lists as its mount
-    /// source), from one `/system/df` call. The daemon computes all sizes, so
-    /// Sentinel needs no access to host paths. bollard cannot encode the `type`
-    /// filter (a list), so the daemon also computes image and build cache usage.
-    pub async fn disk_usage(
-        &self,
-    ) -> Result<(Vec<ContainerDisk>, HashMap<String, u64>), DockerError> {
+    /// The size of every named volume, keyed by host mountpoint (the same
+    /// path a container lists as its mount source). The daemon computes the
+    /// sizes, so Sentinel needs no access to host paths. Empty on daemons older
+    /// than API 1.52, see [`has_volume_usage`].
+    pub async fn volume_sizes(&self) -> Result<HashMap<String, u64>, DockerError> {
+        let version = self.inner.version().await?;
+        if !has_volume_usage(version.api_version.as_deref()) {
+            return Ok(HashMap::new());
+        }
         // API 1.52+ only returns the per-object `Items` with `verbose`.
         let opts = DataUsageOptions {
             verbose: true,
             ..Default::default()
         };
         let df = self.inner.df(Some(opts)).await?;
-        let containers = df
-            .container_usage
-            .and_then(|c| c.items)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| serde_json::from_value::<bollard::models::ContainerSummary>(v).ok())
-            .map(container_disk_from_summary)
-            .collect();
         let volumes = df.volume_usage.and_then(|v| v.items).unwrap_or_default();
-        Ok((containers, volume_sizes_from_items(&volumes)))
+        Ok(volume_sizes_from_items(&volumes))
     }
 
     pub async fn stats(&self, id: &str) -> Result<ContainerStats, DockerError> {
@@ -279,6 +273,34 @@ fn container_disk_from_summary(c: bollard::models::ContainerSummary) -> Containe
         writable_layer: c.size_rw.filter(|v| *v >= 0).unwrap_or(0) as u64,
         mount_sources,
     }
+}
+
+/// `/system/df` returns `VolumeUsage`, the only shape bollard parses, from API
+/// 1.52 (Docker 29) on. Older daemons answer with the `Volumes` list, so the
+/// call would make dockerd walk every volume for a result Sentinel cannot read.
+fn has_volume_usage(api_version: Option<&str>) -> bool {
+    let Some((major, minor)) = api_version.and_then(|v| v.split_once('.')) else {
+        return false;
+    };
+    match (major.parse::<u32>(), minor.parse::<u32>()) {
+        (Ok(major), Ok(minor)) => (major, minor) >= (1, 52),
+        _ => false,
+    }
+}
+
+/// Adds `type=volume` to `/system/df`, which bollard cannot encode (the
+/// parameter is a list). Without it the daemon also sizes every image, layer,
+/// container, and the build cache on each call (coollabsio/coolify#12518).
+fn only_volume_disk_usage(mut request: BollardRequest) -> BollardRequest {
+    let uri = request.uri();
+    if !uri.path().ends_with("/system/df") {
+        return request;
+    }
+    let separator = if uri.query().is_some() { '&' } else { '?' };
+    if let Ok(uri) = format!("{uri}{separator}type=volume").parse() {
+        *request.uri_mut() = uri;
+    }
+    request
 }
 
 /// Docker reports `UsageData.Size` as -1 when the size is not available

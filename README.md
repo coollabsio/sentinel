@@ -121,7 +121,7 @@ Inert unless Sentinel is built with the `traffic` Cargo feature. See [Traffic An
 
 In development mode (`cargo run`/`cargo build` debug profile, or `SENTINEL_DEVELOPMENT=1`), `PUSH_ENDPOINT` defaults to `http://localhost:8000`.
 
-> **Storage collection & host paths.** Disk stats only cover filesystems Sentinel's container can see. **Named volumes** are sized by the Docker daemon (`/system/df`), so they need no host mounts (volumes of drivers other than `local` count as `0`). **Bind mounts** count as `0` unless you mount their host paths (read-only is fine) and point `HOST_MOUNT_PREFIX` at them (e.g. `/host`); a missing path then logs one warning. Large trees (`/`, `/var`, home dirs) are walked every cycle and can be slow; the walk is capped, or set `STORAGE_VOLUMES_ENABLED=false` to skip all volume sizing.
+> **Storage collection & host paths.** Disk stats only cover filesystems Sentinel's container can see. **Named volumes** are sized by the Docker daemon (`/system/df?type=volume`), so they need no host mounts (volumes of drivers other than `local` count as `0`). Docker Engine API versions older than 1.52 (Docker 29) answer in a format that Sentinel cannot read, so on those daemons volumes count as `0` and Sentinel does not call `/system/df`. **Bind mounts** count as `0` unless you mount their host paths (read-only is fine) and point `HOST_MOUNT_PREFIX` at them (e.g. `/host`); a missing path then logs one warning. Large trees (`/`, `/var`, home dirs) are walked every cycle and can be slow; the walk is capped, or set `STORAGE_VOLUMES_ENABLED=false` to skip all volume sizing.
 
 ### Example Configuration
 
