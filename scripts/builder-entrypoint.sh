@@ -8,7 +8,7 @@
 #
 # Arguments: --repository URL --commit SHA --type dockerfile|railpack
 #            --base-directory DIR --dockerfile PATH --image REF
-#            [--push-image REF]
+#            [--push-image REF] [--target STAGE]
 # Without --repository, the build uses /run/coolify-build/dockerfile/Dockerfile
 # with an empty context. Build-time variables are read-only files from
 # Sentinel: /run/coolify-build/args/<KEY> become build args, and
@@ -22,7 +22,7 @@
 #   COOLIFY_BUILD_RESULT {"digest":"sha256:..."}
 set -eu
 
-repository='' commit='' type='' base_directory='' dockerfile='' image='' push_image=''
+repository='' commit='' type='' base_directory='' dockerfile='' image='' push_image='' target=''
 while [ $# -gt 0 ]; do
   [ $# -ge 2 ] || { echo "error: $1 needs a value" >&2; exit 2; }
   case "$1" in
@@ -33,6 +33,7 @@ while [ $# -gt 0 ]; do
     --dockerfile) dockerfile=$2 ;;
     --image) image=$2 ;;
     --push-image) push_image=$2 ;;
+    --target) target=$2 ;;
     *) echo "error: unknown argument $1" >&2; exit 2 ;;
   esac
   shift 2
@@ -111,6 +112,7 @@ case "$type" in
       dockerfile=Dockerfile dockerfile_dir=$inline_dockerfile
       step "Building the Dockerfile of the application"
     fi
+    [ -z "$target" ] || set -- "$@" --opt "target=$target"
     # build OUTPUT METADATA [OPTION...]
     build() {
       build_output=$1 build_metadata=$2
@@ -124,6 +126,7 @@ case "$type" in
     }
     ;;
   railpack)
+    [ -z "$target" ] || { echo "error: --target needs --type dockerfile" >&2; exit 2; }
     plan_dir=/home/build/plan
     mkdir -p "$plan_dir"
     step "Preparing the Railpack plan"

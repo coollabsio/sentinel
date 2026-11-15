@@ -53,6 +53,8 @@ pub(super) struct ImageBuildApiRequest {
     build_secrets: HashMap<String, String>,
     #[serde(default)]
     dockerfile_content: String,
+    #[serde(default)]
+    target: String,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +124,7 @@ pub(super) async fn image_build(
             build_args: request.build_args,
             build_secrets: request.build_secrets,
             dockerfile_content: request.dockerfile_content,
+            target: request.target,
         }),
         DEPLOY_TIMEOUT,
     )

@@ -621,6 +621,11 @@ message ImageBuildRequest {
   // `base_directory`, `dockerfile_path`, and the Git credentials stay empty;
   // `source_type` is "dockerfile". Needs `image.build.inline_dockerfile.v1`.
   string dockerfile_content = 16;
+  // The Dockerfile stage to build, like `docker build --target`. Empty is the
+  // last stage. 1 to 128 ASCII letters, digits, `_`, `.`, or `-`, starting
+  // with a letter or digit. Only for "dockerfile". Needs
+  // `image.build.target.v1`.
+  string target = 17;
 }
 
 message ImageBuildResult {

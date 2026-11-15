@@ -469,6 +469,7 @@ pub(crate) fn validate_build(request: &ImageBuildRequest) -> Result<(), String> 
         return Err("The builder image is invalid.".into());
     }
     validate_variables(request)?;
+    validate_target_stage(request)?;
     if !request.dockerfile_content.is_empty() {
         validate_inline_dockerfile(request)?;
     } else {
@@ -499,6 +500,28 @@ fn validate_inline_dockerfile(request: &ImageBuildRequest) -> Result<(), String>
     ];
     if request.source_type != "dockerfile" || git_fields.iter().any(|field| !field.is_empty()) {
         return Err("A build from an inline Dockerfile takes no repository.".into());
+    }
+    Ok(())
+}
+
+/// The stage becomes a BuildKit option value, so only this set.
+fn validate_target_stage(request: &ImageBuildRequest) -> Result<(), String> {
+    let stage = request.target.as_str();
+    if stage.is_empty() {
+        return Ok(());
+    }
+    if request.source_type != "dockerfile" {
+        return Err("A build target needs the dockerfile source type.".into());
+    }
+    let valid = stage.len() <= 128
+        && stage.starts_with(|character: char| character.is_ascii_alphanumeric())
+        && stage
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character));
+    if !valid {
+        return Err(format!(
+            "The build target {stage:?} is invalid. Use at most 128 letters, digits, _, ., and -, starting with a letter or digit."
+        ));
     }
     Ok(())
 }
@@ -861,6 +884,9 @@ pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<S
     if !request.push_image.is_empty() {
         arguments.extend(["--push-image".into(), request.push_image.clone()]);
     }
+    if !request.target.is_empty() {
+        arguments.extend(["--target".into(), request.target.clone()]);
+    }
     arguments
 }
 
@@ -1068,4 +1094,46 @@ pub(crate) fn old_tags(
         .filter(|name| name != current)
         .skip(keep.saturating_sub(1))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dockerfile_build(target: &str) -> ImageBuildRequest {
+        ImageBuildRequest {
+            build_id: "b1".into(),
+            builder_image: "ghcr.io/coollabsio/coolify-builder:1.0.0".into(),
+            repository_url: "https://github.com/acme/api.git".into(),
+            commit_sha: "a".repeat(40),
+            source_type: "dockerfile".into(),
+            image: format!("{REGISTRY_HOST}/api:1"),
+            target: target.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn builds_a_valid_target_stage_and_rejects_others() {
+        let request = dockerfile_build("prod");
+        assert_eq!(validate_build(&request), Ok(()));
+        let arguments = build_arguments(Path::new("/"), &request);
+        assert_eq!(arguments[arguments.len() - 2..], ["--target", "prod"]);
+        assert!(
+            !build_arguments(Path::new("/"), &dockerfile_build(""))
+                .contains(&"--target".to_string())
+        );
+
+        for stage in ["a b", "-prod", "prod;x", &"a".repeat(129)] {
+            assert!(validate_build(&dockerfile_build(stage)).is_err(), "{stage}");
+        }
+        let railpack = ImageBuildRequest {
+            source_type: "railpack".into(),
+            ..dockerfile_build("prod")
+        };
+        assert_eq!(
+            validate_build(&railpack),
+            Err("A build target needs the dockerfile source type.".into())
+        );
+    }
 }

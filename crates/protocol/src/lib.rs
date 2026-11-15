@@ -59,13 +59,17 @@ pub const CAPABILITY_IMAGE_BUILD_VARIABLES: &str = "image.build.variables.v1";
 /// `image.build.v1` accepts `dockerfile_content` without a repository. Not a
 /// command: an older Sentinel rejects the request for its empty repository.
 pub const CAPABILITY_IMAGE_BUILD_INLINE_DOCKERFILE: &str = "image.build.inline_dockerfile.v1";
-pub const BUILD_CAPABILITIES: [&str; 10] = [
+/// `image.build.v1` accepts `target`, a Dockerfile stage. Not a command: an
+/// older Sentinel ignores the field and would build the last stage.
+pub const CAPABILITY_IMAGE_BUILD_TARGET: &str = "image.build.target.v1";
+pub const BUILD_CAPABILITIES: [&str; 11] = [
     CAPABILITY_IMAGE_BUILD,
     CAPABILITY_IMAGE_BUILD_PRIVATE_GIT,
     CAPABILITY_IMAGE_LOAD,
     CAPABILITY_IMAGE_BUILD_EXTERNAL_PUSH,
     CAPABILITY_IMAGE_BUILD_VARIABLES,
     CAPABILITY_IMAGE_BUILD_INLINE_DOCKERFILE,
+    CAPABILITY_IMAGE_BUILD_TARGET,
     CAPABILITY_WORKLOAD_REGISTRY_AUTH,
     CAPABILITY_BUILDER_RECONCILE,
     CAPABILITY_REGISTRY_RECONCILE,
@@ -194,6 +198,7 @@ pub mod control {
                         &self.build_secrets.keys().collect::<Vec<_>>(),
                     )
                     .field("dockerfile_content_bytes", &self.dockerfile_content.len())
+                    .field("target", &self.target)
                     .finish()
             }
         }
