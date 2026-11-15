@@ -2683,6 +2683,7 @@ mod tests {
             flux_probe_host: "10.240.0.1".into(),
             registry_ip: String::new(),
             stack_rules: vec![],
+            published_ports: vec![],
         })
         .unwrap();
         assert!(rendered.contains("table inet coolify_cluster"));
@@ -3274,6 +3275,7 @@ mod tests {
             ingress_rules: vec![],
             registry_ip: String::new(),
             stack_rules: vec![],
+            published_ports: vec![],
         };
         let first = reconcile_firewall(temp.path(), &request).unwrap();
         let second = reconcile_firewall(temp.path(), &request).unwrap();
@@ -3690,6 +3692,7 @@ mod tests {
             ingress_rules: vec![],
             registry_ip: String::new(),
             stack_rules: vec![],
+            published_ports: vec![],
         }
     }
 

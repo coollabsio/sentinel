@@ -1808,7 +1808,7 @@ fn negotiates_the_container_logs_capability_when_granted() {
 }
 
 #[tokio::test]
-async fn firewall_reconcile_route_passes_stack_rules_to_sentinel() {
+async fn firewall_reconcile_route_passes_stack_rules_and_published_ports_to_sentinel() {
     let registry = ConnectionRegistry::default();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
     registry
@@ -1843,6 +1843,10 @@ async fn firewall_reconcile_route_passes_stack_rules_to_sentinel() {
                 "wireguard_interface": "coolify0",
                 "workload_cidrs": ["100.64.0.0/24"],
                 "stack_rules": [{"source_ip": "100.64.0.2", "destination_ip": "100.64.0.3"}],
+                "published_ports": [
+                    {"protocol": "tcp", "host_port": 22222, "destination_ip": "100.64.0.3", "container_port": 22, "source_cidrs": ["203.0.113.0/24"]},
+                    {"protocol": "udp", "host_port": 5353, "destination_ip": "100.64.0.2", "container_port": 5353},
+                ],
             }))
             .send(),
     );
@@ -1864,6 +1868,25 @@ async fn firewall_reconcile_route_passes_stack_rules_to_sentinel() {
             source_ip: "100.64.0.2".into(),
             destination_ip: "100.64.0.3".into(),
         }]
+    );
+    assert_eq!(
+        firewall.published_ports,
+        [
+            sentinel_protocol::control::v1::FirewallPublishedPort {
+                protocol: "tcp".into(),
+                host_port: 22222,
+                destination_ip: "100.64.0.3".into(),
+                container_port: 22,
+                source_cidrs: vec!["203.0.113.0/24".into()],
+            },
+            sentinel_protocol::control::v1::FirewallPublishedPort {
+                protocol: "udp".into(),
+                host_port: 5353,
+                destination_ip: "100.64.0.2".into(),
+                container_port: 5353,
+                source_cidrs: vec![],
+            },
+        ]
     );
     server.abort();
 }

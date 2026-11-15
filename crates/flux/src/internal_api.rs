@@ -12,12 +12,12 @@ use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
     ClusterLeaveRequest, Command, CommandResult, CommandStatus, ContainerListRequest,
     ContainerLogsRequest, ContainerPort, CorrosionInspectRequest, CorrosionReconcileRequest,
-    FirewallIngressRule, FirewallInspectRequest, FirewallReconcileRequest, FirewallRule,
-    FirewallStackRule, IngressReconcileRequest, IngressRoute, LogSource, LogsReadRequest,
-    SystemInfoRequest, SystemPingRequest, TrustBundleUpdateRequest, WireguardInspectRequest,
-    WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest, WorkloadDeployRequest,
-    WorkloadEnvironmentVariable, WorkloadFile, WorkloadHealthCheck, WorkloadLabel,
-    WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadName, WorkloadSecret,
+    FirewallIngressRule, FirewallInspectRequest, FirewallPublishedPort, FirewallReconcileRequest,
+    FirewallRule, FirewallStackRule, IngressReconcileRequest, IngressRoute, LogSource,
+    LogsReadRequest, SystemInfoRequest, SystemPingRequest, TrustBundleUpdateRequest,
+    WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest,
+    WorkloadDeployRequest, WorkloadEnvironmentVariable, WorkloadFile, WorkloadHealthCheck,
+    WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadName, WorkloadSecret,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -321,11 +321,22 @@ struct FirewallReconcileApiRequest {
     registry_ip: String,
     #[serde(default)]
     stack_rules: Vec<FirewallStackRuleApiRequest>,
+    #[serde(default)]
+    published_ports: Vec<FirewallPublishedPortApiRequest>,
 }
 #[derive(Deserialize)]
 struct FirewallStackRuleApiRequest {
     source_ip: String,
     destination_ip: String,
+}
+#[derive(Deserialize)]
+struct FirewallPublishedPortApiRequest {
+    protocol: String,
+    host_port: u32,
+    destination_ip: String,
+    container_port: u32,
+    #[serde(default)]
+    source_cidrs: Vec<String>,
 }
 #[derive(Deserialize)]
 struct CorrosionInspectApiRequest {
@@ -938,6 +949,17 @@ async fn firewall_reconcile(
                 .map(|rule| FirewallStackRule {
                     source_ip: rule.source_ip,
                     destination_ip: rule.destination_ip,
+                })
+                .collect(),
+            published_ports: request
+                .published_ports
+                .into_iter()
+                .map(|port| FirewallPublishedPort {
+                    protocol: port.protocol,
+                    host_port: port.host_port,
+                    destination_ip: port.destination_ip,
+                    container_port: port.container_port,
+                    source_cidrs: port.source_cidrs,
                 })
                 .collect(),
         }),
