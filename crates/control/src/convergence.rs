@@ -95,6 +95,47 @@ impl Runtime for CommandExecutor {
     }
 }
 
+/// Containers that a one-shot command stopped for a while, for example a
+/// volume backup with `stop_container`. The converger does not start them.
+fn held() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+/// Keeps the converger away from a container until the guard drops.
+pub(crate) struct Hold(String);
+
+pub(crate) fn hold(name: &str) -> Hold {
+    *held()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(name.to_string())
+        .or_default() += 1;
+    Hold(name.to_string())
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut held = held()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = held.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.0);
+            }
+        }
+    }
+}
+
+fn is_held(name: &str) -> bool {
+    held()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(name)
+}
+
 fn label<'a>(container: &'a ContainerObservation, key: &str) -> Option<&'a str> {
     container.labels.get(key).map(String::as_str)
 }
@@ -142,6 +183,15 @@ pub(crate) fn converge_once(set: &WorkloadSet, runtime: &impl Runtime, now: i64)
             now,
             network_revision,
         };
+        // A one-shot command stopped the container for a while (a backup).
+        if entry
+            .deploy
+            .as_ref()
+            .is_some_and(|deploy| is_held(&deploy.name))
+        {
+            busy = true;
+            continue;
+        }
         busy |= match WorkloadDesiredState::try_from(entry.desired_state) {
             Ok(WorkloadDesiredState::Stopped) => step.stopped(),
             _ => step.running(),
@@ -1005,6 +1055,61 @@ mod tests {
         assert_eq!(value(&removed[0]), WorkloadStatusValue::Removed);
         set.acknowledge(&removed[0].event_id);
         assert!(set.unreported().is_empty());
+    }
+
+    #[test]
+    fn the_command_executor_applies_a_desired_set_change() {
+        use sentinel_protocol::control::v1::command::Payload;
+        use sentinel_protocol::control::v1::command_result;
+
+        let root = tempfile::tempdir().unwrap();
+        let set = WorkloadSet::open(root.path());
+        let mut executor = CommandExecutor::new("dev").with_workload_set(set.clone());
+        let execution = executor.execute(
+            sentinel_protocol::control::v1::Command {
+                command_id: "reconcile-1".into(),
+                command_type: sentinel_protocol::CAPABILITY_WORKLOAD_RECONCILE.into(),
+                payload_version: 1,
+                created_at_unix_ms: 1,
+                payload: Some(Payload::WorkloadReconcile(change(
+                    1,
+                    true,
+                    vec![entry("w1", "r1", "coolify-w1", "")],
+                ))),
+                expires_at_unix_ms: i64::MAX,
+            },
+            true,
+        );
+        assert!(execution.accepted);
+        assert!(matches!(
+            execution.result.payload,
+            Some(command_result::Payload::WorkloadReconcile(result)) if result.accepted && result.generation == 1
+        ));
+        assert_eq!(set.reported_state().0, 1);
+    }
+
+    #[test]
+    fn does_not_start_a_container_that_a_backup_holds() {
+        let now = now_millis() + 5_000;
+        let root = tempfile::tempdir().unwrap();
+        let set = WorkloadSet::open(root.path());
+        let runtime = FakeRuntime::default();
+        runtime.add("coolify-held", "held", "r1", "running", now - 600_000);
+        set.apply(change(
+            1,
+            true,
+            vec![entry("held", "r1", "coolify-held", "")],
+        ))
+        .unwrap();
+        converge_once(&set, &runtime, now);
+        runtime.containers.borrow_mut()[0].state = "exited".into();
+        {
+            let _hold = hold("coolify-held");
+            assert!(converge_once(&set, &runtime, now + 1_000));
+            assert!(runtime.actions.borrow().is_empty());
+        }
+        converge_once(&set, &runtime, now + 2_000);
+        assert_eq!(*runtime.actions.borrow(), ["start coolify-held"]);
     }
 
     #[test]

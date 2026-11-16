@@ -426,6 +426,7 @@ impl CommandExecutor {
                     | CAPABILITY_DATABASE_RESTORE
                     | CAPABILITY_WORKLOAD_EXEC
                     | CAPABILITY_WORKLOAD_TERMINAL
+                    | CAPABILITY_WORKLOAD_RECONCILE
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
