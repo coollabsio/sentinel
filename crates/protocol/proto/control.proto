@@ -14,6 +14,10 @@ message AgentMessage {
     CommandResult command_result = 4;
     RuntimeChanged runtime_changed = 5;
     TerminalOutput terminal_output = 6;
+    // A status change of a workload of the desired set (`workload.reconcile.v1`).
+    // Flux answers with `EventAck` after Coolify stored it; Sentinel sends it
+    // again until then.
+    WorkloadStatus workload_status = 7;
   }
 }
 
@@ -35,11 +39,19 @@ message Hello {
   repeated string capabilities = 5;
   string boot_id = 6;
   uint64 trust_bundle_version = 7;
+  // The generation and the hash of the stored desired set
+  // (`workload.reconcile.v1`). Coolify sends the full set when they differ
+  // from its own. 0 and empty without a stored set.
+  uint64 workload_generation = 8;
+  string workload_set_hash = 9;
 }
 
 message Heartbeat {
   string connection_id = 1;
   int64 sent_at_unix_ms = 2;
+  // As in `Hello`, so Coolify finds a lost change.
+  uint64 workload_generation = 3;
+  string workload_set_hash = 4;
 }
 
 message RuntimeChanged {
@@ -93,6 +105,7 @@ message Command {
     VolumeBackupRequest volume_backup = 37;
     VolumeRestoreRequest volume_restore = 38;
     ImagePruneRequest image_prune = 39;
+    WorkloadReconcileRequest workload_reconcile = 40;
     DatabaseDumpRequest database_dump = 45;
     DatabaseRestoreRequest database_restore = 46;
     WorkloadExecRequest workload_exec = 50;
@@ -150,6 +163,7 @@ message CommandResult {
     VolumeBackupResult volume_backup = 37;
     VolumeRestoreResult volume_restore = 38;
     ImagePruneResult image_prune = 39;
+    WorkloadReconcileResult workload_reconcile = 40;
     VolumeBackupResult database_dump = 45;
     VolumeRestoreResult database_restore = 46;
     WorkloadExecResult workload_exec = 50;
@@ -1095,4 +1109,123 @@ message TerminalExit {
   optional int32 exit_code = 1;
   // "exited", "closed", "idle", or an error.
   string reason = 2;
+}
+
+// The desired set of the workloads of one Node (decision 0026 of Coolify).
+// Coolify sends one change for each workload, or the full set. Sentinel
+// stores the set and converges the containers to it, also while Flux or
+// Coolify is down.
+message WorkloadReconcileRequest {
+  // Goes only up. Sentinel ignores a request with a generation lower than the
+  // stored one. The same generation with the same hash only confirms the set.
+  uint64 generation = 1;
+  // The hash of the full set after this change: SHA-256 (hex) of the lines
+  // `<workload_id> <entry_hash>\n`, sorted by workload_id.
+  string set_hash = 2;
+  // `puts` is the full set: Sentinel removes the workloads that are not in it.
+  bool full = 3;
+  // Adds or replaces the entries of these workloads.
+  repeated WorkloadSetEntry puts = 4;
+  // The workload IDs to remove. Sentinel removes their containers.
+  repeated string removes = 5;
+}
+
+enum WorkloadDesiredState {
+  WORKLOAD_DESIRED_STATE_UNSPECIFIED = 0;
+  WORKLOAD_DESIRED_STATE_RUNNING = 1;
+  WORKLOAD_DESIRED_STATE_STOPPED = 2;
+}
+
+message WorkloadSetEntry {
+  // The workload UUID: at most 64 ASCII letters, digits, `-` or `_`.
+  string workload_id = 1;
+  // The revision UUID. The containers of the entry have the label
+  // `coolify.revision=<revision_id>`.
+  string revision_id = 2;
+  string configuration_hash = 3;
+  WorkloadDesiredState desired_state = 4;
+  // Sentinel starts a new container of this entry only after it applied this
+  // network revision (the firewall state). 0 means no wait.
+  uint64 network_revision = 5;
+  // The container to run. Its `name` is the container of the entry. Sentinel
+  // stores it without the secret values and the registry login.
+  WorkloadDeployRequest deploy = 6;
+  // A rolling deploy (decision 0022): the container that Sentinel drains and
+  // removes after the new one is healthy. Empty: Podman replaces the
+  // container in place.
+  string replaces = 7;
+  // The Coolify operation that the status events of this entry update. Empty
+  // for none.
+  string operation_id = 8;
+  // Seconds that a stop waits before it kills the container, 1 to 600. Unset
+  // is 10.
+  optional uint32 stop_timeout_seconds = 9;
+  // Coolify's hash of this entry. Sentinel stores it for the set hash.
+  string entry_hash = 10;
+}
+
+message WorkloadReconcileResult {
+  // The stored generation and hash after the request.
+  uint64 generation = 1;
+  string set_hash = 2;
+  // False when the generation was lower than the stored one, or the set hash
+  // after the change differs from `set_hash` of the request. Coolify then
+  // sends the full set.
+  bool accepted = 3;
+  // The latest status of each workload of the set.
+  repeated WorkloadStatus statuses = 4;
+}
+
+enum WorkloadStatusValue {
+  WORKLOAD_STATUS_VALUE_UNSPECIFIED = 0;
+  // Sentinel deploys or starts the revision, or waits for its health check.
+  WORKLOAD_STATUS_VALUE_PROGRESSING = 1;
+  WORKLOAD_STATUS_VALUE_HEALTHY = 2;
+  // See `reason`. An older container of the workload can still run.
+  WORKLOAD_STATUS_VALUE_FAILED = 3;
+  WORKLOAD_STATUS_VALUE_STOPPED = 4;
+  WORKLOAD_STATUS_VALUE_REMOVED = 5;
+}
+
+message WorkloadStatus {
+  // Unique for each status change. `EventAck` uses it.
+  string event_id = 1;
+  string workload_id = 2;
+  string revision_id = 3;
+  string operation_id = 4;
+  WorkloadStatusValue status = 5;
+  // Why the revision failed, or what Sentinel did, for the deployment log.
+  string reason = 6;
+  // The generation of the set when the status changed.
+  uint64 generation = 7;
+  int64 observed_at_unix_ms = 8;
+  string container_name = 9;
+  string runtime_id = 10;
+  // True when Sentinel changed the container without a change of the set,
+  // for example a start after a crash or a reboot.
+  bool autonomous = 11;
+}
+
+// The state file of the desired set on the Node. Not sent.
+message StoredWorkloadSet {
+  uint64 generation = 1;
+  string set_hash = 2;
+  repeated StoredWorkloadEntry entries = 3;
+  // Workloads that Coolify removed. Sentinel removes their containers, then
+  // forgets them. Not in the set hash.
+  repeated string removing = 4;
+}
+
+message StoredWorkloadEntry {
+  WorkloadSetEntry entry = 1;
+  WorkloadStatus status = 2;
+  // The status is not acknowledged yet.
+  bool unreported = 3;
+  // The revision failed while an older container runs: not retried.
+  bool failed = 4;
+  // The revision is converged once: a missing container later is a crash.
+  bool applied = 5;
+  // Unix ms of the last start that Sentinel made alone, for the backoff.
+  int64 last_start_unix_ms = 6;
+  uint32 start_attempts = 7;
 }

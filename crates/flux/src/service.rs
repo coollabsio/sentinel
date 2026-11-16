@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::Stream;
+use sentinel_protocol::CAPABILITY_WORKLOAD_RECONCILE;
 use sentinel_protocol::control::v1::agent_message;
 use sentinel_protocol::control::v1::agent_server::Agent;
 use sentinel_protocol::control::v1::{
@@ -14,7 +15,8 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
-    ConnectedEvent, ConnectionRegistry, CredentialVerifier, EventReporter, negotiate, now_millis,
+    ConnectedEvent, ConnectionRegistry, CredentialVerifier, EventReporter, WorkloadSetState,
+    negotiate, now_millis,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -98,16 +100,26 @@ impl Agent for AgentService {
             })
             .await
             .map_err(|_| Status::unavailable("stream closed"))?;
+        let reconciles = negotiated
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_WORKLOAD_RECONCILE);
         self.reporter
-            .connected(ConnectedEvent {
-                server_id: &hello.server_id,
-                connection_id: &connection_id,
-                sentinel_version: &hello.sentinel_version,
-                protocol_version: negotiated.protocol_version,
-                trust_bundle_version: hello.trust_bundle_version,
-                transport: self.transport,
-                capabilities: &negotiated.capabilities,
-            })
+            .connected(
+                ConnectedEvent {
+                    server_id: &hello.server_id,
+                    connection_id: &connection_id,
+                    sentinel_version: &hello.sentinel_version,
+                    protocol_version: negotiated.protocol_version,
+                    trust_bundle_version: hello.trust_bundle_version,
+                    transport: self.transport,
+                    capabilities: &negotiated.capabilities,
+                },
+                reconciles.then_some(WorkloadSetState {
+                    generation: hello.workload_generation,
+                    set_hash: &hello.workload_set_hash,
+                }),
+            )
             .await;
 
         let registry = self.registry.clone();
@@ -141,7 +153,15 @@ impl Agent for AgentService {
                             break;
                         }
                         reporter
-                            .heartbeat(&server_id, &task_connection_id, now_millis())
+                            .heartbeat(
+                                &server_id,
+                                &task_connection_id,
+                                now_millis(),
+                                reconciles.then_some(WorkloadSetState {
+                                    generation: heartbeat.workload_generation,
+                                    set_hash: &heartbeat.workload_set_hash,
+                                }),
+                            )
                             .await;
                     }
                     Some(agent_message::Message::CommandAccepted(_)) => {}
@@ -172,6 +192,25 @@ impl Agent for AgentService {
                             break;
                         }
                     }
+                    Some(agent_message::Message::WorkloadStatus(status)) if reconciles => {
+                        // Acknowledged only after Coolify stored it, so
+                        // Sentinel sends it again after a failure.
+                        if reporter
+                            .workload_status(&server_id, &task_connection_id, &status)
+                            .await
+                            && event_sender
+                                .send(ControlMessage {
+                                    message: Some(control_message::Message::EventAck(EventAck {
+                                        event_id: status.event_id,
+                                    })),
+                                })
+                                .await
+                                .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Some(agent_message::Message::WorkloadStatus(_)) => {}
                     // A message type that a newer Sentinel sends and this Flux
                     // does not know decodes as `None`; skip it instead of
                     // dropping the connection.

@@ -151,6 +151,7 @@ pub async fn connect(
                 .collect(),
                 boot_id: boot_id(),
                 trust_bundle_version,
+                ..Default::default()
             })),
         })
         .await
@@ -223,7 +224,7 @@ pub async fn connect(
                 return Ok(());
             }
             _ = ticker.tick() => {
-                sender.send(AgentMessage { message: Some(agent_message::Message::Heartbeat(Heartbeat { connection_id: welcome.connection_id.clone(), sent_at_unix_ms: now_millis() })) }).await.map_err(|_| FluxConnectionError::Connection)?;
+                sender.send(AgentMessage { message: Some(agent_message::Message::Heartbeat(Heartbeat { connection_id: welcome.connection_id.clone(), sent_at_unix_ms: now_millis(), ..Default::default() })) }).await.map_err(|_| FluxConnectionError::Connection)?;
             }
             message = inbound.message() => match message {
                 Ok(Some(message)) => {

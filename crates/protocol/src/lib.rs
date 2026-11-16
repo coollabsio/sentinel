@@ -76,6 +76,11 @@ pub const CAPABILITY_IMAGE_BUILD_STATIC: &str = "image.build.static.v1";
 /// Removes unused images and ended build containers, except a keep list
 /// (decision 0027 of Coolify).
 pub const CAPABILITY_IMAGE_PRUNE: &str = "image.prune.v1";
+/// Sentinel stores the desired set of the workloads of its Node and converges
+/// the containers to it (decision 0026 of Coolify). `Hello` and `Heartbeat`
+/// carry the generation and the hash of the set, and Sentinel sends
+/// `WorkloadStatus` events.
+pub const CAPABILITY_WORKLOAD_RECONCILE: &str = "workload.reconcile.v1";
 pub const BUILD_CAPABILITIES: [&str; 14] = [
     CAPABILITY_IMAGE_BUILD,
     CAPABILITY_IMAGE_BUILD_PRIVATE_GIT,
