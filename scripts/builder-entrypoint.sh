@@ -160,6 +160,10 @@ case "$type" in
       IFS=$old_ifs
       static_env="--config-file ${up}plan/railpack-static.json --env RAILPACK_STATIC_FILE_ROOT"
       step "Serving the files of $static_root (static)"
+      # Railpack makes each --env variable a secret of the plan, so BuildKit
+      # needs this one as a secret too.
+      printf '%s' "$static_root" > "$plan_dir/static-root"
+      set -- "$@" --secret "id=RAILPACK_STATIC_FILE_ROOT,src=$plan_dir/static-root"
     fi
     step "Preparing the Railpack plan"
     # Railpack puts only the names of --env variables into the plan. A name
