@@ -297,6 +297,13 @@ message WorkloadDeployRequest {
   // Rewritten on each deploy, deleted on remove. At most 64, 1 MiB each, 4 MiB
   // together. Needs `workload.files.v1`.
   repeated WorkloadFile files = 23;
+  // Paths inside the container where Sentinel bind-mounts the host Podman
+  // socket `/run/podman/podman.sock` (Docker API compatible), read-write. This
+  // gives the container root on the Node. At most 4. Each path is absolute and
+  // normalized, not `/`, without `,` or `:`, not under `/proc`, `/sys`, `/dev`,
+  // or `/run/secrets`, unique, and not equal to a path of `mounts` or `files`.
+  // Needs `workload.container_socket.v1`.
+  repeated string container_socket_paths = 24;
 }
 
 message WorkloadFile {

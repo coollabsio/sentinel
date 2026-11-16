@@ -894,6 +894,7 @@ fn workload_deploy(
     request: &WorkloadDeployRequest,
 ) -> Result<WorkloadDeployResult, String> {
     let mut deploy = podman_deploy_args(root, request)?;
+    crate::container_socket::ensure_host_socket(root, request)?;
     let auth = crate::registry::pull_auth_path(root);
     // Lives until `podman run` has pulled the image; dropping it deletes the file.
     let mut _login = None;
@@ -1393,6 +1394,7 @@ pub(crate) fn podman_deploy_args(
     args.extend(crate::volumes::mount_args(&request.mounts)?);
     args.extend(crate::secrets::mount_args(request)?);
     args.extend(crate::files::mount_args(root, request)?);
+    args.extend(crate::container_socket::mount_args(request)?);
     args.push(request.image.clone());
     args.extend(request.command.clone());
     Ok(PodmanDeploy {

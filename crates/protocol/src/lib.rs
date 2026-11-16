@@ -139,12 +139,18 @@ pub const CAPABILITY_DISCOVERY_NAMES_UNDERSCORE: &str = "discovery.names.undersc
 /// exec form of the Compose `CMD` test, which runs without `/bin/sh` (decision
 /// 0023). Not a command.
 pub const CAPABILITY_WORKLOAD_HEALTHCHECK_EXEC: &str = "workload.healthcheck.exec.v1";
-pub const STACK_CAPABILITIES: [&str; 5] = [
+/// `workload.deploy.v1` accepts `container_socket_paths`: Sentinel bind-mounts
+/// the host Podman socket at each path. The socket gives the container root on
+/// the Node, so Coolify permits it only for admins. Not a command: an older
+/// Sentinel ignores the field and would start the container without the socket.
+pub const CAPABILITY_WORKLOAD_CONTAINER_SOCKET: &str = "workload.container_socket.v1";
+pub const STACK_CAPABILITIES: [&str; 6] = [
     CAPABILITY_WORKLOAD_DNS_SEARCH,
     CAPABILITY_WORKLOAD_FILES,
     CAPABILITY_FIREWALL_STACK_RULES,
     CAPABILITY_DISCOVERY_NAMES_UNDERSCORE,
     CAPABILITY_WORKLOAD_HEALTHCHECK_EXEC,
+    CAPABILITY_WORKLOAD_CONTAINER_SOCKET,
 ];
 pub const VOLUME_CAPABILITIES: [&str; 9] = [
     CAPABILITY_VOLUME_MOUNTS,

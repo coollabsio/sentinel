@@ -25,8 +25,9 @@ use sentinel_protocol::{
     CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES,
-    CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_SECRETS_OWNER,
+    CAPABILITY_WORKLOAD_CONTAINER_SOCKET, CAPABILITY_WORKLOAD_DEPLOY,
+    CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_WORKLOAD_SECRETS_OWNER,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -165,6 +166,10 @@ struct WorkloadDeployApiRequest {
     dns_search: Vec<String>,
     #[serde(default)]
     files: Vec<DeployFile>,
+    /// Paths of `workload.container_socket.v1`. Sentinel validates them. The
+    /// socket gives the container root on the Node.
+    #[serde(default)]
+    container_socket_paths: Vec<String>,
 }
 
 /// A file of `workload.files.v1`. Sentinel validates the path, mode, and sizes.
@@ -1233,10 +1238,12 @@ async fn workload_deploy(
         .collect();
     secrets.sort_by(|left, right| left.key.cmp(&right.key));
     // An older Sentinel ignores the fields and would start the container
-    // without its files, search domains, or secret file owners.
+    // without its files, search domains, secret file owners, or socket.
     let needed = [
         (!request.dns_search.is_empty()).then_some(CAPABILITY_WORKLOAD_DNS_SEARCH),
         (!files.is_empty()).then_some(CAPABILITY_WORKLOAD_FILES),
+        (!request.container_socket_paths.is_empty())
+            .then_some(CAPABILITY_WORKLOAD_CONTAINER_SOCKET),
         secrets
             .iter()
             .any(|secret| secret.uid.is_some() || secret.gid.is_some() || secret.mode.is_some())
@@ -1313,6 +1320,7 @@ async fn workload_deploy(
                     registry_password: request.registry_password,
                     dns_search: request.dns_search,
                     files,
+                    container_socket_paths: request.container_socket_paths,
                 })),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },

@@ -716,6 +716,7 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
                 sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into(),
                 sentinel_protocol::CAPABILITY_WORKLOAD_DNS_SEARCH.into(),
                 sentinel_protocol::CAPABILITY_WORKLOAD_FILES.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_CONTAINER_SOCKET.into(),
             ],
         )
         .await;
@@ -746,6 +747,7 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
             "restart_policy": "no",
             "dns_search": ["shop.coolify.internal"],
             "files": files,
+            "container_socket_paths": ["/var/run/docker.sock"],
         })
     };
     let post = |body: serde_json::Value| {
@@ -761,6 +763,17 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
         "server-old",
         serde_json::json!([{"path": "/etc/nginx.conf", "content_base64": encoded}]),
     ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let response = post(serde_json::json!({
+        "server_id": "server-old",
+        "command_id": "deploy-1",
+        "name": "coolify-p1test-main",
+        "image": "docker.io/library/nginx:latest",
+        "restart_policy": "no",
+        "container_socket_paths": ["/var/run/docker.sock"],
+    }))
     .await
     .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
@@ -808,6 +821,7 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
         panic!("expected a deploy");
     };
     assert_eq!(deploy.dns_search, ["shop.coolify.internal"]);
+    assert_eq!(deploy.container_socket_paths, ["/var/run/docker.sock"]);
     assert_eq!(deploy.files.len(), 6);
     assert_eq!(deploy.files[0].content.len(), 1024 * 1024);
     assert_eq!(deploy.files[4].path, "/etc/nginx.conf");
