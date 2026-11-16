@@ -11,6 +11,7 @@ mod database_dump;
 mod discovery;
 mod exec;
 mod files;
+mod image_prune;
 mod ingress;
 mod ingress_tls;
 mod logs;

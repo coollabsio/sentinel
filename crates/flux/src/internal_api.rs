@@ -662,6 +662,7 @@ pub async fn serve(
         .route("/v1/commands/ingress.reconcile", post(ingress_reconcile))
         .route("/v1/commands/image.build", post(build::image_build))
         .route("/v1/commands/image.load", post(build::image_load))
+        .route("/v1/commands/image.prune", post(build::image_prune))
         .route(
             "/v1/commands/builder.reconcile",
             post(build::builder_reconcile),

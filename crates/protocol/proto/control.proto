@@ -92,6 +92,7 @@ message Command {
     ImageLoadRequest image_load = 36;
     VolumeBackupRequest volume_backup = 37;
     VolumeRestoreRequest volume_restore = 38;
+    ImagePruneRequest image_prune = 39;
     DatabaseDumpRequest database_dump = 45;
     DatabaseRestoreRequest database_restore = 46;
     WorkloadExecRequest workload_exec = 50;
@@ -148,6 +149,7 @@ message CommandResult {
     ImageLoadResult image_load = 36;
     VolumeBackupResult volume_backup = 37;
     VolumeRestoreResult volume_restore = 38;
+    ImagePruneResult image_prune = 39;
     VolumeBackupResult database_dump = 45;
     VolumeRestoreResult database_restore = 46;
     WorkloadExecResult workload_exec = 50;
@@ -691,6 +693,33 @@ message ImageLoadResult {
   string image = 1;
   // The Podman image ID, `sha256:...`.
   string image_id = 2;
+}
+
+// Removes the images that no container uses, in any state, except the kept
+// ones, and the build containers that ended. Dangling images are images that no
+// container uses too. Sentinel always keeps the BuildKit and zot images and the
+// newest `sentinel-host` image. It never touches volumes, networks, the
+// BuildKit cache, or the registry data. A container that starts to use an image
+// in between makes Podman refuse that image, which is then skipped.
+message ImagePruneRequest {
+  // 0 to 2048 image references (`repo:tag`, `repo@sha256:...`) or IDs
+  // (`sha256:...`) to keep. A reference without a registry is a Docker Hub one.
+  repeated string keep = 1;
+  // The `coolify-build-<id>` containers of builds that run. Sentinel removes
+  // every other `coolify-build-*` container that does not run.
+  repeated string running_build_containers = 2;
+}
+
+message ImagePruneResult {
+  // The growth of the free space of the root disk.
+  uint64 freed_bytes = 1;
+  // A name, digest reference, or ID of each removed image.
+  repeated string removed_images = 2;
+  repeated string removed_containers = 3;
+  uint32 kept_images = 4;
+  // Images that Podman refused to remove, with the reason.
+  repeated string skipped = 5;
+  optional uint64 disk_available_bytes = 6;
 }
 
 // Converges BuildKit on this Node: the `coolify-buildkitd` container (rootless

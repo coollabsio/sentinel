@@ -73,7 +73,10 @@ pub const CAPABILITY_IMAGE_BUILD_TARGET: &str = "image.build.target.v1";
 /// only. Not a command: an older Sentinel ignores the field and would let
 /// Railpack detect the provider, for example Node.
 pub const CAPABILITY_IMAGE_BUILD_STATIC: &str = "image.build.static.v1";
-pub const BUILD_CAPABILITIES: [&str; 13] = [
+/// Removes unused images and ended build containers, except a keep list
+/// (decision 0027 of Coolify).
+pub const CAPABILITY_IMAGE_PRUNE: &str = "image.prune.v1";
+pub const BUILD_CAPABILITIES: [&str; 14] = [
     CAPABILITY_IMAGE_BUILD,
     CAPABILITY_IMAGE_BUILD_PRIVATE_GIT,
     CAPABILITY_IMAGE_LOAD,
@@ -87,6 +90,7 @@ pub const BUILD_CAPABILITIES: [&str; 13] = [
     CAPABILITY_BUILDER_RECONCILE,
     CAPABILITY_REGISTRY_RECONCILE,
     CAPABILITY_REGISTRY_INSPECT,
+    CAPABILITY_IMAGE_PRUNE,
 ];
 /// `workload.deploy.v1` accepts `mounts`. Not a command: an older Sentinel
 /// ignores the field and would run the container without its data.

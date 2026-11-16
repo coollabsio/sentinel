@@ -2026,3 +2026,113 @@ async fn firewall_reconcile_route_passes_stack_rules_and_published_ports_to_sent
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn image_prune_route_sends_the_keep_list_and_returns_the_result() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_IMAGE_PRUNE.into()],
+        )
+        .await;
+    let (old_sender, _old_receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-old",
+            "connection-2",
+            old_sender,
+            1,
+            vec![CAPABILITY_SYSTEM_PING.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let post = |body: serde_json::Value| {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/image.prune"))
+            .bearer_auth("internal-secret")
+            .json(&body)
+            .send()
+    };
+    let response = post(serde_json::json!({
+        "server_id": "server-old",
+        "command_id": "prune-1",
+        "keep": ["nginx:alpine"],
+    }))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+    let request = tokio::spawn(post(serde_json::json!({
+        "server_id": "server-1",
+        "command_id": "prune-2",
+        "keep": ["nginx:alpine", "sha256:abc"],
+        "running_build_containers": ["coolify-build-b1"],
+    })));
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    assert_eq!(
+        command.command_type,
+        sentinel_protocol::CAPABILITY_IMAGE_PRUNE
+    );
+    let Some(sentinel_protocol::control::v1::command::Payload::ImagePrune(prune)) =
+        &command.payload
+    else {
+        panic!("expected an image prune");
+    };
+    assert_eq!(prune.keep, ["nginx:alpine", "sha256:abc"]);
+    assert_eq!(prune.running_build_containers, ["coolify-build-b1"]);
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: "prune-2:result".into(),
+                command_id: "prune-2".into(),
+                status: sentinel_protocol::control::v1::CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: 1_700_000_000_500,
+                payload: Some(
+                    sentinel_protocol::control::v1::command_result::Payload::ImagePrune(
+                        sentinel_protocol::control::v1::ImagePruneResult {
+                            freed_bytes: 1024,
+                            removed_images: vec!["docker.io/library/nginx:1".into()],
+                            removed_containers: vec!["coolify-build-a1".into()],
+                            kept_images: 3,
+                            skipped: vec![],
+                            disk_available_bytes: Some(4096),
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({
+            "command_id": "prune-2",
+            "observed_at_unix_ms": 1_700_000_000_500_i64,
+            "freed_bytes": 1024,
+            "removed_images": ["docker.io/library/nginx:1"],
+            "removed_containers": ["coolify-build-a1"],
+            "kept_images": 3,
+            "skipped": [],
+            "disk_available_bytes": 4096,
+        })
+    );
+    server.abort();
+}

@@ -9,12 +9,12 @@ use axum::http::{HeaderMap, StatusCode};
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    BuilderReconcileRequest, ImageBuildRequest, ImageLoadRequest, RegistryInspectRequest,
-    RegistryReconcileRequest, RegistryServer,
+    BuilderReconcileRequest, ImageBuildRequest, ImageLoadRequest, ImagePruneRequest,
+    RegistryInspectRequest, RegistryReconcileRequest, RegistryServer,
 };
 use sentinel_protocol::{
     CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_LOAD,
-    CAPABILITY_REGISTRY_INSPECT, CAPABILITY_REGISTRY_RECONCILE,
+    CAPABILITY_IMAGE_PRUNE, CAPABILITY_REGISTRY_INSPECT, CAPABILITY_REGISTRY_RECONCILE,
 };
 use serde::Deserialize;
 
@@ -261,6 +261,51 @@ pub(super) async fn registry_inspect(
         "registry_bytes": value.registry_bytes,
         "build_cache_bytes": value.build_cache_bytes,
         "builder_running": value.builder_running,
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct ImagePruneApiRequest {
+    server_id: String,
+    command_id: String,
+    #[serde(default)]
+    keep: Vec<String>,
+    #[serde(default)]
+    running_build_containers: Vec<String>,
+}
+
+/// Removes unused images and ended build containers on one Node, except the
+/// keep list. A Sentinel without `image.prune.v1` gets 409.
+pub(super) async fn image_prune(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ImagePruneApiRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = dispatch_with_timeout(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_IMAGE_PRUNE,
+        Payload::ImagePrune(ImagePruneRequest {
+            keep: request.keep,
+            running_build_containers: request.running_build_containers,
+        }),
+        DEPLOY_TIMEOUT,
+    )
+    .await?;
+    let Some(command_result::Payload::ImagePrune(value)) = result.payload else {
+        return Err(invalid_response());
+    };
+    Ok(Json(serde_json::json!({
+        "command_id": request.command_id,
+        "observed_at_unix_ms": result.observed_at_unix_ms,
+        "freed_bytes": value.freed_bytes,
+        "removed_images": value.removed_images,
+        "removed_containers": value.removed_containers,
+        "kept_images": value.kept_images,
+        "skipped": value.skipped,
+        "disk_available_bytes": value.disk_available_bytes,
     })))
 }
 

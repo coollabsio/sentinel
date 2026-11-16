@@ -14,7 +14,8 @@ use sentinel_protocol::control::v1::{
 };
 use sentinel_protocol::{
     CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_LOAD,
-    CAPABILITY_REGISTRY_INSPECT, CAPABILITY_REGISTRY_RECONCILE, REGISTRY_HOST,
+    CAPABILITY_IMAGE_PRUNE, CAPABILITY_REGISTRY_INSPECT, CAPABILITY_REGISTRY_RECONCILE,
+    REGISTRY_HOST,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -281,6 +282,9 @@ impl CommandExecutor {
             (CAPABILITY_IMAGE_LOAD, Some(Payload::ImageLoad(request))) => {
                 crate::builder::validate_load(request).is_ok()
             }
+            (CAPABILITY_IMAGE_PRUNE, Some(Payload::ImagePrune(request))) => {
+                crate::image_prune::validate(request).is_ok()
+            }
             (CAPABILITY_VOLUME_DELETE, Some(Payload::VolumeDelete(request))) => {
                 crate::volumes::validate_delete(request).is_ok()
             }
@@ -335,6 +339,7 @@ impl CommandExecutor {
                     | CAPABILITY_REGISTRY_RECONCILE
                     | CAPABILITY_REGISTRY_INSPECT
                     | CAPABILITY_IMAGE_LOAD
+                    | CAPABILITY_IMAGE_PRUNE
                     | CAPABILITY_VOLUME_DELETE
                     | CAPABILITY_VOLUME_SERVE
                     | CAPABILITY_VOLUME_RECEIVE
@@ -650,6 +655,14 @@ impl CommandExecutor {
                     command_result::Payload::RegistryReconcile(result),
                 ),
                 Err(message) => failed(&command.command_id, "registry_reconcile_failed", &message),
+            }
+        } else if let Some(Payload::ImagePrune(request)) = command.payload {
+            match crate::image_prune::prune(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::ImagePrune(result),
+                ),
+                Err(message) => failed(&command.command_id, "image_prune_failed", &message),
             }
         } else if let Some(Payload::VolumeDelete(request)) = command.payload {
             match crate::volumes::delete(&self.podman, &request) {
