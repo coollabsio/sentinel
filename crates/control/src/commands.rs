@@ -23,7 +23,7 @@ use sentinel_protocol::{
     CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RECONCILE,
 };
 use sentinel_protocol::{CAPABILITY_DATABASE_DUMP, CAPABILITY_DATABASE_RESTORE};
 use sentinel_protocol::{
@@ -59,6 +59,7 @@ pub(crate) struct CommandExecutor {
     discovery_trigger: Option<Arc<Notify>>,
     ingress_trigger: Option<Arc<Notify>>,
     control_tls: Option<config::ControlTlsConfig>,
+    workload_set: Option<crate::workload_set::WorkloadSet>,
 }
 
 impl CommandExecutor {
@@ -80,6 +81,76 @@ impl CommandExecutor {
             discovery_trigger: None,
             ingress_trigger: None,
             control_tls: None,
+            workload_set: None,
+        }
+    }
+
+    /// Lets `workload.reconcile.v1` change the desired set, and the image
+    /// cleanup keep its images (decision 0026 of Coolify).
+    pub(crate) fn with_workload_set(mut self, set: crate::workload_set::WorkloadSet) -> Self {
+        self.workload_set = Some(set);
+        self
+    }
+
+    /// The containers of this Node, for the converger.
+    pub(crate) fn list_containers(&self) -> Result<Vec<ContainerObservation>, String> {
+        let output = output_with_timeout(
+            std::process::Command::new(&self.podman).args([
+                "ps",
+                "--all",
+                "--no-trunc",
+                "--format",
+                "json",
+            ]),
+            PODMAN_QUERY_TIMEOUT,
+        )
+        .map_err(|_| "Podman is unavailable or did not answer.".to_string())?;
+        if !output.status.success() {
+            return Err("Podman could not list containers.".into());
+        }
+        parse_podman_containers(&output.stdout).map_err(str::to_string)
+    }
+
+    /// A deploy of the converger. It works as `workload.deploy.v1`.
+    pub(crate) fn converge_deploy(
+        &self,
+        request: &WorkloadDeployRequest,
+    ) -> Result<WorkloadDeployResult, String> {
+        let result = workload_deploy(&self.network_root, &self.podman, request);
+        self.notify_workloads_changed();
+        result
+    }
+
+    /// A lifecycle action of the converger. A stop or a removal drains the
+    /// endpoint first, as `workload.lifecycle.v1` does.
+    pub(crate) fn converge_lifecycle(
+        &self,
+        request: &WorkloadLifecycleRequest,
+    ) -> Result<WorkloadLifecycleResult, String> {
+        let _drain = self.drain_before_stopping(request);
+        let result = workload_lifecycle(&self.network_root, &self.podman, request);
+        self.notify_workloads_changed();
+        result
+    }
+
+    /// The network revision that this Node applied: the revision of the
+    /// firewall state, which the network reconcile writes last.
+    pub(crate) fn applied_firewall_revision(&self) -> u64 {
+        std::fs::read_to_string(crate::network::state_path(
+            &self.network_root,
+            "firewall.state",
+        ))
+        .ok()
+        .and_then(|contents| contents.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0)
+    }
+
+    fn notify_workloads_changed(&self) {
+        if let Some(trigger) = &self.discovery_trigger {
+            trigger.notify_one();
+        }
+        if let Some(trigger) = &self.ingress_trigger {
+            trigger.notify_one();
         }
     }
 
@@ -166,6 +237,9 @@ impl CommandExecutor {
                 | CAPABILITY_DATABASE_RESTORE
                 | CAPABILITY_WORKLOAD_EXEC
                 | CAPABILITY_WORKLOAD_TERMINAL
+                // Carries secret values; a repeated change with the same
+                // generation changes nothing.
+                | CAPABILITY_WORKLOAD_RECONCILE
         );
         let lookup = if journaled {
             self.journal.lookup(&command.command_id, &request)
@@ -284,6 +358,9 @@ impl CommandExecutor {
             }
             (CAPABILITY_IMAGE_PRUNE, Some(Payload::ImagePrune(request))) => {
                 crate::image_prune::validate(request).is_ok()
+            }
+            (CAPABILITY_WORKLOAD_RECONCILE, Some(Payload::WorkloadReconcile(request))) => {
+                self.workload_set.is_some() && crate::workload_set::validate(request).is_ok()
             }
             (CAPABILITY_VOLUME_DELETE, Some(Payload::VolumeDelete(request))) => {
                 crate::volumes::validate_delete(request).is_ok()
@@ -656,7 +733,26 @@ impl CommandExecutor {
                 ),
                 Err(message) => failed(&command.command_id, "registry_reconcile_failed", &message),
             }
-        } else if let Some(Payload::ImagePrune(request)) = command.payload {
+        } else if let Some(Payload::WorkloadReconcile(request)) = command.payload {
+            match self
+                .workload_set
+                .as_ref()
+                .map(|set| set.apply(request))
+                .unwrap_or_else(|| Err("This Sentinel has no desired workload set.".into()))
+            {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::WorkloadReconcile(result),
+                ),
+                Err(message) => failed(&command.command_id, "workload_reconcile_failed", &message),
+            }
+        } else if let Some(Payload::ImagePrune(mut request)) = command.payload {
+            // The images of the desired set stay (decision 0026 of Coolify).
+            if let Some(set) = &self.workload_set {
+                request.keep.extend(set.images());
+                request.keep.sort();
+                request.keep.dedup();
+            }
             match crate::image_prune::prune(&self.podman, &request) {
                 Ok(result) => succeeded(
                     &command.command_id,

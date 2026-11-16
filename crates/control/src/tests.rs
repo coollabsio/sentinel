@@ -591,6 +591,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "logs.read.v1",
             "container.logs.v1",
             "trust.bundle.update.v1",
+            "workload.reconcile.v1",
             "network.cluster.leave.v1",
             "network.wireguard.key.ensure.v1",
             "network.wireguard.inspect.v1",
@@ -1098,6 +1099,7 @@ async fn rejects_assignment_with_a_different_trust_bundle_version_before_connect
             shutdown,
             command_executor.clone(),
             command_executor,
+            crate::workload_set::WorkloadSet::open(tempfile::tempdir().unwrap().path()),
         )
         .await,
         Err(FluxConnectionError::TrustBundleVersionMismatch)

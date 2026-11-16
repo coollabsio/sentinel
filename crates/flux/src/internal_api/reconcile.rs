@@ -36,6 +36,8 @@ pub(super) struct WorkloadReconcileApiRequest {
     puts: Vec<SetEntryApiRequest>,
     #[serde(default)]
     removes: Vec<String>,
+    #[serde(default)]
+    releases: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +56,8 @@ struct SetEntryApiRequest {
     operation_id: String,
     stop_timeout_seconds: Option<u32>,
     entry_hash: String,
+    #[serde(default)]
+    redeploy: bool,
 }
 
 fn valid_id(value: &str) -> bool {
@@ -72,9 +76,13 @@ pub(super) async fn workload_reconcile(
     Json(request): Json<WorkloadReconcileApiRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     super::authorize(&state.token, &headers)?;
-    if request.puts.len() + request.removes.len() > MAX_ENTRIES
+    if request.puts.len() + request.removes.len() + request.releases.len() > MAX_ENTRIES
         || request.set_hash.len() != 64
-        || !request.removes.iter().all(|id| valid_id(id))
+        || !request
+            .removes
+            .iter()
+            .chain(&request.releases)
+            .all(|id| valid_id(id))
     {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid workload set").into());
     }
@@ -114,6 +122,7 @@ pub(super) async fn workload_reconcile(
             operation_id: put.operation_id,
             stop_timeout_seconds: put.stop_timeout_seconds,
             entry_hash: put.entry_hash,
+            redeploy: put.redeploy,
         });
     }
     // An older Sentinel ignores unknown deploy fields, as for workload.deploy.
@@ -140,6 +149,7 @@ pub(super) async fn workload_reconcile(
             full: request.full,
             puts,
             removes: request.removes,
+            releases: request.releases,
         }),
         LIFECYCLE_TIMEOUT,
     )

@@ -1128,6 +1128,9 @@ message WorkloadReconcileRequest {
   repeated WorkloadSetEntry puts = 4;
   // The workload IDs to remove. Sentinel removes their containers.
   repeated string removes = 5;
+  // The workload IDs that leave the set without a change of their
+  // containers, because Coolify manages them with commands again.
+  repeated string releases = 6;
 }
 
 enum WorkloadDesiredState {
@@ -1162,6 +1165,10 @@ message WorkloadSetEntry {
   optional uint32 stop_timeout_seconds = 9;
   // Coolify's hash of this entry. Sentinel stores it for the set hash.
   string entry_hash = 10;
+  // A redeploy: with a new `operation_id`, Sentinel runs the container again
+  // also when it already runs this revision, for example to pull a newer
+  // image of the same tag.
+  bool redeploy = 11;
 }
 
 message WorkloadReconcileResult {
@@ -1214,6 +1221,8 @@ message StoredWorkloadSet {
   // Workloads that Coolify removed. Sentinel removes their containers, then
   // forgets them. Not in the set hash.
   repeated string removing = 4;
+  // `removed` statuses that Coolify did not acknowledge yet.
+  repeated WorkloadStatus removed_statuses = 5;
 }
 
 message StoredWorkloadEntry {
@@ -1228,4 +1237,15 @@ message StoredWorkloadEntry {
   // Unix ms of the last start that Sentinel made alone, for the backoff.
   int64 last_start_unix_ms = 6;
   uint32 start_attempts = 7;
+  // Unix ms of the last failure. A failed revision without an older running
+  // container is tried again after a backoff.
+  int64 failed_at_unix_ms = 8;
+  // Unix ms when Coolify put this revision and container. An older running
+  // container of the same revision is adopted, not judged as a new one.
+  int64 put_at_unix_ms = 9;
+  // A redeploy that did not run yet.
+  bool redeploy_pending = 10;
+  // Coolify asked for a start (the desired state changed to running). The
+  // start is not one that Sentinel made alone.
+  bool start_requested = 11;
 }
