@@ -8,13 +8,16 @@
 #
 # Arguments: --repository URL --commit SHA --type dockerfile|railpack
 #            --base-directory DIR --dockerfile PATH --image REF
-#            [--push-image REF] [--target STAGE]
+#            [--push-image REF] [--target STAGE] [--static-root DIR]
 # Without --repository, the build uses /run/coolify-build/dockerfile/Dockerfile
 # with an empty context. Build-time variables are read-only files from
 # Sentinel: /run/coolify-build/args/<KEY> become build args, and
 # /run/coolify-build/secrets/<KEY> become BuildKit secret mounts, never build
 # args. Their values are never in an argument of this container or in its
 # environment. Railpack takes both as secrets.
+# With --static-root, a Railpack build serves only the files of DIR (relative
+# to the base directory) with the Railpack staticfile provider, also when the
+# source has a package.json.
 # With --push-image, a second BuildKit run from the cache pushes the same
 # build to that external image. Its login, if any, is the read-only Docker
 # config /run/coolify-push/config.json, used only for that push.
@@ -22,7 +25,7 @@
 #   COOLIFY_BUILD_RESULT {"digest":"sha256:..."}
 set -eu
 
-repository='' commit='' type='' base_directory='' dockerfile='' image='' push_image='' target=''
+repository='' commit='' type='' base_directory='' dockerfile='' image='' push_image='' target='' static_root=''
 while [ $# -gt 0 ]; do
   [ $# -ge 2 ] || { echo "error: $1 needs a value" >&2; exit 2; }
   case "$1" in
@@ -34,6 +37,7 @@ while [ $# -gt 0 ]; do
     --image) image=$2 ;;
     --push-image) push_image=$2 ;;
     --target) target=$2 ;;
+    --static-root) static_root=$2 ;;
     *) echo "error: unknown argument $1" >&2; exit 2 ;;
   esac
   shift 2
@@ -112,6 +116,7 @@ case "$type" in
       dockerfile=Dockerfile dockerfile_dir=$inline_dockerfile
       step "Building the Dockerfile of the application"
     fi
+    [ -n "$static_root" ] && { echo "error: --static-root needs --type railpack" >&2; exit 2; }
     [ -z "$target" ] || set -- "$@" --opt "target=$target"
     # build OUTPUT METADATA [OPTION...]
     build() {
@@ -129,6 +134,33 @@ case "$type" in
     [ -z "$target" ] || { echo "error: --target needs --type dockerfile" >&2; exit 2; }
     plan_dir=/home/build/plan
     mkdir -p "$plan_dir"
+    static_env=''
+    if [ -n "$static_root" ]; then
+      publish_dir=$context/$static_root
+      [ -d "$publish_dir" ] || { echo "error: the publish directory $static_root does not exist" >&2; exit 1; }
+      [ -n "$(find "$publish_dir" -type f | head -n 1)" ] || { echo "error: the publish directory $static_root has no files" >&2; exit 1; }
+      # Our config file replaces the railpack.json of the source, so it
+      # contains the keys of that file. Our provider has priority.
+      static_config=$plan_dir/railpack-static.json
+      if [ -f "$context/railpack.json" ]; then
+        jq '. + {"provider": "staticfile"}' "$context/railpack.json" > "$static_config" 2>/dev/null ||
+          { echo "error: railpack.json in ${base_directory:-.} is not a valid JSON object" >&2; exit 1; }
+      else
+        printf '{"provider":"staticfile"}\n' > "$static_config"
+      fi
+      # Railpack reads --config-file relative to the source directory. The
+      # config is outside the source, so go up from the context to
+      # /home/build: one step for each segment of the base directory and one
+      # for source.
+      up=../
+      old_ifs=$IFS IFS=/
+      for segment in ${base_directory:-.}; do
+        case "$segment" in ''|.) ;; *) up=$up../ ;; esac
+      done
+      IFS=$old_ifs
+      static_env="--config-file ${up}plan/railpack-static.json --env RAILPACK_STATIC_FILE_ROOT"
+      step "Serving the files of $static_root (static)"
+    fi
     step "Preparing the Railpack plan"
     # Railpack puts only the names of --env variables into the plan. A name
     # without a value is read from the environment of this one process.
@@ -136,8 +168,9 @@ case "$type" in
       for key in $secret_keys; do
         export "$key=$(file_value "$(variable_file "$key")")"
       done
+      [ -z "$static_root" ] || export RAILPACK_STATIC_FILE_ROOT="$static_root"
       # shellcheck disable=SC2086
-      railpack prepare "$context" $(for key in $secret_keys; do printf -- '--env %s ' "$key"; done) \
+      railpack prepare "$context" $static_env $(for key in $secret_keys; do printf -- '--env %s ' "$key"; done) \
         --plan-out "$plan_dir/railpack-plan.json" --info-out "$plan_dir/info.json"
     )
     # BuildKit does not see a changed secret value, so Railpack mounts this

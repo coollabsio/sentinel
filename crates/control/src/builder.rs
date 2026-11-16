@@ -470,6 +470,7 @@ pub(crate) fn validate_build(request: &ImageBuildRequest) -> Result<(), String> 
     }
     validate_variables(request)?;
     validate_target_stage(request)?;
+    validate_static_root(request)?;
     if !request.dockerfile_content.is_empty() {
         validate_inline_dockerfile(request)?;
     } else {
@@ -521,6 +522,24 @@ fn validate_target_stage(request: &ImageBuildRequest) -> Result<(), String> {
     if !valid {
         return Err(format!(
             "The build target {stage:?} is invalid. Use at most 128 letters, digits, _, ., and -, starting with a letter or digit."
+        ));
+    }
+    Ok(())
+}
+
+/// The publish directory of a build that serves files only. The same path
+/// rules as `base_directory`.
+fn validate_static_root(request: &ImageBuildRequest) -> Result<(), String> {
+    let root = request.static_root.as_str();
+    if root.is_empty() {
+        return Ok(());
+    }
+    if request.source_type != "railpack" {
+        return Err("A static build needs the railpack source type.".into());
+    }
+    if !valid_relative_path(root) {
+        return Err(format!(
+            "The publish directory {root:?} is invalid. Use . or a relative path without .. or a leading -."
         ));
     }
     Ok(())
@@ -887,6 +906,9 @@ pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<S
     if !request.target.is_empty() {
         arguments.extend(["--target".into(), request.target.clone()]);
     }
+    if !request.static_root.is_empty() {
+        arguments.extend(["--static-root".into(), request.static_root.clone()]);
+    }
     arguments
 }
 
@@ -1134,6 +1156,37 @@ mod tests {
         assert_eq!(
             validate_build(&railpack),
             Err("A build target needs the dockerfile source type.".into())
+        );
+    }
+
+    #[test]
+    fn builds_a_valid_static_root_and_rejects_others() {
+        let static_build = |root: &str| ImageBuildRequest {
+            source_type: "railpack".into(),
+            static_root: root.into(),
+            ..dockerfile_build("")
+        };
+        for root in [".", "dist", "apps/web/dist"] {
+            let request = static_build(root);
+            assert_eq!(validate_build(&request), Ok(()), "{root}");
+            let arguments = build_arguments(Path::new("/"), &request);
+            assert_eq!(arguments[arguments.len() - 2..], ["--static-root", root]);
+        }
+        assert!(
+            !build_arguments(Path::new("/"), &static_build(""))
+                .contains(&"--static-root".to_string())
+        );
+
+        for root in ["/dist", "../dist", "a/../../b", "-dist", "dist;x", "a b"] {
+            assert!(validate_build(&static_build(root)).is_err(), "{root}");
+        }
+        let dockerfile = ImageBuildRequest {
+            static_root: "dist".into(),
+            ..dockerfile_build("")
+        };
+        assert_eq!(
+            validate_build(&dockerfile),
+            Err("A static build needs the railpack source type.".into())
         );
     }
 }

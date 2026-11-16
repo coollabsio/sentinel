@@ -641,6 +641,12 @@ message ImageBuildRequest {
   // with a letter or digit. Only for "dockerfile". Needs
   // `image.build.target.v1`.
   string target = 17;
+  // Only for `source_type` "railpack". When not empty, the build serves files
+  // only: Railpack uses its `staticfile` provider and serves this folder with
+  // Caddy, also when the source has a `package.json`. Relative to
+  // `base_directory`; "." is `base_directory` itself. Needs
+  // `image.build.static.v1`.
+  string static_root = 18;
 }
 
 message ImageBuildResult {

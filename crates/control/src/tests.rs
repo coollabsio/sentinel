@@ -610,6 +610,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "image.build.variables.v1",
             "image.build.inline_dockerfile.v1",
             "image.build.target.v1",
+            "image.build.static.v1",
             "workload.registry_auth.v1",
             "builder.reconcile.v1",
             "registry.reconcile.v1",

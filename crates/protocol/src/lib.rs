@@ -65,7 +65,11 @@ pub const CAPABILITY_IMAGE_BUILD_INLINE_DOCKERFILE: &str = "image.build.inline_d
 /// `image.build.v1` accepts `target`, a Dockerfile stage. Not a command: an
 /// older Sentinel ignores the field and would build the last stage.
 pub const CAPABILITY_IMAGE_BUILD_TARGET: &str = "image.build.target.v1";
-pub const BUILD_CAPABILITIES: [&str; 11] = [
+/// `image.build.v1` accepts `static_root`, a Railpack build that serves files
+/// only. Not a command: an older Sentinel ignores the field and would let
+/// Railpack detect the provider, for example Node.
+pub const CAPABILITY_IMAGE_BUILD_STATIC: &str = "image.build.static.v1";
+pub const BUILD_CAPABILITIES: [&str; 12] = [
     CAPABILITY_IMAGE_BUILD,
     CAPABILITY_IMAGE_BUILD_PRIVATE_GIT,
     CAPABILITY_IMAGE_LOAD,
@@ -73,6 +77,7 @@ pub const BUILD_CAPABILITIES: [&str; 11] = [
     CAPABILITY_IMAGE_BUILD_VARIABLES,
     CAPABILITY_IMAGE_BUILD_INLINE_DOCKERFILE,
     CAPABILITY_IMAGE_BUILD_TARGET,
+    CAPABILITY_IMAGE_BUILD_STATIC,
     CAPABILITY_WORKLOAD_REGISTRY_AUTH,
     CAPABILITY_BUILDER_RECONCILE,
     CAPABILITY_REGISTRY_RECONCILE,
@@ -207,6 +212,7 @@ pub mod control {
                     )
                     .field("dockerfile_content_bytes", &self.dockerfile_content.len())
                     .field("target", &self.target)
+                    .field("static_root", &self.static_root)
                     .finish()
             }
         }
