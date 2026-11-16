@@ -304,6 +304,12 @@ message WorkloadDeployRequest {
   // or `/run/secrets`, unique, and not equal to a path of `mounts` or `files`.
   // Needs `workload.container_socket.v1`.
   repeated string container_socket_paths = 24;
+  // The user of the container process, the Compose `user:`: a name or a uid,
+  // with an optional `:group` or `:gid`. Empty runs the user of the image.
+  // Sentinel refuses a value outside
+  // `^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})?$`.
+  // Needs `workload.user.v1`.
+  string user = 25;
 }
 
 message WorkloadFile {

@@ -632,6 +632,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "discovery.names.underscore.v1",
             "workload.healthcheck.exec.v1",
             "workload.container_socket.v1",
+            "workload.user.v1",
             "workload.exec.v1",
             "workload.terminal.v1"
         ])
@@ -1514,6 +1515,7 @@ fn builds_shell_free_podman_deploy_arguments() {
         dns_search: vec!["web.coolify.internal".into()],
         files: Vec::new(),
         container_socket_paths: Vec::new(),
+        user: String::new(),
     };
 
     let deploy = crate::commands::podman_deploy_args(std::path::Path::new("/"), &request).unwrap();

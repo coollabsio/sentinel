@@ -149,13 +149,18 @@ pub const CAPABILITY_WORKLOAD_HEALTHCHECK_EXEC: &str = "workload.healthcheck.exe
 /// the Node, so Coolify permits it only for admins. Not a command: an older
 /// Sentinel ignores the field and would start the container without the socket.
 pub const CAPABILITY_WORKLOAD_CONTAINER_SOCKET: &str = "workload.container_socket.v1";
-pub const STACK_CAPABILITIES: [&str; 6] = [
+/// `workload.deploy.v1` accepts `user`: the container process runs as this user
+/// (`podman run --user`), the Compose `user:`. Not a command: an older Sentinel
+/// ignores the field and would start the container as the user of the image.
+pub const CAPABILITY_WORKLOAD_USER: &str = "workload.user.v1";
+pub const STACK_CAPABILITIES: [&str; 7] = [
     CAPABILITY_WORKLOAD_DNS_SEARCH,
     CAPABILITY_WORKLOAD_FILES,
     CAPABILITY_FIREWALL_STACK_RULES,
     CAPABILITY_DISCOVERY_NAMES_UNDERSCORE,
     CAPABILITY_WORKLOAD_HEALTHCHECK_EXEC,
     CAPABILITY_WORKLOAD_CONTAINER_SOCKET,
+    CAPABILITY_WORKLOAD_USER,
 ];
 pub const VOLUME_CAPABILITIES: [&str; 9] = [
     CAPABILITY_VOLUME_MOUNTS,

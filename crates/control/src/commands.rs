@@ -1395,6 +1395,7 @@ pub(crate) fn podman_deploy_args(
     args.extend(crate::secrets::mount_args(request)?);
     args.extend(crate::files::mount_args(root, request)?);
     args.extend(crate::container_socket::mount_args(request)?);
+    args.extend(crate::workload_user::user_args(request)?);
     args.push(request.image.clone());
     args.extend(request.command.clone());
     Ok(PodmanDeploy {

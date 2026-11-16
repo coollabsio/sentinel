@@ -24,6 +24,7 @@ mod trust;
 mod volume_backup;
 mod volume_transfer;
 mod volumes;
+mod workload_user;
 
 pub use assignment::{
     Assignment, AssignmentClient, AssignmentError, AssignmentErrorKind, AssignmentOutcome,

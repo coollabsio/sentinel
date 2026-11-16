@@ -27,7 +27,7 @@ use sentinel_protocol::{
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
     CAPABILITY_WORKLOAD_CONTAINER_SOCKET, CAPABILITY_WORKLOAD_DEPLOY,
     CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES, CAPABILITY_WORKLOAD_LIFECYCLE,
-    CAPABILITY_WORKLOAD_SECRETS_OWNER,
+    CAPABILITY_WORKLOAD_SECRETS_OWNER, CAPABILITY_WORKLOAD_USER,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -170,6 +170,9 @@ struct WorkloadDeployApiRequest {
     /// socket gives the container root on the Node.
     #[serde(default)]
     container_socket_paths: Vec<String>,
+    /// The `user` of `workload.user.v1`. Sentinel validates it.
+    #[serde(default)]
+    user: String,
 }
 
 /// A file of `workload.files.v1`. Sentinel validates the path, mode, and sizes.
@@ -1244,6 +1247,7 @@ async fn workload_deploy(
         (!files.is_empty()).then_some(CAPABILITY_WORKLOAD_FILES),
         (!request.container_socket_paths.is_empty())
             .then_some(CAPABILITY_WORKLOAD_CONTAINER_SOCKET),
+        (!request.user.is_empty()).then_some(CAPABILITY_WORKLOAD_USER),
         secrets
             .iter()
             .any(|secret| secret.uid.is_some() || secret.gid.is_some() || secret.mode.is_some())
@@ -1321,6 +1325,7 @@ async fn workload_deploy(
                     dns_search: request.dns_search,
                     files,
                     container_socket_paths: request.container_socket_paths,
+                    user: request.user,
                 })),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },
