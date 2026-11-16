@@ -96,7 +96,7 @@ Sentinel is configured using environment variables:
 | `PORT` | `8888` | HTTP server port |
 | `SENTINEL_COMMAND_RETENTION_DAYS` | 7 | Days to keep completed control-command results for replay |
 | `SENTINEL_COMMAND_MAX_RECORDS` | 100000 | Maximum completed control-command results; active records are not removed |
-| `LOG_ARCHIVE_ENABLED` | `true` | Archive the logs of Coolify-managed containers to files, so they stay readable after the container is removed |
+| `LOG_ARCHIVE_ENABLED` | `false` | Archive the logs of Coolify-managed containers to files, so they stay readable after the container is removed. Coolify turns it on with the `Keep logs of removed containers` setting of the server |
 | `LOG_ARCHIVE_DIR` | `/app/db/container-logs` | Archive root (next to the metrics database). Each container writes `<owner-uuid>/<container-name>.<short-id>.log` |
 | `LOG_ARCHIVE_MAX_FILE_MB` | 10 | Size at which an archive file is rotated to `.log.1` (one rotated file is kept) |
 | `LOG_ARCHIVE_MAX_TOTAL_MB` | 1024 | Total archive size; the oldest files are deleted above it |

@@ -91,7 +91,8 @@ pub struct TrafficSettings {
 
 /// Container log archive (LOG_ARCHIVE_*): Sentinel appends the logs of
 /// Coolify-managed containers to files under `dir`, so Coolify can read them
-/// after Docker removes the container and its json log.
+/// after Docker removes the container and its json log. Off unless Coolify
+/// turns it on, because older Coolify versions cannot show or turn off the archive.
 #[derive(Debug, Clone)]
 pub struct LogArchiveSettings {
     pub enabled: bool,
@@ -202,7 +203,7 @@ impl Config {
         };
 
         let log_archive = LogArchiveSettings {
-            enabled: bool_from_env("LOG_ARCHIVE_ENABLED", true)?,
+            enabled: bool_from_env("LOG_ARCHIVE_ENABLED", false)?,
             dir: non_empty("LOG_ARCHIVE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| default_log_archive_dir(&metrics_file)),

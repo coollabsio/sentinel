@@ -485,7 +485,7 @@ fn log_archive_defaults_next_to_the_metrics_db() {
         ("LOG_ARCHIVE_RETENTION_DAYS", ""),
     ]);
     let a = Config::load(false).unwrap().log_archive;
-    assert!(a.enabled);
+    assert!(!a.enabled);
     assert_eq!(a.dir.to_str().unwrap(), "/app/db/container-logs");
     assert_eq!(a.max_file_mb, 10);
     assert_eq!(a.max_total_mb, 1024);
@@ -507,14 +507,14 @@ fn log_archive_reads_overrides() {
     let _g = EnvGuard::set(&[
         ("TOKEN", "t"),
         ("PUSH_ENDPOINT", "https://example.com"),
-        ("LOG_ARCHIVE_ENABLED", "false"),
+        ("LOG_ARCHIVE_ENABLED", "true"),
         ("LOG_ARCHIVE_DIR", "/tmp/archive"),
         ("LOG_ARCHIVE_MAX_FILE_MB", "5"),
         ("LOG_ARCHIVE_MAX_TOTAL_MB", "200"),
         ("LOG_ARCHIVE_RETENTION_DAYS", "3"),
     ]);
     let a = Config::load(false).unwrap().log_archive;
-    assert!(!a.enabled);
+    assert!(a.enabled);
     assert_eq!(a.dir.to_str().unwrap(), "/tmp/archive");
     assert_eq!(a.max_file_mb, 5);
     assert_eq!(a.max_total_mb, 200);
