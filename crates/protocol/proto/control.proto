@@ -607,7 +607,9 @@ message ImageBuildRequest {
   // "registry.cluster.coolify.internal:5443/<repository>:<tag>". Or, with
   // `image.load.v1`, a local image "localhost/<repository>:<tag>": the build
   // writes a docker archive on this Node instead of a push, and
-  // `image.load.v1` loads it after the build.
+  // `image.load.v1` loads it after the build. Or, with
+  // `image.build.external_image.v1`, a tag in another registry, for example
+  // "ghcr.io/acme/builds:<tag>": the external image storage of the cluster.
   string image = 8;
   // A short-lived HTTPS token for the repository host, for example a GitHub
   // App installation token. Git sends it as the password of `x-access-token`.
@@ -654,6 +656,11 @@ message ImageBuildRequest {
   // `base_directory`; "." is `base_directory` itself. Needs
   // `image.build.static.v1`.
   string static_root = 18;
+  // An optional login for the registry of an external `image`. Both set or
+  // both empty. Handled like `push_username` and `push_password`, but only
+  // the push to `image` uses it. Needs `image.build.external_image.v1`.
+  string image_username = 19;
+  string image_password = 20;
 }
 
 message ImageBuildResult {

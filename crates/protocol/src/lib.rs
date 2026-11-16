@@ -51,6 +51,10 @@ pub const CAPABILITY_IMAGE_LOAD: &str = "image.load.v1";
 /// `push_password`. Not a command: an older Sentinel ignores the fields and
 /// would not push the image.
 pub const CAPABILITY_IMAGE_BUILD_EXTERNAL_PUSH: &str = "image.build.external_push.v1";
+/// `image.build.v1` accepts an `image` outside the cluster registry, with
+/// `image_username` and `image_password`, so a cluster can store its builds
+/// in an external registry. Not a command: an older Sentinel rejects the image.
+pub const CAPABILITY_IMAGE_BUILD_EXTERNAL_IMAGE: &str = "image.build.external_image.v1";
 /// `workload.deploy.v1` accepts `registry_username` and `registry_password`.
 /// Not a command: an older Sentinel ignores the fields and would pull without
 /// the login.
@@ -69,11 +73,12 @@ pub const CAPABILITY_IMAGE_BUILD_TARGET: &str = "image.build.target.v1";
 /// only. Not a command: an older Sentinel ignores the field and would let
 /// Railpack detect the provider, for example Node.
 pub const CAPABILITY_IMAGE_BUILD_STATIC: &str = "image.build.static.v1";
-pub const BUILD_CAPABILITIES: [&str; 12] = [
+pub const BUILD_CAPABILITIES: [&str; 13] = [
     CAPABILITY_IMAGE_BUILD,
     CAPABILITY_IMAGE_BUILD_PRIVATE_GIT,
     CAPABILITY_IMAGE_LOAD,
     CAPABILITY_IMAGE_BUILD_EXTERNAL_PUSH,
+    CAPABILITY_IMAGE_BUILD_EXTERNAL_IMAGE,
     CAPABILITY_IMAGE_BUILD_VARIABLES,
     CAPABILITY_IMAGE_BUILD_INLINE_DOCKERFILE,
     CAPABILITY_IMAGE_BUILD_TARGET,
@@ -208,6 +213,8 @@ pub mod control {
                     .field("push_image", &self.push_image)
                     .field("push_username", &self.push_username)
                     .field("push_password", &redacted(&self.push_password))
+                    .field("image_username", &self.image_username)
+                    .field("image_password", &redacted(&self.image_password))
                     .field(
                         "build_arg_keys",
                         &self.build_args.keys().collect::<Vec<_>>(),

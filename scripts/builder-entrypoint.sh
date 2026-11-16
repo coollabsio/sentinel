@@ -1,6 +1,7 @@
 #!/bin/sh
 # Builds one commit, or a Dockerfile that Coolify sent, through BuildKit and
-# pushes it to the cluster registry.
+# pushes it to the cluster registry, or to the external registry of the
+# cluster with the read-only Docker config /run/coolify-image/config.json.
 # A localhost/ image is not pushed: the build writes a docker archive to
 # /coolify/out/image.tar, and Sentinel loads it into the Podman store.
 # Sentinel validates every argument before it starts this container. The
@@ -199,7 +200,10 @@ case "$type" in
   *)
     echo "error: unknown build type $type" >&2; exit 2 ;;
 esac
-build "$output" "$metadata" "$@"
+# An external image (the image storage of the cluster) has its own login.
+image_config=$DOCKER_CONFIG
+[ -f /run/coolify-image/config.json ] && image_config=/run/coolify-image
+(export DOCKER_CONFIG="$image_config"; build "$output" "$metadata" "$@")
 
 if [ -n "$push_image" ]; then
   step "Pushing $push_image"

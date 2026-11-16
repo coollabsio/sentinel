@@ -57,6 +57,10 @@ pub(super) struct ImageBuildApiRequest {
     target: String,
     #[serde(default)]
     static_root: String,
+    #[serde(default)]
+    image_username: String,
+    #[serde(default)]
+    image_password: String,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +132,8 @@ pub(super) async fn image_build(
             dockerfile_content: request.dockerfile_content,
             target: request.target,
             static_root: request.static_root,
+            image_username: request.image_username,
+            image_password: request.image_password,
         }),
         DEPLOY_TIMEOUT,
     )

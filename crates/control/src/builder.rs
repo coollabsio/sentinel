@@ -476,12 +476,31 @@ pub(crate) fn validate_build(request: &ImageBuildRequest) -> Result<(), String> 
     } else {
         validate_git_source(request)?;
     }
-    if build_target(&request.image).is_none() {
+    let external = is_external_tag(&request.image);
+    if build_target(&request.image).is_none() && !external {
         return Err(
-            "The build image must be a tag in the cluster registry or a localhost/ image.".into(),
+            "The build image must be a tag in the cluster registry, a localhost/ image, or a tag in another registry.".into(),
         );
     }
+    if crate::registry::validate_login(&request.image_username, &request.image_password)?
+        && !external
+    {
+        return Err("An image login needs an image outside the cluster registry.".into());
+    }
     validate_push(request)
+}
+
+/// A tag outside the cluster registry and the local store.
+fn is_external_tag(image: &str) -> bool {
+    let repository_end = image.rfind('/').map_or(0, |slash| slash + 1);
+    !image.starts_with('-')
+        && image.len() <= 2_048
+        && image
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-/:".contains(character))
+        && image[repository_end..].contains(':')
+        && !image.starts_with(&format!("{REGISTRY_HOST}/"))
+        && !is_local_image(image)
 }
 
 /// An inline Dockerfile has no repository, so no Git field may be set.
@@ -643,16 +662,7 @@ fn validate_push(request: &ImageBuildRequest) -> Result<(), String> {
             Ok(())
         };
     }
-    let repository_end = image.rfind('/').map_or(0, |slash| slash + 1);
-    let valid = !image.starts_with('-')
-        && image.len() <= 2_048
-        && image
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._-/:".contains(character))
-        && image[repository_end..].contains(':')
-        && !image.starts_with(&format!("{REGISTRY_HOST}/"))
-        && !is_local_image(image);
-    if !valid {
+    if !is_external_tag(image) {
         return Err("The push image must be a tag outside the cluster registry.".into());
     }
     Ok(())
@@ -660,6 +670,8 @@ fn validate_push(request: &ImageBuildRequest) -> Result<(), String> {
 
 const PUSH_LOGIN_FILE: &str = "push-config.json";
 const PUSH_LOGIN_MOUNT: &str = "/run/coolify-push";
+const IMAGE_LOGIN_FILE: &str = "image-config.json";
+const IMAGE_LOGIN_MOUNT: &str = "/run/coolify-image";
 
 /// One directory per build under the host `/run` (tmpfs), so an input never
 /// reaches the disk and is gone after a reboot.
@@ -727,6 +739,16 @@ fn write_build_inputs(root: &Path, request: &ImageBuildRequest) -> Result<bool, 
                 &crate::registry::image_registry_host(&request.push_image),
                 &request.push_username,
                 &request.push_password,
+            ),
+        )?;
+    }
+    if !request.image_username.is_empty() {
+        write(
+            IMAGE_LOGIN_FILE,
+            &crate::registry::login_auth_file(
+                &crate::registry::image_registry_host(&request.image),
+                &request.image_username,
+                &request.image_password,
             ),
         )?;
     }
@@ -851,6 +873,17 @@ pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<S
                 "{}:{PUSH_LOGIN_MOUNT}/config.json:ro",
                 build_input_dir(root, &request.build_id)
                     .join(PUSH_LOGIN_FILE)
+                    .display()
+            ),
+        ]);
+    }
+    if !request.image_username.is_empty() {
+        arguments.extend([
+            "--volume".into(),
+            format!(
+                "{}:{IMAGE_LOGIN_MOUNT}/config.json:ro",
+                build_input_dir(root, &request.build_id)
+                    .join(IMAGE_LOGIN_FILE)
                     .display()
             ),
         ]);
