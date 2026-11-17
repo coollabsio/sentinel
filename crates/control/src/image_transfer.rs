@@ -223,6 +223,8 @@ struct Serve {
     repository: String,
     digest: String,
     image_id: String,
+    size_bytes: u64,
+    bytes_sent: Arc<AtomicU64>,
     deadline: Arc<AtomicI64>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -261,17 +263,20 @@ pub(crate) fn validate_serve(request: &ImageServeRequest) -> Result<(), String> 
     Ok(())
 }
 
-fn stop_serve(transfer_id: &str) {
+/// Stops a serve and returns the bytes that it sent, 0 when nothing ran.
+fn stop_serve(transfer_id: &str) -> u64 {
     let serve = SERVES
         .lock()
         .ok()
         .and_then(|mut serves| serves.remove(transfer_id));
-    if let Some(mut serve) = serve {
-        serve.stop.store(true, Ordering::SeqCst);
-        if let Some(worker) = serve.worker.take() {
-            let _ = worker.join();
-        }
+    let Some(mut serve) = serve else {
+        return 0;
+    };
+    serve.stop.store(true, Ordering::SeqCst);
+    if let Some(worker) = serve.worker.take() {
+        let _ = worker.join();
     }
+    serve.bytes_sent.load(Ordering::SeqCst)
 }
 
 pub(crate) fn serve(
@@ -281,9 +286,12 @@ pub(crate) fn serve(
 ) -> Result<ImageServeResult, String> {
     validate_serve(request)?;
     if request.stop {
-        stop_serve(&request.transfer_id);
+        let bytes_sent = stop_serve(&request.transfer_id);
         remove_dir(&export_dir(root, &request.transfer_id));
-        return Ok(ImageServeResult::default());
+        return Ok(ImageServeResult {
+            bytes_sent,
+            ..ImageServeResult::default()
+        });
     }
     let peer_ip: Ipv4Addr = request
         .peer_ip
@@ -307,6 +315,8 @@ pub(crate) fn serve(
                 repository: serve.repository.clone(),
                 digest: serve.digest.clone(),
                 image_id: serve.image_id.clone(),
+                size_bytes: serve.size_bytes,
+                bytes_sent: serve.bytes_sent.load(Ordering::SeqCst),
             });
         }
     }
@@ -329,10 +339,8 @@ fn start_serve(
     remove_dir(&directory);
     // The export is a full uncompressed copy of the image: check the disk
     // first, so that a transfer never fills it.
-    if let (Some(size), Some(available)) = (
-        image_size(podman, &request.image),
-        available_bytes(&directory),
-    ) {
+    let size_bytes = image_size(podman, &request.image);
+    if let (Some(size), Some(available)) = (size_bytes, available_bytes(&directory)) {
         ensure_free_space(size, available)?;
     }
     create_private_dir(&directory)?;
@@ -379,17 +387,20 @@ fn start_serve(
         repository: export.repository.clone(),
         digest: export.manifest_digest.clone(),
         image_id,
+        size_bytes: size_bytes.unwrap_or(0),
+        bytes_sent: 0,
     };
 
     let generation = GENERATION.fetch_add(1, Ordering::SeqCst);
     let deadline = Arc::new(AtomicI64::new(request.expires_at_unix_ms));
     let stop = Arc::new(AtomicBool::new(false));
+    let bytes_sent = Arc::new(AtomicU64::new(0));
     let worker = {
-        let (deadline, stop) = (deadline.clone(), stop.clone());
+        let (deadline, stop, sent) = (deadline.clone(), stop.clone(), bytes_sent.clone());
         let transfer_id = request.transfer_id.clone();
         let root = root.to_path_buf();
         std::thread::spawn(move || {
-            run_server(listener, Arc::new(export), secret, &deadline, &stop);
+            run_server(listener, Arc::new(export), secret, &deadline, &stop, sent);
             tracing::info!(transfer_id, "image transfer stopped");
             if root == Path::new("/") {
                 revoke_peer(peer_ip, port);
@@ -421,6 +432,8 @@ fn start_serve(
                 repository: result.repository.clone(),
                 digest: result.digest.clone(),
                 image_id: result.image_id.clone(),
+                size_bytes: result.size_bytes,
+                bytes_sent,
                 deadline,
                 stop,
                 worker: Some(worker),
@@ -531,6 +544,7 @@ fn run_server(
     secret: [u8; 32],
     deadline: &AtomicI64,
     stop: &AtomicBool,
+    bytes_sent: Arc<AtomicU64>,
 ) {
     let connections = Arc::new(Mutex::new(Connections::default()));
     let active = Arc::new(AtomicUsize::new(0));
@@ -571,9 +585,14 @@ fn run_server(
             id
         };
         active.fetch_add(1, Ordering::SeqCst);
-        let (export, connections, active) = (export.clone(), connections.clone(), active.clone());
+        let (export, connections, active, sent) = (
+            export.clone(),
+            connections.clone(),
+            active.clone(),
+            bytes_sent.clone(),
+        );
         std::thread::spawn(move || {
-            handle_connection(stream, &export, &secret);
+            handle_connection(stream, &export, &secret, &sent);
             if let Ok(mut connections) = connections.lock() {
                 connections.open.remove(&id);
             }
@@ -588,7 +607,12 @@ fn run_server(
     }
 }
 
-fn handle_connection(mut stream: TcpStream, export: &Export, secret: &[u8; 32]) {
+fn handle_connection(
+    mut stream: TcpStream,
+    export: &Export,
+    secret: &[u8; 32],
+    bytes_sent: &AtomicU64,
+) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let head = match read_head(&mut stream) {
@@ -611,7 +635,7 @@ fn handle_connection(mut stream: TcpStream, export: &Export, secret: &[u8; 32]) 
         None => Response::error(400, "UNSUPPORTED", "The request is invalid."),
     };
     let head_only = response.head_only;
-    let _ = write_response(&mut stream, response, head_only);
+    let _ = write_response(&mut stream, response, head_only, bytes_sent);
     let _ = stream.shutdown(Shutdown::Both);
 }
 
@@ -814,6 +838,7 @@ fn write_response(
     stream: &mut TcpStream,
     response: Response,
     head_only: bool,
+    bytes_sent: &AtomicU64,
 ) -> std::io::Result<()> {
     let mut file = match &response.body {
         Body::File(path) => std::fs::File::open(path).ok(),
@@ -849,8 +874,17 @@ fn write_response(
     }
     match (response.body, file.as_mut()) {
         (Body::Bytes(bytes), _) => stream.write_all(&bytes)?,
+        // Blob and manifest bodies count as sent bytes while they go out.
         (Body::File(_), Some(file)) => {
-            std::io::copy(file, stream)?;
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                stream.write_all(&buffer[..read])?;
+                bytes_sent.fetch_add(read as u64, Ordering::SeqCst);
+            }
         }
         (Body::File(_), None) => {}
     }
@@ -1380,10 +1414,18 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let deadline = Arc::new(AtomicI64::new(now_millis() + 60_000));
         let stop = Arc::new(AtomicBool::new(false));
+        let bytes_sent = Arc::new(AtomicU64::new(0));
         let server = {
-            let (deadline, stop) = (deadline.clone(), stop.clone());
+            let (deadline, stop, sent) = (deadline.clone(), stop.clone(), bytes_sent.clone());
             std::thread::spawn(move || {
-                run_server(listener, Arc::new(export), digest(SECRET), &deadline, &stop)
+                run_server(
+                    listener,
+                    Arc::new(export),
+                    digest(SECRET),
+                    &deadline,
+                    &stop,
+                    sent,
+                )
             })
         };
 
@@ -1403,11 +1445,17 @@ mod tests {
             "{response}"
         );
 
+        // Only the manifest body counts so far: no JSON bodies.
+        assert_eq!(bytes_sent.load(Ordering::SeqCst), body.len() as u64);
+
         let path = format!("/v2/coolify-transfer/move-1/blobs/{layer}");
+        let sent = bytes_sent.load(Ordering::SeqCst);
         let head = get(address, "HEAD", &path, true);
         assert!(head.contains("Content-Length: 9\r\n"), "{head}");
         assert!(head.ends_with("\r\n\r\n"), "{head}");
+        assert_eq!(bytes_sent.load(Ordering::SeqCst), sent);
         assert!(get(address, "GET", &path, true).ends_with("\r\n\r\nlayer tar"));
+        assert_eq!(bytes_sent.load(Ordering::SeqCst), sent + 9);
 
         for (method, path, status) in [
             (
@@ -1471,6 +1519,7 @@ mod tests {
             digest(SECRET),
             &deadline,
             &AtomicBool::new(false),
+            Arc::new(AtomicU64::new(0)),
         );
         assert!(started.elapsed() < Duration::from_secs(5));
     }

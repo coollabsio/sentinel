@@ -746,6 +746,12 @@ message ImageServeResult {
   string digest = 4;
   // The Podman image ID, `sha256:...`. The same on the fetching Node.
   string image_id = 5;
+  // The uncompressed size of the served image. 0 when unknown and after
+  // `stop`.
+  uint64 size_bytes = 6;
+  // The bytes of blob and manifest bodies sent so far for this transfer.
+  // After `stop`, the bytes of the stopped transfer, or 0 when nothing ran.
+  uint64 bytes_sent = 7;
 }
 
 // Pulls a local image from a Node that serves it (`image.serve.v1`), tags it

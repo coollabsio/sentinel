@@ -293,6 +293,8 @@ pub(super) async fn image_serve(
         "repository": value.repository,
         "digest": value.digest,
         "image_id": value.image_id,
+        "size_bytes": value.size_bytes,
+        "bytes_sent": value.bytes_sent,
     })))
 }
 
