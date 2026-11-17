@@ -85,6 +85,57 @@ fn export_dir(root: &Path, transfer_id: &str) -> PathBuf {
     root.join(EXPORT_DIR).join(transfer_id)
 }
 
+/// Free disk that the export must leave, so that the Node keeps working.
+const EXPORT_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The uncompressed size of a local image, as `podman save --uncompressed`
+/// writes it.
+fn image_size(podman: &Path, image: &str) -> Option<u64> {
+    let output = output_with_timeout(
+        Command::new(podman).args(["image", "inspect", "--format", "{{.Size}}", image]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// The free bytes of the file system of `path`: the disk with the longest
+/// mount point that contains it.
+fn available_bytes(path: &Path) -> Option<u64> {
+    sysinfo::Disks::new_with_refreshed_list()
+        .list()
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(sysinfo::Disk::available_space)
+}
+
+fn ensure_free_space(image_bytes: u64, available_bytes: u64) -> Result<(), String> {
+    let needed = image_bytes.saturating_add(EXPORT_RESERVE_BYTES);
+    if available_bytes >= needed {
+        return Ok(());
+    }
+    Err(format!(
+        "The server has {} free, but the copy of the image needs {} (the uncompressed image and 1 GiB that stays free). Free disk space, then try again.",
+        human_bytes(available_bytes),
+        human_bytes(needed)
+    ))
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB)
+    } else {
+        format!("{:.0} MiB", bytes as f64 / MIB)
+    }
+}
+
 fn create_private_dir(path: &Path) -> Result<(), String> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -276,6 +327,14 @@ fn start_serve(
     };
     let directory = export_dir(root, &request.transfer_id);
     remove_dir(&directory);
+    // The export is a full uncompressed copy of the image: check the disk
+    // first, so that a transfer never fills it.
+    if let (Some(size), Some(available)) = (
+        image_size(podman, &request.image),
+        available_bytes(&directory),
+    ) {
+        ensure_free_space(size, available)?;
+    }
     create_private_dir(&directory)?;
     let started = (|| {
         let oci = directory.join("oci");
@@ -1214,6 +1273,18 @@ mod tests {
             change(&mut request);
             assert_eq!(validate_fetch(&request), Err(error.into()));
         }
+    }
+
+    #[test]
+    fn needs_the_image_and_a_reserve_of_free_disk() {
+        let gib = 1024 * 1024 * 1024;
+        assert!(ensure_free_space(2 * gib, 3 * gib).is_ok());
+        let error = ensure_free_space(2 * gib, 3 * gib - 1).unwrap_err();
+        assert!(
+            error.contains("3.0 GiB free") || error.contains("needs 3.0 GiB"),
+            "{error}"
+        );
+        assert!(ensure_free_space(u64::MAX, u64::MAX - 1).is_err());
     }
 
     #[test]
