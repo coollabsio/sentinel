@@ -813,10 +813,10 @@ pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<S
         "--env".into(),
         "BUILDKIT_HOST=unix:///run/buildkit/buildkitd.sock".into(),
         // No login: a build without `image_username` or `push_username`
-        // pulls and pushes anonymously. The entrypoint of older builder
-        // images reads this variable under `set -u`.
+        // pulls and pushes anonymously. BuildKit creates this directory, so it
+        // must be writable. The entrypoint reads this variable under `set -u`.
         "--env".into(),
-        "DOCKER_CONFIG=/coolify/docker".into(),
+        "DOCKER_CONFIG=/home/build/.docker".into(),
         "--volume".into(),
         format!("{}:/run/buildkit", socket_dir(root).display()),
     ]);
