@@ -261,8 +261,6 @@ fn render_peer(peer: &WireguardPeer) -> String {
     )
 }
 
-/// The cluster registry port (`sentinel_protocol::REGISTRY_HOST`).
-const REGISTRY_PORT: u16 = 5443;
 /// The Corrosion gossip and API ports (`render_corrosion`).
 const CORROSION_GOSSIP_PORT: u32 = 8787;
 const CORROSION_API_PORT: u32 = 8080;
@@ -281,7 +279,6 @@ fn reserved_host_port(port: u32, wireguard_port: u32) -> bool {
             443,
             CORROSION_GOSSIP_PORT,
             CORROSION_API_PORT,
-            u32::from(REGISTRY_PORT),
             SENTINEL_API_PORT,
         ]
         .contains(&port)
@@ -418,8 +415,6 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
             .workload_cidrs
             .iter()
             .any(|cidr| !valid_ipv4_cidr(cidr))
-        || (!request.registry_ip.is_empty()
-            && !ipv4_in_cidr(&request.registry_ip, &request.cluster_cidr))
         || request.rules.len() > 100_000
         || request.ingress_rules.len() > 100_000
         || request.stack_rules.len() > 100_000
@@ -608,22 +603,6 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
         .join(" ");
 
     let local_node_ip = &request.local_node_ip;
-    // Node hosts reach the cluster registry over the mesh. The input rule
-    // matches only on the registry Node; the source must be a Node address.
-    let (input_registry_rule, output_registry_rule) = if request.registry_ip.is_empty() {
-        (String::new(), String::new())
-    } else {
-        (
-            format!(
-                "ip saddr {} ip daddr {} tcp dport {REGISTRY_PORT} accept; ",
-                request.cluster_cidr, request.registry_ip
-            ),
-            format!(
-                "ip daddr {} tcp dport {REGISTRY_PORT} accept; ",
-                request.registry_ip
-            ),
-        )
-    };
 
     // Netavark masquerades everything that leaves a workload network, in a nat
     // chain of its own table. A verdict in another chain cannot stop that
@@ -634,10 +613,10 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
     Ok(format!(
         "table inet {COOLIFY_NFT_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
- chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; ip saddr {} udp dport 8787 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} udp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 8080 accept; {input_registry_rule}ip saddr {} drop; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
+ chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; ip saddr {} udp dport 8787 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} udp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 8080 accept; ip saddr {} drop; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
  chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} {stack_allow_rules}{forward_ingress_rules} {forward_published_rules}ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; ip saddr != @workload_networks ip daddr @workload_networks drop; }}
  chain {MESH_NAT_CHAIN} {{ type nat hook postrouting priority srcnat - 5; policy accept; oifname \"{}\" ip saddr @workload_networks ip daddr @workload_networks snat ip to ip saddr; }}
- chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; ip daddr {local_node_ip} udp dport 53 accept; ip daddr {local_node_ip} tcp dport 53 accept; ip daddr {local_node_ip} tcp dport 8080 accept; {output_allow_rules} {output_ingress_rules} {output_registry_rule}{output_published_rules}ip daddr {} drop; ip daddr @workload_networks drop; }}
+ chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; ip daddr {local_node_ip} udp dport 53 accept; ip daddr {local_node_ip} tcp dport 53 accept; ip daddr {local_node_ip} tcp dport 8080 accept; {output_allow_rules} {output_ingress_rules} {output_published_rules}ip daddr {} drop; ip daddr @workload_networks drop; }}
 }}
 table bridge {COOLIFY_NFT_BRIDGE_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
@@ -1199,8 +1178,9 @@ pub(crate) fn reconcile_firewall(
     atomic_write(&snapshot_path, snapshot.as_bytes(), 0o600)?;
     if root == Path::new("/") {
         activate_firewall(root, &snapshot, request)?;
-        // The new table has no volume transfer rules.
+        // The new table has no volume or image transfer rules.
         crate::volume_transfer::restore_firewall();
+        crate::image_transfer::restore_firewall();
         refresh_discovery_resolver(root)?;
     }
     atomic_write(
@@ -2655,8 +2635,12 @@ pub(crate) fn apply_restore_step(root: &Path, step: &RestoreStep) -> Result<(), 
         RestoreStep::LoadFirewall {
             inet_table_exists,
             bridge_table_exists,
-        } => restore_firewall_tables(root, *inet_table_exists, *bridge_table_exists)
-            .inspect(|()| crate::volume_transfer::restore_firewall()),
+        } => {
+            restore_firewall_tables(root, *inet_table_exists, *bridge_table_exists).inspect(|()| {
+                crate::volume_transfer::restore_firewall();
+                crate::image_transfer::restore_firewall();
+            })
+        }
         RestoreStep::WireguardUp { interface, address } => {
             restore_wireguard_link(interface, address)
         }
@@ -2871,7 +2855,6 @@ mod tests {
             wireguard_interface: "coolify0".into(),
             workload_cidrs: vec!["100.64.0.0/24".into(), "100.64.1.0/24".into()],
             flux_probe_host: "10.240.0.1".into(),
-            registry_ip: String::new(),
             stack_rules: vec![],
             published_ports: vec![],
         })
@@ -3530,7 +3513,6 @@ mod tests {
             flux_probe_host: String::new(),
             workload_cidrs: vec!["100.64.0.0/24".into()],
             ingress_rules: vec![],
-            registry_ip: String::new(),
             stack_rules: vec![],
             published_ports: vec![],
         };
@@ -3869,7 +3851,7 @@ mod tests {
         ] {
             assert!(!valid(invalid));
         }
-        for reserved in [51_820, 53, 80, 443, 8787, 8080, 5443, 8888, 7800, 7899] {
+        for reserved in [51_820, 53, 80, 443, 8787, 8080, 8888, 7800, 7899] {
             assert_eq!(
                 render_firewall(&request(vec![tcp(reserved)])).unwrap_err(),
                 format!("The host port {reserved} is reserved for the Node.")
@@ -4317,7 +4299,6 @@ mod tests {
             flux_probe_host: String::new(),
             workload_cidrs: vec!["100.64.1.0/24".into(), "100.64.0.0/24".into()],
             ingress_rules: vec![],
-            registry_ip: String::new(),
             stack_rules: vec![],
             published_ports: vec![],
         }

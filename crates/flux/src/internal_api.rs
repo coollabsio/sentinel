@@ -373,8 +373,6 @@ struct FirewallReconcileApiRequest {
     #[serde(default)]
     ingress_rules: Vec<FirewallIngressRuleApiRequest>,
     #[serde(default)]
-    registry_ip: String,
-    #[serde(default)]
     stack_rules: Vec<FirewallStackRuleApiRequest>,
     #[serde(default)]
     published_ports: Vec<FirewallPublishedPortApiRequest>,
@@ -670,6 +668,8 @@ pub async fn serve(
         .route("/v1/commands/ingress.reconcile", post(ingress_reconcile))
         .route("/v1/commands/image.build", post(build::image_build))
         .route("/v1/commands/image.load", post(build::image_load))
+        .route("/v1/commands/image.serve", post(build::image_serve))
+        .route("/v1/commands/image.fetch", post(build::image_fetch))
         .route("/v1/commands/image.prune", post(build::image_prune))
         .route(
             "/v1/commands/workload.reconcile",
@@ -680,14 +680,6 @@ pub async fn serve(
         .route(
             "/v1/commands/builder.reconcile",
             post(build::builder_reconcile),
-        )
-        .route(
-            "/v1/commands/registry.reconcile",
-            post(build::registry_reconcile),
-        )
-        .route(
-            "/v1/commands/registry.inspect",
-            post(build::registry_inspect),
         )
         .route("/v1/commands/volume.delete", post(volume::volume_delete))
         .route("/v1/commands/volume.serve", post(volume::volume_serve))
@@ -1004,7 +996,6 @@ async fn firewall_reconcile(
             flux_probe_host: request.flux_probe_host,
             workload_cidrs: request.workload_cidrs,
             ingress_rules,
-            registry_ip: request.registry_ip,
             stack_rules: request
                 .stack_rules
                 .into_iter()

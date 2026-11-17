@@ -343,11 +343,18 @@ impl AssignmentClient {
             )
             .with_workload_set(workload_set.clone()),
         ));
-        // Volume transfers keep their state in memory; daemons and firewall
-        // elements of an earlier Sentinel process have no owner any more. Git
-        // credentials of builds that an earlier process started get a watcher.
+        // Volume and image transfers keep their state in memory; daemons,
+        // exports, and firewall elements of an earlier Sentinel process have
+        // no owner any more. Git credentials of builds that an earlier process
+        // started get a watcher. The built-in registry of earlier versions is
+        // removed.
         let _ = tokio::task::spawn_blocking(|| {
             crate::volume_transfer::remove_leftovers(std::path::Path::new("/"));
+            crate::image_transfer::remove_leftovers(std::path::Path::new("/"));
+            crate::registry::remove_builtin_registry(
+                std::path::Path::new("/"),
+                std::path::Path::new("podman"),
+            );
             crate::builder::remove_build_inputs_after_builds(
                 std::path::Path::new("/"),
                 std::path::Path::new("podman"),

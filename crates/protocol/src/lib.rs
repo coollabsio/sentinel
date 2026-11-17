@@ -37,8 +37,6 @@ pub const CAPABILITY_INGRESS_ROUTES_V2: &str = "ingress.routes.v2";
 pub const CAPABILITY_FIREWALL_PUBLISHED_PORTS: &str = "network.firewall.published_ports.v1";
 pub const CAPABILITY_IMAGE_BUILD: &str = "image.build.v1";
 pub const CAPABILITY_BUILDER_RECONCILE: &str = "builder.reconcile.v1";
-pub const CAPABILITY_REGISTRY_RECONCILE: &str = "registry.reconcile.v1";
-pub const CAPABILITY_REGISTRY_INSPECT: &str = "registry.inspect.v1";
 /// `image.build.v1` accepts `git_https_token` and `git_ssh_private_key`
 /// (decision 0011). Not a command: an older Sentinel ignores the fields and
 /// would clone without the credential.
@@ -47,11 +45,16 @@ pub const CAPABILITY_IMAGE_BUILD_PRIVATE_GIT: &str = "image.build.private_git.v1
 /// `image.build.v1` accepts a `localhost/` image, so a single-Node cluster
 /// needs no registry.
 pub const CAPABILITY_IMAGE_LOAD: &str = "image.load.v1";
+/// Serves a local image to one peer Node (decision 0030 of Coolify).
+pub const CAPABILITY_IMAGE_SERVE: &str = "image.serve.v1";
+/// Fetches a local image from a peer Node that serves it (decision 0030 of
+/// Coolify).
+pub const CAPABILITY_IMAGE_FETCH: &str = "image.fetch.v1";
 /// `image.build.v1` accepts `push_image`, `push_username`, and
 /// `push_password`. Not a command: an older Sentinel ignores the fields and
 /// would not push the image.
 pub const CAPABILITY_IMAGE_BUILD_EXTERNAL_PUSH: &str = "image.build.external_push.v1";
-/// `image.build.v1` accepts an `image` outside the cluster registry, with
+/// `image.build.v1` accepts an `image` in a registry, with
 /// `image_username` and `image_password`, so a cluster can store its builds
 /// in an external registry. Not a command: an older Sentinel rejects the image.
 pub const CAPABILITY_IMAGE_BUILD_EXTERNAL_IMAGE: &str = "image.build.external_image.v1";
@@ -85,6 +88,8 @@ pub const BUILD_CAPABILITIES: [&str; 14] = [
     CAPABILITY_IMAGE_BUILD,
     CAPABILITY_IMAGE_BUILD_PRIVATE_GIT,
     CAPABILITY_IMAGE_LOAD,
+    CAPABILITY_IMAGE_SERVE,
+    CAPABILITY_IMAGE_FETCH,
     CAPABILITY_IMAGE_BUILD_EXTERNAL_PUSH,
     CAPABILITY_IMAGE_BUILD_EXTERNAL_IMAGE,
     CAPABILITY_IMAGE_BUILD_VARIABLES,
@@ -93,8 +98,6 @@ pub const BUILD_CAPABILITIES: [&str; 14] = [
     CAPABILITY_IMAGE_BUILD_STATIC,
     CAPABILITY_WORKLOAD_REGISTRY_AUTH,
     CAPABILITY_BUILDER_RECONCILE,
-    CAPABILITY_REGISTRY_RECONCILE,
-    CAPABILITY_REGISTRY_INSPECT,
     CAPABILITY_IMAGE_PRUNE,
 ];
 /// `workload.deploy.v1` accepts `mounts`. Not a command: an older Sentinel
@@ -187,9 +190,6 @@ pub const CAPABILITY_WORKLOAD_EXEC: &str = "workload.exec.v1";
 /// Opens an interactive shell in a managed container (decision 0018).
 pub const CAPABILITY_WORKLOAD_TERMINAL: &str = "workload.terminal.v1";
 pub const EXEC_CAPABILITIES: [&str; 2] = [CAPABILITY_WORKLOAD_EXEC, CAPABILITY_WORKLOAD_TERMINAL];
-/// The cluster registry. Sentinel discovery DNS resolves it to the Node that
-/// runs the registry.
-pub const REGISTRY_HOST: &str = "registry.cluster.coolify.internal:5443";
 pub const NETWORK_CAPABILITIES: [&str; 12] = [
     CAPABILITY_CLUSTER_LEAVE,
     CAPABILITY_WIREGUARD_KEY_ENSURE,
@@ -261,6 +261,36 @@ pub mod control {
                     .field("registry_username", &self.registry_username)
                     .field("registry_password", &redacted(&self.registry_password))
                     .finish_non_exhaustive()
+            }
+        }
+
+        impl std::fmt::Debug for ImageServeRequest {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter
+                    .debug_struct("ImageServeRequest")
+                    .field("transfer_id", &self.transfer_id)
+                    .field("image", &self.image)
+                    .field("peer_ip", &self.peer_ip)
+                    .field("secret", &"[redacted]")
+                    .field("expires_at_unix_ms", &self.expires_at_unix_ms)
+                    .field("stop", &self.stop)
+                    .finish()
+            }
+        }
+
+        impl std::fmt::Debug for ImageFetchRequest {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter
+                    .debug_struct("ImageFetchRequest")
+                    .field("transfer_id", &self.transfer_id)
+                    .field("source_address", &self.source_address)
+                    .field("source_port", &self.source_port)
+                    .field("secret", &"[redacted]")
+                    .field("repository", &self.repository)
+                    .field("digest", &self.digest)
+                    .field("image", &self.image)
+                    .field("image_id", &self.image_id)
+                    .finish()
             }
         }
 

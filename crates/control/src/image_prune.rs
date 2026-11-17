@@ -1,8 +1,7 @@
 //! `image.prune.v1`: removes the images that no container uses, except the
 //! images that Coolify keeps for rollbacks and the infrastructure images, and
 //! the `coolify-build-*` containers of builds that ended (decision 0027 of
-//! Coolify). It never touches volumes, networks, the BuildKit cache, or the
-//! registry data.
+//! Coolify). It never touches volumes, networks, or the BuildKit cache.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -14,7 +13,6 @@ use sysinfo::Disks;
 use crate::builder::BUILDKIT_IMAGE;
 use crate::commands::{PODMAN_QUERY_TIMEOUT, podman_failure};
 use crate::network::output_with_timeout;
-use crate::registry::ZOT_IMAGE;
 
 pub(crate) const MAX_KEEP: usize = 2048;
 const MAX_REFERENCE: usize = 512;
@@ -217,7 +215,7 @@ pub(crate) fn plan(
         .keep
         .iter()
         .map(String::as_str)
-        .chain([BUILDKIT_IMAGE, ZOT_IMAGE])
+        .chain([BUILDKIT_IMAGE])
         .collect();
     let mut kept_images = 0;
     let mut remove_images = Vec::new();
@@ -386,8 +384,8 @@ mod tests {
         assert_eq!(normalize("nginx:alpine"), "docker.io/library/nginx:alpine");
         assert_eq!(normalize("n8nio/n8n:2.10.2"), "docker.io/n8nio/n8n:2.10.2");
         assert_eq!(
-            normalize("registry.cluster.coolify.internal:5443/app@sha256:aa"),
-            "registry.cluster.coolify.internal:5443/app@sha256:aa"
+            normalize("registry.example:5443/app@sha256:aa"),
+            "registry.example:5443/app@sha256:aa"
         );
         assert_eq!(normalize("localhost/app:abc"), "localhost/app:abc");
         assert_eq!(normalize("localhost:5000/app"), "localhost:5000/app:latest");
@@ -407,17 +405,14 @@ mod tests {
             image("a1", &["docker.io/library/nginx:alpine"], &[], 1),
             image(
                 "b2",
-                &["registry.cluster.coolify.internal:5443/app@sha256:2222"],
-                &[&format!(
-                    "registry.cluster.coolify.internal:5443/app{}",
-                    "@sha256:2222"
-                )],
+                &["registry.example:5443/app@sha256:2222"],
+                &[&format!("registry.example:5443/app{}", "@sha256:2222")],
                 2,
             ),
             image(
                 "c3",
-                &["registry.cluster.coolify.internal:5443/app@sha256:1111"],
-                &["registry.cluster.coolify.internal:5443/app@sha256:1111"],
+                &["registry.example:5443/app@sha256:1111"],
+                &["registry.example:5443/app@sha256:1111"],
                 1,
             ),
             image("d4", &[], &[], 1),
@@ -434,7 +429,7 @@ mod tests {
             &containers,
             &request(
                 &[
-                    "registry.cluster.coolify.internal:5443/app@sha256:2222",
+                    "registry.example:5443/app@sha256:2222",
                     "sha256:aaaaaaaaaaaa",
                 ],
                 &[],
@@ -473,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn always_keeps_buildkit_zot_and_the_newest_sentinel_host() {
+    fn always_keeps_buildkit_and_the_newest_sentinel_host() {
         let buildkit_digest = digest_of(BUILDKIT_IMAGE).unwrap();
         let images = [
             image(
@@ -482,7 +477,7 @@ mod tests {
                 &[&format!("docker.io/moby/buildkit@{buildkit_digest}")],
                 1,
             ),
-            image("zot", &[ZOT_IMAGE.split('@').next().unwrap()], &[], 1),
+            image("zot", &["ghcr.io/project-zot/zot:v2.1.23"], &[], 1),
             image(
                 "old-host",
                 &["ghcr.io/coollabsio/sentinel-host:main-1"],
@@ -497,7 +492,7 @@ mod tests {
             ),
         ];
         let plan = plan(&images, &[], &request(&[], &[]));
-        // zot is pinned by digest: a tag without that digest is not the pinned image.
+        // The zot image of the removed built-in registry is not kept.
         assert_eq!(removed(&plan), ["zot", "old-host"]);
     }
 

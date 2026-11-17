@@ -305,7 +305,8 @@ fn build_ptr_response(
 /// workload ID through `workload_names`, which Coolify writes, so a rename
 /// applies without touching the containers.
 const NODE_NAMESPACE: &str = "nodes";
-/// Cluster services, for example `registry.cluster`. Endpoint rows of their own.
+/// Reserved for cluster services, endpoint rows of their own. Sentinel
+/// publishes none at the moment.
 const CLUSTER_NAMESPACE: &str = "cluster";
 
 /// A workload name in any other namespace, `default` or the name of a stack

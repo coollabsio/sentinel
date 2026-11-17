@@ -13,9 +13,8 @@ use sentinel_protocol::control::v1::{
     WorkloadLifecycleRequest, WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
-    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_LOAD,
-    CAPABILITY_IMAGE_PRUNE, CAPABILITY_REGISTRY_INSPECT, CAPABILITY_REGISTRY_RECONCILE,
-    REGISTRY_HOST,
+    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_FETCH,
+    CAPABILITY_IMAGE_LOAD, CAPABILITY_IMAGE_PRUNE, CAPABILITY_IMAGE_SERVE,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -218,9 +217,9 @@ impl CommandExecutor {
         let request = journal_request(&command);
         // logs.read and container.logs are read-only, frequently polled
         // commands. Their results are never replayed, so they are not
-        // journaled; a repeated ID reads again. volume.serve and
-        // volume.receive are idempotent per transfer and carry the transfer
-        // secret, which must not be stored. registry.inspect is a read-only report.
+        // journaled; a repeated ID reads again. volume.serve, volume.receive,
+        // image.serve, and image.fetch are idempotent per transfer and carry
+        // the transfer secret, which must not be stored.
         // volume.backup, volume.restore, database.dump, and database.restore
         // carry presigned S3 URLs.
         // workload.exec and workload.terminal carry commands and sessions.
@@ -230,7 +229,8 @@ impl CommandExecutor {
                 | CAPABILITY_CONTAINER_LOGS
                 | CAPABILITY_VOLUME_SERVE
                 | CAPABILITY_VOLUME_RECEIVE
-                | CAPABILITY_REGISTRY_INSPECT
+                | CAPABILITY_IMAGE_SERVE
+                | CAPABILITY_IMAGE_FETCH
                 | CAPABILITY_VOLUME_BACKUP
                 | CAPABILITY_VOLUME_RESTORE
                 | CAPABILITY_DATABASE_DUMP
@@ -346,15 +346,15 @@ impl CommandExecutor {
             (CAPABILITY_IMAGE_BUILD, Some(Payload::ImageBuild(request))) => {
                 crate::builder::validate_build(request).is_ok()
             }
-            (CAPABILITY_BUILDER_RECONCILE, Some(Payload::BuilderReconcile(request))) => {
-                crate::builder::validate_reconcile(request).is_ok()
-            }
-            (CAPABILITY_REGISTRY_RECONCILE, Some(Payload::RegistryReconcile(request))) => {
-                crate::registry::validate(request).is_ok()
-            }
-            (CAPABILITY_REGISTRY_INSPECT, Some(Payload::RegistryInspect(_))) => true,
+            (CAPABILITY_BUILDER_RECONCILE, Some(Payload::BuilderReconcile(_))) => true,
             (CAPABILITY_IMAGE_LOAD, Some(Payload::ImageLoad(request))) => {
                 crate::builder::validate_load(request).is_ok()
+            }
+            (CAPABILITY_IMAGE_SERVE, Some(Payload::ImageServe(request))) => {
+                crate::image_transfer::validate_serve(request).is_ok()
+            }
+            (CAPABILITY_IMAGE_FETCH, Some(Payload::ImageFetch(request))) => {
+                crate::image_transfer::validate_fetch(request).is_ok()
             }
             (CAPABILITY_IMAGE_PRUNE, Some(Payload::ImagePrune(request))) => {
                 crate::image_prune::validate(request).is_ok()
@@ -413,9 +413,9 @@ impl CommandExecutor {
                     | CAPABILITY_INGRESS_RECONCILE
                     | CAPABILITY_IMAGE_BUILD
                     | CAPABILITY_BUILDER_RECONCILE
-                    | CAPABILITY_REGISTRY_RECONCILE
-                    | CAPABILITY_REGISTRY_INSPECT
                     | CAPABILITY_IMAGE_LOAD
+                    | CAPABILITY_IMAGE_SERVE
+                    | CAPABILITY_IMAGE_FETCH
                     | CAPABILITY_IMAGE_PRUNE
                     | CAPABILITY_VOLUME_DELETE
                     | CAPABILITY_VOLUME_SERVE
@@ -713,26 +713,21 @@ impl CommandExecutor {
                 ),
                 Err(message) => failed(&command.command_id, "image_load_failed", &message),
             }
-        } else if let Some(Payload::RegistryInspect(_)) = command.payload {
-            succeeded(
-                &command.command_id,
-                command_result::Payload::RegistryInspect(crate::registry_inspect::inspect(
-                    &self.network_root,
-                    &self.podman,
-                )),
-            )
-        } else if let Some(Payload::RegistryReconcile(request)) = command.payload {
-            let result = crate::registry::reconcile(&self.network_root, &self.podman, &request);
-            // The registry Node publishes `registry.cluster.coolify.internal`.
-            if let Some(trigger) = &self.discovery_trigger {
-                trigger.notify_one();
-            }
-            match result {
+        } else if let Some(Payload::ImageServe(request)) = command.payload {
+            match crate::image_transfer::serve(&self.network_root, &self.podman, &request) {
                 Ok(result) => succeeded(
                     &command.command_id,
-                    command_result::Payload::RegistryReconcile(result),
+                    command_result::Payload::ImageServe(result),
                 ),
-                Err(message) => failed(&command.command_id, "registry_reconcile_failed", &message),
+                Err(message) => failed(&command.command_id, "image_serve_failed", &message),
+            }
+        } else if let Some(Payload::ImageFetch(request)) = command.payload {
+            match crate::image_transfer::fetch(&self.network_root, &self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::ImageFetch(result),
+                ),
+                Err(message) => failed(&command.command_id, "image_fetch_failed", &message),
             }
         } else if let Some(Payload::WorkloadReconcile(request)) = command.payload {
             match self
@@ -1005,14 +1000,9 @@ fn workload_deploy(
 ) -> Result<WorkloadDeployResult, String> {
     let mut deploy = podman_deploy_args(root, request)?;
     crate::container_socket::ensure_host_socket(root, request)?;
-    let auth = crate::registry::pull_auth_path(root);
     // Lives until `podman run` has pulled the image; dropping it deletes the file.
     let mut _login = None;
-    if request.image.starts_with(&format!("{REGISTRY_HOST}/")) && auth.exists() {
-        deploy
-            .arguments
-            .splice(1..1, ["--authfile".to_string(), auth.display().to_string()]);
-    } else if !request.registry_username.is_empty() {
+    if !request.registry_username.is_empty() {
         let login = TemporaryAuthFile::write(
             root,
             &request.name,
@@ -1330,12 +1320,11 @@ pub(crate) fn podman_deploy_args(
         return Err("The container name is invalid.".into());
     }
     if crate::registry::validate_login(&request.registry_username, &request.registry_password)?
-        && (request.image.starts_with(&format!("{REGISTRY_HOST}/"))
-            || request
-                .image
-                .starts_with(crate::builder::LOCAL_IMAGE_PREFIX))
+        && request
+            .image
+            .starts_with(crate::builder::LOCAL_IMAGE_PREFIX)
     {
-        return Err("A registry login is not used for a cluster image.".into());
+        return Err("A registry login is not used for a local image.".into());
     }
     if request.image.is_empty()
         || request.image.starts_with('-')
