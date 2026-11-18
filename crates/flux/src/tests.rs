@@ -721,6 +721,7 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
                 sentinel_protocol::CAPABILITY_WORKLOAD_FILES.into(),
                 sentinel_protocol::CAPABILITY_WORKLOAD_CONTAINER_SOCKET.into(),
                 sentinel_protocol::CAPABILITY_WORKLOAD_USER.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_RUNTIME_OPTIONS.into(),
             ],
         )
         .await;
@@ -753,6 +754,12 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
             "files": files,
             "container_socket_paths": ["/var/run/docker.sock"],
             "user": "0:0",
+            "shm_size_bytes": 268435456,
+            "ulimits": [{"name": "nofile", "soft": 1024, "hard": 65535}],
+            "tmpfs": [{"path": "/tmp"}, {"path": "/cache", "size_bytes": 1048576}],
+            "stop_timeout_seconds": 90,
+            "tty": true,
+            "stdin_open": true,
         })
     };
     let post = |body: serde_json::Value| {
@@ -793,6 +800,28 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
     .await
     .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    for (key, value) in [
+        ("shm_size_bytes", serde_json::json!(1024)),
+        (
+            "ulimits",
+            serde_json::json!([{"name": "nofile", "soft": 1, "hard": 1}]),
+        ),
+        ("tmpfs", serde_json::json!([{"path": "/tmp"}])),
+        ("stop_timeout_seconds", serde_json::json!(30)),
+        ("tty", serde_json::json!(true)),
+        ("stdin_open", serde_json::json!(true)),
+    ] {
+        let mut request = serde_json::json!({
+            "server_id": "server-old",
+            "command_id": "deploy-1",
+            "name": "coolify-p1test-main",
+            "image": "docker.io/library/nginx:latest",
+            "restart_policy": "no",
+        });
+        request[key] = value;
+        let response = post(request).await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT, "{key}");
+    }
     let response = post(body(
         "server-1",
         serde_json::json!([{"path": "/etc/nginx.conf", "content_base64": "not base64!"}]),
@@ -839,6 +868,27 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
     assert_eq!(deploy.dns_search, ["shop.coolify.internal"]);
     assert_eq!(deploy.container_socket_paths, ["/var/run/docker.sock"]);
     assert_eq!(deploy.user, "0:0");
+    assert_eq!(deploy.shm_size_bytes, Some(268_435_456));
+    assert_eq!(deploy.ulimits.len(), 1);
+    assert_eq!(
+        (
+            deploy.ulimits[0].name.as_str(),
+            deploy.ulimits[0].soft,
+            deploy.ulimits[0].hard
+        ),
+        ("nofile", 1024, 65_535)
+    );
+    assert_eq!(deploy.tmpfs.len(), 2);
+    assert_eq!(
+        (deploy.tmpfs[0].path.as_str(), deploy.tmpfs[0].size_bytes),
+        ("/tmp", 0)
+    );
+    assert_eq!(
+        (deploy.tmpfs[1].path.as_str(), deploy.tmpfs[1].size_bytes),
+        ("/cache", 1_048_576)
+    );
+    assert_eq!(deploy.stop_timeout_seconds, Some(90));
+    assert!(deploy.tty && deploy.stdin_open);
     assert_eq!(deploy.files.len(), 6);
     assert_eq!(deploy.files[0].content.len(), 1024 * 1024);
     assert_eq!(deploy.files[4].path, "/etc/nginx.conf");

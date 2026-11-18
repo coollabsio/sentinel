@@ -909,7 +909,7 @@ fn workload_lifecycle(
     };
     // Podman needs the stop timeout plus the time to remove the container.
     let timeout = PODMAN_LIFECYCLE_TIMEOUT.max(Duration::from_secs(
-        u64::from(stop_timeout_seconds(request)?) + 60,
+        u64::from(stop_timeout_seconds(request)?.unwrap_or(MAX_STOP_TIMEOUT_SECONDS)) + 60,
     ));
     let output = output_with_timeout(std::process::Command::new(podman).args(arguments), timeout)
         .map_err(podman_error);
@@ -947,13 +947,15 @@ fn workload_lifecycle(
     })
 }
 
-const DEFAULT_STOP_TIMEOUT_SECONDS: u32 = 10;
-const MAX_STOP_TIMEOUT_SECONDS: u32 = 600;
+use crate::runtime_options::MAX_STOP_TIMEOUT_SECONDS;
 
-fn stop_timeout_seconds(request: &WorkloadLifecycleRequest) -> Result<u32, String> {
+/// The stop timeout of the request. Without one, Podman uses the stop timeout
+/// of the container (`--stop-timeout` of its deploy, else 10 s), which can be
+/// up to the maximum.
+fn stop_timeout_seconds(request: &WorkloadLifecycleRequest) -> Result<Option<u32>, String> {
     match request.stop_timeout_seconds {
-        None => Ok(DEFAULT_STOP_TIMEOUT_SECONDS),
-        Some(seconds) if (1..=MAX_STOP_TIMEOUT_SECONDS).contains(&seconds) => Ok(seconds),
+        None => Ok(None),
+        Some(seconds) if (1..=MAX_STOP_TIMEOUT_SECONDS).contains(&seconds) => Ok(Some(seconds)),
         Some(_) => Err("The stop timeout must be 1 to 600 seconds.".into()),
     }
 }
@@ -966,16 +968,22 @@ pub(crate) fn podman_lifecycle_args(
     }
 
     let name = request.name.clone();
-    let stop_timeout = stop_timeout_seconds(request)?.to_string();
+    let time: Vec<String> = match stop_timeout_seconds(request)? {
+        Some(seconds) => vec!["--time".into(), seconds.to_string()],
+        None => Vec::new(),
+    };
+    let with_time = |action: &str, extra: &[&str]| {
+        let mut args = vec![action.to_string()];
+        args.extend(extra.iter().map(|value| value.to_string()));
+        args.extend(time.iter().cloned());
+        args.push(name.clone());
+        args
+    };
     match WorkloadLifecycleAction::try_from(request.action).ok() {
-        Some(WorkloadLifecycleAction::Start) => Ok(vec!["start".into(), name]),
-        Some(WorkloadLifecycleAction::Stop) => {
-            Ok(vec!["stop".into(), "--time".into(), stop_timeout, name])
-        }
-        Some(WorkloadLifecycleAction::Restart) => {
-            Ok(vec!["restart".into(), "--time".into(), stop_timeout, name])
-        }
-        Some(WorkloadLifecycleAction::Remove) => Ok(vec!["rm".into(), "--force".into(), name]),
+        Some(WorkloadLifecycleAction::Start) => Ok(vec!["start".into(), name.clone()]),
+        Some(WorkloadLifecycleAction::Stop) => Ok(with_time("stop", &[])),
+        Some(WorkloadLifecycleAction::Restart) => Ok(with_time("restart", &[])),
+        Some(WorkloadLifecycleAction::Remove) => Ok(with_time("rm", &["--force"])),
         _ => Err("The workload lifecycle action is invalid.".into()),
     }
 }
@@ -1495,6 +1503,7 @@ pub(crate) fn podman_deploy_args(
     args.extend(crate::files::mount_args(root, request)?);
     args.extend(crate::container_socket::mount_args(request)?);
     args.extend(crate::workload_user::user_args(request)?);
+    args.extend(crate::runtime_options::runtime_args(request)?);
     args.push(request.image.clone());
     args.extend(request.command.clone());
     Ok(PodmanDeploy {

@@ -20,6 +20,7 @@ mod logs;
 mod network;
 mod registry;
 mod restore;
+mod runtime_options;
 mod secrets;
 mod terminal;
 mod trust;

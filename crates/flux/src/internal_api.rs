@@ -18,6 +18,7 @@ use sentinel_protocol::control::v1::{
     WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest,
     WorkloadDeployRequest, WorkloadEnvironmentVariable, WorkloadFile, WorkloadHealthCheck,
     WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadName, WorkloadSecret,
+    WorkloadTmpfs, WorkloadUlimit,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -27,7 +28,8 @@ use sentinel_protocol::{
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
     CAPABILITY_WORKLOAD_CONTAINER_SOCKET, CAPABILITY_WORKLOAD_DEPLOY,
     CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES, CAPABILITY_WORKLOAD_LIFECYCLE,
-    CAPABILITY_WORKLOAD_SECRETS_OWNER, CAPABILITY_WORKLOAD_USER,
+    CAPABILITY_WORKLOAD_RUNTIME_OPTIONS, CAPABILITY_WORKLOAD_SECRETS_OWNER,
+    CAPABILITY_WORKLOAD_USER,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -181,6 +183,36 @@ pub(crate) struct WorkloadDeploySpec {
     /// The `user` of `workload.user.v1`. Sentinel validates it.
     #[serde(default)]
     user: String,
+    /// The runtime options of `workload.runtime_options.v1` (decision 0028).
+    /// Sentinel validates them.
+    #[serde(default)]
+    shm_size_bytes: Option<u64>,
+    #[serde(default)]
+    ulimits: Vec<DeployUlimit>,
+    #[serde(default)]
+    tmpfs: Vec<DeployTmpfs>,
+    #[serde(default)]
+    stop_timeout_seconds: Option<u32>,
+    #[serde(default)]
+    tty: bool,
+    #[serde(default)]
+    stdin_open: bool,
+}
+
+/// A ulimit of `workload.runtime_options.v1`; -1 is unlimited.
+#[derive(Deserialize)]
+struct DeployUlimit {
+    name: String,
+    soft: i64,
+    hard: i64,
+}
+
+/// A tmpfs mount of `workload.runtime_options.v1`; a size of 0 keeps the Podman default.
+#[derive(Deserialize)]
+struct DeployTmpfs {
+    path: String,
+    #[serde(default)]
+    size_bytes: u64,
 }
 
 /// A file of `workload.files.v1`. Sentinel validates the path, mode, and sizes.
@@ -1303,6 +1335,13 @@ pub(crate) fn deploy_request(
         (!files.is_empty()).then_some(CAPABILITY_WORKLOAD_FILES),
         (!spec.container_socket_paths.is_empty()).then_some(CAPABILITY_WORKLOAD_CONTAINER_SOCKET),
         (!spec.user.is_empty()).then_some(CAPABILITY_WORKLOAD_USER),
+        (spec.shm_size_bytes.is_some()
+            || !spec.ulimits.is_empty()
+            || !spec.tmpfs.is_empty()
+            || spec.stop_timeout_seconds.is_some()
+            || spec.tty
+            || spec.stdin_open)
+            .then_some(CAPABILITY_WORKLOAD_RUNTIME_OPTIONS),
         secrets
             .iter()
             .any(|secret| secret.uid.is_some() || secret.gid.is_some() || secret.mode.is_some())
@@ -1362,6 +1401,27 @@ pub(crate) fn deploy_request(
         files,
         container_socket_paths: spec.container_socket_paths,
         user: spec.user,
+        shm_size_bytes: spec.shm_size_bytes,
+        ulimits: spec
+            .ulimits
+            .into_iter()
+            .map(|ulimit| WorkloadUlimit {
+                name: ulimit.name,
+                soft: ulimit.soft,
+                hard: ulimit.hard,
+            })
+            .collect(),
+        tmpfs: spec
+            .tmpfs
+            .into_iter()
+            .map(|tmpfs| WorkloadTmpfs {
+                path: tmpfs.path,
+                size_bytes: tmpfs.size_bytes,
+            })
+            .collect(),
+        stop_timeout_seconds: spec.stop_timeout_seconds,
+        tty: spec.tty,
+        stdin_open: spec.stdin_open,
     };
     Ok((deploy, needed))
 }

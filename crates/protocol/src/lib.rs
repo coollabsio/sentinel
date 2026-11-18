@@ -165,7 +165,12 @@ pub const CAPABILITY_WORKLOAD_CONTAINER_SOCKET: &str = "workload.container_socke
 /// (`podman run --user`), the Compose `user:`. Not a command: an older Sentinel
 /// ignores the field and would start the container as the user of the image.
 pub const CAPABILITY_WORKLOAD_USER: &str = "workload.user.v1";
-pub const STACK_CAPABILITIES: [&str; 7] = [
+/// `workload.deploy.v1` accepts `shm_size_bytes`, `ulimits`, `tmpfs`,
+/// `stop_timeout_seconds`, `tty`, and `stdin_open` (decision 0028). Not a
+/// command: an older Sentinel ignores the fields and would start the container
+/// with the Podman defaults.
+pub const CAPABILITY_WORKLOAD_RUNTIME_OPTIONS: &str = "workload.runtime_options.v1";
+pub const STACK_CAPABILITIES: [&str; 8] = [
     CAPABILITY_WORKLOAD_DNS_SEARCH,
     CAPABILITY_WORKLOAD_FILES,
     CAPABILITY_FIREWALL_STACK_RULES,
@@ -173,6 +178,7 @@ pub const STACK_CAPABILITIES: [&str; 7] = [
     CAPABILITY_WORKLOAD_HEALTHCHECK_EXEC,
     CAPABILITY_WORKLOAD_CONTAINER_SOCKET,
     CAPABILITY_WORKLOAD_USER,
+    CAPABILITY_WORKLOAD_RUNTIME_OPTIONS,
 ];
 pub const VOLUME_CAPABILITIES: [&str; 9] = [
     CAPABILITY_VOLUME_MOUNTS,

@@ -332,6 +332,44 @@ message WorkloadDeployRequest {
   // `^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})?$`.
   // Needs `workload.user.v1`.
   string user = 25;
+  // The size of `/dev/shm` in bytes, the Compose `shm_size` (decision 0028):
+  // 1 byte to 16 GiB, and at most `memory_limit_bytes` when that is set.
+  // Unset keeps the Podman default (64 MiB). Needs `workload.runtime_options.v1`.
+  optional uint64 shm_size_bytes = 26;
+  // Resource limits of the process, the Compose `ulimits`. At most 16, each
+  // name once. Needs `workload.runtime_options.v1`.
+  repeated WorkloadUlimit ulimits = 27;
+  // tmpfs mounts, the Compose `tmpfs`. At most 8. Each path follows the rules
+  // of a `files` path, without `:`, and is not a path of `mounts`, `files`, or
+  // `container_socket_paths`. Needs `workload.runtime_options.v1`.
+  repeated WorkloadTmpfs tmpfs = 28;
+  // Seconds that Podman waits after the stop signal before it kills the
+  // container, the Compose `stop_grace_period`: 1 to 600. Podman uses it for a
+  // stop, a restart, and a remove without an explicit time, also for the
+  // replacement in a deploy. Unset is 10. Needs `workload.runtime_options.v1`.
+  optional uint32 stop_timeout_seconds = 29;
+  // `--tty`, the Compose `tty`. Needs `workload.runtime_options.v1`.
+  bool tty = 30;
+  // `--interactive`, the Compose `stdin_open`. Needs `workload.runtime_options.v1`.
+  bool stdin_open = 31;
+}
+
+// A ulimit, `--ulimit name=soft:hard`. `name` is one of `nofile`, `nproc`,
+// `memlock`, `core`, `stack`, `msgqueue`, `sigpending`, or `rtprio`. -1 is
+// unlimited. `soft` is at most `hard`; an unlimited soft value needs an
+// unlimited hard value.
+message WorkloadUlimit {
+  string name = 1;
+  int64 soft = 2;
+  int64 hard = 3;
+}
+
+// A tmpfs mount, `--tmpfs path` or `--tmpfs path:size=<bytes>`. A size of 0
+// keeps the Podman default; otherwise 1 byte to 16 GiB, and at most
+// `memory_limit_bytes` when that is set.
+message WorkloadTmpfs {
+  string path = 1;
+  uint64 size_bytes = 2;
 }
 
 message WorkloadFile {
@@ -405,8 +443,9 @@ enum WorkloadLifecycleAction {
 message WorkloadLifecycleRequest {
   string name = 1;
   WorkloadLifecycleAction action = 2;
-  // Seconds that STOP and RESTART wait before they kill the container, 1 to
-  // 600. Unset is 10. Needs `workload.stop_timeout.v1`.
+  // Seconds that STOP, RESTART, and REMOVE wait before they kill the
+  // container, 1 to 600. Unset is 10 for STOP and RESTART, and the stop
+  // timeout of the container for REMOVE. Needs `workload.stop_timeout.v1`.
   optional uint32 stop_timeout_seconds = 3;
 }
 

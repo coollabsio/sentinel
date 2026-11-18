@@ -636,6 +636,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "workload.healthcheck.exec.v1",
             "workload.container_socket.v1",
             "workload.user.v1",
+            "workload.runtime_options.v1",
             "workload.exec.v1",
             "workload.terminal.v1"
         ])
@@ -1520,6 +1521,12 @@ fn builds_shell_free_podman_deploy_arguments() {
         files: Vec::new(),
         container_socket_paths: Vec::new(),
         user: String::new(),
+        shm_size_bytes: None,
+        ulimits: Vec::new(),
+        tmpfs: Vec::new(),
+        stop_timeout_seconds: None,
+        tty: false,
+        stdin_open: false,
     };
 
     let deploy = crate::commands::podman_deploy_args(std::path::Path::new("/"), &request).unwrap();
@@ -1719,6 +1726,11 @@ fn builds_shell_free_podman_lifecycle_arguments() {
         action,
         stop_timeout_seconds: None,
     };
+    let timed = |action: WorkloadLifecycleAction| WorkloadLifecycleRequest {
+        name: "coolify-test-web".into(),
+        action: action.into(),
+        stop_timeout_seconds: Some(30),
+    };
 
     assert_eq!(
         crate::commands::podman_lifecycle_args(&request(WorkloadLifecycleAction::Start.into()))
@@ -1728,17 +1740,31 @@ fn builds_shell_free_podman_lifecycle_arguments() {
     assert_eq!(
         crate::commands::podman_lifecycle_args(&request(WorkloadLifecycleAction::Stop.into()))
             .unwrap(),
-        ["stop", "--time", "10", "coolify-test-web"]
+        ["stop", "coolify-test-web"]
     );
     assert_eq!(
         crate::commands::podman_lifecycle_args(&request(WorkloadLifecycleAction::Restart.into()))
             .unwrap(),
-        ["restart", "--time", "10", "coolify-test-web"]
+        ["restart", "coolify-test-web"]
     );
     assert_eq!(
         crate::commands::podman_lifecycle_args(&request(WorkloadLifecycleAction::Remove.into()))
             .unwrap(),
         ["rm", "--force", "coolify-test-web"]
+    );
+    // An explicit stop timeout applies to stop, restart, and remove. Without
+    // one, Podman uses the stop timeout of the container.
+    assert_eq!(
+        crate::commands::podman_lifecycle_args(&timed(WorkloadLifecycleAction::Stop)).unwrap(),
+        ["stop", "--time", "30", "coolify-test-web"]
+    );
+    assert_eq!(
+        crate::commands::podman_lifecycle_args(&timed(WorkloadLifecycleAction::Restart)).unwrap(),
+        ["restart", "--time", "30", "coolify-test-web"]
+    );
+    assert_eq!(
+        crate::commands::podman_lifecycle_args(&timed(WorkloadLifecycleAction::Remove)).unwrap(),
+        ["rm", "--force", "--time", "30", "coolify-test-web"]
     );
 }
 
