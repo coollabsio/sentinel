@@ -3263,3 +3263,39 @@ fn health_check_accepts_the_shell_form_and_the_exec_form() {
     let too_many = serde_json::to_string(&vec!["x"; 65]).unwrap();
     assert!(command_of(&too_many).is_err());
 }
+
+#[test]
+fn names_the_refused_field_of_an_invalid_deploy() {
+    use sentinel_protocol::control::v1::command::Payload;
+    use sentinel_protocol::control::v1::command_result;
+    use sentinel_protocol::control::v1::{Command, WorkloadDeployRequest, WorkloadUlimit};
+
+    let mut executor = crate::commands::CommandExecutor::new("dev");
+    let execution = executor.execute(
+        Command {
+            command_id: "deploy-invalid".into(),
+            command_type: sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into(),
+            payload_version: 1,
+            created_at_unix_ms: 1,
+            payload: Some(Payload::WorkloadDeploy(WorkloadDeployRequest {
+                name: "coolify-test-web".into(),
+                image: "docker.io/library/nginx:latest".into(),
+                restart_policy: "no".into(),
+                ulimits: vec![WorkloadUlimit {
+                    name: "nofiles".into(),
+                    soft: 1,
+                    hard: 1,
+                }],
+                ..Default::default()
+            })),
+            expires_at_unix_ms: i64::MAX,
+        },
+        true,
+    );
+
+    assert!(!execution.accepted);
+    assert!(matches!(
+        execution.result.payload,
+        Some(command_result::Payload::Error(error)) if error.message == "A ulimit name is invalid."
+    ));
+}

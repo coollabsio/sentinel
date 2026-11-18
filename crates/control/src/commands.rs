@@ -433,12 +433,24 @@ impl CommandExecutor {
             || !capability_accepted)
             && has_valid_payload;
         if !accepted {
+            // A deploy names the field that it refuses, so the user can fix the value.
+            let message = match &command.payload {
+                Some(Payload::WorkloadDeploy(request)) if !has_valid_payload => {
+                    podman_deploy_args(Path::new("/"), request).err()
+                }
+                Some(Payload::WorkloadLifecycle(request)) if !has_valid_payload => {
+                    podman_lifecycle_args(request).err()
+                }
+                _ => None,
+            };
             return CommandExecution {
                 accepted: false,
                 result: failed(
                     &command.command_id,
                     "invalid_command",
-                    "Command is invalid or expired.",
+                    message
+                        .as_deref()
+                        .unwrap_or("Command is invalid or expired."),
                 ),
             };
         }
