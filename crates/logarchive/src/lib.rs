@@ -74,7 +74,7 @@ impl LogArchive {
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
         tracing::info!(dir = %self.root.display(), "container log archive started");
-        if let Err(error) = tokio::fs::create_dir_all(&self.root).await {
+        if let Err(error) = file::create_private_dir(&self.root).await {
             tracing::warn!(%error, dir = %self.root.display(), "cannot create the container log archive directory");
         }
 

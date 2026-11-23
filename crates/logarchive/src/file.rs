@@ -21,7 +21,7 @@ pub struct ArchiveWriter {
 impl ArchiveWriter {
     pub async fn open(path: PathBuf, max_bytes: u64) -> io::Result<Self> {
         if let Some(dir) = path.parent() {
-            tokio::fs::create_dir_all(dir).await?;
+            create_private_dir(dir).await?;
         }
         let file = open_append(&path).await?;
         let size = file.metadata().await?.len();
@@ -88,10 +88,21 @@ async fn read_tail(path: &Path) -> io::Result<Vec<u8>> {
     Ok(tail)
 }
 
+/// Archived logs can hold secrets, so new directories are `0700` and new
+/// files `0600`, like the json logs Docker keeps for root only.
+pub async fn create_private_dir(dir: &Path) -> io::Result<()> {
+    tokio::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .await
+}
+
 async fn open_append(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(path)
         .await
 }
@@ -115,6 +126,22 @@ mod tests {
 
         assert_eq!(std::fs::read(rotated_path(&path)).unwrap(), b"0123456789\n");
         assert_eq!(std::fs::read(&path).unwrap(), b"second\nthird\n");
+    }
+
+    #[tokio::test]
+    async fn creates_files_and_directories_readable_by_the_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root/owner/c.0123456789ab.log");
+        let mut writer = ArchiveWriter::open(path.clone(), 1).await.unwrap();
+        writer.write_line(b"one\n").await.unwrap();
+        writer.write_line(b"two\n").await.unwrap();
+        writer.flush().await.unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.path().join("root")), 0o700);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&rotated_path(&path)), 0o600);
     }
 
     #[tokio::test]
