@@ -35,24 +35,36 @@ const EXIT_WAIT: Duration = Duration::from_secs(10);
 /// container does not dump its whole history at Sentinel's first start.
 const FIRST_FOLLOW_TAIL: &str = "10000";
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// How long a failed follower keeps its container followed, so a failure that
+/// repeats at once (an unwritable archive, a logging driver Docker cannot
+/// read) is retried at this pace and not in a busy loop.
+const RETRY_DELAY: Duration = Duration::from_secs(30);
 const MANAGED_FILTER: &str = "coolify.managed=true";
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Clone, Copy)]
 struct Exit {
+    /// When Docker saw the container die, on Docker's clock.
+    at: Timestamp,
     code: i64,
     oom_killed: bool,
 }
 
 struct Followed {
+    /// When the follower started. A `die` before it is from an earlier run,
+    /// replayed when the event stream reconnects.
+    since: Timestamp,
     path: PathBuf,
     exits: mpsc::UnboundedSender<Exit>,
     task: AbortHandle,
 }
 
 pub struct LogArchive {
+    /// For the log and event streams.
     docker: Docker,
+    /// For list and inspect, with a timeout, so a hung daemon cannot stall the run loop.
+    api: Docker,
     root: PathBuf,
     max_file_bytes: u64,
     limits: Limits,
@@ -63,11 +75,12 @@ impl LogArchive {
         const MB: u64 = 1024 * 1024;
         Ok(Self {
             docker: docker::streaming_client()?,
+            api: docker::request_client()?,
             root: settings.dir.clone(),
-            max_file_bytes: settings.max_file_mb * MB,
+            max_file_bytes: settings.max_file_mb.saturating_mul(MB),
             limits: Limits {
                 max_age: Duration::from_secs(u64::from(settings.retention_days) * 24 * 60 * 60),
-                max_total_bytes: settings.max_total_mb * MB,
+                max_total_bytes: settings.max_total_mb.saturating_mul(MB),
             },
         })
     }
@@ -171,8 +184,21 @@ impl LogArchive {
                 let oom_killed = state.oom_killed.remove(&id)
                     || attributes.get("oomKilled").map(String::as_str) == Some("true");
                 let code = attributes.get("exitCode").and_then(|c| c.parse().ok());
-                if let (Some(code), Some(followed)) = (code, state.followed.get(&id)) {
-                    let _ = followed.exits.send(Exit { code, oom_killed });
+                let at = event
+                    .time_nano
+                    .map(Timestamp::from_unix_nanos)
+                    .or(event
+                        .time
+                        .map(|secs| Timestamp::from_unix_nanos(secs * 1_000_000_000)))
+                    .unwrap_or_else(Timestamp::now);
+                if let (Some(code), Some(followed)) = (code, state.followed.get(&id))
+                    && at >= followed.since
+                {
+                    let _ = followed.exits.send(Exit {
+                        at,
+                        code,
+                        oom_killed,
+                    });
                 }
             }
             Some("destroy") => {
@@ -191,7 +217,7 @@ impl LogArchive {
             ])),
             ..Default::default()
         };
-        let containers = match self.docker.list_containers(Some(options)).await {
+        let containers = match self.api.list_containers(Some(options)).await {
             Ok(containers) => containers,
             Err(error) => {
                 tracing::warn!(%error, "cannot list containers to archive their logs");
@@ -219,18 +245,32 @@ impl LogArchive {
         let (exits, exit_rx) = mpsc::unbounded_channel();
         let follower = Follower {
             docker: self.docker.clone(),
+            api: self.api.clone(),
             path: path.clone(),
             max_file_bytes: self.max_file_bytes,
             exits: exit_rx,
             shutdown: shutdown.clone(),
         };
         let id = target.id.clone();
+        let mut shutdown = shutdown.clone();
         let task = state.tasks.spawn(async move {
             if let Err(error) = follower.run(&target).await {
-                tracing::warn!(%error, container = %target.name, "container log archive stopped");
+                tracing::warn!(%error, container = %target.name, "container log archive stopped, retrying");
+                tokio::select! {
+                    _ = shutdown.changed() => {}
+                    _ = tokio::time::sleep(RETRY_DELAY) => {}
+                }
             }
         });
-        state.followed.insert(id, Followed { path, exits, task });
+        state.followed.insert(
+            id,
+            Followed {
+                since: Timestamp::now(),
+                path,
+                exits,
+                task,
+            },
+        );
     }
 
     async fn sweep(&self, state: &State) {
@@ -259,6 +299,7 @@ struct State {
 
 struct Follower {
     docker: Docker,
+    api: Docker,
     path: PathBuf,
     max_file_bytes: u64,
     exits: mpsc::UnboundedReceiver<Exit>,
@@ -288,6 +329,7 @@ impl Follower {
             .logs(&target.id, Some(options))
             .ready_chunks(256);
         tracing::debug!(container = %target.name, path = %self.path.display(), "archiving container logs");
+        let mut last_at = resume;
 
         loop {
             let batch = tokio::select! {
@@ -308,6 +350,7 @@ impl Follower {
                         continue;
                     }
                     writer.write_line(&record.to_line()).await?;
+                    last_at = Some(record.at);
                 }
             }
             writer.flush().await?;
@@ -319,8 +362,11 @@ impl Follower {
         };
         if let Some(exit) = exit {
             let oom_killed = exit.oom_killed || self.inspect_oom_killed(&target.id).await;
+            // Lines drained after the `die` can carry a later timestamp; the
+            // marker must not be older than them, as it is the resume point.
+            let at = last_at.map_or(exit.at, |last| last.max(exit.at));
             writer
-                .write_line(&exit_marker(Timestamp::now(), exit.code, oom_killed))
+                .write_line(&exit_marker(at, exit.code, oom_killed))
                 .await?;
             writer.flush().await?;
         }
@@ -328,12 +374,177 @@ impl Follower {
     }
 
     async fn inspect_oom_killed(&self, id: &str) -> bool {
-        self.docker
+        self.api
             .inspect_container(id, None)
             .await
             .ok()
             .and_then(|c| c.state)
             .and_then(|s| s.oom_killed)
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bollard::models::EventActor;
+
+    use super::*;
+
+    const ID: &str = "0123456789abcdef";
+
+    /// An archive whose Docker clients fail every request: the socket path
+    /// is a plain file, which bollard accepts.
+    fn archive(root: &std::path::Path, socket: &tempfile::NamedTempFile) -> LogArchive {
+        let client = |timeout| {
+            Docker::connect_with_unix(
+                socket.path().to_str().unwrap(),
+                timeout,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .unwrap()
+        };
+        LogArchive {
+            docker: client(3600),
+            api: client(10),
+            root: root.to_path_buf(),
+            max_file_bytes: 1024,
+            limits: Limits {
+                max_age: Duration::from_secs(60),
+                max_total_bytes: 1024,
+            },
+        }
+    }
+
+    fn empty_state() -> State {
+        State {
+            followed: HashMap::new(),
+            tasks: JoinSet::new(),
+            oom_killed: HashSet::new(),
+            last_event_secs: None,
+        }
+    }
+
+    fn target() -> Target {
+        let labels = HashMap::from([
+            ("coolify.managed".to_string(), "true".to_string()),
+            ("coolify.applicationUuid".to_string(), "app1".to_string()),
+        ]);
+        Target::from_container(ID, "web", &labels).unwrap()
+    }
+
+    /// Follows [`ID`] with a task that never ends, and returns the receiver
+    /// of its exits.
+    fn followed_since(state: &mut State, since: Timestamp) -> mpsc::UnboundedReceiver<Exit> {
+        let (exits, exit_rx) = mpsc::unbounded_channel();
+        let task = state.tasks.spawn(std::future::pending());
+        state.followed.insert(
+            ID.to_string(),
+            Followed {
+                since,
+                path: PathBuf::new(),
+                exits,
+                task,
+            },
+        );
+        exit_rx
+    }
+
+    fn event(action: &str, time_nano: i64, attributes: &[(&str, &str)]) -> EventMessage {
+        EventMessage {
+            action: Some(action.to_string()),
+            actor: Some(EventActor {
+                id: Some(ID.to_string()),
+                attributes: Some(
+                    attributes
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                ),
+            }),
+            time: Some(time_nano / 1_000_000_000),
+            time_nano: Some(time_nano),
+            ..Default::default()
+        }
+    }
+
+    const SINCE: i64 = 1_793_096_130_000_000_000;
+
+    #[tokio::test]
+    async fn sends_the_exit_of_a_followed_container() {
+        let (root, socket) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::NamedTempFile::new().unwrap(),
+        );
+        let archive = archive(root.path(), &socket);
+        let (_tx, shutdown) = watch::channel(false);
+        let mut state = empty_state();
+        let mut exits = followed_since(&mut state, Timestamp::from_unix_nanos(SINCE));
+
+        archive.handle_event(event("oom", SINCE + 1, &[]), &mut state, &shutdown);
+        archive.handle_event(
+            event("die", SINCE + 2, &[("exitCode", "137")]),
+            &mut state,
+            &shutdown,
+        );
+
+        let exit = exits.try_recv().unwrap();
+        assert_eq!(exit.code, 137);
+        assert!(exit.oom_killed);
+        assert_eq!(exit.at, Timestamp::from_unix_nanos(SINCE + 2));
+        assert!(state.oom_killed.is_empty());
+        assert_eq!(state.last_event_secs, Some(SINCE / 1_000_000_000));
+    }
+
+    #[tokio::test]
+    async fn drops_a_replayed_exit_of_an_earlier_run() {
+        let (root, socket) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::NamedTempFile::new().unwrap(),
+        );
+        let archive = archive(root.path(), &socket);
+        let (_tx, shutdown) = watch::channel(false);
+        let mut state = empty_state();
+        let mut exits = followed_since(&mut state, Timestamp::from_unix_nanos(SINCE));
+
+        archive.handle_event(
+            event("die", SINCE - 1, &[("exitCode", "1")]),
+            &mut state,
+            &shutdown,
+        );
+        assert!(exits.try_recv().is_err());
+
+        archive.handle_event(
+            event("die", SINCE + 1, &[("exitCode", "0")]),
+            &mut state,
+            &shutdown,
+        );
+        assert_eq!(exits.try_recv().unwrap().code, 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_follower_waits_before_it_is_followed_again() {
+        let (root, socket) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::NamedTempFile::new().unwrap(),
+        );
+        let archive = archive(root.path(), &socket);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let mut state = empty_state();
+        let path = target().path(root.path());
+        archive.follow(target(), &mut state, &shutdown);
+
+        // The log stream fails at once: the archive file exists, the task waits.
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!state.followed[ID].task.is_finished());
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), state.tasks.join_next())
+            .await
+            .expect("shutdown ends the retry wait")
+            .unwrap()
+            .unwrap();
     }
 }

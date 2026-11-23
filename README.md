@@ -99,7 +99,7 @@ Sentinel is configured using environment variables:
 | `LOG_ARCHIVE_ENABLED` | `false` | Archive the logs of Coolify-managed containers to files, so they stay readable after the container is removed. Coolify turns it on with the `Keep logs of removed containers` setting of the server |
 | `LOG_ARCHIVE_DIR` | `/app/db/container-logs` | Archive root (next to the metrics database). Each container writes `<owner-uuid>/<container-name>.<short-id>.log` |
 | `LOG_ARCHIVE_MAX_FILE_MB` | 10 | Size at which an archive file is rotated to `.log.1` (one rotated file is kept) |
-| `LOG_ARCHIVE_MAX_TOTAL_MB` | 1024 | Total archive size; the oldest files are deleted above it |
+| `LOG_ARCHIVE_MAX_TOTAL_MB` | 1024 | Total archive size; the oldest files are deleted above it. Files that are still being written are not deleted, so the total can go above it by up to one file per running container |
 | `LOG_ARCHIVE_RETENTION_DAYS` | 7 | Archive files not written for this many days are deleted |
 | `BIND_ADDRESS` | `127.0.0.1` | IP address the HTTP server listens on. The default accepts only connections from inside the container. Set `::` (all interfaces, IPv4 and IPv6) when you publish the port or call the API from another container |
 

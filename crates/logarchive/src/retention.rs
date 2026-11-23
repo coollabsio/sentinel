@@ -18,37 +18,30 @@ pub struct Limits {
 
 /// The files a sweep deletes, in order. First every file older than
 /// `max_age`, then the oldest files until the rest fit in `max_total_bytes`.
-/// Followed files are spared both passes, unless the cap still overflows
-/// after every other file is gone.
+/// Followed files are never deleted: a follower writes to its open file, so
+/// the lines would be lost. Rotation bounds each of them to the file limit.
 pub fn select_for_deletion(
     files: &[ArchivedFile],
     followed: &HashSet<PathBuf>,
     now: SystemTime,
     limits: Limits,
 ) -> Vec<PathBuf> {
-    let mut order: Vec<&ArchivedFile> = files.iter().collect();
-    order.sort_by_key(|f| (followed.contains(&f.path), f.modified));
-
     let mut total: u64 = files.iter().map(|f| f.size).sum();
+    let mut candidates: Vec<&ArchivedFile> = files
+        .iter()
+        .filter(|f| !followed.contains(&f.path))
+        .collect();
+    candidates.sort_by_key(|f| f.modified);
+
     let mut deleted = Vec::new();
-    let mut kept = Vec::new();
-    for file in order {
+    for file in candidates {
         let expired = now
             .duration_since(file.modified)
             .is_ok_and(|age| age > limits.max_age);
-        if expired && !followed.contains(&file.path) {
+        if expired || total > limits.max_total_bytes {
             total -= file.size;
             deleted.push(file.path.clone());
-        } else {
-            kept.push(file);
         }
-    }
-    for file in kept {
-        if total <= limits.max_total_bytes {
-            break;
-        }
-        total -= file.size;
-        deleted.push(file.path.clone());
     }
     deleted
 }
@@ -164,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn spares_followed_files_until_nothing_else_is_left() {
+    fn never_deletes_followed_files() {
         let now = SystemTime::now();
         let followed: HashSet<PathBuf> = [PathBuf::from("live")].into();
         let files = [file("live", 10, 9, now), file("other", 10, 1, now)];
@@ -174,7 +167,7 @@ mod tests {
         );
         assert_eq!(
             names(select_for_deletion(&files, &followed, now, limits(5))),
-            ["other", "live"]
+            ["other"]
         );
         assert!(select_for_deletion(&files, &followed, now, limits(100)).is_empty());
     }

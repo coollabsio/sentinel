@@ -53,6 +53,15 @@ pub fn streaming_client() -> Result<Docker, DockerError> {
     )?)
 }
 
+/// A raw client for short requests (list, inspect), with the normal timeout.
+pub fn request_client() -> Result<Docker, DockerError> {
+    Ok(Docker::connect_with_unix(
+        &socket_path(),
+        TIMEOUT_SECS,
+        bollard::API_DEFAULT_VERSION,
+    )?)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DockerError {
     #[error("docker: {0}")]

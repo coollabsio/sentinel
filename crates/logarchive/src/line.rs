@@ -3,8 +3,6 @@ use std::fmt;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-const MARKER_PREFIX: &[u8] = b"[coolify] ";
-
 /// A log timestamp as `(seconds, nanoseconds)` since the epoch. Compared
 /// numerically: Docker trims trailing zeros from the fraction, so the text of
 /// two timestamps does not order the way the instants do.
@@ -22,6 +20,13 @@ impl Timestamp {
             secs: at.unix_timestamp(),
             nanos: at.nanosecond(),
         })
+    }
+
+    pub fn from_unix_nanos(nanos: i64) -> Self {
+        Self {
+            secs: nanos.div_euclid(1_000_000_000),
+            nanos: nanos.rem_euclid(1_000_000_000) as u32,
+        }
     }
 
     pub fn now() -> Self {
@@ -101,28 +106,19 @@ fn split_timestamp(line: &[u8]) -> Option<Record<'_>> {
     })
 }
 
-/// The line appended when a container exits.
+/// The line appended when a container exits. `at` must be on Docker's clock
+/// and not before the last archived line, so it can be the resume point.
 pub fn exit_marker(at: Timestamp, exit_code: i64, oom_killed: bool) -> Vec<u8> {
     let oom = if oom_killed { ", OOM killed" } else { "" };
     format!("{at} [coolify] Container exited with code {exit_code}{oom}\n").into_bytes()
 }
 
-/// The resume point of an archive: the timestamp of its last log line. Exit
-/// markers carry Sentinel's clock, not Docker's, so a restarted container's
-/// first lines can be older than the marker; a marker counts only when the
-/// tail holds no log line.
+/// The resume point of an archive: the timestamp of its last line. Exit
+/// markers carry Docker's clock too, so they count like log lines.
 pub fn resume_point(tail: &[u8]) -> Option<Timestamp> {
-    let mut last_marker = None;
-    for line in tail.rsplit(|&b| b == b'\n') {
-        let Some(record) = split_timestamp(line) else {
-            continue;
-        };
-        if !record.text.starts_with(MARKER_PREFIX) {
-            return Some(record.at);
-        }
-        last_marker.get_or_insert(record.at);
-    }
-    last_marker
+    tail.rsplit(|&b| b == b'\n')
+        .find_map(split_timestamp)
+        .map(|record| record.at)
 }
 
 #[cfg(test)]
@@ -213,16 +209,20 @@ mod tests {
     }
 
     #[test]
-    fn resumes_from_the_last_log_line_not_the_marker() {
+    fn resumes_from_the_last_line() {
         let tail = b"ill line\n\
 2026-10-27T10:15:30.100000000Z a\n\
-2026-10-27T10:15:31.000000000Z b\n\
-2026-10-27T10:15:32.000000000Z [coolify] Container exited with code 0\n";
+2026-10-27T10:15:31.000000000Z [coolify] Container exited with code 0\n";
         assert_eq!(resume_point(tail), Some(ts("2026-10-27T10:15:31Z")));
-
-        let only_marker =
-            b"2026-10-27T10:15:32.000000000Z [coolify] Container exited with code 0\n";
-        assert_eq!(resume_point(only_marker), Some(ts("2026-10-27T10:15:32Z")));
+        assert_eq!(resume_point(b"no stamp\n"), None);
         assert_eq!(resume_point(b""), None);
+    }
+
+    #[test]
+    fn converts_unix_nanos() {
+        assert_eq!(
+            Timestamp::from_unix_nanos(1_793_096_130_500_000_000),
+            ts("2026-10-27T10:15:30.5Z")
+        );
     }
 }
