@@ -33,9 +33,6 @@ const MANAGED_LABEL: &str = "coolify.managed";
 const WORKLOAD_LABEL: &str = "coolify.workload";
 const WORKLOAD_NAMESPACE: &str = "default";
 const NODE_NAMESPACE: &str = "nodes";
-/// Cluster services such as `registry.cluster.coolify.internal`. Like Node
-/// names, they are endpoint rows of their own.
-const CLUSTER_NAMESPACE: &str = "cluster";
 const WORKLOAD_NETWORK_PREFIX: &str = "coolify-";
 const ALLOWED_STATES: [&str; 9] = [
     "configured",
@@ -343,7 +340,7 @@ fn normalize_health(health: Option<&str>) -> String {
 }
 
 /// Builds the deduplicated endpoint snapshot of this Node: one row for the
-/// Node itself, one for the cluster registry when this Node runs it, plus one
+/// Node itself, plus one
 /// per published workload container with a workload IP.
 pub(crate) fn endpoint_rows(
     identity: &NodeIdentity,
@@ -372,25 +369,6 @@ pub(crate) fn endpoint_rows(
         "healthy".into(),
     );
     rows.insert(endpoint_key(&node), node);
-    let runs_registry = containers.iter().any(|container| {
-        container.name == crate::registry::REGISTRY_CONTAINER
-            && container.state == "running"
-            && container
-                .labels
-                .get(crate::registry::SERVICE_LABEL)
-                .map(String::as_str)
-                == Some("registry")
-    });
-    if runs_registry {
-        let registry = row(
-            CLUSTER_NAMESPACE,
-            "registry",
-            &identity.owner_node_ip,
-            "running".into(),
-            "healthy".into(),
-        );
-        rows.insert(endpoint_key(&registry), registry);
-    }
 
     for container in containers {
         let Some(workload_id) = published_workload_id(container) else {

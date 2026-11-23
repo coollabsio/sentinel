@@ -438,6 +438,9 @@ fn run_backup(
         backup.used_bytes = used;
         backup.part_size = size;
     }
+    // The converger of the desired set must not start the container while
+    // the backup reads its volume.
+    let _hold = (!container.is_empty()).then(|| crate::convergence::hold(container));
     let stopped = if container.is_empty() {
         Ok(false)
     } else {

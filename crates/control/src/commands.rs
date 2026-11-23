@@ -13,8 +13,8 @@ use sentinel_protocol::control::v1::{
     WorkloadLifecycleRequest, WorkloadLifecycleResult,
 };
 use sentinel_protocol::{
-    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_LOAD,
-    CAPABILITY_REGISTRY_INSPECT, CAPABILITY_REGISTRY_RECONCILE, REGISTRY_HOST,
+    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_FETCH,
+    CAPABILITY_IMAGE_LOAD, CAPABILITY_IMAGE_PRUNE, CAPABILITY_IMAGE_SERVE,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -22,7 +22,7 @@ use sentinel_protocol::{
     CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RECONCILE,
 };
 use sentinel_protocol::{CAPABILITY_DATABASE_DUMP, CAPABILITY_DATABASE_RESTORE};
 use sentinel_protocol::{
@@ -58,6 +58,7 @@ pub(crate) struct CommandExecutor {
     discovery_trigger: Option<Arc<Notify>>,
     ingress_trigger: Option<Arc<Notify>>,
     control_tls: Option<config::ControlTlsConfig>,
+    workload_set: Option<crate::workload_set::WorkloadSet>,
 }
 
 impl CommandExecutor {
@@ -79,6 +80,76 @@ impl CommandExecutor {
             discovery_trigger: None,
             ingress_trigger: None,
             control_tls: None,
+            workload_set: None,
+        }
+    }
+
+    /// Lets `workload.reconcile.v1` change the desired set, and the image
+    /// cleanup keep its images (decision 0026 of Coolify).
+    pub(crate) fn with_workload_set(mut self, set: crate::workload_set::WorkloadSet) -> Self {
+        self.workload_set = Some(set);
+        self
+    }
+
+    /// The containers of this Node, for the converger.
+    pub(crate) fn list_containers(&self) -> Result<Vec<ContainerObservation>, String> {
+        let output = output_with_timeout(
+            std::process::Command::new(&self.podman).args([
+                "ps",
+                "--all",
+                "--no-trunc",
+                "--format",
+                "json",
+            ]),
+            PODMAN_QUERY_TIMEOUT,
+        )
+        .map_err(|_| "Podman is unavailable or did not answer.".to_string())?;
+        if !output.status.success() {
+            return Err("Podman could not list containers.".into());
+        }
+        parse_podman_containers(&output.stdout).map_err(str::to_string)
+    }
+
+    /// A deploy of the converger. It works as `workload.deploy.v1`.
+    pub(crate) fn converge_deploy(
+        &self,
+        request: &WorkloadDeployRequest,
+    ) -> Result<WorkloadDeployResult, String> {
+        let result = workload_deploy(&self.network_root, &self.podman, request);
+        self.notify_workloads_changed();
+        result
+    }
+
+    /// A lifecycle action of the converger. A stop or a removal drains the
+    /// endpoint first, as `workload.lifecycle.v1` does.
+    pub(crate) fn converge_lifecycle(
+        &self,
+        request: &WorkloadLifecycleRequest,
+    ) -> Result<WorkloadLifecycleResult, String> {
+        let _drain = self.drain_before_stopping(request);
+        let result = workload_lifecycle(&self.network_root, &self.podman, request);
+        self.notify_workloads_changed();
+        result
+    }
+
+    /// The network revision that this Node applied: the revision of the
+    /// firewall state, which the network reconcile writes last.
+    pub(crate) fn applied_firewall_revision(&self) -> u64 {
+        std::fs::read_to_string(crate::network::state_path(
+            &self.network_root,
+            "firewall.state",
+        ))
+        .ok()
+        .and_then(|contents| contents.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0)
+    }
+
+    fn notify_workloads_changed(&self) {
+        if let Some(trigger) = &self.discovery_trigger {
+            trigger.notify_one();
+        }
+        if let Some(trigger) = &self.ingress_trigger {
+            trigger.notify_one();
         }
     }
 
@@ -146,9 +217,9 @@ impl CommandExecutor {
         let request = journal_request(&command);
         // logs.read and container.logs are read-only, frequently polled
         // commands. Their results are never replayed, so they are not
-        // journaled; a repeated ID reads again. volume.serve and
-        // volume.receive are idempotent per transfer and carry the transfer
-        // secret, which must not be stored. registry.inspect is a read-only report.
+        // journaled; a repeated ID reads again. volume.serve, volume.receive,
+        // image.serve, and image.fetch are idempotent per transfer and carry
+        // the transfer secret, which must not be stored.
         // volume.backup, volume.restore, database.dump, and database.restore
         // carry presigned S3 URLs.
         // workload.exec and workload.terminal carry commands and sessions.
@@ -158,13 +229,17 @@ impl CommandExecutor {
                 | CAPABILITY_CONTAINER_LOGS
                 | CAPABILITY_VOLUME_SERVE
                 | CAPABILITY_VOLUME_RECEIVE
-                | CAPABILITY_REGISTRY_INSPECT
+                | CAPABILITY_IMAGE_SERVE
+                | CAPABILITY_IMAGE_FETCH
                 | CAPABILITY_VOLUME_BACKUP
                 | CAPABILITY_VOLUME_RESTORE
                 | CAPABILITY_DATABASE_DUMP
                 | CAPABILITY_DATABASE_RESTORE
                 | CAPABILITY_WORKLOAD_EXEC
                 | CAPABILITY_WORKLOAD_TERMINAL
+                // Carries secret values; a repeated change with the same
+                // generation changes nothing.
+                | CAPABILITY_WORKLOAD_RECONCILE
         );
         let lookup = if journaled {
             self.journal.lookup(&command.command_id, &request)
@@ -271,15 +346,21 @@ impl CommandExecutor {
             (CAPABILITY_IMAGE_BUILD, Some(Payload::ImageBuild(request))) => {
                 crate::builder::validate_build(request).is_ok()
             }
-            (CAPABILITY_BUILDER_RECONCILE, Some(Payload::BuilderReconcile(request))) => {
-                crate::builder::validate_reconcile(request).is_ok()
-            }
-            (CAPABILITY_REGISTRY_RECONCILE, Some(Payload::RegistryReconcile(request))) => {
-                crate::registry::validate(request).is_ok()
-            }
-            (CAPABILITY_REGISTRY_INSPECT, Some(Payload::RegistryInspect(_))) => true,
+            (CAPABILITY_BUILDER_RECONCILE, Some(Payload::BuilderReconcile(_))) => true,
             (CAPABILITY_IMAGE_LOAD, Some(Payload::ImageLoad(request))) => {
                 crate::builder::validate_load(request).is_ok()
+            }
+            (CAPABILITY_IMAGE_SERVE, Some(Payload::ImageServe(request))) => {
+                crate::image_transfer::validate_serve(request).is_ok()
+            }
+            (CAPABILITY_IMAGE_FETCH, Some(Payload::ImageFetch(request))) => {
+                crate::image_transfer::validate_fetch(request).is_ok()
+            }
+            (CAPABILITY_IMAGE_PRUNE, Some(Payload::ImagePrune(request))) => {
+                crate::image_prune::validate(request).is_ok()
+            }
+            (CAPABILITY_WORKLOAD_RECONCILE, Some(Payload::WorkloadReconcile(request))) => {
+                self.workload_set.is_some() && crate::workload_set::validate(request).is_ok()
             }
             (CAPABILITY_VOLUME_DELETE, Some(Payload::VolumeDelete(request))) => {
                 crate::volumes::validate_delete(request).is_ok()
@@ -332,9 +413,10 @@ impl CommandExecutor {
                     | CAPABILITY_INGRESS_RECONCILE
                     | CAPABILITY_IMAGE_BUILD
                     | CAPABILITY_BUILDER_RECONCILE
-                    | CAPABILITY_REGISTRY_RECONCILE
-                    | CAPABILITY_REGISTRY_INSPECT
                     | CAPABILITY_IMAGE_LOAD
+                    | CAPABILITY_IMAGE_SERVE
+                    | CAPABILITY_IMAGE_FETCH
+                    | CAPABILITY_IMAGE_PRUNE
                     | CAPABILITY_VOLUME_DELETE
                     | CAPABILITY_VOLUME_SERVE
                     | CAPABILITY_VOLUME_RECEIVE
@@ -344,18 +426,31 @@ impl CommandExecutor {
                     | CAPABILITY_DATABASE_RESTORE
                     | CAPABILITY_WORKLOAD_EXEC
                     | CAPABILITY_WORKLOAD_TERMINAL
+                    | CAPABILITY_WORKLOAD_RECONCILE
             )
             || command.payload_version != 1
             || command.expires_at_unix_ms <= now_millis()
             || !capability_accepted)
             && has_valid_payload;
         if !accepted {
+            // A deploy names the field that it refuses, so the user can fix the value.
+            let message = match &command.payload {
+                Some(Payload::WorkloadDeploy(request)) if !has_valid_payload => {
+                    podman_deploy_args(Path::new("/"), request).err()
+                }
+                Some(Payload::WorkloadLifecycle(request)) if !has_valid_payload => {
+                    podman_lifecycle_args(request).err()
+                }
+                _ => None,
+            };
             return CommandExecution {
                 accepted: false,
                 result: failed(
                     &command.command_id,
                     "invalid_command",
-                    "Command is invalid or expired.",
+                    message
+                        .as_deref()
+                        .unwrap_or("Command is invalid or expired."),
                 ),
             };
         }
@@ -630,26 +725,48 @@ impl CommandExecutor {
                 ),
                 Err(message) => failed(&command.command_id, "image_load_failed", &message),
             }
-        } else if let Some(Payload::RegistryInspect(_)) = command.payload {
-            succeeded(
-                &command.command_id,
-                command_result::Payload::RegistryInspect(crate::registry_inspect::inspect(
-                    &self.network_root,
-                    &self.podman,
-                )),
-            )
-        } else if let Some(Payload::RegistryReconcile(request)) = command.payload {
-            let result = crate::registry::reconcile(&self.network_root, &self.podman, &request);
-            // The registry Node publishes `registry.cluster.coolify.internal`.
-            if let Some(trigger) = &self.discovery_trigger {
-                trigger.notify_one();
-            }
-            match result {
+        } else if let Some(Payload::ImageServe(request)) = command.payload {
+            match crate::image_transfer::serve(&self.network_root, &self.podman, &request) {
                 Ok(result) => succeeded(
                     &command.command_id,
-                    command_result::Payload::RegistryReconcile(result),
+                    command_result::Payload::ImageServe(result),
                 ),
-                Err(message) => failed(&command.command_id, "registry_reconcile_failed", &message),
+                Err(message) => failed(&command.command_id, "image_serve_failed", &message),
+            }
+        } else if let Some(Payload::ImageFetch(request)) = command.payload {
+            match crate::image_transfer::fetch(&self.network_root, &self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::ImageFetch(result),
+                ),
+                Err(message) => failed(&command.command_id, "image_fetch_failed", &message),
+            }
+        } else if let Some(Payload::WorkloadReconcile(request)) = command.payload {
+            match self
+                .workload_set
+                .as_ref()
+                .map(|set| set.apply(request))
+                .unwrap_or_else(|| Err("This Sentinel has no desired workload set.".into()))
+            {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::WorkloadReconcile(result),
+                ),
+                Err(message) => failed(&command.command_id, "workload_reconcile_failed", &message),
+            }
+        } else if let Some(Payload::ImagePrune(mut request)) = command.payload {
+            // The images of the desired set stay (decision 0026 of Coolify).
+            if let Some(set) = &self.workload_set {
+                request.keep.extend(set.images());
+                request.keep.sort();
+                request.keep.dedup();
+            }
+            match crate::image_prune::prune(&self.podman, &request) {
+                Ok(result) => succeeded(
+                    &command.command_id,
+                    command_result::Payload::ImagePrune(result),
+                ),
+                Err(message) => failed(&command.command_id, "image_prune_failed", &message),
             }
         } else if let Some(Payload::VolumeDelete(request)) = command.payload {
             match crate::volumes::delete(&self.podman, &request) {
@@ -804,7 +921,7 @@ fn workload_lifecycle(
     };
     // Podman needs the stop timeout plus the time to remove the container.
     let timeout = PODMAN_LIFECYCLE_TIMEOUT.max(Duration::from_secs(
-        u64::from(stop_timeout_seconds(request)?) + 60,
+        u64::from(stop_timeout_seconds(request)?.unwrap_or(MAX_STOP_TIMEOUT_SECONDS)) + 60,
     ));
     let output = output_with_timeout(std::process::Command::new(podman).args(arguments), timeout)
         .map_err(podman_error);
@@ -842,13 +959,15 @@ fn workload_lifecycle(
     })
 }
 
-const DEFAULT_STOP_TIMEOUT_SECONDS: u32 = 10;
-const MAX_STOP_TIMEOUT_SECONDS: u32 = 600;
+use crate::runtime_options::MAX_STOP_TIMEOUT_SECONDS;
 
-fn stop_timeout_seconds(request: &WorkloadLifecycleRequest) -> Result<u32, String> {
+/// The stop timeout of the request. Without one, Podman uses the stop timeout
+/// of the container (`--stop-timeout` of its deploy, else 10 s), which can be
+/// up to the maximum.
+fn stop_timeout_seconds(request: &WorkloadLifecycleRequest) -> Result<Option<u32>, String> {
     match request.stop_timeout_seconds {
-        None => Ok(DEFAULT_STOP_TIMEOUT_SECONDS),
-        Some(seconds) if (1..=MAX_STOP_TIMEOUT_SECONDS).contains(&seconds) => Ok(seconds),
+        None => Ok(None),
+        Some(seconds) if (1..=MAX_STOP_TIMEOUT_SECONDS).contains(&seconds) => Ok(Some(seconds)),
         Some(_) => Err("The stop timeout must be 1 to 600 seconds.".into()),
     }
 }
@@ -861,16 +980,22 @@ pub(crate) fn podman_lifecycle_args(
     }
 
     let name = request.name.clone();
-    let stop_timeout = stop_timeout_seconds(request)?.to_string();
+    let time: Vec<String> = match stop_timeout_seconds(request)? {
+        Some(seconds) => vec!["--time".into(), seconds.to_string()],
+        None => Vec::new(),
+    };
+    let with_time = |action: &str, extra: &[&str]| {
+        let mut args = vec![action.to_string()];
+        args.extend(extra.iter().map(|value| value.to_string()));
+        args.extend(time.iter().cloned());
+        args.push(name.clone());
+        args
+    };
     match WorkloadLifecycleAction::try_from(request.action).ok() {
-        Some(WorkloadLifecycleAction::Start) => Ok(vec!["start".into(), name]),
-        Some(WorkloadLifecycleAction::Stop) => {
-            Ok(vec!["stop".into(), "--time".into(), stop_timeout, name])
-        }
-        Some(WorkloadLifecycleAction::Restart) => {
-            Ok(vec!["restart".into(), "--time".into(), stop_timeout, name])
-        }
-        Some(WorkloadLifecycleAction::Remove) => Ok(vec!["rm".into(), "--force".into(), name]),
+        Some(WorkloadLifecycleAction::Start) => Ok(vec!["start".into(), name.clone()]),
+        Some(WorkloadLifecycleAction::Stop) => Ok(with_time("stop", &[])),
+        Some(WorkloadLifecycleAction::Restart) => Ok(with_time("restart", &[])),
+        Some(WorkloadLifecycleAction::Remove) => Ok(with_time("rm", &["--force"])),
         _ => Err("The workload lifecycle action is invalid.".into()),
     }
 }
@@ -894,14 +1019,10 @@ fn workload_deploy(
     request: &WorkloadDeployRequest,
 ) -> Result<WorkloadDeployResult, String> {
     let mut deploy = podman_deploy_args(root, request)?;
-    let auth = crate::registry::pull_auth_path(root);
+    crate::container_socket::ensure_host_socket(root, request)?;
     // Lives until `podman run` has pulled the image; dropping it deletes the file.
     let mut _login = None;
-    if request.image.starts_with(&format!("{REGISTRY_HOST}/")) && auth.exists() {
-        deploy
-            .arguments
-            .splice(1..1, ["--authfile".to_string(), auth.display().to_string()]);
-    } else if !request.registry_username.is_empty() {
+    if !request.registry_username.is_empty() {
         let login = TemporaryAuthFile::write(
             root,
             &request.name,
@@ -1219,12 +1340,11 @@ pub(crate) fn podman_deploy_args(
         return Err("The container name is invalid.".into());
     }
     if crate::registry::validate_login(&request.registry_username, &request.registry_password)?
-        && (request.image.starts_with(&format!("{REGISTRY_HOST}/"))
-            || request
-                .image
-                .starts_with(crate::builder::LOCAL_IMAGE_PREFIX))
+        && request
+            .image
+            .starts_with(crate::builder::LOCAL_IMAGE_PREFIX)
     {
-        return Err("A registry login is not used for a cluster image.".into());
+        return Err("A registry login is not used for a local image.".into());
     }
     if request.image.is_empty()
         || request.image.starts_with('-')
@@ -1393,6 +1513,9 @@ pub(crate) fn podman_deploy_args(
     args.extend(crate::volumes::mount_args(&request.mounts)?);
     args.extend(crate::secrets::mount_args(request)?);
     args.extend(crate::files::mount_args(root, request)?);
+    args.extend(crate::container_socket::mount_args(request)?);
+    args.extend(crate::workload_user::user_args(request)?);
+    args.extend(crate::runtime_options::runtime_args(request)?);
     args.push(request.image.clone());
     args.extend(request.command.clone());
     Ok(PodmanDeploy {

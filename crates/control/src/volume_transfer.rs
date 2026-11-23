@@ -18,6 +18,8 @@
 //! target Node opens its connection to the source with an element
 //! `<source_ip> . <port>` in the set `volume_transfer_sources`, matched by one
 //! rule at the top of the output chain, while a receive pass runs.
+//!
+//! Image transfers (`image_transfer.rs`) use the same port range and sets.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
@@ -48,25 +50,25 @@ const NFT_TIMEOUT: Duration = Duration::from_secs(30);
 /// A finished receive pass stays readable this long.
 const RECEIVE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECEIVE_MAX_ENTRIES: usize = 256;
-const ERROR_MAX_CHARS: usize = 2_000;
+pub(crate) const ERROR_MAX_CHARS: usize = 2_000;
 /// The longest checksum check of one volume. It reads all data on both Nodes.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 
-fn valid_transfer_id(value: &str) -> bool {
+pub(crate) fn valid_transfer_id(value: &str) -> bool {
     (1..=64).contains(&value.len())
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
-fn valid_secret(value: &str) -> bool {
+pub(crate) fn valid_secret(value: &str) -> bool {
     (32..=128).contains(&value.len())
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric())
 }
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -74,7 +76,7 @@ fn now_millis() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-fn digest(value: &str) -> [u8; 32] {
+pub(crate) fn digest(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
 }
 
@@ -92,15 +94,15 @@ fn ensure_rsync() -> Result<(), String> {
 }
 
 /// This Node's place in the cluster mesh, from the applied network state.
-struct Mesh {
-    interface: String,
-    address: Ipv4Addr,
+pub(crate) struct Mesh {
+    pub(crate) interface: String,
+    pub(crate) address: Ipv4Addr,
     peer_cidrs: Vec<String>,
     workload_cidrs: Vec<String>,
 }
 
 impl Mesh {
-    fn read(root: &Path) -> Result<Self, String> {
+    pub(crate) fn read(root: &Path) -> Result<Self, String> {
         let applied = read_applied_network(root);
         let firewall = applied
             .firewall
@@ -125,7 +127,7 @@ impl Mesh {
 
     /// The address of another Node: routed to a WireGuard peer, and not a
     /// workload address.
-    fn peer_node(&self, value: &str) -> Result<Ipv4Addr, String> {
+    pub(crate) fn peer_node(&self, value: &str) -> Result<Ipv4Addr, String> {
         let address: Ipv4Addr = value
             .parse()
             .map_err(|_| "The peer address is invalid.".to_string())?;
@@ -246,7 +248,7 @@ fn ensure_source_set(interface: &str) -> Result<(), String> {
     )
 }
 
-fn allow_source(interface: &str, source: Ipv4Addr, port: u16) -> Result<(), String> {
+pub(crate) fn allow_source(interface: &str, source: Ipv4Addr, port: u16) -> Result<(), String> {
     ensure_source_set(interface)?;
     nft_run(
         &[
@@ -261,7 +263,7 @@ fn allow_source(interface: &str, source: Ipv4Addr, port: u16) -> Result<(), Stri
     )
 }
 
-fn revoke_source(source: Ipv4Addr, port: u16) {
+pub(crate) fn revoke_source(source: Ipv4Addr, port: u16) {
     let _ = nft(&[
         "delete",
         "element",
@@ -276,7 +278,7 @@ fn firewall_element(peer: Ipv4Addr, port: u16) -> String {
     format!("{{ {peer} . {port} }}")
 }
 
-fn allow_peer(interface: &str, peer: Ipv4Addr, port: u16) -> Result<(), String> {
+pub(crate) fn allow_peer(interface: &str, peer: Ipv4Addr, port: u16) -> Result<(), String> {
     ensure_firewall_set(interface)?;
     nft_run(
         &[
@@ -291,7 +293,7 @@ fn allow_peer(interface: &str, peer: Ipv4Addr, port: u16) -> Result<(), String> 
     )
 }
 
-fn revoke_peer(peer: Ipv4Addr, port: u16) {
+pub(crate) fn revoke_peer(peer: Ipv4Addr, port: u16) {
     let _ = nft(&[
         "delete",
         "element",
@@ -423,6 +425,14 @@ pub(crate) fn validate_serve(request: &VolumeServeRequest) -> Result<(), String>
     Ok(())
 }
 
+/// The ports of the running volume serves.
+pub(crate) fn serving_ports() -> HashSet<u16> {
+    SERVES
+        .lock()
+        .map(|serves| serves.values().map(|serve| serve.port).collect())
+        .unwrap_or_default()
+}
+
 fn stop_serve(transfer_id: &str) {
     let serve = SERVES
         .lock()
@@ -506,10 +516,8 @@ fn start_serve(
     ensure_rsync()?;
     let mesh = Mesh::read(root)?;
     mesh.peer_node(&request.peer_ip)?;
-    let used_ports: HashSet<u16> = SERVES
-        .lock()
-        .map(|serves| serves.values().map(|serve| serve.port).collect())
-        .unwrap_or_default();
+    let mut used_ports = serving_ports();
+    used_ports.extend(crate::image_transfer::serving_ports());
     let directory = runtime_dir(root).join(&request.transfer_id);
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::DirBuilder::new()
@@ -715,7 +723,7 @@ fn start_daemon(directory: &Path, address: Ipv4Addr, port: u16) -> Result<Child,
     ))
 }
 
-fn tail(text: &str, fallback: &str) -> String {
+pub(crate) fn tail(text: &str, fallback: &str) -> String {
     let text = text.trim();
     if text.is_empty() {
         return fallback.into();
@@ -756,14 +764,14 @@ pub(crate) fn used_bytes(path: &Path) -> u64 {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PassState {
+pub(crate) enum PassState {
     Running,
     Succeeded,
     Failed,
 }
 
 impl PassState {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
             Self::Succeeded => "succeeded",

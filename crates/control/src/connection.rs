@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config::ControlTlsConfig;
+use sentinel_protocol::CAPABILITY_WORKLOAD_RECONCILE;
 use sentinel_protocol::CAPABILITY_WORKLOAD_ROLLING_DEPLOY;
 use sentinel_protocol::DATABASE_CAPABILITIES;
 use sentinel_protocol::STACK_CAPABILITIES;
@@ -39,13 +40,18 @@ const COMMAND_QUEUE: usize = 64;
 /// run in their own lane, so a long command (a drain and stop, an image
 /// pull, a backup) does not delay them. Inspections of the network stay in
 /// the serial lane, because a reconcile changes what they read.
-const READ_ONLY_COMMANDS: [&str; 5] = [
+/// `workload.reconcile.v1` only stores the desired set, and the converger
+/// applies it, so it also runs in this lane.
+const READ_ONLY_COMMANDS: [&str; 6] = [
     CAPABILITY_SYSTEM_PING,
     CAPABILITY_SYSTEM_INFO,
     CAPABILITY_CONTAINER_LIST,
     CAPABILITY_CONTAINER_LOGS,
     CAPABILITY_LOGS_READ,
+    CAPABILITY_WORKLOAD_RECONCILE,
 ];
+/// Statuses that Flux did not acknowledge are sent again after this time.
+const STATUS_RESEND_INTERVAL: Duration = Duration::from_secs(10);
 
 pub(crate) fn is_read_only(command_type: &str) -> bool {
     READ_ONLY_COMMANDS.contains(&command_type)
@@ -104,6 +110,7 @@ pub async fn connect(
     mut shutdown: watch::Receiver<bool>,
     command_executor: Arc<tokio::sync::Mutex<CommandExecutor>>,
     read_executor: Arc<tokio::sync::Mutex<CommandExecutor>>,
+    workload_set: crate::workload_set::WorkloadSet,
 ) -> Result<(), FluxConnectionError> {
     // The installed version can change at runtime through trust.bundle.update.v1.
     let trust_bundle_version = crate::trust::installed_version(&control_tls);
@@ -119,6 +126,9 @@ pub async fn connect(
         .max_decoding_message_size(MESSAGE_LIMIT)
         .max_encoding_message_size(MESSAGE_LIMIT);
     let (sender, receiver) = mpsc::channel(32);
+    // Coolify confirms the stored generation again on each connection.
+    workload_set.connection_changed();
+    let (workload_generation, workload_set_hash) = workload_set.reported_state();
     sender
         .send(AgentMessage {
             message: Some(agent_message::Message::Hello(Hello {
@@ -140,6 +150,7 @@ pub async fn connect(
                     CAPABILITY_LOGS_READ.into(),
                     CAPABILITY_CONTAINER_LOGS.into(),
                     CAPABILITY_TRUST_BUNDLE_UPDATE.into(),
+                    CAPABILITY_WORKLOAD_RECONCILE.into(),
                 ]
                 .into_iter()
                 .chain(NETWORK_CAPABILITIES.map(str::to_string))
@@ -151,6 +162,8 @@ pub async fn connect(
                 .collect(),
                 boot_id: boot_id(),
                 trust_bundle_version,
+                workload_generation,
+                workload_set_hash,
             })),
         })
         .await
@@ -214,6 +227,9 @@ pub async fn connect(
     ));
     let (read_sender, read_receiver) = mpsc::channel(COMMAND_QUEUE);
     tokio::spawn(run_commands(read_receiver, read_executor, sender.clone()));
+    if capability_accepted(CAPABILITY_WORKLOAD_RECONCILE) {
+        tokio::spawn(send_workload_statuses(workload_set.clone(), sender.clone()));
+    }
     ticker.tick().await;
     loop {
         tokio::select! {
@@ -223,12 +239,26 @@ pub async fn connect(
                 return Ok(());
             }
             _ = ticker.tick() => {
-                sender.send(AgentMessage { message: Some(agent_message::Message::Heartbeat(Heartbeat { connection_id: welcome.connection_id.clone(), sent_at_unix_ms: now_millis() })) }).await.map_err(|_| FluxConnectionError::Connection)?;
+                let (workload_generation, workload_set_hash) = workload_set.reported_state();
+                sender
+                    .send(AgentMessage {
+                        message: Some(agent_message::Message::Heartbeat(Heartbeat {
+                            connection_id: welcome.connection_id.clone(),
+                            sent_at_unix_ms: now_millis(),
+                            workload_generation,
+                            workload_set_hash,
+                        })),
+                    })
+                    .await
+                    .map_err(|_| FluxConnectionError::Connection)?;
             }
             message = inbound.message() => match message {
                 Ok(Some(message)) => {
                     match message.message {
                         Some(control_message::Message::ShutdownHint(_)) => return Ok(()),
+                        Some(control_message::Message::EventAck(ack)) => {
+                            workload_set.acknowledge(&ack.event_id);
+                        }
                         Some(control_message::Message::TerminalInput(frame)) if terminal_outbound.is_some() => {
                             crate::terminal::input(frame);
                         }
@@ -289,6 +319,36 @@ pub(crate) async fn run_commands(
             .await
             .is_err()
         {
+            return;
+        }
+    }
+}
+
+/// Sends the workload statuses that Flux did not acknowledge, at once after
+/// a change and again until Flux acknowledges them. It stops when the
+/// connection closes.
+async fn send_workload_statuses(
+    workload_set: crate::workload_set::WorkloadSet,
+    sender: mpsc::Sender<AgentMessage>,
+) {
+    let changed = workload_set.status_changed();
+    loop {
+        for status in workload_set.unreported() {
+            if sender
+                .send(AgentMessage {
+                    message: Some(agent_message::Message::WorkloadStatus(status)),
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        tokio::select! {
+            _ = changed.notified() => {}
+            _ = tokio::time::sleep(STATUS_RESEND_INTERVAL) => {}
+        }
+        if sender.is_closed() {
             return;
         }
     }

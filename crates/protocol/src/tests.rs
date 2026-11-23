@@ -63,7 +63,6 @@ fn network_capabilities_are_typed_and_versioned() {
         flux_probe_host: "10.240.0.1".into(),
         workload_cidrs: vec!["100.64.0.0/24".into()],
         ingress_rules: vec![],
-        registry_ip: String::new(),
         stack_rules: vec![],
         published_ports: vec![],
     };
@@ -262,6 +261,7 @@ fn hello_round_trips_and_ignores_unknown_fields() {
         capabilities: vec![CAPABILITY_SYSTEM_PING.to_string()],
         boot_id: "boot-id".to_string(),
         trust_bundle_version: 7,
+        ..Default::default()
     };
     let mut encoded = hello.encode_to_vec();
 

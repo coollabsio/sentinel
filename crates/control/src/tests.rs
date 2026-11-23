@@ -591,6 +591,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "logs.read.v1",
             "container.logs.v1",
             "trust.bundle.update.v1",
+            "workload.reconcile.v1",
             "network.cluster.leave.v1",
             "network.wireguard.key.ensure.v1",
             "network.wireguard.inspect.v1",
@@ -606,14 +607,17 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "image.build.v1",
             "image.build.private_git.v1",
             "image.load.v1",
+            "image.serve.v1",
+            "image.fetch.v1",
             "image.build.external_push.v1",
+            "image.build.external_image.v1",
             "image.build.variables.v1",
             "image.build.inline_dockerfile.v1",
             "image.build.target.v1",
+            "image.build.static.v1",
             "workload.registry_auth.v1",
             "builder.reconcile.v1",
-            "registry.reconcile.v1",
-            "registry.inspect.v1",
+            "image.prune.v1",
             "volume.mounts.v1",
             "volume.delete.v1",
             "volume.serve.v1",
@@ -630,6 +634,9 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "network.firewall.stack_rules.v1",
             "discovery.names.underscore.v1",
             "workload.healthcheck.exec.v1",
+            "workload.container_socket.v1",
+            "workload.user.v1",
+            "workload.runtime_options.v1",
             "workload.exec.v1",
             "workload.terminal.v1"
         ])
@@ -1093,6 +1100,7 @@ async fn rejects_assignment_with_a_different_trust_bundle_version_before_connect
             shutdown,
             command_executor.clone(),
             command_executor,
+            crate::workload_set::WorkloadSet::open(tempfile::tempdir().unwrap().path()),
         )
         .await,
         Err(FluxConnectionError::TrustBundleVersionMismatch)
@@ -1511,6 +1519,14 @@ fn builds_shell_free_podman_deploy_arguments() {
         registry_password: String::new(),
         dns_search: vec!["web.coolify.internal".into()],
         files: Vec::new(),
+        container_socket_paths: Vec::new(),
+        user: String::new(),
+        shm_size_bytes: None,
+        ulimits: Vec::new(),
+        tmpfs: Vec::new(),
+        stop_timeout_seconds: None,
+        tty: false,
+        stdin_open: false,
     };
 
     let deploy = crate::commands::podman_deploy_args(std::path::Path::new("/"), &request).unwrap();
@@ -1710,6 +1726,11 @@ fn builds_shell_free_podman_lifecycle_arguments() {
         action,
         stop_timeout_seconds: None,
     };
+    let timed = |action: WorkloadLifecycleAction| WorkloadLifecycleRequest {
+        name: "coolify-test-web".into(),
+        action: action.into(),
+        stop_timeout_seconds: Some(30),
+    };
 
     assert_eq!(
         crate::commands::podman_lifecycle_args(&request(WorkloadLifecycleAction::Start.into()))
@@ -1719,17 +1740,31 @@ fn builds_shell_free_podman_lifecycle_arguments() {
     assert_eq!(
         crate::commands::podman_lifecycle_args(&request(WorkloadLifecycleAction::Stop.into()))
             .unwrap(),
-        ["stop", "--time", "10", "coolify-test-web"]
+        ["stop", "coolify-test-web"]
     );
     assert_eq!(
         crate::commands::podman_lifecycle_args(&request(WorkloadLifecycleAction::Restart.into()))
             .unwrap(),
-        ["restart", "--time", "10", "coolify-test-web"]
+        ["restart", "coolify-test-web"]
     );
     assert_eq!(
         crate::commands::podman_lifecycle_args(&request(WorkloadLifecycleAction::Remove.into()))
             .unwrap(),
         ["rm", "--force", "coolify-test-web"]
+    );
+    // An explicit stop timeout applies to stop, restart, and remove. Without
+    // one, Podman uses the stop timeout of the container.
+    assert_eq!(
+        crate::commands::podman_lifecycle_args(&timed(WorkloadLifecycleAction::Stop)).unwrap(),
+        ["stop", "--time", "30", "coolify-test-web"]
+    );
+    assert_eq!(
+        crate::commands::podman_lifecycle_args(&timed(WorkloadLifecycleAction::Restart)).unwrap(),
+        ["restart", "--time", "30", "coolify-test-web"]
+    );
+    assert_eq!(
+        crate::commands::podman_lifecycle_args(&timed(WorkloadLifecycleAction::Remove)).unwrap(),
+        ["rm", "--force", "--time", "30", "coolify-test-web"]
     );
 }
 
@@ -3227,4 +3262,40 @@ fn health_check_accepts_the_shell_form_and_the_exec_form() {
     }
     let too_many = serde_json::to_string(&vec!["x"; 65]).unwrap();
     assert!(command_of(&too_many).is_err());
+}
+
+#[test]
+fn names_the_refused_field_of_an_invalid_deploy() {
+    use sentinel_protocol::control::v1::command::Payload;
+    use sentinel_protocol::control::v1::command_result;
+    use sentinel_protocol::control::v1::{Command, WorkloadDeployRequest, WorkloadUlimit};
+
+    let mut executor = crate::commands::CommandExecutor::new("dev");
+    let execution = executor.execute(
+        Command {
+            command_id: "deploy-invalid".into(),
+            command_type: sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into(),
+            payload_version: 1,
+            created_at_unix_ms: 1,
+            payload: Some(Payload::WorkloadDeploy(WorkloadDeployRequest {
+                name: "coolify-test-web".into(),
+                image: "docker.io/library/nginx:latest".into(),
+                restart_policy: "no".into(),
+                ulimits: vec![WorkloadUlimit {
+                    name: "nofiles".into(),
+                    soft: 1,
+                    hard: 1,
+                }],
+                ..Default::default()
+            })),
+            expires_at_unix_ms: i64::MAX,
+        },
+        true,
+    );
+
+    assert!(!execution.accepted);
+    assert!(matches!(
+        execution.result.payload,
+        Some(command_result::Payload::Error(error)) if error.message == "A ulimit name is invalid."
+    ));
 }

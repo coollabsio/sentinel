@@ -37,8 +37,6 @@ pub const CAPABILITY_INGRESS_ROUTES_V2: &str = "ingress.routes.v2";
 pub const CAPABILITY_FIREWALL_PUBLISHED_PORTS: &str = "network.firewall.published_ports.v1";
 pub const CAPABILITY_IMAGE_BUILD: &str = "image.build.v1";
 pub const CAPABILITY_BUILDER_RECONCILE: &str = "builder.reconcile.v1";
-pub const CAPABILITY_REGISTRY_RECONCILE: &str = "registry.reconcile.v1";
-pub const CAPABILITY_REGISTRY_INSPECT: &str = "registry.inspect.v1";
 /// `image.build.v1` accepts `git_https_token` and `git_ssh_private_key`
 /// (decision 0011). Not a command: an older Sentinel ignores the fields and
 /// would clone without the credential.
@@ -47,10 +45,19 @@ pub const CAPABILITY_IMAGE_BUILD_PRIVATE_GIT: &str = "image.build.private_git.v1
 /// `image.build.v1` accepts a `localhost/` image, so a single-Node cluster
 /// needs no registry.
 pub const CAPABILITY_IMAGE_LOAD: &str = "image.load.v1";
+/// Serves a local image to one peer Node (decision 0030 of Coolify).
+pub const CAPABILITY_IMAGE_SERVE: &str = "image.serve.v1";
+/// Fetches a local image from a peer Node that serves it (decision 0030 of
+/// Coolify).
+pub const CAPABILITY_IMAGE_FETCH: &str = "image.fetch.v1";
 /// `image.build.v1` accepts `push_image`, `push_username`, and
 /// `push_password`. Not a command: an older Sentinel ignores the fields and
 /// would not push the image.
 pub const CAPABILITY_IMAGE_BUILD_EXTERNAL_PUSH: &str = "image.build.external_push.v1";
+/// `image.build.v1` accepts an `image` in a registry, with
+/// `image_username` and `image_password`, so a cluster can store its builds
+/// in an external registry. Not a command: an older Sentinel rejects the image.
+pub const CAPABILITY_IMAGE_BUILD_EXTERNAL_IMAGE: &str = "image.build.external_image.v1";
 /// `workload.deploy.v1` accepts `registry_username` and `registry_password`.
 /// Not a command: an older Sentinel ignores the fields and would pull without
 /// the login.
@@ -65,18 +72,33 @@ pub const CAPABILITY_IMAGE_BUILD_INLINE_DOCKERFILE: &str = "image.build.inline_d
 /// `image.build.v1` accepts `target`, a Dockerfile stage. Not a command: an
 /// older Sentinel ignores the field and would build the last stage.
 pub const CAPABILITY_IMAGE_BUILD_TARGET: &str = "image.build.target.v1";
-pub const BUILD_CAPABILITIES: [&str; 11] = [
+/// `image.build.v1` accepts `static_root`, a Railpack build that serves files
+/// only. Not a command: an older Sentinel ignores the field and would let
+/// Railpack detect the provider, for example Node.
+pub const CAPABILITY_IMAGE_BUILD_STATIC: &str = "image.build.static.v1";
+/// Removes unused images and ended build containers, except a keep list
+/// (decision 0027 of Coolify).
+pub const CAPABILITY_IMAGE_PRUNE: &str = "image.prune.v1";
+/// Sentinel stores the desired set of the workloads of its Node and converges
+/// the containers to it (decision 0026 of Coolify). `Hello` and `Heartbeat`
+/// carry the generation and the hash of the set, and Sentinel sends
+/// `WorkloadStatus` events.
+pub const CAPABILITY_WORKLOAD_RECONCILE: &str = "workload.reconcile.v1";
+pub const BUILD_CAPABILITIES: [&str; 14] = [
     CAPABILITY_IMAGE_BUILD,
     CAPABILITY_IMAGE_BUILD_PRIVATE_GIT,
     CAPABILITY_IMAGE_LOAD,
+    CAPABILITY_IMAGE_SERVE,
+    CAPABILITY_IMAGE_FETCH,
     CAPABILITY_IMAGE_BUILD_EXTERNAL_PUSH,
+    CAPABILITY_IMAGE_BUILD_EXTERNAL_IMAGE,
     CAPABILITY_IMAGE_BUILD_VARIABLES,
     CAPABILITY_IMAGE_BUILD_INLINE_DOCKERFILE,
     CAPABILITY_IMAGE_BUILD_TARGET,
+    CAPABILITY_IMAGE_BUILD_STATIC,
     CAPABILITY_WORKLOAD_REGISTRY_AUTH,
     CAPABILITY_BUILDER_RECONCILE,
-    CAPABILITY_REGISTRY_RECONCILE,
-    CAPABILITY_REGISTRY_INSPECT,
+    CAPABILITY_IMAGE_PRUNE,
 ];
 /// `workload.deploy.v1` accepts `mounts`. Not a command: an older Sentinel
 /// ignores the field and would run the container without its data.
@@ -134,12 +156,29 @@ pub const CAPABILITY_DISCOVERY_NAMES_UNDERSCORE: &str = "discovery.names.undersc
 /// exec form of the Compose `CMD` test, which runs without `/bin/sh` (decision
 /// 0023). Not a command.
 pub const CAPABILITY_WORKLOAD_HEALTHCHECK_EXEC: &str = "workload.healthcheck.exec.v1";
-pub const STACK_CAPABILITIES: [&str; 5] = [
+/// `workload.deploy.v1` accepts `container_socket_paths`: Sentinel bind-mounts
+/// the host Podman socket at each path. The socket gives the container root on
+/// the Node, so Coolify permits it only for admins. Not a command: an older
+/// Sentinel ignores the field and would start the container without the socket.
+pub const CAPABILITY_WORKLOAD_CONTAINER_SOCKET: &str = "workload.container_socket.v1";
+/// `workload.deploy.v1` accepts `user`: the container process runs as this user
+/// (`podman run --user`), the Compose `user:`. Not a command: an older Sentinel
+/// ignores the field and would start the container as the user of the image.
+pub const CAPABILITY_WORKLOAD_USER: &str = "workload.user.v1";
+/// `workload.deploy.v1` accepts `shm_size_bytes`, `ulimits`, `tmpfs`,
+/// `stop_timeout_seconds`, `tty`, and `stdin_open` (decision 0028). Not a
+/// command: an older Sentinel ignores the fields and would start the container
+/// with the Podman defaults.
+pub const CAPABILITY_WORKLOAD_RUNTIME_OPTIONS: &str = "workload.runtime_options.v1";
+pub const STACK_CAPABILITIES: [&str; 8] = [
     CAPABILITY_WORKLOAD_DNS_SEARCH,
     CAPABILITY_WORKLOAD_FILES,
     CAPABILITY_FIREWALL_STACK_RULES,
     CAPABILITY_DISCOVERY_NAMES_UNDERSCORE,
     CAPABILITY_WORKLOAD_HEALTHCHECK_EXEC,
+    CAPABILITY_WORKLOAD_CONTAINER_SOCKET,
+    CAPABILITY_WORKLOAD_USER,
+    CAPABILITY_WORKLOAD_RUNTIME_OPTIONS,
 ];
 pub const VOLUME_CAPABILITIES: [&str; 9] = [
     CAPABILITY_VOLUME_MOUNTS,
@@ -157,9 +196,6 @@ pub const CAPABILITY_WORKLOAD_EXEC: &str = "workload.exec.v1";
 /// Opens an interactive shell in a managed container (decision 0018).
 pub const CAPABILITY_WORKLOAD_TERMINAL: &str = "workload.terminal.v1";
 pub const EXEC_CAPABILITIES: [&str; 2] = [CAPABILITY_WORKLOAD_EXEC, CAPABILITY_WORKLOAD_TERMINAL];
-/// The cluster registry. Sentinel discovery DNS resolves it to the Node that
-/// runs the registry.
-pub const REGISTRY_HOST: &str = "registry.cluster.coolify.internal:5443";
 pub const NETWORK_CAPABILITIES: [&str; 12] = [
     CAPABILITY_CLUSTER_LEAVE,
     CAPABILITY_WIREGUARD_KEY_ENSURE,
@@ -197,6 +233,8 @@ pub mod control {
                     .field("push_image", &self.push_image)
                     .field("push_username", &self.push_username)
                     .field("push_password", &redacted(&self.push_password))
+                    .field("image_username", &self.image_username)
+                    .field("image_password", &redacted(&self.image_password))
                     .field(
                         "build_arg_keys",
                         &self.build_args.keys().collect::<Vec<_>>(),
@@ -207,6 +245,7 @@ pub mod control {
                     )
                     .field("dockerfile_content_bytes", &self.dockerfile_content.len())
                     .field("target", &self.target)
+                    .field("static_root", &self.static_root)
                     .finish()
             }
         }
@@ -228,6 +267,36 @@ pub mod control {
                     .field("registry_username", &self.registry_username)
                     .field("registry_password", &redacted(&self.registry_password))
                     .finish_non_exhaustive()
+            }
+        }
+
+        impl std::fmt::Debug for ImageServeRequest {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter
+                    .debug_struct("ImageServeRequest")
+                    .field("transfer_id", &self.transfer_id)
+                    .field("image", &self.image)
+                    .field("peer_ip", &self.peer_ip)
+                    .field("secret", &"[redacted]")
+                    .field("expires_at_unix_ms", &self.expires_at_unix_ms)
+                    .field("stop", &self.stop)
+                    .finish()
+            }
+        }
+
+        impl std::fmt::Debug for ImageFetchRequest {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter
+                    .debug_struct("ImageFetchRequest")
+                    .field("transfer_id", &self.transfer_id)
+                    .field("source_address", &self.source_address)
+                    .field("source_port", &self.source_port)
+                    .field("secret", &"[redacted]")
+                    .field("repository", &self.repository)
+                    .field("digest", &self.digest)
+                    .field("image", &self.image)
+                    .field("image_id", &self.image_id)
+                    .finish()
             }
         }
 

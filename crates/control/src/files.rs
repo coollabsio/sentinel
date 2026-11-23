@@ -27,7 +27,7 @@ fn host_path(root: &Path, container: &str, path: &str) -> PathBuf {
     container_dir(root, container).join(path.trim_start_matches('/'))
 }
 
-fn valid_path(path: &str) -> bool {
+pub(crate) fn valid_path(path: &str) -> bool {
     path.len() <= 4_096
         && path.starts_with('/')
         && path != "/"

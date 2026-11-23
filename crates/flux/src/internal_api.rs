@@ -18,6 +18,7 @@ use sentinel_protocol::control::v1::{
     WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest,
     WorkloadDeployRequest, WorkloadEnvironmentVariable, WorkloadFile, WorkloadHealthCheck,
     WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadName, WorkloadSecret,
+    WorkloadTmpfs, WorkloadUlimit,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -25,8 +26,10 @@ use sentinel_protocol::{
     CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ,
     CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
     CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
-    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES,
-    CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_SECRETS_OWNER,
+    CAPABILITY_WORKLOAD_CONTAINER_SOCKET, CAPABILITY_WORKLOAD_DEPLOY,
+    CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES, CAPABILITY_WORKLOAD_LIFECYCLE,
+    CAPABILITY_WORKLOAD_RUNTIME_OPTIONS, CAPABILITY_WORKLOAD_SECRETS_OWNER,
+    CAPABILITY_WORKLOAD_USER,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -36,6 +39,7 @@ use crate::{CommandDispatchError, ConnectionRegistry, now_millis};
 mod build;
 mod database;
 mod exec;
+mod reconcile;
 mod volume;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -126,6 +130,13 @@ struct ClusterLeaveApiRequest {
 struct WorkloadDeployApiRequest {
     server_id: String,
     command_id: String,
+    #[serde(flatten)]
+    spec: WorkloadDeploySpec,
+}
+
+/// The container of a deploy, also the `deploy` of a desired set entry.
+#[derive(Deserialize)]
+pub(crate) struct WorkloadDeploySpec {
     name: String,
     image: String,
     #[serde(default)]
@@ -165,6 +176,43 @@ struct WorkloadDeployApiRequest {
     dns_search: Vec<String>,
     #[serde(default)]
     files: Vec<DeployFile>,
+    /// Paths of `workload.container_socket.v1`. Sentinel validates them. The
+    /// socket gives the container root on the Node.
+    #[serde(default)]
+    container_socket_paths: Vec<String>,
+    /// The `user` of `workload.user.v1`. Sentinel validates it.
+    #[serde(default)]
+    user: String,
+    /// The runtime options of `workload.runtime_options.v1` (decision 0028).
+    /// Sentinel validates them.
+    #[serde(default)]
+    shm_size_bytes: Option<u64>,
+    #[serde(default)]
+    ulimits: Vec<DeployUlimit>,
+    #[serde(default)]
+    tmpfs: Vec<DeployTmpfs>,
+    #[serde(default)]
+    stop_timeout_seconds: Option<u32>,
+    #[serde(default)]
+    tty: bool,
+    #[serde(default)]
+    stdin_open: bool,
+}
+
+/// A ulimit of `workload.runtime_options.v1`; -1 is unlimited.
+#[derive(Deserialize)]
+struct DeployUlimit {
+    name: String,
+    soft: i64,
+    hard: i64,
+}
+
+/// A tmpfs mount of `workload.runtime_options.v1`; a size of 0 keeps the Podman default.
+#[derive(Deserialize)]
+struct DeployTmpfs {
+    path: String,
+    #[serde(default)]
+    size_bytes: u64,
 }
 
 /// A file of `workload.files.v1`. Sentinel validates the path, mode, and sizes.
@@ -356,8 +404,6 @@ struct FirewallReconcileApiRequest {
     workload_cidrs: Vec<String>,
     #[serde(default)]
     ingress_rules: Vec<FirewallIngressRuleApiRequest>,
-    #[serde(default)]
-    registry_ip: String,
     #[serde(default)]
     stack_rules: Vec<FirewallStackRuleApiRequest>,
     #[serde(default)]
@@ -654,17 +700,18 @@ pub async fn serve(
         .route("/v1/commands/ingress.reconcile", post(ingress_reconcile))
         .route("/v1/commands/image.build", post(build::image_build))
         .route("/v1/commands/image.load", post(build::image_load))
+        .route("/v1/commands/image.serve", post(build::image_serve))
+        .route("/v1/commands/image.fetch", post(build::image_fetch))
+        .route("/v1/commands/image.prune", post(build::image_prune))
+        .route(
+            "/v1/commands/workload.reconcile",
+            post(reconcile::workload_reconcile).layer(axum::extract::DefaultBodyLimit::max(
+                reconcile::RECONCILE_BODY_LIMIT,
+            )),
+        )
         .route(
             "/v1/commands/builder.reconcile",
             post(build::builder_reconcile),
-        )
-        .route(
-            "/v1/commands/registry.reconcile",
-            post(build::registry_reconcile),
-        )
-        .route(
-            "/v1/commands/registry.inspect",
-            post(build::registry_inspect),
         )
         .route("/v1/commands/volume.delete", post(volume::volume_delete))
         .route("/v1/commands/volume.serve", post(volume::volume_serve))
@@ -981,7 +1028,6 @@ async fn firewall_reconcile(
             flux_probe_host: request.flux_probe_host,
             workload_cidrs: request.workload_cidrs,
             ingress_rules,
-            registry_ip: request.registry_ip,
             stack_rules: request
                 .stack_rules
                 .into_iter()
@@ -1224,31 +1270,15 @@ async fn workload_deploy(
     {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid command request").into());
     }
-    let pull_policy = workload_pull_policy(&request.pull_policy)?;
-    let files = deploy_files(request.files)?;
-    let mut secrets: Vec<_> = request
-        .secrets
-        .into_iter()
-        .map(|(key, secret)| secret.protocol(key))
-        .collect();
-    secrets.sort_by(|left, right| left.key.cmp(&right.key));
+    let (deploy, needed) = deploy_request(request.spec)?;
     // An older Sentinel ignores the fields and would start the container
-    // without its files, search domains, or secret file owners.
-    let needed = [
-        (!request.dns_search.is_empty()).then_some(CAPABILITY_WORKLOAD_DNS_SEARCH),
-        (!files.is_empty()).then_some(CAPABILITY_WORKLOAD_FILES),
-        secrets
-            .iter()
-            .any(|secret| secret.uid.is_some() || secret.gid.is_some() || secret.mode.is_some())
-            .then_some(CAPABILITY_WORKLOAD_SECRETS_OWNER),
-    ];
-    if needed.iter().flatten().next().is_some() {
+    // without its files, search domains, secret file owners, or socket.
+    if !needed.is_empty() {
         let Some(connection) = state.registry.get(&request.server_id).await else {
             return Err(dispatch_error(CommandDispatchError::Offline).into());
         };
         if needed
             .iter()
-            .flatten()
             .any(|capability| !connection.capabilities.iter().any(|c| c == capability))
         {
             return Err(dispatch_error(CommandDispatchError::Unsupported).into());
@@ -1264,56 +1294,7 @@ async fn workload_deploy(
                 command_type: CAPABILITY_WORKLOAD_DEPLOY.into(),
                 payload_version: 1,
                 created_at_unix_ms: now,
-                payload: Some(Payload::WorkloadDeploy(WorkloadDeployRequest {
-                    name: request.name,
-                    image: request.image,
-                    command: request.command,
-                    environment: sorted_pairs(request.environment)
-                        .into_iter()
-                        .map(|(key, value)| WorkloadEnvironmentVariable { key, value })
-                        .collect(),
-                    ports: request
-                        .ports
-                        .into_iter()
-                        .map(|port| ContainerPort {
-                            host_ip: port.host_ip,
-                            host_port: port.host_port,
-                            container_port: port.container_port,
-                            protocol: port.protocol,
-                        })
-                        .collect(),
-                    labels: sorted_pairs(request.labels)
-                        .into_iter()
-                        .map(|(key, value)| WorkloadLabel { key, value })
-                        .collect(),
-                    restart_policy: request.restart_policy,
-                    network_name: request.network_name,
-                    network_subnet: request.network_subnet,
-                    container_ip: request.container_ip,
-                    dns_server: request.dns_server,
-                    cpu_limit: request.cpu_limit,
-                    cpu_reservation: request.cpu_reservation,
-                    memory_limit_bytes: request.memory_limit_bytes,
-                    memory_reservation_bytes: request.memory_reservation_bytes,
-                    pull_policy,
-                    mounts: request
-                        .mounts
-                        .into_iter()
-                        .map(volume::DeployMount::protocol)
-                        .collect(),
-                    health_check: request.health_check.map(|check| WorkloadHealthCheck {
-                        command: check.command,
-                        interval_seconds: check.interval_seconds,
-                        timeout_seconds: check.timeout_seconds,
-                        retries: check.retries,
-                        start_period_seconds: check.start_period_seconds,
-                    }),
-                    secrets,
-                    registry_username: request.registry_username,
-                    registry_password: request.registry_password,
-                    dns_search: request.dns_search,
-                    files,
-                })),
+                payload: Some(Payload::WorkloadDeploy(deploy)),
                 expires_at_unix_ms: now + DEPLOY_TIMEOUT.as_millis() as i64,
             },
             DEPLOY_TIMEOUT,
@@ -1334,6 +1315,115 @@ async fn workload_deploy(
         name: deployed.name,
         image: deployed.image,
     }))
+}
+
+/// Converts the container of a deploy to the protocol, with the capabilities
+/// that its fields need on top of `workload.deploy.v1`.
+pub(crate) fn deploy_request(
+    spec: WorkloadDeploySpec,
+) -> Result<(WorkloadDeployRequest, Vec<&'static str>), ApiError> {
+    let pull_policy = workload_pull_policy(&spec.pull_policy)?;
+    let files = deploy_files(spec.files)?;
+    let mut secrets: Vec<_> = spec
+        .secrets
+        .into_iter()
+        .map(|(key, secret)| secret.protocol(key))
+        .collect();
+    secrets.sort_by(|left, right| left.key.cmp(&right.key));
+    let needed = [
+        (!spec.dns_search.is_empty()).then_some(CAPABILITY_WORKLOAD_DNS_SEARCH),
+        (!files.is_empty()).then_some(CAPABILITY_WORKLOAD_FILES),
+        (!spec.container_socket_paths.is_empty()).then_some(CAPABILITY_WORKLOAD_CONTAINER_SOCKET),
+        (!spec.user.is_empty()).then_some(CAPABILITY_WORKLOAD_USER),
+        (spec.shm_size_bytes.is_some()
+            || !spec.ulimits.is_empty()
+            || !spec.tmpfs.is_empty()
+            || spec.stop_timeout_seconds.is_some()
+            || spec.tty
+            || spec.stdin_open)
+            .then_some(CAPABILITY_WORKLOAD_RUNTIME_OPTIONS),
+        secrets
+            .iter()
+            .any(|secret| secret.uid.is_some() || secret.gid.is_some() || secret.mode.is_some())
+            .then_some(CAPABILITY_WORKLOAD_SECRETS_OWNER),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let deploy = WorkloadDeployRequest {
+        name: spec.name,
+        image: spec.image,
+        command: spec.command,
+        environment: sorted_pairs(spec.environment)
+            .into_iter()
+            .map(|(key, value)| WorkloadEnvironmentVariable { key, value })
+            .collect(),
+        ports: spec
+            .ports
+            .into_iter()
+            .map(|port| ContainerPort {
+                host_ip: port.host_ip,
+                host_port: port.host_port,
+                container_port: port.container_port,
+                protocol: port.protocol,
+            })
+            .collect(),
+        labels: sorted_pairs(spec.labels)
+            .into_iter()
+            .map(|(key, value)| WorkloadLabel { key, value })
+            .collect(),
+        restart_policy: spec.restart_policy,
+        network_name: spec.network_name,
+        network_subnet: spec.network_subnet,
+        container_ip: spec.container_ip,
+        dns_server: spec.dns_server,
+        cpu_limit: spec.cpu_limit,
+        cpu_reservation: spec.cpu_reservation,
+        memory_limit_bytes: spec.memory_limit_bytes,
+        memory_reservation_bytes: spec.memory_reservation_bytes,
+        pull_policy,
+        mounts: spec
+            .mounts
+            .into_iter()
+            .map(volume::DeployMount::protocol)
+            .collect(),
+        health_check: spec.health_check.map(|check| WorkloadHealthCheck {
+            command: check.command,
+            interval_seconds: check.interval_seconds,
+            timeout_seconds: check.timeout_seconds,
+            retries: check.retries,
+            start_period_seconds: check.start_period_seconds,
+        }),
+        secrets,
+        registry_username: spec.registry_username,
+        registry_password: spec.registry_password,
+        dns_search: spec.dns_search,
+        files,
+        container_socket_paths: spec.container_socket_paths,
+        user: spec.user,
+        shm_size_bytes: spec.shm_size_bytes,
+        ulimits: spec
+            .ulimits
+            .into_iter()
+            .map(|ulimit| WorkloadUlimit {
+                name: ulimit.name,
+                soft: ulimit.soft,
+                hard: ulimit.hard,
+            })
+            .collect(),
+        tmpfs: spec
+            .tmpfs
+            .into_iter()
+            .map(|tmpfs| WorkloadTmpfs {
+                path: tmpfs.path,
+                size_bytes: tmpfs.size_bytes,
+            })
+            .collect(),
+        stop_timeout_seconds: spec.stop_timeout_seconds,
+        tty: spec.tty,
+        stdin_open: spec.stdin_open,
+    };
+    Ok((deploy, needed))
 }
 
 fn sorted_pairs(values: std::collections::HashMap<String, String>) -> Vec<(String, String)> {

@@ -118,6 +118,7 @@ fn selects_protocol_and_capabilities_for_valid_hello() {
         ],
         boot_id: "boot-1".into(),
         trust_bundle_version: 1,
+        ..Default::default()
     };
 
     let negotiated = negotiate(&claims, &hello).unwrap();
@@ -150,6 +151,7 @@ async fn accepts_a_hello_with_unknown_or_ungranted_capabilities_without_granting
         ],
         boot_id: "boot-1".into(),
         trust_bundle_version: 1,
+        ..Default::default()
     };
 
     let negotiated = negotiate(&claims, &hello).unwrap();
@@ -197,6 +199,7 @@ fn still_refuses_a_hello_with_an_invalid_identity_or_protocol() {
         capabilities: vec![CAPABILITY_SYSTEM_PING.into()],
         boot_id: "boot-1".into(),
         trust_bundle_version: 1,
+        ..Default::default()
     };
 
     for invalid in [
@@ -716,6 +719,9 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
                 sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY.into(),
                 sentinel_protocol::CAPABILITY_WORKLOAD_DNS_SEARCH.into(),
                 sentinel_protocol::CAPABILITY_WORKLOAD_FILES.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_CONTAINER_SOCKET.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_USER.into(),
+                sentinel_protocol::CAPABILITY_WORKLOAD_RUNTIME_OPTIONS.into(),
             ],
         )
         .await;
@@ -746,6 +752,14 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
             "restart_policy": "no",
             "dns_search": ["shop.coolify.internal"],
             "files": files,
+            "container_socket_paths": ["/var/run/docker.sock"],
+            "user": "0:0",
+            "shm_size_bytes": 268435456,
+            "ulimits": [{"name": "nofile", "soft": 1024, "hard": 65535}],
+            "tmpfs": [{"path": "/tmp"}, {"path": "/cache", "size_bytes": 1048576}],
+            "stop_timeout_seconds": 90,
+            "tty": true,
+            "stdin_open": true,
         })
     };
     let post = |body: serde_json::Value| {
@@ -764,6 +778,50 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
     .await
     .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let response = post(serde_json::json!({
+        "server_id": "server-old",
+        "command_id": "deploy-1",
+        "name": "coolify-p1test-main",
+        "image": "docker.io/library/nginx:latest",
+        "restart_policy": "no",
+        "container_socket_paths": ["/var/run/docker.sock"],
+    }))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let response = post(serde_json::json!({
+        "server_id": "server-old",
+        "command_id": "deploy-1",
+        "name": "coolify-p1test-main",
+        "image": "docker.io/library/nginx:latest",
+        "restart_policy": "no",
+        "user": "1000:1000",
+    }))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    for (key, value) in [
+        ("shm_size_bytes", serde_json::json!(1024)),
+        (
+            "ulimits",
+            serde_json::json!([{"name": "nofile", "soft": 1, "hard": 1}]),
+        ),
+        ("tmpfs", serde_json::json!([{"path": "/tmp"}])),
+        ("stop_timeout_seconds", serde_json::json!(30)),
+        ("tty", serde_json::json!(true)),
+        ("stdin_open", serde_json::json!(true)),
+    ] {
+        let mut request = serde_json::json!({
+            "server_id": "server-old",
+            "command_id": "deploy-1",
+            "name": "coolify-p1test-main",
+            "image": "docker.io/library/nginx:latest",
+            "restart_policy": "no",
+        });
+        request[key] = value;
+        let response = post(request).await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT, "{key}");
+    }
     let response = post(body(
         "server-1",
         serde_json::json!([{"path": "/etc/nginx.conf", "content_base64": "not base64!"}]),
@@ -808,6 +866,29 @@ async fn workload_deploy_route_sends_files_and_dns_search_to_a_sentinel_that_sup
         panic!("expected a deploy");
     };
     assert_eq!(deploy.dns_search, ["shop.coolify.internal"]);
+    assert_eq!(deploy.container_socket_paths, ["/var/run/docker.sock"]);
+    assert_eq!(deploy.user, "0:0");
+    assert_eq!(deploy.shm_size_bytes, Some(268_435_456));
+    assert_eq!(deploy.ulimits.len(), 1);
+    assert_eq!(
+        (
+            deploy.ulimits[0].name.as_str(),
+            deploy.ulimits[0].soft,
+            deploy.ulimits[0].hard
+        ),
+        ("nofile", 1024, 65_535)
+    );
+    assert_eq!(deploy.tmpfs.len(), 2);
+    assert_eq!(
+        (deploy.tmpfs[0].path.as_str(), deploy.tmpfs[0].size_bytes),
+        ("/tmp", 0)
+    );
+    assert_eq!(
+        (deploy.tmpfs[1].path.as_str(), deploy.tmpfs[1].size_bytes),
+        ("/cache", 1_048_576)
+    );
+    assert_eq!(deploy.stop_timeout_seconds, Some(90));
+    assert!(deploy.tty && deploy.stdin_open);
     assert_eq!(deploy.files.len(), 6);
     assert_eq!(deploy.files[0].content.len(), 1024 * 1024);
     assert_eq!(deploy.files[4].path, "/etc/nginx.conf");
@@ -1367,6 +1448,7 @@ fn negotiates_the_trust_bundle_update_capability_when_granted() {
         capabilities: vec![sentinel_protocol::CAPABILITY_TRUST_BUNDLE_UPDATE.into()],
         boot_id: "boot-1".into(),
         trust_bundle_version: 2,
+        ..Default::default()
     };
 
     assert_eq!(
@@ -1586,6 +1668,7 @@ fn negotiates_the_ingress_reconcile_capability_when_granted() {
         capabilities: vec![sentinel_protocol::CAPABILITY_INGRESS_RECONCILE.into()],
         boot_id: "boot-1".into(),
         trust_bundle_version: 2,
+        ..Default::default()
     };
 
     assert_eq!(
@@ -1897,6 +1980,7 @@ fn negotiates_the_container_logs_capability_when_granted() {
         capabilities: vec![sentinel_protocol::CAPABILITY_CONTAINER_LOGS.into()],
         boot_id: "boot-1".into(),
         trust_bundle_version: 2,
+        ..Default::default()
     };
 
     assert_eq!(
@@ -1996,5 +2080,252 @@ async fn firewall_reconcile_route_passes_stack_rules_and_published_ports_to_sent
             },
         ]
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn image_prune_route_sends_the_keep_list_and_returns_the_result() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_IMAGE_PRUNE.into()],
+        )
+        .await;
+    let (old_sender, _old_receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-old",
+            "connection-2",
+            old_sender,
+            1,
+            vec![CAPABILITY_SYSTEM_PING.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let post = |body: serde_json::Value| {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/image.prune"))
+            .bearer_auth("internal-secret")
+            .json(&body)
+            .send()
+    };
+    let response = post(serde_json::json!({
+        "server_id": "server-old",
+        "command_id": "prune-1",
+        "keep": ["nginx:alpine"],
+    }))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+    let request = tokio::spawn(post(serde_json::json!({
+        "server_id": "server-1",
+        "command_id": "prune-2",
+        "keep": ["nginx:alpine", "sha256:abc"],
+        "running_build_containers": ["coolify-build-b1"],
+    })));
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    assert_eq!(
+        command.command_type,
+        sentinel_protocol::CAPABILITY_IMAGE_PRUNE
+    );
+    let Some(sentinel_protocol::control::v1::command::Payload::ImagePrune(prune)) =
+        &command.payload
+    else {
+        panic!("expected an image prune");
+    };
+    assert_eq!(prune.keep, ["nginx:alpine", "sha256:abc"]);
+    assert_eq!(prune.running_build_containers, ["coolify-build-b1"]);
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: "prune-2:result".into(),
+                command_id: "prune-2".into(),
+                status: sentinel_protocol::control::v1::CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: 1_700_000_000_500,
+                payload: Some(
+                    sentinel_protocol::control::v1::command_result::Payload::ImagePrune(
+                        sentinel_protocol::control::v1::ImagePruneResult {
+                            freed_bytes: 1024,
+                            removed_images: vec!["docker.io/library/nginx:1".into()],
+                            removed_containers: vec!["coolify-build-a1".into()],
+                            kept_images: 3,
+                            skipped: vec![],
+                            disk_available_bytes: Some(4096),
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({
+            "command_id": "prune-2",
+            "observed_at_unix_ms": 1_700_000_000_500_i64,
+            "freed_bytes": 1024,
+            "removed_images": ["docker.io/library/nginx:1"],
+            "removed_containers": ["coolify-build-a1"],
+            "kept_images": 3,
+            "skipped": [],
+            "disk_available_bytes": 4096,
+        })
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn workload_reconcile_route_sends_the_set_change_and_returns_the_state() {
+    use sentinel_protocol::control::v1::{
+        WorkloadDesiredState, WorkloadReconcileResult, WorkloadStatus, WorkloadStatusValue,
+    };
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_WORKLOAD_RECONCILE.into()],
+        )
+        .await;
+    let (old_sender, _old_receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-old",
+            "connection-2",
+            old_sender,
+            1,
+            vec![CAPABILITY_SYSTEM_PING.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let post = |body: serde_json::Value| {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/workload.reconcile"))
+            .bearer_auth("internal-secret")
+            .json(&body)
+            .send()
+    };
+    let hash = "a".repeat(64);
+    let body = |server_id: &str, command_id: &str| {
+        serde_json::json!({
+            "server_id": server_id,
+            "command_id": command_id,
+            "generation": 4,
+            "set_hash": hash,
+            "puts": [{
+                "workload_id": "workload-1",
+                "revision_id": "revision-2",
+                "configuration_hash": "config",
+                "desired_state": "running",
+                "network_revision": 9,
+                "replaces": "coolify-workload-1",
+                "operation_id": "operation-1",
+                "entry_hash": "entry",
+                "deploy": {
+                    "name": "coolify-workload-1-b",
+                    "image": "nginx:alpine",
+                    "restart_policy": "unless-stopped",
+                    "environment": {"B": "2", "A": "1"},
+                    "secrets": {"token": "secret-value"},
+                },
+            }],
+            "removes": ["workload-old"],
+        })
+    };
+    let response = post(body("server-old", "reconcile-1")).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+    let mut invalid = body("server-1", "reconcile-2");
+    invalid["puts"][0]["desired_state"] = "removed".into();
+    let response = post(invalid).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+
+    let request = tokio::spawn(post(body("server-1", "reconcile-3")));
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    assert_eq!(
+        command.command_type,
+        sentinel_protocol::CAPABILITY_WORKLOAD_RECONCILE
+    );
+    let Some(sentinel_protocol::control::v1::command::Payload::WorkloadReconcile(change)) =
+        &command.payload
+    else {
+        panic!("expected a workload reconcile");
+    };
+    assert_eq!(change.generation, 4);
+    assert!(!change.full);
+    assert_eq!(change.removes, ["workload-old"]);
+    let entry = &change.puts[0];
+    assert_eq!(entry.desired_state, WorkloadDesiredState::Running as i32);
+    assert_eq!(entry.network_revision, 9);
+    assert_eq!(entry.replaces, "coolify-workload-1");
+    let deploy = entry.deploy.as_ref().unwrap();
+    assert_eq!(deploy.name, "coolify-workload-1-b");
+    assert_eq!(deploy.environment[0].key, "A");
+    assert_eq!(deploy.secrets[0].value, "secret-value");
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: "reconcile-3:result".into(),
+                command_id: "reconcile-3".into(),
+                status: sentinel_protocol::control::v1::CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: 1_700_000_000_500,
+                payload: Some(
+                    sentinel_protocol::control::v1::command_result::Payload::WorkloadReconcile(
+                        WorkloadReconcileResult {
+                            generation: 4,
+                            set_hash: "a".repeat(64),
+                            accepted: true,
+                            statuses: vec![WorkloadStatus {
+                                workload_id: "workload-1".into(),
+                                revision_id: "revision-2".into(),
+                                status: WorkloadStatusValue::Progressing as i32,
+                                ..Default::default()
+                            }],
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let value = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(value["accepted"], true);
+    assert_eq!(value["generation"], 4);
+    assert_eq!(value["statuses"][0]["status"], "progressing");
     server.abort();
 }

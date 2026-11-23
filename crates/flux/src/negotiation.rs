@@ -1,3 +1,4 @@
+use sentinel_protocol::CAPABILITY_WORKLOAD_RECONCILE;
 use sentinel_protocol::CAPABILITY_WORKLOAD_ROLLING_DEPLOY;
 use sentinel_protocol::control::v1::Hello;
 use sentinel_protocol::{
@@ -63,6 +64,7 @@ pub fn negotiate(claims: &CredentialClaims, hello: &Hello) -> Result<Negotiated,
         CAPABILITY_LOGS_READ,
         CAPABILITY_CONTAINER_LOGS,
         CAPABILITY_TRUST_BUNDLE_UPDATE,
+        CAPABILITY_WORKLOAD_RECONCILE,
     ]
     .into_iter()
     .chain(NETWORK_CAPABILITIES)

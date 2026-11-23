@@ -14,6 +14,10 @@ message AgentMessage {
     CommandResult command_result = 4;
     RuntimeChanged runtime_changed = 5;
     TerminalOutput terminal_output = 6;
+    // A status change of a workload of the desired set (`workload.reconcile.v1`).
+    // Flux answers with `EventAck` after Coolify stored it; Sentinel sends it
+    // again until then.
+    WorkloadStatus workload_status = 7;
   }
 }
 
@@ -35,11 +39,19 @@ message Hello {
   repeated string capabilities = 5;
   string boot_id = 6;
   uint64 trust_bundle_version = 7;
+  // The generation and the hash of the stored desired set
+  // (`workload.reconcile.v1`). Coolify sends the full set when they differ
+  // from its own. 0 and empty without a stored set.
+  uint64 workload_generation = 8;
+  string workload_set_hash = 9;
 }
 
 message Heartbeat {
   string connection_id = 1;
   int64 sent_at_unix_ms = 2;
+  // As in `Hello`, so Coolify finds a lost change.
+  uint64 workload_generation = 3;
+  string workload_set_hash = 4;
 }
 
 message RuntimeChanged {
@@ -64,6 +76,10 @@ message Command {
   // 23 was CorrosionEndpointReconcileRequest; Sentinel now publishes its own endpoints.
   reserved 23;
   reserved "corrosion_endpoint_reconcile";
+  // 31 and 35 were the built-in registry (registry.reconcile.v1 and
+  // registry.inspect.v1). Nodes now fetch local images from each other.
+  reserved 31, 35;
+  reserved "registry_reconcile", "registry_inspect";
   oneof payload {
     SystemPingRequest system_ping = 10;
     SystemInfoRequest system_info = 11;
@@ -84,18 +100,20 @@ message Command {
     ContainerLogsRequest container_logs = 28;
     ImageBuildRequest image_build = 29;
     BuilderReconcileRequest builder_reconcile = 30;
-    RegistryReconcileRequest registry_reconcile = 31;
     VolumeDeleteRequest volume_delete = 32;
     VolumeServeRequest volume_serve = 33;
     VolumeReceiveRequest volume_receive = 34;
-    RegistryInspectRequest registry_inspect = 35;
     ImageLoadRequest image_load = 36;
     VolumeBackupRequest volume_backup = 37;
     VolumeRestoreRequest volume_restore = 38;
+    ImagePruneRequest image_prune = 39;
+    WorkloadReconcileRequest workload_reconcile = 40;
     DatabaseDumpRequest database_dump = 45;
     DatabaseRestoreRequest database_restore = 46;
     WorkloadExecRequest workload_exec = 50;
     WorkloadTerminalRequest workload_terminal = 51;
+    ImageServeRequest image_serve = 52;
+    ImageFetchRequest image_fetch = 53;
   }
   int64 expires_at_unix_ms = 20;
 }
@@ -120,6 +138,8 @@ message CommandResult {
   // 23 was CorrosionEndpointReconcileResult; Sentinel now publishes its own endpoints.
   reserved 23;
   reserved "corrosion_endpoint_reconcile";
+  reserved 31, 35;
+  reserved "registry_reconcile", "registry_inspect";
   oneof payload {
     SystemPingResult system_ping = 10;
     SystemInfoResult system_info = 11;
@@ -140,18 +160,20 @@ message CommandResult {
     ContainerLogsResult container_logs = 28;
     ImageBuildResult image_build = 29;
     BuilderReconcileResult builder_reconcile = 30;
-    RegistryReconcileResult registry_reconcile = 31;
     VolumeDeleteResult volume_delete = 32;
     VolumeServeResult volume_serve = 33;
     VolumeReceiveResult volume_receive = 34;
-    RegistryInspectResult registry_inspect = 35;
     ImageLoadResult image_load = 36;
     VolumeBackupResult volume_backup = 37;
     VolumeRestoreResult volume_restore = 38;
+    ImagePruneResult image_prune = 39;
+    WorkloadReconcileResult workload_reconcile = 40;
     VolumeBackupResult database_dump = 45;
     VolumeRestoreResult database_restore = 46;
     WorkloadExecResult workload_exec = 50;
     WorkloadTerminalResult workload_terminal = 51;
+    ImageServeResult image_serve = 52;
+    ImageFetchResult image_fetch = 53;
     CommandError error = 20;
   }
 }
@@ -282,7 +304,7 @@ message WorkloadDeployRequest {
   // the label `coolify.revision` and `workload.secrets.v1`. At most 128.
   repeated WorkloadSecret secrets = 19;
   // A login for the registry of `image`, for example a private GHCR or Docker
-  // Hub image. Both set or both empty; not for the cluster registry. Needs
+  // Hub image. Both set or both empty; not for a localhost/ image. Needs
   // `workload.registry_auth.v1`. Sentinel writes them to a temporary Podman
   // `--authfile` on tmpfs (0600, only the registry host of `image`), deletes it
   // after `podman run`, and never journals or logs them.
@@ -297,6 +319,57 @@ message WorkloadDeployRequest {
   // Rewritten on each deploy, deleted on remove. At most 64, 1 MiB each, 4 MiB
   // together. Needs `workload.files.v1`.
   repeated WorkloadFile files = 23;
+  // Paths inside the container where Sentinel bind-mounts the host Podman
+  // socket `/run/podman/podman.sock` (Docker API compatible), read-write. This
+  // gives the container root on the Node. At most 4. Each path is absolute and
+  // normalized, not `/`, without `,` or `:`, not under `/proc`, `/sys`, `/dev`,
+  // or `/run/secrets`, unique, and not equal to a path of `mounts` or `files`.
+  // Needs `workload.container_socket.v1`.
+  repeated string container_socket_paths = 24;
+  // The user of the container process, the Compose `user:`: a name or a uid,
+  // with an optional `:group` or `:gid`. Empty runs the user of the image.
+  // Sentinel refuses a value outside
+  // `^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})?$`.
+  // Needs `workload.user.v1`.
+  string user = 25;
+  // The size of `/dev/shm` in bytes, the Compose `shm_size` (decision 0028):
+  // 1 byte to 16 GiB, and at most `memory_limit_bytes` when that is set.
+  // Unset keeps the Podman default (64 MiB). Needs `workload.runtime_options.v1`.
+  optional uint64 shm_size_bytes = 26;
+  // Resource limits of the process, the Compose `ulimits`. At most 16, each
+  // name once. Needs `workload.runtime_options.v1`.
+  repeated WorkloadUlimit ulimits = 27;
+  // tmpfs mounts, the Compose `tmpfs`. At most 8. Each path follows the rules
+  // of a `files` path, without `:`, and is not a path of `mounts`, `files`, or
+  // `container_socket_paths`. Needs `workload.runtime_options.v1`.
+  repeated WorkloadTmpfs tmpfs = 28;
+  // Seconds that Podman waits after the stop signal before it kills the
+  // container, the Compose `stop_grace_period`: 1 to 600. Podman uses it for a
+  // stop, a restart, and a remove without an explicit time, also for the
+  // replacement in a deploy. Unset is 10. Needs `workload.runtime_options.v1`.
+  optional uint32 stop_timeout_seconds = 29;
+  // `--tty`, the Compose `tty`. Needs `workload.runtime_options.v1`.
+  bool tty = 30;
+  // `--interactive`, the Compose `stdin_open`. Needs `workload.runtime_options.v1`.
+  bool stdin_open = 31;
+}
+
+// A ulimit, `--ulimit name=soft:hard`. `name` is one of `nofile`, `nproc`,
+// `memlock`, `core`, `stack`, `msgqueue`, `sigpending`, or `rtprio`. -1 is
+// unlimited. `soft` is at most `hard`; an unlimited soft value needs an
+// unlimited hard value.
+message WorkloadUlimit {
+  string name = 1;
+  int64 soft = 2;
+  int64 hard = 3;
+}
+
+// A tmpfs mount, `--tmpfs path` or `--tmpfs path:size=<bytes>`. A size of 0
+// keeps the Podman default; otherwise 1 byte to 16 GiB, and at most
+// `memory_limit_bytes` when that is set.
+message WorkloadTmpfs {
+  string path = 1;
+  uint64 size_bytes = 2;
 }
 
 message WorkloadFile {
@@ -370,8 +443,9 @@ enum WorkloadLifecycleAction {
 message WorkloadLifecycleRequest {
   string name = 1;
   WorkloadLifecycleAction action = 2;
-  // Seconds that STOP and RESTART wait before they kill the container, 1 to
-  // 600. Unset is 10. Needs `workload.stop_timeout.v1`.
+  // Seconds that STOP, RESTART, and REMOVE wait before they kill the
+  // container, 1 to 600. Unset is 10 for STOP and RESTART, and the stop
+  // timeout of the container for REMOVE. Needs `workload.stop_timeout.v1`.
   optional uint32 stop_timeout_seconds = 3;
 }
 
@@ -412,9 +486,9 @@ message FirewallStackRule { string source_ip = 1; string destination_ip = 2; }
 // source.
 message FirewallPublishedPort { string protocol = 1; uint32 host_port = 2; string destination_ip = 3; uint32 container_port = 4; repeated string source_cidrs = 5; }
 message FirewallReconcileRequest { uint64 revision = 1; uint32 wireguard_port = 2; string cluster_cidr = 3; repeated FirewallRule rules = 4; string wireguard_interface = 5; string flux_probe_host = 6; repeated string workload_cidrs = 7; repeated FirewallIngressRule ingress_rules = 8; string local_node_ip = 9;
-  // Mesh IP of the Node that runs the cluster registry, or empty. Every Node
-  // host may then reach it on tcp 5443; workload addresses may not.
-  string registry_ip = 10;
+  // 10 was `registry_ip`, the Node of the built-in registry.
+  reserved 10;
+  reserved "registry_ip";
   // Both addresses in `workload_cidrs`, unique, at most 100000. Needs
   // `network.firewall.stack_rules.v1`.
   repeated FirewallStackRule stack_rules = 11;
@@ -596,11 +670,11 @@ message ImageBuildRequest {
   string base_directory = 6;
   // Relative to `base_directory`; empty is "Dockerfile". Only for "dockerfile".
   string dockerfile_path = 7;
-  // The target in the cluster registry:
-  // "registry.cluster.coolify.internal:5443/<repository>:<tag>". Or, with
-  // `image.load.v1`, a local image "localhost/<repository>:<tag>": the build
-  // writes a docker archive on this Node instead of a push, and
-  // `image.load.v1` loads it after the build.
+  // A local image "localhost/<repository>:<tag>" (`image.load.v1`): the
+  // build writes a docker archive on this Node, and `image.load.v1` loads it
+  // after the build. Or, with `image.build.external_image.v1`, a tag in a
+  // registry, for example "ghcr.io/acme/builds:<tag>": the external image
+  // storage of the cluster.
   string image = 8;
   // A short-lived HTTPS token for the repository host, for example a GitHub
   // App installation token. Git sends it as the password of `x-access-token`.
@@ -641,6 +715,17 @@ message ImageBuildRequest {
   // with a letter or digit. Only for "dockerfile". Needs
   // `image.build.target.v1`.
   string target = 17;
+  // Only for `source_type` "railpack". When not empty, the build serves files
+  // only: Railpack uses its `staticfile` provider and serves this folder with
+  // Caddy, also when the source has a `package.json`. Relative to
+  // `base_directory`; "." is `base_directory` itself. Needs
+  // `image.build.static.v1`.
+  string static_root = 18;
+  // An optional login for the registry of an external `image`. Both set or
+  // both empty. Handled like `push_username` and `push_password`, but only
+  // the push to `image` uses it. Needs `image.build.external_image.v1`.
+  string image_username = 19;
+  string image_password = 20;
 }
 
 message ImageBuildResult {
@@ -667,17 +752,115 @@ message ImageLoadResult {
   string image_id = 2;
 }
 
+// Serves one local image read-only to one peer Node (decision 0030 of
+// Coolify). Sentinel exports it with `podman save --format oci-dir
+// --uncompressed` and serves the export with the OCI distribution API (GET
+// and HEAD of `/v2/`) over plain HTTP on this Node's WireGuard address, with
+// HTTP Basic auth: user `coolify`, password `secret`. Idempotent per
+// `transfer_id`. Never journaled: the request holds the transfer secret.
+message ImageServeRequest {
+  // 1 to 64 ASCII letters, digits or `-`.
+  string transfer_id = 1;
+  // The local image: "localhost/<repository>:<tag>". Not needed with `stop`.
+  string image = 2;
+  // The WireGuard address of the fetching Node.
+  string peer_ip = 3;
+  // 32 to 128 ASCII letters or digits.
+  string secret = 4;
+  // Sentinel stops serving and removes the export at this time.
+  int64 expires_at_unix_ms = 5;
+  // Stops serving, removes the export and the firewall element. Succeeds when
+  // nothing runs.
+  bool stop = 6;
+}
+
+message ImageServeResult {
+  // Empty after `stop`.
+  string address = 1;
+  uint32 port = 2;
+  // "coolify-transfer/<transfer_id in lowercase>".
+  string repository = 3;
+  // The digest of the served manifest, `sha256:...`. Not the digest of a
+  // registry copy of the image.
+  string digest = 4;
+  // The Podman image ID, `sha256:...`. The same on the fetching Node.
+  string image_id = 5;
+  // The uncompressed size of the served image. 0 when unknown and after
+  // `stop`.
+  uint64 size_bytes = 6;
+  // The bytes of blob and manifest bodies sent so far for this transfer.
+  // After `stop`, the bytes of the stopped transfer, or 0 when nothing ran.
+  uint64 bytes_sent = 7;
+}
+
+// Pulls a local image from a Node that serves it (`image.serve.v1`), tags it
+// as `image`, removes the transfer reference, and checks the image ID. The
+// first call for a `transfer_id` starts the pull in the background; every
+// call returns the current state. When an image with `image_id` is already
+// here, Sentinel only tags it. Never journaled: the request holds the
+// transfer secret.
+message ImageFetchRequest {
+  string transfer_id = 1;
+  string source_address = 2;
+  uint32 source_port = 3;
+  string secret = 4;
+  // `repository` and `digest` of `ImageServeResult`.
+  string repository = 5;
+  string digest = 6;
+  // The local reference to tag: "localhost/<repository>:<tag>".
+  string image = 7;
+  // The expected Podman image ID, `sha256:...`.
+  string image_id = 8;
+}
+
+message ImageFetchResult {
+  // "running", "succeeded" or "failed".
+  string state = 1;
+  // 0 while unknown.
+  uint64 bytes_done = 2;
+  // Why the fetch failed. Never holds the secret.
+  string error = 3;
+  // The image ID after a successful fetch.
+  string image_id = 4;
+}
+
+// Removes the images that no container uses, in any state, except the kept
+// ones, and the build containers that ended. Dangling images are images that no
+// container uses too. Sentinel always keeps the BuildKit image and the
+// newest `sentinel-host` image. It never touches volumes, networks, or the
+// BuildKit cache. A container that starts to use an image
+// in between makes Podman refuse that image, which is then skipped.
+message ImagePruneRequest {
+  // 0 to 2048 image references (`repo:tag`, `repo@sha256:...`) or IDs
+  // (`sha256:...`) to keep. A reference without a registry is a Docker Hub one.
+  repeated string keep = 1;
+  // The `coolify-build-<id>` containers of builds that run. Sentinel removes
+  // every other `coolify-build-*` container that does not run.
+  repeated string running_build_containers = 2;
+}
+
+message ImagePruneResult {
+  // The growth of the free space of the root disk.
+  uint64 freed_bytes = 1;
+  // A name, digest reference, or ID of each removed image.
+  repeated string removed_images = 2;
+  repeated string removed_containers = 3;
+  uint32 kept_images = 4;
+  // Images that Podman refused to remove, with the reason.
+  repeated string skipped = 5;
+  optional uint64 disk_available_bytes = 6;
+}
+
 // Converges BuildKit on this Node: the `coolify-buildkitd` container (rootless
 // BuildKit with a private uid range) and its cache limit. A disabled builder
-// removes the container and its cache. Needs the registry trust from
-// `registry.reconcile.v1`.
+// removes the container and its cache.
 message BuilderReconcileRequest {
   bool enabled = 1;
   // The BuildKit cache limit. 0 uses 20% of the root disk.
   uint64 max_used_space_bytes = 2;
-  // The registry user that may push. Set exactly when `enabled` is set.
-  string push_username = 3;
-  string push_password = 4;
+  // 3 and 4 were the push login of the built-in registry.
+  reserved 3, 4;
+  reserved "push_username", "push_password";
 }
 
 message BuilderReconcileResult {
@@ -685,69 +868,6 @@ message BuilderReconcileResult {
   bool running = 2;
   // A user-namespace AppArmor profile was needed and is loaded.
   bool apparmor_profile = 3;
-}
-
-// Converges the cluster registry on this Node. Every Node gets the trust (CA
-// and pull credential for Podman). Only the registry Node gets `server`; on
-// every other Node Sentinel removes the registry container and keeps its
-// data volume, so a role that returns finds its images again.
-message RegistryReconcileRequest {
-  // PEM of the registry CA. Never a private key.
-  string ca_pem = 1;
-  string pull_username = 2;
-  string pull_password = 3;
-  RegistryServer server = 4;
-}
-
-message RegistryServer {
-  // Server certificate for `registry.cluster.coolify.internal` and its key.
-  string certificate_pem = 1;
-  string private_key_pem = 2;
-  // bcrypt htpasswd lines of the push and pull users.
-  string htpasswd = 3;
-  // The user with push access. Every other user can only pull.
-  string push_username = 4;
-  // Tags to keep in each repository, 1 to 100.
-  uint32 keep_tags = 5;
-}
-
-// A read-only report of the cluster registry and the build cache on this
-// Node. Every Node reports its disk use; the registry Node also reports
-// whether zot answers, and its repositories and tags.
-message RegistryInspectRequest {}
-
-message RegistryInspectResult {
-  // zot runs on this Node.
-  bool registry_running = 1;
-  // zot answered over TLS with the pull credential. Only on the registry Node.
-  bool healthy = 2;
-  // Why zot did not answer, when it runs but is not healthy.
-  string error = 3;
-  // At most 100 repositories with at most 50 tags each.
-  repeated RegistryRepository repositories = 4;
-  bool repositories_truncated = 5;
-  // Disk use of the registry volume and the BuildKit cache on this Node.
-  uint64 registry_bytes = 6;
-  uint64 build_cache_bytes = 7;
-  bool builder_running = 8;
-}
-
-message RegistryRepository {
-  string name = 1;
-  repeated RegistryTag tags = 2;
-}
-
-message RegistryTag {
-  string tag = 1;
-  // `sha256:...`, or empty when it was not looked up.
-  string digest = 2;
-}
-
-message RegistryReconcileResult {
-  bool trust_installed = 1;
-  bool server_running = 2;
-  // "registry.cluster.coolify.internal:5443".
-  string registry_host = 3;
 }
 
 // Deletes Coolify volumes. Sentinel rejects the request when a container
@@ -1040,4 +1160,143 @@ message TerminalExit {
   optional int32 exit_code = 1;
   // "exited", "closed", "idle", or an error.
   string reason = 2;
+}
+
+// The desired set of the workloads of one Node (decision 0026 of Coolify).
+// Coolify sends one change for each workload, or the full set. Sentinel
+// stores the set and converges the containers to it, also while Flux or
+// Coolify is down.
+message WorkloadReconcileRequest {
+  // Goes only up. Sentinel ignores a request with a generation lower than the
+  // stored one. The same generation with the same hash only confirms the set.
+  uint64 generation = 1;
+  // The hash of the full set after this change: SHA-256 (hex) of the lines
+  // `<workload_id> <entry_hash>\n`, sorted by workload_id.
+  string set_hash = 2;
+  // `puts` is the full set: Sentinel removes the workloads that are not in it.
+  bool full = 3;
+  // Adds or replaces the entries of these workloads.
+  repeated WorkloadSetEntry puts = 4;
+  // The workload IDs to remove. Sentinel removes their containers.
+  repeated string removes = 5;
+  // The workload IDs that leave the set without a change of their
+  // containers, because Coolify manages them with commands again.
+  repeated string releases = 6;
+}
+
+enum WorkloadDesiredState {
+  WORKLOAD_DESIRED_STATE_UNSPECIFIED = 0;
+  WORKLOAD_DESIRED_STATE_RUNNING = 1;
+  WORKLOAD_DESIRED_STATE_STOPPED = 2;
+}
+
+message WorkloadSetEntry {
+  // The workload UUID: at most 64 ASCII letters, digits, `-` or `_`.
+  string workload_id = 1;
+  // The revision UUID. The containers of the entry have the label
+  // `coolify.revision=<revision_id>`.
+  string revision_id = 2;
+  string configuration_hash = 3;
+  WorkloadDesiredState desired_state = 4;
+  // Sentinel starts a new container of this entry only after it applied this
+  // network revision (the firewall state). 0 means no wait.
+  uint64 network_revision = 5;
+  // The container to run. Its `name` is the container of the entry. Sentinel
+  // stores it without the secret values and the registry login.
+  WorkloadDeployRequest deploy = 6;
+  // A rolling deploy (decision 0022): the container that Sentinel drains and
+  // removes after the new one is healthy. Empty: Podman replaces the
+  // container in place.
+  string replaces = 7;
+  // The Coolify operation that the status events of this entry update. Empty
+  // for none.
+  string operation_id = 8;
+  // Seconds that a stop waits before it kills the container, 1 to 600. Unset
+  // is 10.
+  optional uint32 stop_timeout_seconds = 9;
+  // Coolify's hash of this entry. Sentinel stores it for the set hash.
+  string entry_hash = 10;
+  // A redeploy: with a new `operation_id`, Sentinel runs the container again
+  // also when it already runs this revision, for example to pull a newer
+  // image of the same tag.
+  bool redeploy = 11;
+}
+
+message WorkloadReconcileResult {
+  // The stored generation and hash after the request.
+  uint64 generation = 1;
+  string set_hash = 2;
+  // False when the generation was lower than the stored one, or the set hash
+  // after the change differs from `set_hash` of the request. Coolify then
+  // sends the full set.
+  bool accepted = 3;
+  // The latest status of each workload of the set.
+  repeated WorkloadStatus statuses = 4;
+}
+
+enum WorkloadStatusValue {
+  WORKLOAD_STATUS_VALUE_UNSPECIFIED = 0;
+  // Sentinel deploys or starts the revision, or waits for its health check.
+  WORKLOAD_STATUS_VALUE_PROGRESSING = 1;
+  WORKLOAD_STATUS_VALUE_HEALTHY = 2;
+  // See `reason`. An older container of the workload can still run.
+  WORKLOAD_STATUS_VALUE_FAILED = 3;
+  WORKLOAD_STATUS_VALUE_STOPPED = 4;
+  WORKLOAD_STATUS_VALUE_REMOVED = 5;
+}
+
+message WorkloadStatus {
+  // Unique for each status change. `EventAck` uses it.
+  string event_id = 1;
+  string workload_id = 2;
+  string revision_id = 3;
+  string operation_id = 4;
+  WorkloadStatusValue status = 5;
+  // Why the revision failed, or what Sentinel did, for the deployment log.
+  string reason = 6;
+  // The generation of the set when the status changed.
+  uint64 generation = 7;
+  int64 observed_at_unix_ms = 8;
+  string container_name = 9;
+  string runtime_id = 10;
+  // True when Sentinel changed the container without a change of the set,
+  // for example a start after a crash or a reboot.
+  bool autonomous = 11;
+}
+
+// The state file of the desired set on the Node. Not sent.
+message StoredWorkloadSet {
+  uint64 generation = 1;
+  string set_hash = 2;
+  repeated StoredWorkloadEntry entries = 3;
+  // Workloads that Coolify removed. Sentinel removes their containers, then
+  // forgets them. Not in the set hash.
+  repeated string removing = 4;
+  // `removed` statuses that Coolify did not acknowledge yet.
+  repeated WorkloadStatus removed_statuses = 5;
+}
+
+message StoredWorkloadEntry {
+  WorkloadSetEntry entry = 1;
+  WorkloadStatus status = 2;
+  // The status is not acknowledged yet.
+  bool unreported = 3;
+  // The revision failed while an older container runs: not retried.
+  bool failed = 4;
+  // The revision is converged once: a missing container later is a crash.
+  bool applied = 5;
+  // Unix ms of the last start that Sentinel made alone, for the backoff.
+  int64 last_start_unix_ms = 6;
+  uint32 start_attempts = 7;
+  // Unix ms of the last failure. A failed revision without an older running
+  // container is tried again after a backoff.
+  int64 failed_at_unix_ms = 8;
+  // Unix ms when Coolify put this revision and container. An older running
+  // container of the same revision is adopted, not judged as a new one.
+  int64 put_at_unix_ms = 9;
+  // A redeploy that did not run yet.
+  bool redeploy_pending = 10;
+  // Coolify asked for a start (the desired state changed to running). The
+  // start is not one that Sentinel made alone.
+  bool start_requested = 11;
 }

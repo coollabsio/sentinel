@@ -1,5 +1,6 @@
-//! Image builds and the cluster registry (decision 0006). Sentinel validates
-//! every field; these handlers only map the JSON from Coolify.
+//! Image builds (decision 0006) and local image transfers between Nodes
+//! (decision 0030). Sentinel validates every field; these handlers only map
+//! the JSON from Coolify.
 
 use std::collections::HashMap;
 
@@ -9,12 +10,12 @@ use axum::http::{HeaderMap, StatusCode};
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    BuilderReconcileRequest, ImageBuildRequest, ImageLoadRequest, RegistryInspectRequest,
-    RegistryReconcileRequest, RegistryServer,
+    BuilderReconcileRequest, ImageBuildRequest, ImageFetchRequest, ImageLoadRequest,
+    ImagePruneRequest, ImageServeRequest,
 };
 use sentinel_protocol::{
-    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_LOAD,
-    CAPABILITY_REGISTRY_INSPECT, CAPABILITY_REGISTRY_RECONCILE,
+    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_FETCH,
+    CAPABILITY_IMAGE_LOAD, CAPABILITY_IMAGE_PRUNE, CAPABILITY_IMAGE_SERVE,
 };
 use serde::Deserialize;
 
@@ -55,6 +56,12 @@ pub(super) struct ImageBuildApiRequest {
     dockerfile_content: String,
     #[serde(default)]
     target: String,
+    #[serde(default)]
+    static_root: String,
+    #[serde(default)]
+    image_username: String,
+    #[serde(default)]
+    image_password: String,
 }
 
 #[derive(Deserialize)]
@@ -64,30 +71,6 @@ pub(super) struct BuilderReconcileApiRequest {
     enabled: bool,
     #[serde(default)]
     max_used_space_bytes: u64,
-    #[serde(default)]
-    push_username: String,
-    #[serde(default)]
-    push_password: String,
-}
-
-#[derive(Deserialize)]
-pub(super) struct RegistryReconcileApiRequest {
-    server_id: String,
-    command_id: String,
-    ca_pem: String,
-    pull_username: String,
-    pull_password: String,
-    #[serde(default)]
-    server: Option<RegistryServerApiRequest>,
-}
-
-#[derive(Deserialize)]
-pub(super) struct RegistryServerApiRequest {
-    certificate_pem: String,
-    private_key_pem: String,
-    htpasswd: String,
-    push_username: String,
-    keep_tags: u32,
 }
 
 fn invalid_response() -> ApiError {
@@ -125,6 +108,9 @@ pub(super) async fn image_build(
             build_secrets: request.build_secrets,
             dockerfile_content: request.dockerfile_content,
             target: request.target,
+            static_root: request.static_root,
+            image_username: request.image_username,
+            image_password: request.image_password,
         }),
         DEPLOY_TIMEOUT,
     )
@@ -154,8 +140,6 @@ pub(super) async fn builder_reconcile(
         Payload::BuilderReconcile(BuilderReconcileRequest {
             enabled: request.enabled,
             max_used_space_bytes: request.max_used_space_bytes,
-            push_username: request.push_username,
-            push_password: request.push_password,
         }),
         DEPLOY_TIMEOUT,
     )
@@ -172,86 +156,48 @@ pub(super) async fn builder_reconcile(
     })))
 }
 
-pub(super) async fn registry_reconcile(
+#[derive(Deserialize)]
+pub(super) struct ImagePruneApiRequest {
+    server_id: String,
+    command_id: String,
+    #[serde(default)]
+    keep: Vec<String>,
+    #[serde(default)]
+    running_build_containers: Vec<String>,
+}
+
+/// Removes unused images and ended build containers on one Node, except the
+/// keep list. A Sentinel without `image.prune.v1` gets 409.
+pub(super) async fn image_prune(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(request): Json<RegistryReconcileApiRequest>,
+    Json(request): Json<ImagePruneApiRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let result = dispatch_with_timeout(
         &state,
         &headers,
         &request.server_id,
         &request.command_id,
-        CAPABILITY_REGISTRY_RECONCILE,
-        Payload::RegistryReconcile(RegistryReconcileRequest {
-            ca_pem: request.ca_pem,
-            pull_username: request.pull_username,
-            pull_password: request.pull_password,
-            server: request.server.map(|server| RegistryServer {
-                certificate_pem: server.certificate_pem,
-                private_key_pem: server.private_key_pem,
-                htpasswd: server.htpasswd,
-                push_username: server.push_username,
-                keep_tags: server.keep_tags,
-            }),
+        CAPABILITY_IMAGE_PRUNE,
+        Payload::ImagePrune(ImagePruneRequest {
+            keep: request.keep,
+            running_build_containers: request.running_build_containers,
         }),
         DEPLOY_TIMEOUT,
     )
     .await?;
-    let Some(command_result::Payload::RegistryReconcile(value)) = result.payload else {
+    let Some(command_result::Payload::ImagePrune(value)) = result.payload else {
         return Err(invalid_response());
     };
     Ok(Json(serde_json::json!({
         "command_id": request.command_id,
         "observed_at_unix_ms": result.observed_at_unix_ms,
-        "trust_installed": value.trust_installed,
-        "server_running": value.server_running,
-        "registry_host": value.registry_host,
-    })))
-}
-
-#[derive(Deserialize)]
-pub(super) struct RegistryInspectApiRequest {
-    server_id: String,
-    command_id: String,
-}
-
-/// A read-only report of the registry and build cache on one Node.
-pub(super) async fn registry_inspect(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(request): Json<RegistryInspectApiRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let result = dispatch_with_timeout(
-        &state,
-        &headers,
-        &request.server_id,
-        &request.command_id,
-        CAPABILITY_REGISTRY_INSPECT,
-        Payload::RegistryInspect(RegistryInspectRequest {}),
-        LIFECYCLE_TIMEOUT,
-    )
-    .await?;
-    let Some(command_result::Payload::RegistryInspect(value)) = result.payload else {
-        return Err(invalid_response());
-    };
-    Ok(Json(serde_json::json!({
-        "command_id": request.command_id,
-        "observed_at_unix_ms": result.observed_at_unix_ms,
-        "registry_running": value.registry_running,
-        "healthy": value.healthy,
-        "error": value.error,
-        "repositories": value.repositories.iter().map(|repository| serde_json::json!({
-            "name": repository.name,
-            "tags": repository.tags.iter().map(|tag| serde_json::json!({
-                "tag": tag.tag,
-                "digest": tag.digest,
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "repositories_truncated": value.repositories_truncated,
-        "registry_bytes": value.registry_bytes,
-        "build_cache_bytes": value.build_cache_bytes,
-        "builder_running": value.builder_running,
+        "freed_bytes": value.freed_bytes,
+        "removed_images": value.removed_images,
+        "removed_containers": value.removed_containers,
+        "kept_images": value.kept_images,
+        "skipped": value.skipped,
+        "disk_available_bytes": value.disk_available_bytes,
     })))
 }
 
@@ -291,6 +237,116 @@ pub(super) async fn image_load(
         "command_id": request.command_id,
         "observed_at_unix_ms": result.observed_at_unix_ms,
         "image": value.image,
+        "image_id": value.image_id,
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct ImageServeApiRequest {
+    server_id: String,
+    command_id: String,
+    transfer_id: String,
+    #[serde(default)]
+    image: String,
+    #[serde(default)]
+    peer_ip: String,
+    #[serde(default)]
+    secret: String,
+    #[serde(default)]
+    expires_at_unix_ms: i64,
+    #[serde(default)]
+    stop: bool,
+}
+
+/// Exports a local image and serves it to one peer Node, repeats a running
+/// serve, or stops it. The export can take a few minutes for a large image.
+pub(super) async fn image_serve(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ImageServeApiRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = dispatch_with_timeout(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_IMAGE_SERVE,
+        Payload::ImageServe(ImageServeRequest {
+            transfer_id: request.transfer_id,
+            image: request.image,
+            peer_ip: request.peer_ip,
+            secret: request.secret,
+            expires_at_unix_ms: request.expires_at_unix_ms,
+            stop: request.stop,
+        }),
+        DEPLOY_TIMEOUT,
+    )
+    .await?;
+    let Some(command_result::Payload::ImageServe(value)) = result.payload else {
+        return Err(invalid_response());
+    };
+    Ok(Json(serde_json::json!({
+        "command_id": request.command_id,
+        "observed_at_unix_ms": result.observed_at_unix_ms,
+        "address": value.address,
+        "port": value.port,
+        "repository": value.repository,
+        "digest": value.digest,
+        "image_id": value.image_id,
+        "size_bytes": value.size_bytes,
+        "bytes_sent": value.bytes_sent,
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct ImageFetchApiRequest {
+    server_id: String,
+    command_id: String,
+    transfer_id: String,
+    source_address: String,
+    source_port: u32,
+    secret: String,
+    repository: String,
+    digest: String,
+    image: String,
+    image_id: String,
+}
+
+/// Starts the pull of a served image on the target Node, or reads its state.
+/// It never waits for the pull.
+pub(super) async fn image_fetch(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<ImageFetchApiRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = dispatch_with_timeout(
+        &state,
+        &headers,
+        &request.server_id,
+        &request.command_id,
+        CAPABILITY_IMAGE_FETCH,
+        Payload::ImageFetch(ImageFetchRequest {
+            transfer_id: request.transfer_id,
+            source_address: request.source_address,
+            source_port: request.source_port,
+            secret: request.secret,
+            repository: request.repository,
+            digest: request.digest,
+            image: request.image,
+            image_id: request.image_id,
+        }),
+        LIFECYCLE_TIMEOUT,
+    )
+    .await?;
+    let Some(command_result::Payload::ImageFetch(value)) = result.payload else {
+        return Err(invalid_response());
+    };
+    Ok(Json(serde_json::json!({
+        "command_id": request.command_id,
+        "observed_at_unix_ms": result.observed_at_unix_ms,
+        "state": value.state,
+        "bytes_done": value.bytes_done,
+        "error": value.error,
         "image_id": value.image_id,
     })))
 }

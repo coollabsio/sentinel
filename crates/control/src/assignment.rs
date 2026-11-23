@@ -252,6 +252,7 @@ impl AssignmentClient {
                 CAPABILITY_LOGS_READ,
                 CAPABILITY_CONTAINER_LOGS,
                 CAPABILITY_TRUST_BUNDLE_UPDATE,
+                sentinel_protocol::CAPABILITY_WORKLOAD_RECONCILE,
             ]
             .into_iter()
             .chain(NETWORK_CAPABILITIES)
@@ -322,11 +323,13 @@ impl AssignmentClient {
         let mut connection_attempt = 0;
         let discovery_trigger = Arc::new(tokio::sync::Notify::new());
         let ingress_trigger = Arc::new(tokio::sync::Notify::new());
+        let workload_set = crate::workload_set::WorkloadSet::open(std::path::Path::new("/"));
         let command_executor = Arc::new(tokio::sync::Mutex::new(
             crate::commands::CommandExecutor::with_journal(
                 &self.sentinel_version,
                 self.command_journal.clone(),
             )
+            .with_workload_set(workload_set.clone())
             .with_discovery_trigger(discovery_trigger.clone())
             .with_ingress_trigger(ingress_trigger.clone())
             .with_control_tls(self.control_tls.clone()),
@@ -337,13 +340,21 @@ impl AssignmentClient {
             crate::commands::CommandExecutor::with_journal(
                 &self.sentinel_version,
                 self.command_journal.clone(),
-            ),
+            )
+            .with_workload_set(workload_set.clone()),
         ));
-        // Volume transfers keep their state in memory; daemons and firewall
-        // elements of an earlier Sentinel process have no owner any more. Git
-        // credentials of builds that an earlier process started get a watcher.
+        // Volume and image transfers keep their state in memory; daemons,
+        // exports, and firewall elements of an earlier Sentinel process have
+        // no owner any more. Git credentials of builds that an earlier process
+        // started get a watcher. The built-in registry of earlier versions is
+        // removed.
         let _ = tokio::task::spawn_blocking(|| {
             crate::volume_transfer::remove_leftovers(std::path::Path::new("/"));
+            crate::image_transfer::remove_leftovers(std::path::Path::new("/"));
+            crate::registry::remove_builtin_registry(
+                std::path::Path::new("/"),
+                std::path::Path::new("podman"),
+            );
             crate::builder::remove_build_inputs_after_builds(
                 std::path::Path::new("/"),
                 std::path::Path::new("podman"),
@@ -358,6 +369,13 @@ impl AssignmentClient {
             crate::commands::boot_id(),
             command_executor.clone(),
             discovery_trigger.clone(),
+        ));
+        // Converges the containers to the stored desired set, also while
+        // Coolify and Flux are unavailable (decision 0026 of Coolify).
+        let converger = tokio::spawn(crate::convergence::run(
+            workload_set.clone(),
+            command_executor.clone(),
+            shutdown.clone(),
         ));
         // Publishes this Node's own discovery endpoints independently of the
         // Coolify and Flux connections, so DNS survives a control-plane outage.
@@ -415,6 +433,7 @@ impl AssignmentClient {
                         shutdown.clone(),
                         command_executor.clone(),
                         read_executor.clone(),
+                        workload_set.clone(),
                     )
                     .await
                     {
@@ -479,6 +498,7 @@ impl AssignmentClient {
         }
 
         boot_restore.abort();
+        converger.abort();
         discovery_publisher.abort();
         ingress_renderer.abort();
         certificate_issuer.abort();
