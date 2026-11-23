@@ -117,6 +117,10 @@ pub struct Config {
     pub token: String,
     /// PUSH_ENDPOINT. Required only when push or the control plane is enabled.
     pub endpoint: Option<String>,
+    /// PUSH_ENDPOINT_CA_PATH: a PEM file of extra CA certificates that Sentinel
+    /// trusts, in addition to the system roots, for HTTPS requests to
+    /// PUSH_ENDPOINT. For a Coolify instance with a certificate from a private CA.
+    pub push_endpoint_ca_path: Option<PathBuf>,
     pub metrics_file: PathBuf,
     pub command_journal_file: PathBuf,
     pub command_retention_days: u32,
@@ -243,6 +247,8 @@ impl Config {
             return Err(ConfigError::MissingEndpoint);
         }
 
+        let push_endpoint_ca_path = non_empty("PUSH_ENDPOINT_CA_PATH").map(PathBuf::from);
+
         let push_path = "/api/v1/sentinel/push".to_string();
         let push_url = match &endpoint {
             Some(endpoint) if push_enabled => Some(format!("{endpoint}{push_path}")),
@@ -260,6 +266,7 @@ impl Config {
             push_url,
             token,
             endpoint,
+            push_endpoint_ca_path,
             metrics_file,
             command_journal_file,
             command_retention_days,
@@ -290,6 +297,7 @@ impl Config {
             push_url: None,
             token: "test-token".to_string(),
             endpoint: Some("http://localhost:8000".to_string()),
+            push_endpoint_ca_path: None,
             metrics_file: PathBuf::from(":memory:"),
             command_journal_file: PathBuf::from(":memory:"),
             command_retention_days: 7,

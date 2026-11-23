@@ -35,7 +35,7 @@ fn a_service_error_is_propagated() {
 
 #[test]
 fn control_assignment_stays_dormant_when_disabled() {
-    let client = assignment_client(false, None, "", "", None, command_journal());
+    let client = assignment_client(false, None, "", "", None, &[], command_journal());
 
     assert!(client.is_none());
 }
@@ -48,6 +48,7 @@ fn control_assignment_client_is_created_when_enabled() {
         "token",
         "main",
         Some(&control_tls_config()),
+        &[],
         command_journal(),
     );
 
@@ -62,6 +63,7 @@ fn invalid_control_assignment_configuration_does_not_fail_startup() {
         "token",
         "main",
         Some(&control_tls_config()),
+        &[],
         command_journal(),
     );
 

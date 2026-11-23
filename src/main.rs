@@ -58,6 +58,7 @@ fn assignment_client(
     token: &str,
     version: &str,
     control_tls: Option<&config::ControlTlsConfig>,
+    endpoint_ca: &[reqwest::Certificate],
     command_journal: store::CommandJournal,
 ) -> Option<control::AssignmentClient> {
     if !enabled {
@@ -72,7 +73,8 @@ fn assignment_client(
         return None;
     };
 
-    match control::AssignmentClient::new(endpoint, token, version, control_tls.clone()) {
+    match control::AssignmentClient::new(endpoint, token, version, control_tls.clone(), endpoint_ca)
+    {
         Ok(client) => Some(client.with_command_journal(command_journal)),
         Err(error) => {
             tracing::error!(%error, "Sentinel control task could not start; existing services remain active");
@@ -161,6 +163,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tracing::info!(version = %config.version, "Sentinel is starting");
+
+    // An unreadable or invalid CA file stops startup: pushes would fail
+    // anyway, and the error names the file.
+    let endpoint_ca = match &config.push_endpoint_ca_path {
+        Some(path) => {
+            let certificates = push::load_endpoint_ca(path)?;
+            tracing::info!(path = %path.display(), count = certificates.len(), "trusting extra CA certificates for PUSH_ENDPOINT");
+            certificates
+        }
+        None => Vec::new(),
+    };
 
     // Bind eagerly: a bind failure surfaces via `?` here, and health checks
     // answer as soon as the process is up. The startup API answers until the
@@ -334,7 +347,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Pusher
     if let Some(url) = &config.push_url {
-        let pusher = push::Pusher::new(config.clone(), url.clone(), payload, push_status.clone())?;
+        let pusher = push::Pusher::new(
+            config.clone(),
+            url.clone(),
+            payload,
+            push_status.clone(),
+            &endpoint_ca,
+        )?;
         let rx = shutdown_rx.clone();
         services.spawn(async move {
             pusher.run(rx).await;
@@ -368,6 +387,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &config.token,
         &config.version,
         config.control_tls.as_ref(),
+        &endpoint_ca,
         command_journal.clone(),
     ) {
         let rx = shutdown_rx.clone();

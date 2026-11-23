@@ -61,6 +61,7 @@ docker = { path = "crates/docker" }
 logarchive = { path = "crates/logarchive" }
 push = { path = "crates/push" }
 store = { path = "crates/store" }
+reqwest.workspace = true
 traffic = { workspace = true, optional = true }
 axum.workspace = true
 clap.workspace = true

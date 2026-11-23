@@ -27,6 +27,7 @@ fn test_config(access_log_path: PathBuf, sample_threshold: u32) -> config::Confi
         push_url: None,
         token: "test-token".into(),
         endpoint: Some("http://localhost:8000".into()),
+        push_endpoint_ca_path: None,
         metrics_file: PathBuf::from("./db/metrics.sqlite"),
         command_journal_file: PathBuf::from(":memory:"),
         command_retention_days: 7,

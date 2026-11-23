@@ -434,7 +434,7 @@ async fn start_stalled_server() -> (String, Arc<AtomicUsize>) {
 async fn polls_again_after_a_disabled_assignment() {
     let (endpoint, requests) = start_counting_disabled_server(1).await;
     let client =
-        AssignmentClient::new(&endpoint, "token", "main", test_control_tls_config()).unwrap();
+        AssignmentClient::new(&endpoint, "token", "main", test_control_tls_config(), &[]).unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(client.run(shutdown_rx));
 
@@ -457,7 +457,7 @@ async fn polls_again_after_a_disabled_assignment() {
 async fn shutdown_interrupts_the_assignment_retry_delay() {
     let (endpoint, requests) = start_counting_disabled_server(3600).await;
     let client =
-        AssignmentClient::new(&endpoint, "token", "main", test_control_tls_config()).unwrap();
+        AssignmentClient::new(&endpoint, "token", "main", test_control_tls_config(), &[]).unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(client.run(shutdown_rx));
 
@@ -480,7 +480,7 @@ async fn shutdown_interrupts_the_assignment_retry_delay() {
 async fn shutdown_interrupts_an_assignment_request() {
     let (endpoint, requests) = start_stalled_server().await;
     let client =
-        AssignmentClient::new(&endpoint, "token", "main", test_control_tls_config()).unwrap();
+        AssignmentClient::new(&endpoint, "token", "main", test_control_tls_config(), &[]).unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(client.run(shutdown_rx));
 
@@ -554,6 +554,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
         "existing-token",
         "1.0.1",
         test_control_tls_config(),
+        &[],
     )
     .unwrap();
 
@@ -656,6 +657,7 @@ async fn parses_enabled_assignment_and_redacts_credentials() {
         "existing-token",
         "1.0.1",
         test_control_tls_config(),
+        &[],
     )
     .unwrap();
 
@@ -685,7 +687,7 @@ async fn parses_disabled_assignment() {
     })
     .await;
     let client =
-        AssignmentClient::new(&endpoint, "token", "1.0.1", test_control_tls_config()).unwrap();
+        AssignmentClient::new(&endpoint, "token", "1.0.1", test_control_tls_config(), &[]).unwrap();
 
     assert!(matches!(
         client.request().await.unwrap(),
@@ -726,7 +728,8 @@ async fn rejects_invalid_enabled_assignments() {
         })
         .await;
         let client =
-            AssignmentClient::new(&endpoint, "token", "1.0.1", test_control_tls_config()).unwrap();
+            AssignmentClient::new(&endpoint, "token", "1.0.1", test_control_tls_config(), &[])
+                .unwrap();
         assert!(
             matches!(
                 client.request().await,
@@ -746,7 +749,7 @@ async fn rejects_invalid_disabled_assignment() {
     })
     .await;
     let client =
-        AssignmentClient::new(&endpoint, "token", "1.0.1", test_control_tls_config()).unwrap();
+        AssignmentClient::new(&endpoint, "token", "1.0.1", test_control_tls_config(), &[]).unwrap();
 
     assert!(matches!(
         client.request().await,
@@ -767,7 +770,7 @@ async fn rejects_assignment_response_larger_than_64_kib() {
     })
     .await;
     let client =
-        AssignmentClient::new(&endpoint, "token", "1.0.1", test_control_tls_config()).unwrap();
+        AssignmentClient::new(&endpoint, "token", "1.0.1", test_control_tls_config(), &[]).unwrap();
 
     assert!(matches!(
         client.request().await,
@@ -799,7 +802,8 @@ async fn maps_response_statuses_to_stable_errors() {
         })
         .await;
         let client =
-            AssignmentClient::new(&endpoint, "token", "1.0.1", test_control_tls_config()).unwrap();
+            AssignmentClient::new(&endpoint, "token", "1.0.1", test_control_tls_config(), &[])
+                .unwrap();
         let error = client.request().await.unwrap_err();
         assert_eq!(error.kind(), expected);
         assert!(!error.to_string().contains("must-not-leak"));
@@ -815,7 +819,7 @@ async fn parses_rate_limit_retry_after_seconds() {
     })
     .await;
     let client =
-        AssignmentClient::new(&endpoint, "token", "1.0.1", test_control_tls_config()).unwrap();
+        AssignmentClient::new(&endpoint, "token", "1.0.1", test_control_tls_config(), &[]).unwrap();
 
     assert!(matches!(
         client.request().await,
@@ -834,6 +838,7 @@ async fn maps_network_failure_to_temporary_without_exposing_token() {
         "very-secret-token",
         "1.0.1",
         test_control_tls_config(),
+        &[],
     )
     .unwrap();
 
@@ -855,6 +860,7 @@ fn rejects_invalid_client_configuration_without_exposing_token() {
             "very-secret-token",
             "1.0.1",
             test_control_tls_config(),
+            &[],
         )
         .unwrap_err();
         assert_eq!(error.kind(), AssignmentErrorKind::InvalidConfiguration);
@@ -1083,7 +1089,8 @@ async fn rejects_assignment_with_a_different_trust_bundle_version_before_connect
     })
     .await;
     let tls_config = control_tls_config(PathBuf::from("/tmp/sentinel-missing-ca.pem"), 1);
-    let client = AssignmentClient::new(&endpoint, "token", "1.0.1", tls_config.clone()).unwrap();
+    let client =
+        AssignmentClient::new(&endpoint, "token", "1.0.1", tls_config.clone(), &[]).unwrap();
     let AssignmentOutcome::Enabled(assignment) = client.request().await.unwrap() else {
         panic!("expected an enabled assignment");
     };

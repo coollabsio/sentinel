@@ -15,3 +15,9 @@ time = { workspace = true, features = ["formatting", "parsing", "macros", "serde
 tokio.workspace = true
 tracing.workspace = true
 libc = "0.2"
+
+[dev-dependencies]
+rcgen = "0.14.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tempfile = "3"
+tokio-rustls = { version = "0.26", default-features = false }

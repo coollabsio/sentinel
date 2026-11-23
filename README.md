@@ -82,6 +82,7 @@ Sentinel is configured using environment variables:
 |----------|---------|-------------|
 | `PUSH_ENABLED` | `true` | Enable/disable the push service |
 | `PUSH_INTERVAL_SECONDS` | 60 | Interval for pushing metrics |
+| `PUSH_ENDPOINT_CA_PATH` | *(empty)* | PEM file with one or more CA certificates that Sentinel trusts for HTTPS requests to `PUSH_ENDPOINT`, in addition to the system roots. Use it when the certificate of your Coolify instance comes from a private or internal CA. Mount the file into the container (for example `-v /etc/ssl/internal-ca.pem:/app/push-ca.pem:ro`). An unreadable file, or a file without a PEM certificate, stops startup |
 | `COLLECTOR_ENABLED` | `false` | Enable/disable metrics collection |
 | `COLLECTOR_REFRESH_RATE_SECONDS` | 5 | Metrics collection interval |
 | `COLLECTOR_RETENTION_PERIOD_DAYS` | 7 | How long to keep metrics in database |
