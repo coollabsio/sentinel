@@ -96,12 +96,14 @@ pub struct Config {
     pub control_plane_enabled: bool,
     pub control_tls: Option<ControlTlsConfig>,
     pub refresh_rate_seconds: u64,
-    pub push_enabled: bool,
     pub push_interval_seconds: u64,
     pub push_path: String,
-    pub push_url: String,
+    /// Set exactly when push is enabled (PUSH_ENABLED, default true). With
+    /// push disabled Coolify pulls `/api/push-payload` over SSH instead.
+    pub push_url: Option<String>,
     pub token: String,
-    pub endpoint: String,
+    /// PUSH_ENDPOINT. Required only when push or the control plane is enabled.
+    pub endpoint: Option<String>,
     pub metrics_file: PathBuf,
     pub command_journal_file: PathBuf,
     pub command_retention_days: u32,
@@ -207,19 +209,21 @@ impl Config {
 
         let token = non_empty("TOKEN").ok_or(ConfigError::MissingToken)?;
 
-        let mut endpoint = non_empty("PUSH_ENDPOINT")
+        let endpoint = non_empty("PUSH_ENDPOINT")
             .map(|e| e.trim_end_matches('/').to_string())
-            .unwrap_or_default();
-        if endpoint.is_empty() && development {
-            endpoint = "http://localhost:8000".to_string();
-        }
-        if endpoint.is_empty() {
+            .filter(|e| !e.is_empty())
+            .or_else(|| development.then(|| "http://localhost:8000".to_string()));
+        if let Some(endpoint) = &endpoint {
+            validate_endpoint(endpoint)?;
+        } else if push_enabled || control_plane_enabled {
             return Err(ConfigError::MissingEndpoint);
         }
-        validate_endpoint(&endpoint)?;
 
         let push_path = "/api/v1/sentinel/push".to_string();
-        let push_url = format!("{endpoint}{push_path}");
+        let push_url = match &endpoint {
+            Some(endpoint) if push_enabled => Some(format!("{endpoint}{push_path}")),
+            _ => None,
+        };
 
         Ok(Config {
             version: VERSION.to_string(),
@@ -227,7 +231,6 @@ impl Config {
             control_plane_enabled,
             control_tls,
             refresh_rate_seconds,
-            push_enabled,
             push_interval_seconds,
             push_path,
             push_url,
@@ -257,12 +260,11 @@ impl Config {
             control_plane_enabled: false,
             control_tls: None,
             refresh_rate_seconds: 5,
-            push_enabled: false,
             push_interval_seconds: 60,
             push_path: "/api/v1/sentinel/push".to_string(),
-            push_url: "http://localhost:8000/api/v1/sentinel/push".to_string(),
+            push_url: None,
             token: "test-token".to_string(),
-            endpoint: "http://localhost:8000".to_string(),
+            endpoint: Some("http://localhost:8000".to_string()),
             metrics_file: PathBuf::from(":memory:"),
             command_journal_file: PathBuf::from(":memory:"),
             command_retention_days: 7,

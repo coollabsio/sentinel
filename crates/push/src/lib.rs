@@ -76,11 +76,12 @@ pub fn snapshot_metadata(inspection_failures: usize) -> serde_json::Value {
 /// Sentinel without an SSH round trip.
 pub fn push_request(
     client: &reqwest::Client,
+    url: &str,
     config: &Config,
     payload: &serde_json::Value,
 ) -> reqwest::RequestBuilder {
     client
-        .post(&config.push_url)
+        .post(url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
         .header("X-Sentinel-Version", &config.version)
@@ -147,10 +148,18 @@ pub fn error_message(error: &PushError) -> String {
     message
 }
 
-pub struct Pusher {
-    config: Arc<Config>,
+/// Builds the push body. Shared by the push loop and `/api/push-payload`,
+/// which Coolify pulls over SSH when it cannot be reached by a push.
+#[derive(Clone)]
+pub struct PayloadBuilder {
     docker: DockerClient,
     store: Store,
+}
+
+pub struct Pusher {
+    config: Arc<Config>,
+    url: String,
+    payload: PayloadBuilder,
     client: reqwest::Client,
     status: SharedPushStatus,
 }
@@ -158,8 +167,8 @@ pub struct Pusher {
 impl Pusher {
     pub fn new(
         config: Arc<Config>,
-        docker: DockerClient,
-        store: Store,
+        url: String,
+        payload: PayloadBuilder,
         status: SharedPushStatus,
     ) -> Result<Self, PushError> {
         let client = reqwest::Client::builder()
@@ -169,8 +178,8 @@ impl Pusher {
             .build()?;
         Ok(Self {
             config,
-            docker,
-            store,
+            url,
+            payload,
             client,
             status,
         })
@@ -217,10 +226,10 @@ impl Pusher {
     }
 
     pub async fn push_once(&self) -> Result<(), PushError> {
-        tracing::info!(url = %self.config.push_url, "pushing");
-        let payload = self.build_payload().await?;
+        tracing::info!(url = %self.url, "pushing");
+        let payload = self.payload.build().await?;
 
-        let response = push_request(&self.client, &self.config, &payload)
+        let response = push_request(&self.client, &self.url, &self.config, &payload)
             .send()
             .await?;
 
@@ -234,7 +243,7 @@ impl Pusher {
                 .map(|seconds| std::time::Duration::from_secs(seconds).min(MAX_RETRY_AFTER));
             let body = response.text().await.unwrap_or_default();
             return Err(PushError::Status {
-                url: self.config.push_url.clone(),
+                url: self.url.clone(),
                 status: status.as_u16(),
                 body: body
                     .chars()
@@ -247,8 +256,14 @@ impl Pusher {
         }
         Ok(())
     }
+}
 
-    pub async fn build_payload(&self) -> Result<serde_json::Value, PushError> {
+impl PayloadBuilder {
+    pub fn new(docker: DockerClient, store: Store) -> Self {
+        Self { docker, store }
+    }
+
+    pub async fn build(&self) -> Result<serde_json::Value, PushError> {
         let (containers, failures) = self.container_data().await?;
         let used_percentage = fs_usage::root_used_percentage()?;
         let (filesystem_usage, container_storage) = self.storage_data().await;

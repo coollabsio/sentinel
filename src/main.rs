@@ -54,7 +54,7 @@ fn unexpected_service_exit(
 
 fn assignment_client(
     enabled: bool,
-    endpoint: &str,
+    endpoint: Option<&str>,
     token: &str,
     version: &str,
     control_tls: Option<&config::ControlTlsConfig>,
@@ -65,6 +65,10 @@ fn assignment_client(
     }
     let Some(control_tls) = control_tls else {
         tracing::error!("Sentinel control task could not start; TLS configuration is missing");
+        return None;
+    };
+    let Some(endpoint) = endpoint else {
+        tracing::error!("Sentinel control task could not start; PUSH_ENDPOINT is missing");
         return None;
     };
 
@@ -242,6 +246,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Stays at its default (all null / 0) when push is disabled.
     let push_status = push::SharedPushStatus::default();
 
+    let docker = docker::DockerClient::new()?;
+    let payload = push::PayloadBuilder::new(docker.clone(), store.clone());
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut services = tokio::task::JoinSet::new();
     let mut control_services = tokio::task::JoinSet::new();
@@ -263,6 +270,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             analytics: None,
             geoip_attribution: geoip_attribution.clone(),
             push_status: push_status.clone(),
+            payload: payload.clone(),
         });
         let app = api::router(state);
         let mut rx = shutdown_rx.clone();
@@ -300,8 +308,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let docker = docker::DockerClient::new()?;
-
     // Collector
     if config.collector_enabled {
         let c = collector::Collector::new(config.clone(), store.clone(), docker.clone());
@@ -327,27 +333,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Pusher
-    if config.push_enabled {
-        let pusher = push::Pusher::new(
-            config.clone(),
-            docker.clone(),
-            store.clone(),
-            push_status.clone(),
-        )?;
+    if let Some(url) = &config.push_url {
+        let pusher = push::Pusher::new(config.clone(), url.clone(), payload, push_status.clone())?;
         let rx = shutdown_rx.clone();
         services.spawn(async move {
             pusher.run(rx).await;
             Ok::<(), String>(())
         });
     } else {
-        tracing::info!("push disabled");
+        tracing::info!("push disabled, Coolify pulls /api/push-payload");
     }
 
     // V5 control assignment discovery. This remains fully dormant unless the
     // explicit gate is enabled and does not affect metrics or push services.
     if let Some(client) = assignment_client(
         config.control_plane_enabled,
-        &config.endpoint,
+        config.endpoint.as_deref(),
         &config.token,
         &config.version,
         config.control_tls.as_ref(),

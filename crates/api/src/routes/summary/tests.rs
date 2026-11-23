@@ -58,7 +58,7 @@ fn state(store: Store) -> Arc<AppState> {
     Arc::new(AppState {
         auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
-        store,
+        store: store.clone(),
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
         memory: Arc::new(crate::CachedMemory::new(
             collector::HostSampler::new().sample_memory(),
@@ -72,6 +72,7 @@ fn state(store: Store) -> Arc<AppState> {
         analytics: None,
         geoip_attribution: Arc::new(std::sync::RwLock::new(None)),
         push_status: Default::default(),
+        payload: push::PayloadBuilder::new(docker::DockerClient::new().unwrap(), store),
     })
 }
 

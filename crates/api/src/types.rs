@@ -83,6 +83,18 @@ pub struct PushStatusBody {
     pub consecutive_failures: u64,
 }
 
+/// What Sentinel would push to Coolify, for Coolify to pull instead.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PushPayloadBody {
+    /// Sentinel version, the value pushes send as `X-Sentinel-Version`.
+    #[schema(example = "1.0.0")]
+    pub version: String,
+    /// The push body: `containers`, `filesystem_usage_root`, `filesystem_usage`,
+    /// `container_storage` and `snapshot`.
+    #[schema(value_type = Object)]
+    pub payload: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ErrorBody {
     pub error: String,

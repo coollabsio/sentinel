@@ -62,8 +62,11 @@ fn builds_push_url_and_trims_trailing_slash() {
     let _l = env_lock().lock().unwrap();
     let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", "https://example.com///")]);
     let c = Config::load(false).unwrap();
-    assert_eq!(c.endpoint, "https://example.com");
-    assert_eq!(c.push_url, "https://example.com/api/v1/sentinel/push");
+    assert_eq!(c.endpoint.as_deref(), Some("https://example.com"));
+    assert_eq!(
+        c.push_url.as_deref(),
+        Some("https://example.com/api/v1/sentinel/push")
+    );
 }
 
 #[test]
@@ -252,7 +255,7 @@ fn defaults_match_go_implementation() {
     ]);
     let c = Config::load(false).unwrap();
     assert_eq!(c.refresh_rate_seconds, 5);
-    assert!(c.push_enabled);
+    assert!(c.push_url.is_some());
     assert_eq!(c.push_interval_seconds, 60);
     assert_eq!(c.collector_retention_period_days, 7);
     assert!(!c.collector_enabled);
@@ -283,7 +286,70 @@ fn push_can_be_disabled_for_control_only_hosts() {
         ("PUSH_ENABLED", "false"),
     ]);
 
-    assert!(!Config::load(false).unwrap().push_enabled);
+    let c = Config::load(false).unwrap();
+    assert_eq!(c.push_url, None);
+    assert_eq!(c.endpoint.as_deref(), Some("https://example.com"));
+}
+
+#[test]
+fn pull_mode_needs_no_push_endpoint() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", ""),
+        ("PUSH_ENABLED", "false"),
+        ("CONTROL_PLANE_ENABLED", ""),
+    ]);
+    let c = Config::load(false).unwrap();
+    assert_eq!(c.endpoint, None);
+    assert_eq!(c.push_url, None);
+}
+
+#[test]
+fn pull_mode_still_validates_a_set_push_endpoint() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", "ftp://example.com"),
+        ("PUSH_ENABLED", "false"),
+        ("CONTROL_PLANE_ENABLED", ""),
+    ]);
+    assert!(matches!(
+        Config::load(false),
+        Err(ConfigError::InvalidEndpoint)
+    ));
+}
+
+#[test]
+fn enabled_push_requires_push_endpoint() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", ""),
+        ("PUSH_ENABLED", "true"),
+        ("CONTROL_PLANE_ENABLED", ""),
+    ]);
+    assert!(matches!(
+        Config::load(false),
+        Err(ConfigError::MissingEndpoint)
+    ));
+}
+
+#[test]
+fn control_plane_requires_push_endpoint_with_push_disabled() {
+    let _l = env_lock().lock().unwrap();
+    let _g = EnvGuard::set(&[
+        ("TOKEN", "t"),
+        ("PUSH_ENDPOINT", ""),
+        ("PUSH_ENABLED", "false"),
+        ("CONTROL_PLANE_ENABLED", "true"),
+        ("FLUX_CA_PATH", "/tmp/ca.pem"),
+        ("FLUX_TRUST_BUNDLE_VERSION", "1"),
+    ]);
+    assert!(matches!(
+        Config::load(false),
+        Err(ConfigError::MissingEndpoint)
+    ));
 }
 
 #[test]
@@ -292,7 +358,7 @@ fn development_uses_local_db_path() {
     let _g = EnvGuard::set(&[("TOKEN", "t"), ("PUSH_ENDPOINT", "")]);
     let c = Config::load(true).unwrap();
     // development supplies a default endpoint
-    assert_eq!(c.endpoint, "http://localhost:8000");
+    assert_eq!(c.endpoint.as_deref(), Some("http://localhost:8000"));
     assert_eq!(c.metrics_file.to_str().unwrap(), "./db/metrics.sqlite");
     // analytics DB mirrors the metrics_file dev/prod split
     assert_eq!(

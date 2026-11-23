@@ -35,7 +35,7 @@ fn a_service_error_is_propagated() {
 
 #[test]
 fn control_assignment_stays_dormant_when_disabled() {
-    let client = assignment_client(false, "", "", "", None, command_journal());
+    let client = assignment_client(false, None, "", "", None, command_journal());
 
     assert!(client.is_none());
 }
@@ -44,7 +44,7 @@ fn control_assignment_stays_dormant_when_disabled() {
 fn control_assignment_client_is_created_when_enabled() {
     let client = assignment_client(
         true,
-        "https://coolify.example.com",
+        Some("https://coolify.example.com"),
         "token",
         "main",
         Some(&control_tls_config()),
@@ -58,7 +58,7 @@ fn control_assignment_client_is_created_when_enabled() {
 fn invalid_control_assignment_configuration_does_not_fail_startup() {
     let client = assignment_client(
         true,
-        "not-a-url",
+        Some("not-a-url"),
         "token",
         "main",
         Some(&control_tls_config()),

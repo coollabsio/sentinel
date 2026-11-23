@@ -101,6 +101,8 @@ pub struct AppState {
     /// Written by the push loop after every attempt, read by
     /// `/api/push-status`. Left at its default when push is disabled.
     pub push_status: push::SharedPushStatus,
+    /// Builds the `/api/push-payload` body, the same body the push loop sends.
+    pub payload: push::PayloadBuilder,
 }
 
 /// Everything except the debug-gated `/api/stats` *route*. Its documentation
