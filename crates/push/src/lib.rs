@@ -3,6 +3,7 @@
 pub mod fs_usage;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use config::Config;
@@ -33,6 +34,8 @@ pub enum PushError {
     Io(#[from] std::io::Error),
     #[error("time format: {0}")]
     TimeFormat(#[from] time::error::Format),
+    #[error("PUSH_ENDPOINT_CA_PATH {path}: {reason}")]
+    EndpointCa { path: String, reason: String },
     #[error("push to {url} returned {status}: {body}")]
     Status {
         url: String,
@@ -156,6 +159,22 @@ pub struct PayloadBuilder {
     store: Store,
 }
 
+/// Reads the PEM CA certificates at PUSH_ENDPOINT_CA_PATH. The HTTP clients
+/// add them to the system roots, so a public certificate still verifies.
+pub fn load_endpoint_ca(path: &Path) -> Result<Vec<reqwest::Certificate>, PushError> {
+    let invalid = |reason: String| PushError::EndpointCa {
+        path: path.display().to_string(),
+        reason,
+    };
+    let pem = std::fs::read(path).map_err(|e| invalid(e.to_string()))?;
+    let certificates =
+        reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| invalid(e.to_string()))?;
+    if certificates.is_empty() {
+        return Err(invalid("the file has no PEM certificate".into()));
+    }
+    Ok(certificates)
+}
+
 pub struct Pusher {
     config: Arc<Config>,
     url: String,
@@ -170,8 +189,10 @@ impl Pusher {
         url: String,
         payload: PayloadBuilder,
         status: SharedPushStatus,
+        endpoint_ca: &[reqwest::Certificate],
     ) -> Result<Self, PushError> {
         let client = reqwest::Client::builder()
+            .tls_certs_merge(endpoint_ca.iter().cloned())
             .pool_max_idle_per_host(100)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .timeout(std::time::Duration::from_secs(10))

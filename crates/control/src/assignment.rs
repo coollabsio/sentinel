@@ -199,6 +199,7 @@ impl AssignmentClient {
         token: &str,
         sentinel_version: &str,
         control_tls: ControlTlsConfig,
+        endpoint_ca: &[reqwest::Certificate],
     ) -> Result<Self, AssignmentError> {
         let assignment_url = assignment_url(endpoint)?;
         if token.is_empty() {
@@ -213,6 +214,7 @@ impl AssignmentClient {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
+            .tls_certs_merge(endpoint_ca.iter().cloned())
             .build()
             .map_err(|_| AssignmentError::InvalidConfiguration("HTTP client could not start"))?;
 
