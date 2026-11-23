@@ -10,6 +10,7 @@
 # Arguments: --repository URL --commit SHA --type dockerfile|railpack
 #            --base-directory DIR --dockerfile PATH --image REF
 #            [--push-image REF] [--target STAGE] [--static-root DIR]
+#            [--untrusted-source]
 # Without --repository, the build uses /run/coolify-build/dockerfile/Dockerfile
 # with an empty context. Build-time variables are read-only files from
 # Sentinel: /run/coolify-build/args/<KEY> become build args, and
@@ -22,12 +23,21 @@
 # With --push-image, a second BuildKit run from the cache pushes the same
 # build to that external image. Its login, if any, is the read-only Docker
 # config /run/coolify-push/config.json, used only for that push.
+# With --untrusted-source (a pull request from a fork), the Git credential
+# opens only the repository of --repository: an HTTPS token answers only for
+# its path, and an SSH key fetches only the commit. Submodules and Git LFS
+# objects of other repositories get no credential.
 # The last line of a successful build is:
 #   COOLIFY_BUILD_RESULT {"digest":"sha256:..."}
 set -eu
 
-repository='' commit='' type='' base_directory='' dockerfile='' image='' push_image='' target='' static_root=''
+repository='' commit='' type='' base_directory='' dockerfile='' image='' push_image='' target='' static_root='' untrusted=''
 while [ $# -gt 0 ]; do
+  if [ "$1" = --untrusted-source ]; then
+    untrusted=1
+    shift
+    continue
+  fi
   [ $# -ge 2 ] || { echo "error: $1 needs a value" >&2; exit 2; }
   case "$1" in
     --repository) repository=$2 ;;
@@ -55,14 +65,33 @@ step() { printf '==> %s\n' "$*"; }
 # A private repository comes with one read-only file from Sentinel. The
 # credential stays in it: never in a URL, an argument, or the environment, so
 # Git output cannot show it. The helper answers only for the repository host,
-# so a submodule or redirect to another host never gets the token.
-if [ -f /run/coolify-git/token ]; then
-  host=${repository#https://}
-  host=${host%%/*}
-  git config --global "credential.https://$host.helper" \
-    '!f() { test "$1" = get || return 0; echo username=x-access-token; echo "password=$(cat /run/coolify-git/token)"; }; f'
-elif [ -f /run/coolify-git/ssh-key ]; then
-  export GIT_SSH_COMMAND='ssh -i /run/coolify-git/ssh-key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+# so a submodule or redirect to another host never gets the token. For an
+# untrusted source, it answers only for the path of the repository (Git
+# selects credential.<url> by path prefix), with and without `.git`, which
+# also covers its LFS endpoint `<path>.git/info/lfs`.
+# Sentinel mounts the credential at /run/coolify-git; the unit tests set another directory.
+git_credentials=${COOLIFY_GIT_CREDENTIALS:-/run/coolify-git}
+ssh_options='-o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+key_ssh="ssh -i $git_credentials/ssh-key $ssh_options"
+if [ -f "$git_credentials/token" ]; then
+  helper="!f() { test \"\$1\" = get || return 0; echo username=x-access-token; echo \"password=\$(cat '$git_credentials/token')\"; }; f"
+  if [ -n "$untrusted" ]; then
+    path=${repository%/}
+    path=${path%.git}
+    git config --global "credential.$path.helper" "$helper"
+    git config --global "credential.$path.git.helper" "$helper"
+  else
+    host=${repository#https://}
+    host=${host%%/*}
+    git config --global "credential.https://$host.helper" "$helper"
+  fi
+elif [ -f "$git_credentials/ssh-key" ]; then
+  # An untrusted source uses the key only for the fetch of the commit below.
+  if [ -n "$untrusted" ]; then
+    export GIT_SSH_COMMAND="ssh -o IdentityFile=none $ssh_options"
+  else
+    export GIT_SSH_COMMAND="$key_ssh"
+  fi
 fi
 
 source_dir=/home/build/source
@@ -70,7 +99,11 @@ if [ -n "$repository" ]; then
   step "Fetching commit $commit"
   git init --quiet "$source_dir"
   git -C "$source_dir" remote add origin "$repository"
-  git -C "$source_dir" -c protocol.file.allow=never fetch --quiet --depth=1 origin "$commit"
+  if [ -f "$git_credentials/ssh-key" ]; then
+    GIT_SSH_COMMAND="$key_ssh" git -C "$source_dir" -c protocol.file.allow=never fetch --quiet --depth=1 origin "$commit"
+  else
+    git -C "$source_dir" -c protocol.file.allow=never fetch --quiet --depth=1 origin "$commit"
+  fi
   git -C "$source_dir" checkout --quiet FETCH_HEAD
   if [ -f "$source_dir/.gitmodules" ]; then
     step "Fetching submodules"

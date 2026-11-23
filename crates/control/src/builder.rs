@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 use sentinel_protocol::control::v1::{
     BuilderReconcileRequest, BuilderReconcileResult, ImageBuildRequest, ImageBuildResult,
@@ -63,6 +64,8 @@ const OUTPUT_DIR: &str = "var/lib/coolify/builder/out";
 /// Where the build container writes the archive. Matches the entrypoint.
 const OUTPUT_MOUNT: &str = "/coolify/out";
 const ARCHIVE_FILE: &str = "image.tar";
+/// A build output that no build loaded after this time is removed.
+const STALE_OUTPUT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// A build image with this prefix stays on the builder Node.
 pub(crate) const LOCAL_IMAGE_PREFIX: &str = "localhost/";
 
@@ -910,6 +913,9 @@ pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<S
     if !request.static_root.is_empty() {
         arguments.extend(["--static-root".into(), request.static_root.clone()]);
     }
+    if request.untrusted_source {
+        arguments.push("--untrusted-source".into());
+    }
     arguments
 }
 
@@ -938,8 +944,11 @@ pub(crate) fn start(
     }
     let local = is_local_image(&request.image);
     if local {
-        remove_stale_outputs(root, podman);
         let dir = output_dir(root, &request.build_id);
+        // Only the output of this build: another build on this Node can have
+        // an archive that waits for its `image.load`.
+        let _ = std::fs::remove_dir_all(&dir);
+        remove_stale_outputs(root, podman, SystemTime::now());
         std::fs::create_dir_all(&dir)
             .map_err(|_| "The build output directory could not be created.")?;
         own_by_build_user(&dir)?;
@@ -984,15 +993,19 @@ fn run_build(
     Ok(ImageBuildResult { runtime_id, name })
 }
 
-/// Deletes the output of builds whose container is gone: they failed, were
-/// cancelled, or Coolify never loaded them. Coolify runs one build at a time
-/// on a builder Node and loads it before the next one starts, so no archive
-/// that waits for its load is deleted.
-fn remove_stale_outputs(root: &Path, podman: &Path) {
+/// Deletes the output of builds that ended more than a day ago and were
+/// never loaded: they failed, were cancelled, or Coolify did not load them.
+/// A build runs at most a few hours and Coolify loads it right after, so the
+/// age keeps every archive that waits for its load, also when several builds
+/// run on this Node.
+fn remove_stale_outputs(root: &Path, podman: &Path, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(root.join(OUTPUT_DIR)) else {
         return;
     };
     for entry in entries.flatten() {
+        if !is_stale_output(&entry.path(), now) {
+            continue;
+        }
         let Some(build_id) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
@@ -1005,6 +1018,15 @@ fn remove_stale_outputs(root: &Path, podman: &Path) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
+}
+
+fn is_stale_output(path: &Path, now: SystemTime) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| {
+            now.duration_since(modified)
+                .is_ok_and(|age| age >= STALE_OUTPUT_AGE)
+        })
 }
 
 pub(crate) fn validate_load(request: &ImageLoadRequest) -> Result<(), String> {
@@ -1135,6 +1157,173 @@ mod tests {
             target: target.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn passes_an_untrusted_source_to_the_builder() {
+        let trusted = dockerfile_build("");
+        assert!(
+            !build_arguments(Path::new("/"), &trusted).contains(&"--untrusted-source".to_string())
+        );
+        let untrusted = ImageBuildRequest {
+            untrusted_source: true,
+            ..dockerfile_build("")
+        };
+        assert_eq!(validate_build(&untrusted), Ok(()));
+        assert_eq!(
+            build_arguments(Path::new("/"), &untrusted)
+                .last()
+                .map(String::as_str),
+            Some("--untrusted-source")
+        );
+    }
+
+    /// Runs the Git steps of the builder entrypoint with a fake `git` that
+    /// only records its calls, except `git config`, which the real Git writes
+    /// to a temporary home. Returns the log and the home.
+    fn run_entrypoint_git_steps(
+        credential: (&str, &str),
+        untrusted: bool,
+    ) -> (String, tempfile::TempDir) {
+        let home = tempfile::tempdir().unwrap();
+        let credentials = home.path().join("git-credential");
+        std::fs::create_dir(&credentials).unwrap();
+        std::fs::write(credentials.join(credential.0), credential.1).unwrap();
+        let real_git = String::from_utf8(
+            Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let log = home.path().join("git.log");
+        std::fs::write(
+            bin.join("git"),
+            format!(
+                "#!/bin/sh\nprintf '%s | %s\\n' \"${{GIT_SSH_COMMAND:-}}\" \"$*\" >> '{}'\n[ \"$1\" = config ] && exec '{}' \"$@\"\nexit 0\n",
+                log.display(),
+                real_git.trim()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            bin.join("git"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let mut arguments = vec![
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../scripts/builder-entrypoint.sh"
+            )
+            .to_string(),
+            "--repository".into(),
+            if credential.0 == "token" {
+                "https://git.example.com/acme/api.git".into()
+            } else {
+                "git@git.example.com:acme/api.git".into()
+            },
+            "--commit".into(),
+            "a".repeat(40),
+            "--type".into(),
+            "dockerfile".into(),
+            "--image".into(),
+            "localhost/api:1".into(),
+        ];
+        if untrusted {
+            arguments.push("--untrusted-source".into());
+        }
+        // The script stops at the missing build context, after the Git steps.
+        let _ = Command::new("sh")
+            .args(&arguments)
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("COOLIFY_GIT_CREDENTIALS", &credentials)
+            .output()
+            .unwrap();
+        (std::fs::read_to_string(&log).unwrap_or_default(), home)
+    }
+
+    /// Whether `git credential fill` gives the token of the home for a URL.
+    fn token_for(home: &Path, url: &str) -> bool {
+        let mut child = Command::new("git")
+            .args(["credential", "fill"])
+            .env("HOME", home)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "/bin/false")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(
+            child.stdin.as_mut().unwrap(),
+            format!("url={url}\n\n").as_bytes(),
+        )
+        .unwrap();
+        String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout)
+            .contains("password=t0ken")
+    }
+
+    #[test]
+    fn an_untrusted_source_gets_the_token_only_for_its_repository() {
+        let parent = "https://git.example.com/acme/api.git";
+        let other = "https://git.example.com/acme/private.git";
+        let (_, trusted) = run_entrypoint_git_steps(("token", "t0ken"), false);
+        assert!(token_for(trusted.path(), parent));
+        assert!(token_for(trusted.path(), other));
+
+        let (_, untrusted) = run_entrypoint_git_steps(("token", "t0ken"), true);
+        for url in [
+            parent,
+            "https://git.example.com/acme/api",
+            "https://git.example.com/acme/api.git/info/lfs",
+        ] {
+            assert!(token_for(untrusted.path(), url), "{url}");
+        }
+        for url in [
+            other,
+            "https://git.example.com/acme/api-other.git",
+            "https://git.example.com/acme/api.git/../private.git",
+            "https://other.example.com/acme/api.git",
+        ] {
+            assert!(!token_for(untrusted.path(), url), "{url}");
+        }
+    }
+
+    #[test]
+    fn an_untrusted_source_uses_the_ssh_key_only_for_the_commit() {
+        let calls = |untrusted| {
+            let (log, home) = run_entrypoint_git_steps(("ssh-key", "key"), untrusted);
+            let key = format!("-i {}/git-credential/ssh-key", home.path().display());
+            log.lines()
+                .filter(|line| line.contains(" fetch ") || line.contains(" lfs pull"))
+                .map(|line| (line.contains(" fetch "), line.contains(&key)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(calls(false), [(true, true), (false, true)]);
+        assert_eq!(calls(true), [(true, true), (false, false)]);
+    }
+
+    #[test]
+    fn keeps_the_outputs_of_other_builds_for_a_day() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join(OUTPUT_DIR).join("waits-for-load");
+        std::fs::create_dir_all(&output).unwrap();
+        // `false` reports every build container as gone, like a build that
+        // ended and waits for its `image.load`.
+        remove_stale_outputs(root.path(), Path::new("/bin/false"), SystemTime::now());
+        assert!(output.exists());
+        remove_stale_outputs(
+            root.path(),
+            Path::new("/bin/false"),
+            SystemTime::now() + STALE_OUTPUT_AGE,
+        );
+        assert!(!output.exists());
     }
 
     #[test]
