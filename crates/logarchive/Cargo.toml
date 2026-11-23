@@ -1,0 +1,16 @@
+[package]
+name = "logarchive"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bollard.workspace = true
+config = { path = "../config" }
+docker = { path = "../docker" }
+futures-util.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

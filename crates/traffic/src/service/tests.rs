@@ -57,6 +57,7 @@ fn test_config(access_log_path: PathBuf, sample_threshold: u32) -> config::Confi
             geoip_maxmind_edition: "GeoLite2-Country".into(),
             geoip_refresh_days: 30,
         },
+        log_archive: config::Config::load_for_test().log_archive,
     }
 }
 

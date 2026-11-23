@@ -89,6 +89,19 @@ pub struct TrafficSettings {
     pub geoip_refresh_days: u32,
 }
 
+/// Container log archive (LOG_ARCHIVE_*): Sentinel appends the logs of
+/// Coolify-managed containers to files under `dir`, so Coolify can read them
+/// after Docker removes the container and its json log. Off unless Coolify
+/// turns it on, because older Coolify versions cannot show or turn off the archive.
+#[derive(Debug, Clone)]
+pub struct LogArchiveSettings {
+    pub enabled: bool,
+    pub dir: PathBuf,
+    pub max_file_mb: u64,
+    pub max_total_mb: u64,
+    pub retention_days: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub version: String,
@@ -115,6 +128,7 @@ pub struct Config {
     pub storage_volumes_refresh_rate_seconds: u64,
     pub host_mount_prefix: String,
     pub traffic: TrafficSettings,
+    pub log_archive: LogArchiveSettings,
 }
 
 impl Config {
@@ -188,6 +202,16 @@ impl Config {
             geoip_refresh_days: u32_from_env("GEOIP_REFRESH_DAYS", 30)?,
         };
 
+        let log_archive = LogArchiveSettings {
+            enabled: bool_from_env("LOG_ARCHIVE_ENABLED", false)?,
+            dir: non_empty("LOG_ARCHIVE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_log_archive_dir(&metrics_file)),
+            max_file_mb: positive_from_env("LOG_ARCHIVE_MAX_FILE_MB", 10)?,
+            max_total_mb: positive_from_env("LOG_ARCHIVE_MAX_TOTAL_MB", 1024)?,
+            retention_days: u32_from_env("LOG_ARCHIVE_RETENTION_DAYS", 7)?,
+        };
+
         let port: u16 = match non_empty("PORT") {
             None => 8888,
             Some(v) => v.parse().map_err(|_| ConfigError::InvalidPort)?,
@@ -246,6 +270,7 @@ impl Config {
             storage_volumes_refresh_rate_seconds,
             host_mount_prefix,
             traffic,
+            log_archive,
         })
     }
 
@@ -292,8 +317,24 @@ impl Config {
                 geoip_maxmind_edition: "GeoLite2-City".to_string(),
                 geoip_refresh_days: 30,
             },
+            log_archive: LogArchiveSettings {
+                enabled: false,
+                dir: PathBuf::from("/app/db/container-logs"),
+                max_file_mb: 10,
+                max_total_mb: 1024,
+                retention_days: 7,
+            },
         }
     }
+}
+
+/// `container-logs` next to the metrics database, so it lands on the same
+/// host mount (`/data/coolify/sentinel`).
+fn default_log_archive_dir(metrics_file: &std::path::Path) -> PathBuf {
+    metrics_file
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("container-logs")
 }
 
 fn non_empty(key: &str) -> Option<String> {

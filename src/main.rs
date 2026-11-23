@@ -35,7 +35,7 @@ enum CliCommand {
 /// log full Docker API responses at debug, and those include container
 /// commands and environments that can hold secrets.
 const DEBUG_LOG_FILTER: &str = "info,sentinel=debug,api=debug,collector=debug,config=debug,\
-control=debug,docker=debug,push=debug,store=debug,traffic=debug";
+control=debug,docker=debug,logarchive=debug,push=debug,store=debug,traffic=debug";
 
 fn default_log_filter(debug: bool) -> &'static str {
     if debug { DEBUG_LOG_FILTER } else { "info" }
@@ -341,6 +341,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     } else {
         tracing::info!("push disabled");
+    }
+
+    // Container log archive. A failure here leaves the other services running.
+    if config.log_archive.enabled {
+        match logarchive::LogArchive::new(&config.log_archive) {
+            Ok(archive) => {
+                let rx = shutdown_rx.clone();
+                services.spawn(async move {
+                    archive.run(rx).await;
+                    Ok::<(), String>(())
+                });
+            }
+            Err(error) => tracing::warn!(%error, "container log archive disabled"),
+        }
+    } else {
+        tracing::info!("container log archive disabled");
     }
 
     // V5 control assignment discovery. This remains fully dormant unless the

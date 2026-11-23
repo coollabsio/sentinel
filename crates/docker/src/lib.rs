@@ -41,6 +41,27 @@ fn socket_path() -> String {
 // gaps in the recorded metrics.
 const TIMEOUT_SECS: u64 = 10;
 
+/// A raw client for long-lived streams (`logs` with follow, `events`). Its
+/// request timeout only bounds the wait for response headers, so it is long:
+/// the daemon may hold those back until the first log line or event.
+pub fn streaming_client() -> Result<Docker, DockerError> {
+    const STREAM_TIMEOUT_SECS: u64 = 365 * 24 * 60 * 60;
+    Ok(Docker::connect_with_unix(
+        &socket_path(),
+        STREAM_TIMEOUT_SECS,
+        bollard::API_DEFAULT_VERSION,
+    )?)
+}
+
+/// A raw client for short requests (list, inspect), with the normal timeout.
+pub fn request_client() -> Result<Docker, DockerError> {
+    Ok(Docker::connect_with_unix(
+        &socket_path(),
+        TIMEOUT_SECS,
+        bollard::API_DEFAULT_VERSION,
+    )?)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DockerError {
     #[error("docker: {0}")]
