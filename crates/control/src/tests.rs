@@ -430,11 +430,20 @@ async fn start_stalled_server() -> (String, Arc<AtomicUsize>) {
     (format!("http://{address}"), requests)
 }
 
+/// A client for the `run` tests. The startup cleanup of `run` calls podman
+/// before the first request; with the podman of the host, it can take longer
+/// than the timeouts of these tests.
+fn polling_client(endpoint: &str) -> AssignmentClient {
+    let mut client =
+        AssignmentClient::new(endpoint, "token", "main", test_control_tls_config(), &[]).unwrap();
+    client.podman = PathBuf::from("/nonexistent/podman");
+    client
+}
+
 #[tokio::test]
 async fn polls_again_after_a_disabled_assignment() {
     let (endpoint, requests) = start_counting_disabled_server(1).await;
-    let client =
-        AssignmentClient::new(&endpoint, "token", "main", test_control_tls_config(), &[]).unwrap();
+    let client = polling_client(&endpoint);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(client.run(shutdown_rx));
 
@@ -456,8 +465,7 @@ async fn polls_again_after_a_disabled_assignment() {
 #[tokio::test]
 async fn shutdown_interrupts_the_assignment_retry_delay() {
     let (endpoint, requests) = start_counting_disabled_server(3600).await;
-    let client =
-        AssignmentClient::new(&endpoint, "token", "main", test_control_tls_config(), &[]).unwrap();
+    let client = polling_client(&endpoint);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(client.run(shutdown_rx));
 
@@ -479,8 +487,7 @@ async fn shutdown_interrupts_the_assignment_retry_delay() {
 #[tokio::test]
 async fn shutdown_interrupts_an_assignment_request() {
     let (endpoint, requests) = start_stalled_server().await;
-    let client =
-        AssignmentClient::new(&endpoint, "token", "main", test_control_tls_config(), &[]).unwrap();
+    let client = polling_client(&endpoint);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(client.run(shutdown_rx));
 

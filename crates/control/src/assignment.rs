@@ -191,6 +191,9 @@ pub struct AssignmentClient {
     sentinel_version: String,
     control_tls: ControlTlsConfig,
     command_journal: CommandJournal,
+    /// The podman binary of the startup cleanup. Tests replace it, so they do
+    /// not wait for the podman of the host.
+    pub(crate) podman: std::path::PathBuf,
 }
 
 impl AssignmentClient {
@@ -227,6 +230,7 @@ impl AssignmentClient {
             command_journal: CommandJournal::open_in_memory(7, 100_000).map_err(|_| {
                 AssignmentError::InvalidConfiguration("command journal could not start")
             })?,
+            podman: std::path::PathBuf::from("podman"),
         })
     }
 
@@ -350,17 +354,12 @@ impl AssignmentClient {
         // no owner any more. Git credentials of builds that an earlier process
         // started get a watcher. The built-in registry of earlier versions is
         // removed.
-        let _ = tokio::task::spawn_blocking(|| {
+        let podman = self.podman.clone();
+        let _ = tokio::task::spawn_blocking(move || {
             crate::volume_transfer::remove_leftovers(std::path::Path::new("/"));
             crate::image_transfer::remove_leftovers(std::path::Path::new("/"));
-            crate::registry::remove_builtin_registry(
-                std::path::Path::new("/"),
-                std::path::Path::new("podman"),
-            );
-            crate::builder::remove_build_inputs_after_builds(
-                std::path::Path::new("/"),
-                std::path::Path::new("podman"),
-            );
+            crate::registry::remove_builtin_registry(std::path::Path::new("/"), &podman);
+            crate::builder::remove_build_inputs_after_builds(std::path::Path::new("/"), &podman);
         })
         .await;
         // Restores the approved cluster network and stopped workloads once per
