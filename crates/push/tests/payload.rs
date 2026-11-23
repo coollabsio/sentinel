@@ -48,9 +48,14 @@ fn container_entry_serializes_expected_keys() {
 #[test]
 fn push_request_sends_sentinel_version_header() {
     let config = config::Config::load_for_test();
-    let request = push::push_request(&reqwest::Client::new(), &config, &serde_json::json!({}))
-        .build()
-        .unwrap();
+    let request = push::push_request(
+        &reqwest::Client::new(),
+        "http://localhost:8000/api/v1/sentinel/push",
+        &config,
+        &serde_json::json!({}),
+    )
+    .build()
+    .unwrap();
 
     assert_eq!(
         request.headers().get("X-Sentinel-Version").unwrap(),

@@ -42,7 +42,7 @@ async fn fetch(uri: &str) -> serde_json::Value {
     let state = Arc::new(api::AppState {
         auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
-        store,
+        store: store.clone(),
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
         memory: Arc::new(api::CachedMemory::new(
             collector::HostSampler::new().sample_memory(),
@@ -56,6 +56,7 @@ async fn fetch(uri: &str) -> serde_json::Value {
         analytics: None,
         geoip_attribution: Arc::new(std::sync::RwLock::new(None)),
         push_status: Default::default(),
+        payload: push::PayloadBuilder::new(docker::DockerClient::new().unwrap(), store),
     });
 
     let res = api::router(state)

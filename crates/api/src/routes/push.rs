@@ -2,15 +2,19 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
+use axum::response::{IntoResponse, Response};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::AppState;
-use crate::types::{PushStatusBody, UnauthorizedError};
+use crate::routes::cpu::internal_error;
+use crate::types::{InternalServerError, PushPayloadBody, PushStatusBody, UnauthorizedError};
 
 pub fn routes() -> OpenApiRouter<Arc<AppState>> {
-    OpenApiRouter::new().routes(routes!(push_status))
+    OpenApiRouter::new()
+        .routes(routes!(push_status))
+        .routes(routes!(push_payload))
 }
 
 #[utoipa::path(
@@ -38,6 +42,30 @@ async fn push_status(State(state): State<Arc<AppState>>) -> Json<PushStatusBody>
         last_status: status.last_status,
         consecutive_failures: status.consecutive_failures,
     })
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/push-payload",
+    tag = "Core",
+    summary = "Get push payload",
+    description = "The body Sentinel would push to Coolify right now, built on request. Coolify pulls it over SSH when the server cannot reach Coolify (PUSH_ENABLED=false). Served whether push is enabled or not.",
+    responses(
+        (status = 200, description = "Sentinel version and push payload", body = PushPayloadBody),
+        (status = 401, response = UnauthorizedError),
+        (status = 500, response = InternalServerError),
+    ),
+    security(("bearerAuth" = []))
+)]
+async fn push_payload(State(state): State<Arc<AppState>>) -> Response {
+    match state.payload.build().await {
+        Ok(payload) => Json(PushPayloadBody {
+            version: state.config.version.clone(),
+            payload,
+        })
+        .into_response(),
+        Err(e) => internal_error(push::error_message(&e)),
+    }
 }
 
 /// Whole seconds, UTC (`2026-10-04T12:00:00Z`): sub-second precision adds

@@ -28,7 +28,7 @@ fn state() -> Arc<AppState> {
     Arc::new(AppState {
         auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
-        store,
+        store: store.clone(),
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
         memory: Arc::new(api::CachedMemory::new(
             collector::HostSampler::new().sample_memory(),
@@ -42,6 +42,7 @@ fn state() -> Arc<AppState> {
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
         push_status: Default::default(),
+        payload: push::PayloadBuilder::new(docker::DockerClient::new().unwrap(), store),
     })
 }
 
@@ -119,7 +120,7 @@ async fn distinct_punctuated_container_names_keep_separate_histories() {
     let st = Arc::new(AppState {
         auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
-        store,
+        store: store.clone(),
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
         memory: Arc::new(api::CachedMemory::new(
             collector::HostSampler::new().sample_memory(),
@@ -133,6 +134,7 @@ async fn distinct_punctuated_container_names_keep_separate_histories() {
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
         push_status: Default::default(),
+        payload: push::PayloadBuilder::new(docker::DockerClient::new().unwrap(), store),
     });
     for (name, expected) in [("postgres-db", "7.00"), ("postgres_db", "9.00")] {
         let res = router(st.clone())
@@ -197,7 +199,7 @@ async fn container_history_default_from_is_one_second_not_zero() {
     let st = Arc::new(AppState {
         auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
-        store,
+        store: store.clone(),
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
         memory: Arc::new(api::CachedMemory::new(
             collector::HostSampler::new().sample_memory(),
@@ -211,6 +213,7 @@ async fn container_history_default_from_is_one_second_not_zero() {
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
         push_status: Default::default(),
+        payload: push::PayloadBuilder::new(docker::DockerClient::new().unwrap(), store),
     });
 
     let get_st = |uri: &'static str, st: Arc<AppState>| async move {
@@ -265,7 +268,7 @@ async fn stats_route_reports_row_counts_and_live_memory_when_debug() {
     let st = Arc::new(AppState {
         auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
-        store,
+        store: store.clone(),
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
         memory: Arc::new(api::CachedMemory::new(
             collector::HostSampler::new().sample_memory(),
@@ -279,6 +282,7 @@ async fn stats_route_reports_row_counts_and_live_memory_when_debug() {
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
         push_status: Default::default(),
+        payload: push::PayloadBuilder::new(docker::DockerClient::new().unwrap(), store),
     });
 
     let res = router(st)

@@ -29,6 +29,7 @@ default = []
 traffic = ["dep:traffic"]
 
 [dev-dependencies]
+docker = { path = "../docker" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 

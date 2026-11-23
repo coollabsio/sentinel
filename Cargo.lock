@@ -86,6 +86,7 @@ dependencies = [
  "axum",
  "collector",
  "config",
+ "docker",
  "http-body-util",
  "push",
  "serde",

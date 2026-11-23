@@ -83,8 +83,8 @@ fn test_state() -> std::sync::Arc<api::AppState> {
     let mut config = config::Config::load_for_test();
     // Override minimal fields for this test
     config.token = "secret".to_string();
-    config.endpoint = "http://localhost".to_string();
-    config.push_url = "http://localhost/api/v1/sentinel/push".to_string();
+    config.endpoint = Some("http://localhost".to_string());
+    config.push_url = Some("http://localhost/api/v1/sentinel/push".to_string());
     config.bind_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
     std::sync::Arc::new(api::AppState {
         auth_header: format!("Bearer {}", config.token),
@@ -103,6 +103,10 @@ fn test_state() -> std::sync::Arc<api::AppState> {
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
         push_status: Default::default(),
+        payload: push::PayloadBuilder::new(
+            docker::DockerClient::new().unwrap(),
+            store::Store::open_in_memory().unwrap(),
+        ),
     })
 }
 

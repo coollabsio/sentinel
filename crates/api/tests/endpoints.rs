@@ -28,7 +28,7 @@ fn state(debug: bool) -> Arc<AppState> {
     Arc::new(AppState {
         auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
-        store,
+        store: store.clone(),
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
         memory: Arc::new(api::CachedMemory::new(
             collector::HostSampler::new().sample_memory(),
@@ -42,6 +42,7 @@ fn state(debug: bool) -> Arc<AppState> {
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
         push_status: Default::default(),
+        payload: push::PayloadBuilder::new(docker::DockerClient::new().unwrap(), store),
     })
 }
 
@@ -290,7 +291,7 @@ async fn cpu_history_returns_empty_array_not_null() {
     let st = Arc::new(AppState {
         auth_header: format!("Bearer {}", config.token),
         config: Arc::new(config),
-        store,
+        store: store.clone(),
         sampler: Arc::new(tokio::sync::Mutex::new(collector::HostSampler::new())),
         memory: Arc::new(api::CachedMemory::new(
             collector::HostSampler::new().sample_memory(),
@@ -304,6 +305,7 @@ async fn cpu_history_returns_empty_array_not_null() {
         analytics: None,
         geoip_attribution: std::sync::Arc::new(std::sync::RwLock::new(None)),
         push_status: Default::default(),
+        payload: push::PayloadBuilder::new(docker::DockerClient::new().unwrap(), store),
     });
     let (s, j) = get(router(st), "/api/cpu/history", Some("secret")).await;
     assert_eq!(s, StatusCode::OK);
@@ -355,6 +357,15 @@ async fn push_status_requires_the_bearer_token() {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 
     let (s, _) = get(router(state(false)), "/api/push-status", Some("wrong")).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn push_payload_requires_the_bearer_token() {
+    let (s, _) = get(router(state(false)), "/api/push-payload", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    let (s, _) = get(router(state(false)), "/api/push-payload", Some("wrong")).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
 

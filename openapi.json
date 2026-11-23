@@ -1378,6 +1378,39 @@
         ]
       }
     },
+    "/api/push-payload": {
+      "get": {
+        "tags": [
+          "Core"
+        ],
+        "summary": "Get push payload",
+        "description": "The body Sentinel would push to Coolify right now, built on request. Coolify pulls it over SSH when the server cannot reach Coolify (PUSH_ENABLED=false). Served whether push is enabled or not.",
+        "operationId": "push_payload",
+        "responses": {
+          "200": {
+            "description": "Sentinel version and push payload",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PushPayloadBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/push-status": {
       "get": {
         "tags": [
@@ -2748,6 +2781,25 @@
           "txBytesPerSec": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "PushPayloadBody": {
+        "type": "object",
+        "description": "What Sentinel would push to Coolify, for Coolify to pull instead.",
+        "required": [
+          "version",
+          "payload"
+        ],
+        "properties": {
+          "payload": {
+            "type": "object",
+            "description": "The push body: `containers`, `filesystem_usage_root`, `filesystem_usage`,\n`container_storage` and `snapshot`."
+          },
+          "version": {
+            "type": "string",
+            "description": "Sentinel version, the value pushes send as `X-Sentinel-Version`.",
+            "example": "1.0.0"
           }
         }
       },
