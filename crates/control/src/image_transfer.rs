@@ -284,9 +284,13 @@ fn acquire_export(
     Ok((lease, shared))
 }
 
-/// Writes the export of `image` to `dir` with `podman save`, after a check
-/// that the disk has room for it.
-fn save_export(podman: &Path, image: &str, dir: &Path) -> Result<SharedExport, String> {
+/// Writes the export of the image `image_id` (`sha256:<hex>`) to `dir` with
+/// `podman save`, after a check that the disk has room for it. It saves by
+/// the ID, not the tag, so that the export is the image of its directory
+/// even when the tag moved meanwhile. The index of the export then names no
+/// tag; the fetch tags the image itself.
+fn save_export(podman: &Path, image_id: &str, dir: &Path) -> Result<SharedExport, String> {
+    let image = image_id.strip_prefix("sha256:").unwrap_or(image_id);
     remove_dir(dir);
     // The export is a full uncompressed copy of the image: check the disk
     // first, so that a transfer never fills it.
@@ -455,7 +459,7 @@ fn start_serve(
     };
     let directory = export_dir(root, &image_id).ok_or("Podman returned an invalid image ID.")?;
     let (lease, shared) = acquire_export(&directory, |directory| {
-        save_export(podman, &request.image, directory)
+        save_export(podman, &image_id, directory)
     })?;
     let repository = repository_of(&request.transfer_id);
     let listener = bind(mesh.address)?;
@@ -1736,5 +1740,35 @@ mod tests {
         drop(lease);
         assert!(!dir.exists());
         assert!(!EXPORTS.lock().unwrap().contains_key(&dir));
+    }
+
+    #[test]
+    fn exports_the_image_by_its_id() {
+        let root = tempfile::tempdir().unwrap();
+        let podman = root.path().join("podman");
+        let log = root.path().join("podman.log");
+        std::fs::write(
+            &podman,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\n[ \"$1\" = save ] && exit 125\necho 1\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&podman, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let dir = export_dir(root.path(), &sha('d')).unwrap();
+
+        assert!(save_export(&podman, &sha('d'), &dir).is_err());
+        let id = "d".repeat(64);
+        let oci = dir.join("oci");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!(
+                "image inspect --format {{{{.Size}}}} {id}\nsave --format oci-dir --uncompressed --output {} {id}\n",
+                oci.display()
+            )
+        );
+        assert!(!dir.exists());
     }
 }
