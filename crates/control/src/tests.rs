@@ -625,6 +625,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "image.build.target.v1",
             "image.build.static.v1",
             "image.build.untrusted_source.v1",
+            "image.build.concurrent.v1",
             "workload.registry_auth.v1",
             "builder.reconcile.v1",
             "image.prune.v1",

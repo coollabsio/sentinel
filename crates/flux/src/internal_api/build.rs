@@ -67,6 +67,8 @@ pub(super) struct ImageBuildApiRequest {
     image_password: String,
     #[serde(default)]
     untrusted_source: bool,
+    #[serde(default)]
+    max_concurrent_builds: u32,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +78,10 @@ pub(super) struct BuilderReconcileApiRequest {
     enabled: bool,
     #[serde(default)]
     max_used_space_bytes: u64,
+    #[serde(default)]
+    memory_limit_bytes: u64,
+    #[serde(default)]
+    cpu_limit_millis: u32,
 }
 
 fn invalid_response() -> ApiError {
@@ -132,6 +138,7 @@ pub(super) async fn image_build(
             image_username: request.image_username,
             image_password: request.image_password,
             untrusted_source: request.untrusted_source,
+            max_concurrent_builds: request.max_concurrent_builds,
         }),
         DEPLOY_TIMEOUT,
     )
@@ -161,6 +168,8 @@ pub(super) async fn builder_reconcile(
         Payload::BuilderReconcile(BuilderReconcileRequest {
             enabled: request.enabled,
             max_used_space_bytes: request.max_used_space_bytes,
+            memory_limit_bytes: request.memory_limit_bytes,
+            cpu_limit_millis: request.cpu_limit_millis,
         }),
         DEPLOY_TIMEOUT,
     )
@@ -174,6 +183,8 @@ pub(super) async fn builder_reconcile(
         "enabled": value.enabled,
         "running": value.running,
         "apparmor_profile": value.apparmor_profile,
+        "replace_pending": value.replace_pending,
+        "memory_limit_bytes": value.memory_limit_bytes,
     })))
 }
 

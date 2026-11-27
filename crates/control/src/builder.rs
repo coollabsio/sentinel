@@ -58,6 +58,20 @@ const MAX_INLINE_DOCKERFILE_BYTES: usize = 128 * 1024;
 const APPARMOR_PROFILE: &str = "coolify-buildkit";
 const APPARMOR_PROFILE_PATH: &str = "etc/apparmor.d/coolify-buildkit";
 const DEFAULT_CACHE_PERCENT: u64 = 20;
+/// BuildKit gets this share of the memory of the Node when Coolify sends no
+/// limit (decision 0035 of Coolify).
+const DEFAULT_MEMORY_PERCENT: u64 = 50;
+const MIN_MEMORY_LIMIT: u64 = 256 * 1024 * 1024;
+/// Half of the default CPU weight: builds use idle CPU, and workloads get the
+/// CPU first when the Node is busy.
+const BUILDKIT_CPU_SHARES: &str = "512";
+const BUILDKIT_PIDS_LIMIT: &str = "4096";
+/// The build container only clones, prepares, and calls `buildctl`. The `RUN`
+/// steps run in BuildKit.
+const BUILD_CONTAINER_MEMORY: &str = "1g";
+const BUILD_CONTAINER_CPUS: &str = "1";
+const BUILD_CONTAINER_PIDS_LIMIT: &str = "1024";
+pub(crate) const BUILDER_BUSY: &str = "The builder is busy.";
 /// One directory per local build. It holds the docker archive until
 /// `image.load.v1` loads it.
 const OUTPUT_DIR: &str = "var/lib/coolify/builder/out";
@@ -117,8 +131,10 @@ fn uid_map() -> [String; 4] {
 
 pub(crate) fn buildkitd_config(max_used_space_bytes: u64) -> String {
     let reserved = (max_used_space_bytes / 4).min(10 * 1024 * 1024 * 1024);
+    // BuildKit removes cache until 10% of the disk is free, so the cache never
+    // fills the disk of the workloads.
     format!(
-        "[worker.oci]\n  gc = true\n  maxUsedSpace = \"{max_used_space_bytes}\"\n  reservedSpace = \"{reserved}\"\n"
+        "[worker.oci]\n  gc = true\n  maxUsedSpace = \"{max_used_space_bytes}\"\n  reservedSpace = \"{reserved}\"\n  minFreeSpace = \"10%\"\n"
     )
 }
 
@@ -168,6 +184,113 @@ fn root_disk_bytes() -> u64 {
         .map_or(0, |disk| disk.total_space())
 }
 
+fn host_memory_bytes() -> u64 {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    system.total_memory()
+}
+
+/// The memory limit of BuildKit: the requested value, or 50% of the Node.
+pub(crate) fn buildkit_memory_limit(requested: u64, host_memory: u64) -> Result<u64, String> {
+    let limit = match requested {
+        0 => host_memory * DEFAULT_MEMORY_PERCENT / 100,
+        value => value,
+    };
+    if limit < MIN_MEMORY_LIMIT || (host_memory > 0 && limit > host_memory) {
+        return Err(
+            "The memory limit of the builder must be between 256 MiB and the memory of the Node."
+                .into(),
+        );
+    }
+    Ok(limit)
+}
+
+/// `--cpus` of BuildKit, or None without a limit.
+pub(crate) fn buildkit_cpus(millis: u32, host_cpus: usize) -> Result<Option<String>, String> {
+    if millis == 0 {
+        return Ok(None);
+    }
+    if millis < 100 || u64::from(millis) > host_cpus as u64 * 1000 {
+        return Err(
+            "The CPU limit of the builder must be between 0.1 and the CPUs of the Node.".into(),
+        );
+    }
+    Ok(Some(format!("{}.{:03}", millis / 1000, millis % 1000)))
+}
+
+/// The arguments of `podman run` that limit `coolify-buildkitd`.
+pub(crate) fn buildkit_limit_arguments(memory_limit: u64, cpus: Option<&str>) -> Vec<String> {
+    let mut arguments: Vec<String> = vec![
+        "--memory".into(),
+        memory_limit.to_string(),
+        // No swap above the limit: the kernel stops BuildKit instead of
+        // slowing down the workloads of the Node.
+        "--memory-swap".into(),
+        memory_limit.to_string(),
+        "--cpu-shares".into(),
+        BUILDKIT_CPU_SHARES.into(),
+        "--pids-limit".into(),
+        BUILDKIT_PIDS_LIMIT.into(),
+    ];
+    if let Some(cpus) = cpus {
+        arguments.extend(["--cpus".into(), cpus.into()]);
+    }
+    arguments
+}
+
+/// The names of the build containers that run now.
+fn running_builds(podman: &Path) -> Result<Vec<String>, String> {
+    let output = output_with_timeout(
+        Command::new(podman).args([
+            "ps",
+            "--filter",
+            &format!("label={BUILD_LABEL}"),
+            "--format",
+            "{{.Names}}",
+        ]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .map_err(|error| podman_failure(&error))?;
+    if !output.status.success() {
+        return Err(stderr_or(
+            &output.stderr,
+            "Podman could not list the builds.",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Whether a build may start: fewer than `max` other builds run. 0 does not check.
+pub(crate) fn builder_has_slot(running: &[String], own_name: &str, max: u32) -> bool {
+    max == 0
+        || running
+            .iter()
+            .filter(|name| name.as_str() != own_name)
+            .count()
+            < max as usize
+}
+
+fn container_running(podman: &Path, name: &str) -> bool {
+    output_with_timeout(
+        Command::new(podman).args([
+            "container",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+            name,
+        ]),
+        PODMAN_QUERY_TIMEOUT,
+    )
+    .is_ok_and(|output| {
+        output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true"
+    })
+}
+
 fn own_by_build_user(path: &Path) -> Result<(), String> {
     std::os::unix::fs::chown(
         path,
@@ -196,6 +319,8 @@ pub(crate) fn reconcile(
             enabled: false,
             running: false,
             apparmor_profile: false,
+            replace_pending: false,
+            memory_limit_bytes: 0,
         });
     }
 
@@ -208,6 +333,11 @@ pub(crate) fn reconcile(
         return Err("The build cache limit must be at least 1 GiB.".into());
     }
 
+    let memory_limit = buildkit_memory_limit(request.memory_limit_bytes, host_memory_bytes())?;
+    let host_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let cpus = buildkit_cpus(request.cpu_limit_millis, host_cpus)?;
+    let limits = buildkit_limit_arguments(memory_limit, cpus.as_deref());
+
     let dir = builder_dir(root);
     let config = buildkitd_config(max_used_space);
     write_if_changed(&dir.join("buildkitd.toml"), config.as_bytes(), 0o644)?;
@@ -219,8 +349,21 @@ pub(crate) fn reconcile(
     let mut fingerprint = config.into_bytes();
     fingerprint.extend_from_slice(BUILDKIT_IMAGE.as_bytes());
     fingerprint.push(u8::from(apparmor_profile));
+    fingerprint.extend_from_slice(limits.join(" ").as_bytes());
     let config_hash = hash(&fingerprint);
     if !running_with_hash(podman, BUILDKIT_CONTAINER, &config_hash) {
+        // A replace stops every build in BuildKit. A running BuildKit keeps
+        // its old settings until its builds end; Coolify starts no new build
+        // on this Node meanwhile and reconciles again.
+        if container_running(podman, BUILDKIT_CONTAINER) && !running_builds(podman)?.is_empty() {
+            return Ok(BuilderReconcileResult {
+                enabled: true,
+                running: true,
+                apparmor_profile,
+                replace_pending: true,
+                memory_limit_bytes: memory_limit,
+            });
+        }
         let mut arguments: Vec<String> = vec![
             "run".into(),
             "--detach".into(),
@@ -242,6 +385,7 @@ pub(crate) fn reconcile(
             "host".into(),
         ];
         arguments.extend(uid_map());
+        arguments.extend(limits);
         arguments.extend([
             "--security-opt".into(),
             "seccomp=unconfined".into(),
@@ -286,6 +430,8 @@ pub(crate) fn reconcile(
         enabled: true,
         running: true,
         apparmor_profile,
+        replace_pending: false,
+        memory_limit_bytes: memory_limit,
     })
 }
 
@@ -804,6 +950,12 @@ pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<S
         "no".into(),
         "--label".into(),
         format!("{BUILD_LABEL}={}", request.build_id),
+        "--memory".into(),
+        BUILD_CONTAINER_MEMORY.into(),
+        "--cpus".into(),
+        BUILD_CONTAINER_CPUS.into(),
+        "--pids-limit".into(),
+        BUILD_CONTAINER_PIDS_LIMIT.into(),
     ];
     arguments.extend(uid_map());
     arguments.extend([
@@ -941,6 +1093,17 @@ pub(crate) fn start(
     }
     if !socket_dir(root).join("buildkitd.sock").exists() {
         return Err("BuildKit is not running on this Node.".into());
+    }
+    // The second check of the limit (decision 0035 of Coolify): Coolify
+    // claims a slot first and puts the build back in its queue on this error.
+    if request.max_concurrent_builds > 0
+        && !builder_has_slot(
+            &running_builds(podman)?,
+            &name,
+            request.max_concurrent_builds,
+        )
+    {
+        return Err(BUILDER_BUSY.into());
     }
     let local = is_local_image(&request.image);
     if local {
@@ -1157,6 +1320,53 @@ mod tests {
             target: target.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn limits_buildkit_and_the_build_container() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(buildkit_memory_limit(0, 8 * gib), Ok(4 * gib));
+        assert_eq!(buildkit_memory_limit(2 * gib, 8 * gib), Ok(2 * gib));
+        assert!(buildkit_memory_limit(9 * gib, 8 * gib).is_err());
+        assert!(buildkit_memory_limit(1024, 8 * gib).is_err());
+        assert_eq!(buildkit_cpus(0, 4), Ok(None));
+        assert_eq!(buildkit_cpus(1500, 4), Ok(Some("1.500".into())));
+        assert!(buildkit_cpus(5000, 4).is_err());
+        assert!(buildkit_cpus(50, 4).is_err());
+        let arguments = buildkit_limit_arguments(4 * gib, Some("1.500"));
+        for pair in [
+            ["--memory", "4294967296"],
+            ["--memory-swap", "4294967296"],
+            ["--cpu-shares", "512"],
+            ["--pids-limit", "4096"],
+            ["--cpus", "1.500"],
+        ] {
+            assert!(
+                arguments.windows(2).any(|window| window == pair),
+                "{pair:?}"
+            );
+        }
+        assert!(!buildkit_limit_arguments(gib, None).contains(&"--cpus".to_string()));
+        let build = build_arguments(Path::new("/"), &dockerfile_build(""));
+        for pair in [
+            ["--memory", "1g"],
+            ["--cpus", "1"],
+            ["--pids-limit", "1024"],
+        ] {
+            assert!(build.windows(2).any(|window| window == pair), "{pair:?}");
+        }
+        assert!(buildkitd_config(2 * gib).contains("minFreeSpace = \"10%\""));
+    }
+
+    #[test]
+    fn refuses_a_build_at_the_limit() {
+        let running = vec!["coolify-build-a".to_string(), "coolify-build-b".to_string()];
+        assert!(builder_has_slot(&running, "coolify-build-c", 0));
+        assert!(builder_has_slot(&running, "coolify-build-c", 3));
+        assert!(!builder_has_slot(&running, "coolify-build-c", 2));
+        // A retry of a running build does not count itself.
+        assert!(builder_has_slot(&running, "coolify-build-b", 2));
+        assert!(builder_has_slot(&[], "coolify-build-a", 1));
     }
 
     #[test]

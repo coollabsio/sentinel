@@ -818,6 +818,10 @@ message ImageBuildRequest {
   // commit. Submodules and Git LFS objects from other repositories get no
   // credential. Needs `image.build.untrusted_source.v1`.
   bool untrusted_source = 21;
+  // The number of builds that this Node may run at the same time. At the
+  // limit, Sentinel refuses the build with "The builder is busy." 0 does not
+  // check. Needs `image.build.concurrent.v1`.
+  uint32 max_concurrent_builds = 22;
 }
 
 message ImageBuildResult {
@@ -953,6 +957,12 @@ message BuilderReconcileRequest {
   // 3 and 4 were the push login of the built-in registry.
   reserved 3, 4;
   reserved "push_username", "push_password";
+  // The memory limit of `coolify-buildkitd`. 0 uses 50% of the memory of the
+  // Node. Needs `image.build.concurrent.v1`.
+  uint64 memory_limit_bytes = 5;
+  // The CPU limit of `coolify-buildkitd` in thousandths of a CPU. 0 sets no
+  // limit. Needs `image.build.concurrent.v1`.
+  uint32 cpu_limit_millis = 6;
 }
 
 message BuilderReconcileResult {
@@ -960,6 +970,11 @@ message BuilderReconcileResult {
   bool running = 2;
   // A user-namespace AppArmor profile was needed and is loaded.
   bool apparmor_profile = 3;
+  // The limits changed while builds run. BuildKit keeps the old limits and
+  // is replaced by the next reconcile after the builds end.
+  bool replace_pending = 4;
+  // The memory limit of `coolify-buildkitd` that applies now.
+  uint64 memory_limit_bytes = 5;
 }
 
 // Deletes Coolify volumes. Sentinel rejects the request when a container

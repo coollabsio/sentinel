@@ -85,6 +85,11 @@ pub const CAPABILITY_IMAGE_BUILD_STATIC: &str = "image.build.static.v1";
 /// the repository of the build. Not a command: an older Sentinel ignores the
 /// field and would give the credential to every repository on the host.
 pub const CAPABILITY_IMAGE_BUILD_UNTRUSTED_SOURCE: &str = "image.build.untrusted_source.v1";
+/// `image.build.v1` accepts `max_concurrent_builds` and refuses a build at the
+/// limit, and `builder.reconcile.v1` accepts the memory and CPU limits of
+/// BuildKit (decision 0035 of Coolify). Not a command: an older Sentinel
+/// ignores the fields.
+pub const CAPABILITY_IMAGE_BUILD_CONCURRENT: &str = "image.build.concurrent.v1";
 /// Removes unused images and ended build containers, except a keep list
 /// (decision 0027 of Coolify).
 pub const CAPABILITY_IMAGE_PRUNE: &str = "image.prune.v1";
@@ -93,7 +98,7 @@ pub const CAPABILITY_IMAGE_PRUNE: &str = "image.prune.v1";
 /// carry the generation and the hash of the set, and Sentinel sends
 /// `WorkloadStatus` events.
 pub const CAPABILITY_WORKLOAD_RECONCILE: &str = "workload.reconcile.v1";
-pub const BUILD_CAPABILITIES: [&str; 15] = [
+pub const BUILD_CAPABILITIES: [&str; 16] = [
     CAPABILITY_IMAGE_BUILD,
     CAPABILITY_IMAGE_BUILD_PRIVATE_GIT,
     CAPABILITY_IMAGE_LOAD,
@@ -106,6 +111,7 @@ pub const BUILD_CAPABILITIES: [&str; 15] = [
     CAPABILITY_IMAGE_BUILD_TARGET,
     CAPABILITY_IMAGE_BUILD_STATIC,
     CAPABILITY_IMAGE_BUILD_UNTRUSTED_SOURCE,
+    CAPABILITY_IMAGE_BUILD_CONCURRENT,
     CAPABILITY_WORKLOAD_REGISTRY_AUTH,
     CAPABILITY_BUILDER_RECONCILE,
     CAPABILITY_IMAGE_PRUNE,
