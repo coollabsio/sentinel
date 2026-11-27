@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `ImageBuildRequest` carries Git credentials and `WorkloadDeployRequest`
     // the registry login, variables, and secret files; lib.rs redacts them.
     // Presigned S3 URLs of volume backups and restores, and the image transfer
-    // secrets, too. One call: a
+    // secrets, too, and the basic auth hash of an ingress route. One call: a
     // second `skip_debug` replaces the first list.
     prost.skip_debug([
         ".coolify.sentinel.control.v1.ImageBuildRequest",
@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ".coolify.sentinel.control.v1.DatabaseRestoreRequest",
         ".coolify.sentinel.control.v1.ImageServeRequest",
         ".coolify.sentinel.control.v1.ImageFetchRequest",
+        ".coolify.sentinel.control.v1.IngressRoute",
     ]);
 
     tonic_prost_build::configure()

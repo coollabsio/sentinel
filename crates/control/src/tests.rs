@@ -611,6 +611,7 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "ingress.reconcile.v1",
             "ingress.tls.v1",
             "ingress.routes.v2",
+            "ingress.route_options.v1",
             "network.firewall.published_ports.v1",
             "image.build.v1",
             "image.build.private_git.v1",

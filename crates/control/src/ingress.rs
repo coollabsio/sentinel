@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha512};
 use tokio::sync::{Notify, watch};
 
+use crate::ingress_options::RouteOptions;
 use crate::ingress_tls::{Challenge, LoadedCertificate};
 use crate::network::{
     atomic_write, run as run_command, state_path, valid_discovery_label, write_if_changed,
@@ -57,6 +58,7 @@ const INGRESS_HOME: &str = "/var/lib/coolify-ingress";
 const NODE_NAMESPACE: &str = "nodes";
 const NO_UPSTREAM_BODY: &str = "No healthy upstream\n";
 const NOT_FOUND_BODY: &str = "Not Found\n";
+const INVALID_OPTIONS_BODY: &str = "The proxy options of this route are invalid\n";
 
 /// Serializes the renderer with the ingress command and cluster leave, so a
 /// render cannot re-create the configuration after ingress was removed.
@@ -136,6 +138,11 @@ pub(crate) fn validate_routes(request: &IngressReconcileRequest) -> Result<(), S
         }
         if !valid_route_path(&route.path) {
             return Err("An ingress route path is invalid.".into());
+        }
+        let options = RouteOptions::of(route);
+        options.validate()?;
+        if !route.redirect_host.is_empty() && !options.is_empty() {
+            return Err("An ingress redirect route cannot have proxy options.".into());
         }
         if route.redirect_host.is_empty() {
             if !valid_discovery_label(&route.workload_id)
@@ -222,6 +229,9 @@ pub(crate) struct StoredRoute {
     pub(crate) temporary_redirect: bool,
     pub(crate) noindex: bool,
     pub(crate) strip_path: bool,
+    /// The stored form of the route options: empty, or canonical JSON. See
+    /// [`RouteOptions::stored`].
+    pub(crate) options: String,
 }
 
 impl From<&IngressRoute> for StoredRoute {
@@ -238,6 +248,7 @@ impl From<&IngressRoute> for StoredRoute {
             temporary_redirect: route.temporary_redirect,
             noindex: route.noindex,
             strip_path: route.strip_path,
+            options: RouteOptions::of(route).stored(),
         }
     }
 }
@@ -277,7 +288,9 @@ pub(crate) enum RouteWrite {
 }
 
 pub(crate) fn routes_query_sql() -> &'static str {
-    "SELECT host, path, workload_id, namespace, port, redirect_host, http_only, allow_http, temporary_redirect, noindex, strip_path, revision FROM ingress_http_routes WHERE revision = (SELECT MAX(revision) FROM ingress_http_routes) ORDER BY host, path"
+    // The options of a route are in the transaction of the route, so they
+    // have its revision.
+    "SELECT r.host, r.path, r.workload_id, r.namespace, r.port, r.redirect_host, r.http_only, r.allow_http, r.temporary_redirect, r.noindex, r.strip_path, r.revision, COALESCE(o.options, '') FROM ingress_http_routes r LEFT JOIN ingress_route_options o ON o.host = r.host AND o.path = r.path AND o.revision = r.revision WHERE r.revision = (SELECT MAX(revision) FROM ingress_http_routes) ORDER BY r.host, r.path"
 }
 
 pub(crate) fn names_query_sql() -> &'static str {
@@ -412,8 +425,26 @@ pub(crate) fn route_transaction(
             ]
         ]));
     }
+    // Only a route with options has a row, so an older Sentinel never gets a
+    // change of this table while no route uses an option.
+    let mut routes = request.routes.iter().collect::<Vec<_>>();
+    routes.sort_by(|left, right| (&left.host, &left.path).cmp(&(&right.host, &right.path)));
+    for route in routes {
+        let options = RouteOptions::of(route).stored();
+        if options.is_empty() {
+            continue;
+        }
+        transaction.push(json!([
+            "INSERT INTO ingress_route_options (host, path, options, revision, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (host, path) DO UPDATE SET options = excluded.options, revision = excluded.revision, updated_at = excluded.updated_at WHERE excluded.revision >= ingress_route_options.revision",
+            [route.host, route.path, options, revision, now]
+        ]));
+    }
     transaction.push(json!([
         "DELETE FROM ingress_http_routes WHERE revision < ?",
+        [revision]
+    ]));
+    transaction.push(json!([
+        "DELETE FROM ingress_route_options WHERE revision < ?",
         [revision]
     ]));
     Ok(transaction)
@@ -496,6 +527,7 @@ pub(crate) fn parse_stored_routes(rows: &[Vec<Value>]) -> Result<StoredRoutes, S
             .get(11)
             .and_then(Value::as_u64)
             .ok_or("Corrosion returned an invalid ingress route.")?;
+        let options = text(12).ok_or("Corrosion returned an invalid ingress route.")?;
         stored.revision = Some(
             stored
                 .revision
@@ -513,6 +545,7 @@ pub(crate) fn parse_stored_routes(rows: &[Vec<Value>]) -> Result<StoredRoutes, S
             temporary_redirect,
             noindex,
             strip_path,
+            options,
         });
     }
     Ok(stored)
@@ -581,7 +614,7 @@ pub(crate) fn parse_live_endpoints(rows: &[Vec<Value>]) -> Vec<LiveEndpoint> {
         .collect()
 }
 
-fn static_response(status: u16, body: &str) -> Value {
+pub(crate) fn static_response(status: u16, body: &str) -> Value {
     json!({
         "handler": "static_response",
         "status_code": status,
@@ -649,12 +682,21 @@ pub(crate) fn render_caddy_config(
         }
         let mut handle = Vec::new();
         if route.redirect_host.is_empty() {
-            if route.noindex {
-                handle.push(json!({
-                    "handler": "headers",
-                    "response": {"set": {"X-Robots-Tag": ["noindex, nofollow"]}},
-                }));
-            }
+            // A route whose stored options do not parse is not served
+            // without them.
+            let Ok(options) = RouteOptions::parse_stored(&route.options) else {
+                hosts
+                    .entry(route.host.as_str())
+                    .or_insert_with(|| (route, Vec::new()))
+                    .1
+                    .push(json!({
+                        "match": [matcher],
+                        "handle": [static_response(503, INVALID_OPTIONS_BODY)],
+                        "terminal": true,
+                    }));
+                continue;
+            };
+            handle.extend(options.handlers(route.noindex));
             if route.strip_path && !route.path.is_empty() {
                 handle.push(json!({"handler": "rewrite", "strip_path_prefix": route.path}));
             }
@@ -1543,7 +1585,7 @@ mod tests {
 
         let transaction = route_transaction(&request, 1_700_000_000).unwrap();
 
-        assert_eq!(transaction.len(), 3);
+        assert_eq!(transaction.len(), 4);
         for statement in &transaction[..2] {
             assert_eq!(
                 statement[0],
@@ -1590,15 +1632,145 @@ mod tests {
             transaction[2],
             json!(["DELETE FROM ingress_http_routes WHERE revision < ?", [7]])
         );
+        // Routes without options write no option rows.
+        assert_eq!(
+            transaction[3],
+            json!(["DELETE FROM ingress_route_options WHERE revision < ?", [7]])
+        );
 
         // An empty route set clears every older route.
         assert_eq!(
             route_transaction(&self::request(8, vec![]), 1).unwrap(),
-            vec![json!([
-                "DELETE FROM ingress_http_routes WHERE revision < ?",
-                [8]
-            ])]
+            vec![
+                json!(["DELETE FROM ingress_http_routes WHERE revision < ?", [8]]),
+                json!(["DELETE FROM ingress_route_options WHERE revision < ?", [8]]),
+            ]
         );
+    }
+
+    fn protected(host: &str) -> IngressRoute {
+        IngressRoute {
+            basic_auth_username: "admin".into(),
+            basic_auth_password_hash: format!("$2y$10${}", "a".repeat(53)),
+            allowed_ips: vec!["203.0.113.0/24".into()],
+            response_headers: vec![sentinel_protocol::control::v1::IngressHeader {
+                name: "X-Frame-Options".into(),
+                value: "DENY".into(),
+            }],
+            compress: true,
+            ..route(host, "web", 3000)
+        }
+    }
+
+    #[test]
+    fn route_options_are_stored_with_the_route_revision() {
+        let request = request(
+            9,
+            vec![
+                route("b.example.com", "api", 4000),
+                protected("a.example.com"),
+            ],
+        );
+        let transaction = route_transaction(&request, 5).unwrap();
+        let options = transaction
+            .iter()
+            .filter(|statement| {
+                statement[0]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("INSERT INTO ingress_route_options")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0][1][0], "a.example.com");
+        assert_eq!(
+            options[0][1][2],
+            RouteOptions::of(&protected("a.example.com")).stored()
+        );
+        assert_eq!(options[0][1][3], 9);
+
+        // A stored row with options parses back to the same route.
+        let row = vec![
+            json!("a.example.com"),
+            json!(""),
+            json!("web"),
+            json!("default"),
+            json!(3000),
+            json!(""),
+            json!(0),
+            json!(0),
+            json!(0),
+            json!(0),
+            json!(0),
+            json!(9),
+            json!(RouteOptions::of(&protected("a.example.com")).stored()),
+        ];
+        let parsed = parse_stored_routes(&[row]).unwrap();
+        assert_eq!(
+            parsed.routes,
+            vec![StoredRoute::from(&protected("a.example.com"))]
+        );
+        // The same revision with changed options is a conflict, not a silent skip.
+        let mut changed = protected("a.example.com");
+        changed.allowed_ips = vec!["198.51.100.0/24".into()];
+        assert!(plan_route_write(&parsed, &self::request(9, vec![changed]), 1).is_err());
+    }
+
+    #[test]
+    fn route_options_are_validated_and_refused_on_redirects() {
+        assert!(validate_routes(&request(1, vec![protected("a.example.com")])).is_ok());
+        let mut invalid = protected("a.example.com");
+        invalid.request_headers = vec![sentinel_protocol::control::v1::IngressHeader {
+            name: "Host".into(),
+            value: "b.example.com".into(),
+        }];
+        assert!(validate_routes(&request(1, vec![invalid])).is_err());
+        let redirect = IngressRoute {
+            host: "www.a.example.com".into(),
+            redirect_host: "a.example.com".into(),
+            compress: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_routes(&request(1, vec![redirect])),
+            Err("An ingress redirect route cannot have proxy options.".into())
+        );
+    }
+
+    #[test]
+    fn renders_route_options_before_the_proxy_and_fails_closed() {
+        let mut route = StoredRoute::from(&protected("a.example.com"));
+        route.path = "/api".into();
+        route.strip_path = true;
+        route.noindex = true;
+        let endpoints = [endpoint("web", "10.240.0.2", "100.64.0.5")];
+        let rendered = config(&[route.clone()], &endpoints);
+        let handle = &rendered["apps"]["http"]["servers"]["ingress"]["routes"][0]["handle"];
+        let names = handle
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|handler| handler["handler"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "subroute",
+                "authentication",
+                "headers",
+                "headers",
+                "encode",
+                "rewrite",
+                "reverse_proxy"
+            ]
+        );
+
+        // Changed stored options are not served without their protection.
+        route.options = r#"{"allowed_ips":["0.0.0.0/0"],"unknown":1}"#.into();
+        let rendered = config(&[route], &endpoints);
+        let handle = &rendered["apps"]["http"]["servers"]["ingress"]["routes"][0]["handle"];
+        assert_eq!(handle.as_array().unwrap().len(), 1);
+        assert_eq!(handle[0]["status_code"], 503);
     }
 
     #[test]
@@ -1798,8 +1970,8 @@ mod tests {
     #[test]
     fn query_events_parse_rows_and_reject_errors_or_truncation() {
         let output = br#"{"columns":["host","path","workload_id","namespace","port","redirect_host","http_only","allow_http","temporary_redirect","noindex","strip_path","revision"]}
-{"row":[1,["a.example.com","","web","default",3000,"",0,0,0,0,0,7]]}
-{"row":[2,["b.example.com","","api","default",4000,"",0,0,0,0,0,7]]}
+{"row":[1,["a.example.com","","web","default",3000,"",0,0,0,0,0,7,""]]}
+{"row":[2,["b.example.com","","api","default",4000,"",0,0,0,0,0,7,""]]}
 {"eoq":{"time":0.001}}
 "#;
         let rows = parse_query_events(output).unwrap();
@@ -1886,7 +2058,7 @@ mod tests {
         assert!(sql.contains("namespace != 'nodes'"));
         assert!(
             routes_query_sql()
-                .contains("WHERE revision = (SELECT MAX(revision) FROM ingress_http_routes)")
+                .contains("WHERE r.revision = (SELECT MAX(revision) FROM ingress_http_routes)")
         );
     }
 

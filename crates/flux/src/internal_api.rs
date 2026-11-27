@@ -13,8 +13,8 @@ use sentinel_protocol::control::v1::{
     ClusterLeaveRequest, Command, CommandResult, CommandStatus, ContainerListRequest,
     ContainerLogsRequest, ContainerPort, CorrosionInspectRequest, CorrosionReconcileRequest,
     FirewallIngressRule, FirewallInspectRequest, FirewallPublishedPort, FirewallReconcileRequest,
-    FirewallRule, FirewallStackRule, IngressReconcileRequest, IngressRoute, LogSource,
-    LogsReadRequest, SystemInfoRequest, SystemPingRequest, TrustBundleUpdateRequest,
+    FirewallRule, FirewallStackRule, IngressHeader, IngressReconcileRequest, IngressRoute,
+    LogSource, LogsReadRequest, SystemInfoRequest, SystemPingRequest, TrustBundleUpdateRequest,
     WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest,
     WorkloadDeployRequest, WorkloadEnvironmentVariable, WorkloadFile, WorkloadHealthCheck,
     WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadName, WorkloadSecret,
@@ -23,13 +23,13 @@ use sentinel_protocol::control::v1::{
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
     CAPABILITY_CORROSION_INSPECT, CAPABILITY_CORROSION_RECONCILE, CAPABILITY_FIREWALL_INSPECT,
-    CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_INGRESS_RECONCILE, CAPABILITY_LOGS_READ,
-    CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING, CAPABILITY_TRUST_BUNDLE_UPDATE,
-    CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE, CAPABILITY_WIREGUARD_RECONCILE,
-    CAPABILITY_WORKLOAD_CONTAINER_SOCKET, CAPABILITY_WORKLOAD_DEPLOY,
-    CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES, CAPABILITY_WORKLOAD_LIFECYCLE,
-    CAPABILITY_WORKLOAD_RUNTIME_OPTIONS, CAPABILITY_WORKLOAD_SECRETS_OWNER,
-    CAPABILITY_WORKLOAD_USER,
+    CAPABILITY_FIREWALL_RECONCILE, CAPABILITY_INGRESS_RECONCILE, CAPABILITY_INGRESS_ROUTE_OPTIONS,
+    CAPABILITY_LOGS_READ, CAPABILITY_SYSTEM_INFO, CAPABILITY_SYSTEM_PING,
+    CAPABILITY_TRUST_BUNDLE_UPDATE, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
+    CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_CONTAINER_SOCKET,
+    CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES,
+    CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RUNTIME_OPTIONS,
+    CAPABILITY_WORKLOAD_SECRETS_OWNER, CAPABILITY_WORKLOAD_USER,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -496,6 +496,44 @@ struct IngressRouteApiRequest {
     noindex: bool,
     #[serde(default)]
     strip_path: bool,
+    #[serde(default)]
+    basic_auth_username: String,
+    #[serde(default)]
+    basic_auth_password_hash: String,
+    #[serde(default)]
+    allowed_ips: Vec<String>,
+    #[serde(default)]
+    request_headers: Vec<IngressHeaderApiRequest>,
+    #[serde(default)]
+    response_headers: Vec<IngressHeaderApiRequest>,
+    #[serde(default)]
+    compress: bool,
+}
+
+#[derive(Deserialize)]
+struct IngressHeaderApiRequest {
+    name: String,
+    value: String,
+}
+
+impl IngressHeaderApiRequest {
+    fn protocol(self) -> IngressHeader {
+        IngressHeader {
+            name: self.name,
+            value: self.value,
+        }
+    }
+}
+
+impl IngressRouteApiRequest {
+    fn has_options(&self) -> bool {
+        !self.basic_auth_username.is_empty()
+            || !self.basic_auth_password_hash.is_empty()
+            || !self.allowed_ips.is_empty()
+            || !self.request_headers.is_empty()
+            || !self.response_headers.is_empty()
+            || self.compress
+    }
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -1125,6 +1163,24 @@ async fn ingress_reconcile(
     let tls_key = base64::engine::general_purpose::STANDARD
         .decode(&request.tls_key)
         .map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, "invalid TLS key"))?;
+    // An older Sentinel ignores the options and would serve the route without
+    // its basic auth or IP allow list.
+    if request
+        .routes
+        .iter()
+        .any(IngressRouteApiRequest::has_options)
+    {
+        let Some(connection) = state.registry.get(&request.server_id).await else {
+            return Err(dispatch_error(CommandDispatchError::Offline).into());
+        };
+        if !connection
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_INGRESS_ROUTE_OPTIONS)
+        {
+            return Err(dispatch_error(CommandDispatchError::Unsupported).into());
+        }
+    }
     let result = dispatch_network(
         &state,
         &headers,
@@ -1150,6 +1206,20 @@ async fn ingress_reconcile(
                     temporary_redirect: route.temporary_redirect,
                     noindex: route.noindex,
                     strip_path: route.strip_path,
+                    basic_auth_username: route.basic_auth_username,
+                    basic_auth_password_hash: route.basic_auth_password_hash,
+                    allowed_ips: route.allowed_ips,
+                    request_headers: route
+                        .request_headers
+                        .into_iter()
+                        .map(IngressHeaderApiRequest::protocol)
+                        .collect(),
+                    response_headers: route
+                        .response_headers
+                        .into_iter()
+                        .map(IngressHeaderApiRequest::protocol)
+                        .collect(),
+                    compress: route.compress,
                 })
                 .collect(),
             names: request

@@ -32,6 +32,11 @@ pub const CAPABILITY_INGRESS_TLS: &str = "ingress.tls.v1";
 /// http_only, allow_http, temporary_redirect, noindex, and strip_path. Not a
 /// command.
 pub const CAPABILITY_INGRESS_ROUTES_V2: &str = "ingress.routes.v2";
+/// `ingress.reconcile.v1` accepts the route options basic auth, IP allow
+/// list, request and response headers, and compression (decision 0031 of
+/// Coolify). Not a command: an older Sentinel ignores the fields and would
+/// serve the route without its protection.
+pub const CAPABILITY_INGRESS_ROUTE_OPTIONS: &str = "ingress.route_options.v1";
 /// `network.firewall.reconcile.v1` accepts `published_ports`, translated in
 /// `table ip coolify_cluster_nat` (decision 0016). Not a command.
 pub const CAPABILITY_FIREWALL_PUBLISHED_PORTS: &str = "network.firewall.published_ports.v1";
@@ -201,7 +206,7 @@ pub const CAPABILITY_WORKLOAD_EXEC: &str = "workload.exec.v1";
 /// Opens an interactive shell in a managed container (decision 0018).
 pub const CAPABILITY_WORKLOAD_TERMINAL: &str = "workload.terminal.v1";
 pub const EXEC_CAPABILITIES: [&str; 2] = [CAPABILITY_WORKLOAD_EXEC, CAPABILITY_WORKLOAD_TERMINAL];
-pub const NETWORK_CAPABILITIES: [&str; 12] = [
+pub const NETWORK_CAPABILITIES: [&str; 13] = [
     CAPABILITY_CLUSTER_LEAVE,
     CAPABILITY_WIREGUARD_KEY_ENSURE,
     CAPABILITY_WIREGUARD_INSPECT,
@@ -213,6 +218,7 @@ pub const NETWORK_CAPABILITIES: [&str; 12] = [
     CAPABILITY_INGRESS_RECONCILE,
     CAPABILITY_INGRESS_TLS,
     CAPABILITY_INGRESS_ROUTES_V2,
+    CAPABILITY_INGRESS_ROUTE_OPTIONS,
     CAPABILITY_FIREWALL_PUBLISHED_PORTS,
 ];
 
@@ -271,6 +277,27 @@ pub mod control {
                     .field("container_ip", &self.container_ip)
                     .field("registry_username", &self.registry_username)
                     .field("registry_password", &redacted(&self.registry_password))
+                    .finish_non_exhaustive()
+            }
+        }
+
+        impl std::fmt::Debug for IngressRoute {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let redacted = |value: &str| if value.is_empty() { "" } else { "[redacted]" };
+                formatter
+                    .debug_struct("IngressRoute")
+                    .field("host", &self.host)
+                    .field("path", &self.path)
+                    .field("workload_id", &self.workload_id)
+                    .field("namespace", &self.namespace)
+                    .field("port", &self.port)
+                    .field("redirect_host", &self.redirect_host)
+                    .field("basic_auth_username", &self.basic_auth_username)
+                    .field(
+                        "basic_auth_password_hash",
+                        &redacted(&self.basic_auth_password_hash),
+                    )
+                    .field("allowed_ips", &self.allowed_ips)
                     .finish_non_exhaustive()
             }
         }

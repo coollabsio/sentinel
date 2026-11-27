@@ -632,6 +632,35 @@ message IngressRoute {
   bool noindex = 10;
   // Removes the `path` prefix before proxying.
   bool strip_path = 11;
+  // The proxy options below need `ingress.route_options.v1` and are empty on
+  // a redirect route. Sentinel stores them in `ingress_route_options`, in the
+  // transaction of the route, and renders them as fixed Caddy handlers in
+  // this order: IP allow list, basic auth, headers, compression.
+  //
+  // Basic auth: both set or both empty. The username has 1 to 64 printable
+  // ASCII characters without `:`. The hash is bcrypt (`$2a$`, `$2b$`, or
+  // `$2y$`) with a cost of 10 to 12; Sentinel never gets the password.
+  string basic_auth_username = 12;
+  string basic_auth_password_hash = 13;
+  // At most 32 IPv4 or IPv6 addresses or CIDR ranges without host bits, for
+  // example "203.0.113.0/24". Other peer addresses get 403.
+  repeated string allowed_ips = 14;
+  // At most 16 each. Set on the request to the workload, or on the response
+  // to the client. See `IngressHeader`.
+  repeated IngressHeader request_headers = 15;
+  repeated IngressHeader response_headers = 16;
+  // Compresses responses with zstd or gzip.
+  bool compress = 17;
+}
+
+// A header that the ingress sets. The name is an HTTP token of at most 64
+// characters, unique in its list without case, and not a connection, framing,
+// proxy, or forwarding header (`Host`, `Connection`, `Proxy-*`,
+// `X-Forwarded-*`, and others). The value has at most 1024 printable ASCII
+// characters without `{` or `}`, so Caddy reads it as literal text.
+message IngressHeader {
+  string name = 1;
+  string value = 2;
 }
 
 message IngressReconcileResult {

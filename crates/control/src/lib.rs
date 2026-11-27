@@ -15,6 +15,7 @@ mod files;
 mod image_prune;
 mod image_transfer;
 mod ingress;
+mod ingress_options;
 mod ingress_tls;
 mod logs;
 mod network;

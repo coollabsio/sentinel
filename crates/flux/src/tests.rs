@@ -2407,3 +2407,112 @@ async fn image_build_route_refuses_an_untrusted_source_without_the_capability() 
     request.abort();
     server.abort();
 }
+
+#[tokio::test]
+async fn ingress_reconcile_route_sends_route_options_only_to_a_sentinel_with_the_capability() {
+    use sentinel_protocol::control::v1::{
+        IngressHeader, command::Payload, control_message::Message,
+    };
+
+    let registry = ConnectionRegistry::default();
+    let (old_sender, _old_receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-old",
+            "connection-1",
+            old_sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_INGRESS_RECONCILE.into()],
+        )
+        .await;
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-2",
+            sender,
+            1,
+            vec![
+                sentinel_protocol::CAPABILITY_INGRESS_RECONCILE.into(),
+                sentinel_protocol::CAPABILITY_INGRESS_ROUTE_OPTIONS.into(),
+            ],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let body = |server_id: &str, route: serde_json::Value| {
+        serde_json::json!({
+            "server_id": server_id,
+            "command_id": "ingress-8",
+            "enabled": true,
+            "caddy_version": "v2.11.7",
+            "revision": 8,
+            "routes": [route],
+        })
+    };
+    let post = |body: serde_json::Value| {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/ingress.reconcile"))
+            .bearer_auth("internal-secret")
+            .json(&body)
+            .send()
+    };
+    let base = serde_json::json!({"host": "app.example.com", "workload_id": "web", "namespace": "default", "port": 3000});
+
+    // An older Sentinel would serve the route without its protection.
+    for (key, value) in [
+        ("basic_auth_username", serde_json::json!("admin")),
+        ("allowed_ips", serde_json::json!(["203.0.113.0/24"])),
+        (
+            "request_headers",
+            serde_json::json!([{"name": "X-A", "value": "1"}]),
+        ),
+        (
+            "response_headers",
+            serde_json::json!([{"name": "X-A", "value": "1"}]),
+        ),
+        ("compress", serde_json::json!(true)),
+    ] {
+        let mut route = base.clone();
+        route[key] = value;
+        let response = post(body("server-old", route)).await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT, "{key}");
+    }
+
+    let mut route = base.clone();
+    route["basic_auth_username"] = serde_json::json!("admin");
+    route["basic_auth_password_hash"] = serde_json::json!("hash");
+    route["allowed_ips"] = serde_json::json!(["203.0.113.0/24"]);
+    route["response_headers"] = serde_json::json!([{"name": "X-Frame-Options", "value": "DENY"}]);
+    route["compress"] = serde_json::json!(true);
+    let request = tokio::spawn(post(body("server-1", route)));
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(Message::Command(command)) = message.message else {
+        panic!("expected a command");
+    };
+    let Some(Payload::IngressReconcile(ingress)) = command.payload else {
+        panic!("expected an ingress reconcile");
+    };
+    let route = &ingress.routes[0];
+    assert_eq!(route.basic_auth_username, "admin");
+    assert_eq!(route.basic_auth_password_hash, "hash");
+    assert_eq!(route.allowed_ips, ["203.0.113.0/24"]);
+    assert_eq!(
+        route.response_headers,
+        [IngressHeader {
+            name: "X-Frame-Options".into(),
+            value: "DENY".into()
+        }]
+    );
+    assert!(route.compress);
+    request.abort();
+    server.abort();
+}
