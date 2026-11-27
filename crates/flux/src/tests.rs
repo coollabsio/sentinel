@@ -2329,3 +2329,81 @@ async fn workload_reconcile_route_sends_the_set_change_and_returns_the_state() {
     assert_eq!(value["statuses"][0]["status"], "progressing");
     server.abort();
 }
+
+#[tokio::test]
+async fn image_build_route_refuses_an_untrusted_source_without_the_capability() {
+    let registry = ConnectionRegistry::default();
+    let (old_sender, _old_receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-old",
+            "connection-1",
+            old_sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_IMAGE_BUILD.into()],
+        )
+        .await;
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-2",
+            sender,
+            1,
+            vec![
+                sentinel_protocol::CAPABILITY_IMAGE_BUILD.into(),
+                sentinel_protocol::CAPABILITY_IMAGE_BUILD_UNTRUSTED_SOURCE.into(),
+            ],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let body = |server_id: &str| {
+        serde_json::json!({
+            "server_id": server_id,
+            "command_id": "build-1",
+            "build_id": "b1",
+            "builder_image": "ghcr.io/coollabsio/coolify-builder:1.0.0",
+            "repository_url": "https://github.com/acme/api.git",
+            "commit_sha": "a".repeat(40),
+            "source_type": "dockerfile",
+            "image": "localhost/api:1",
+            "git_https_token": "token",
+            "untrusted_source": true,
+        })
+    };
+    let post = |body: serde_json::Value| {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/image.build"))
+            .bearer_auth("internal-secret")
+            .json(&body)
+            .send()
+    };
+
+    // An older Sentinel would give the token to every repository of the host.
+    let response = post(body("server-old")).await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+    let request = tokio::spawn(post(body("server-1")));
+    let command = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        command.message
+    else {
+        panic!("expected a command");
+    };
+    let Some(sentinel_protocol::control::v1::command::Payload::ImageBuild(build)) = command.payload
+    else {
+        panic!("expected an image build");
+    };
+    assert!(build.untrusted_source);
+    request.abort();
+    server.abort();
+}

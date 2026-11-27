@@ -14,12 +14,15 @@ use sentinel_protocol::control::v1::{
     ImagePruneRequest, ImageServeRequest,
 };
 use sentinel_protocol::{
-    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_FETCH,
-    CAPABILITY_IMAGE_LOAD, CAPABILITY_IMAGE_PRUNE, CAPABILITY_IMAGE_SERVE,
+    CAPABILITY_BUILDER_RECONCILE, CAPABILITY_IMAGE_BUILD, CAPABILITY_IMAGE_BUILD_UNTRUSTED_SOURCE,
+    CAPABILITY_IMAGE_FETCH, CAPABILITY_IMAGE_LOAD, CAPABILITY_IMAGE_PRUNE, CAPABILITY_IMAGE_SERVE,
 };
 use serde::Deserialize;
 
-use super::{ApiError, ApiState, DEPLOY_TIMEOUT, LIFECYCLE_TIMEOUT, dispatch_with_timeout};
+use super::{
+    ApiError, ApiState, DEPLOY_TIMEOUT, LIFECYCLE_TIMEOUT, dispatch_error, dispatch_with_timeout,
+};
+use crate::CommandDispatchError;
 
 #[derive(Deserialize)]
 pub(super) struct ImageBuildApiRequest {
@@ -62,6 +65,8 @@ pub(super) struct ImageBuildApiRequest {
     image_username: String,
     #[serde(default)]
     image_password: String,
+    #[serde(default)]
+    untrusted_source: bool,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +89,21 @@ pub(super) async fn image_build(
     headers: HeaderMap,
     Json(request): Json<ImageBuildApiRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // An older Sentinel ignores `untrusted_source` and would give the Git
+    // credential to the submodules of the source.
+    if request.untrusted_source {
+        super::authorize(&state.token, &headers)?;
+        let Some(connection) = state.registry.get(&request.server_id).await else {
+            return Err(dispatch_error(CommandDispatchError::Offline).into());
+        };
+        if !connection
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_IMAGE_BUILD_UNTRUSTED_SOURCE)
+        {
+            return Err(dispatch_error(CommandDispatchError::Unsupported).into());
+        }
+    }
     let result = dispatch_with_timeout(
         &state,
         &headers,
@@ -111,6 +131,7 @@ pub(super) async fn image_build(
             static_root: request.static_root,
             image_username: request.image_username,
             image_password: request.image_password,
+            untrusted_source: request.untrusted_source,
         }),
         DEPLOY_TIMEOUT,
     )

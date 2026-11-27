@@ -6,6 +6,10 @@
 //! digests are the DiffIDs, and Podman skips each layer that it already has.
 //! The image ID stays the same; the manifest digest does not.
 //!
+//! The serves of one image (one for each target Node) share one export of
+//! it, which stays on disk until the last of them stops. Each serve has its
+//! own port, secret, and repository name.
+//!
 //! Like the volume transfer (`volume_transfer.rs`), both keep their state in
 //! memory only, because the requests hold the transfer secret, and they share
 //! its port range and its nftables sets. On start Sentinel removes the
@@ -23,7 +27,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -39,7 +43,7 @@ use crate::volume_transfer::{
     revoke_peer, revoke_source, valid_secret, valid_transfer_id,
 };
 
-/// One export per transfer. On disk, not on the `/run` tmpfs: an export is as
+/// One export per image. On disk, not on the `/run` tmpfs: an export is as
 /// large as the uncompressed image.
 const EXPORT_DIR: &str = "var/lib/coolify/image-transfer";
 /// The pull login of one fetch, on the host `/run` (tmpfs).
@@ -81,8 +85,12 @@ fn valid_repository(value: &str) -> bool {
     })
 }
 
-fn export_dir(root: &Path, transfer_id: &str) -> PathBuf {
-    root.join(EXPORT_DIR).join(transfer_id)
+/// The shared export of an image ID (`sha256:<hex>`).
+fn export_dir(root: &Path, image_id: &str) -> Option<PathBuf> {
+    valid_sha256(image_id).then(|| {
+        root.join(EXPORT_DIR)
+            .join(format!("image-{}", &image_id["sha256:".len()..]))
+    })
 }
 
 /// Free disk that the export must leave, so that the Node keeps working.
@@ -207,10 +215,125 @@ pub(crate) fn restore_firewall() {
 }
 
 // ---------------------------------------------------------------------------
+// Shared exports
+
+/// A finished export and the uncompressed size of its image.
+struct SharedExport {
+    export: Arc<Export>,
+    size_bytes: u64,
+}
+
+/// The serves that use one export directory. The slot is locked while
+/// Podman writes the export, so a second serve of the image waits for it
+/// instead of exporting again. It stays empty when the export failed; the
+/// next serve then tries again.
+struct ExportEntry {
+    references: usize,
+    slot: Arc<Mutex<Option<Arc<SharedExport>>>>,
+}
+
+static EXPORTS: Mutex<BTreeMap<PathBuf, ExportEntry>> = Mutex::new(BTreeMap::new());
+
+/// One reference to a shared export. The last one removes the directory.
+struct ExportLease {
+    dir: PathBuf,
+}
+
+impl Drop for ExportLease {
+    fn drop(&mut self) {
+        let mut exports = EXPORTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = exports.get_mut(&self.dir) else {
+            return;
+        };
+        entry.references = entry.references.saturating_sub(1);
+        if entry.references == 0 {
+            exports.remove(&self.dir);
+            // Under the lock, so that a new export of the image cannot start
+            // in the directory while it is removed.
+            remove_dir(&self.dir);
+        }
+    }
+}
+
+/// Returns the export in `dir`, and runs `export` to write it when no other
+/// serve has it. `export` runs without the global locks.
+fn acquire_export(
+    dir: &Path,
+    export: impl FnOnce(&Path) -> Result<SharedExport, String>,
+) -> Result<(ExportLease, Arc<SharedExport>), String> {
+    let slot = {
+        let mut exports = EXPORTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = exports
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| ExportEntry {
+                references: 0,
+                slot: Arc::new(Mutex::new(None)),
+            });
+        entry.references += 1;
+        entry.slot.clone()
+    };
+    let lease = ExportLease {
+        dir: dir.to_path_buf(),
+    };
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(shared) = slot.as_ref() {
+        return Ok((lease, shared.clone()));
+    }
+    let shared = Arc::new(export(dir)?);
+    *slot = Some(shared.clone());
+    Ok((lease, shared))
+}
+
+/// Writes the export of the image `image_id` (`sha256:<hex>`) to `dir` with
+/// `podman save`, after a check that the disk has room for it. It saves by
+/// the ID, not the tag, so that the export is the image of its directory
+/// even when the tag moved meanwhile. The index of the export then names no
+/// tag; the fetch tags the image itself.
+fn save_export(podman: &Path, image_id: &str, dir: &Path) -> Result<SharedExport, String> {
+    let image = image_id.strip_prefix("sha256:").unwrap_or(image_id);
+    remove_dir(dir);
+    // The export is a full uncompressed copy of the image: check the disk
+    // first, so that a transfer never fills it.
+    let size_bytes = image_size(podman, image);
+    if let (Some(size), Some(available)) = (size_bytes, available_bytes(dir)) {
+        ensure_free_space(size, available)?;
+    }
+    create_private_dir(dir)?;
+    let export = (|| {
+        let oci = dir.join("oci");
+        let output = output_with_timeout(
+            Command::new(podman)
+                .args(["save", "--format", "oci-dir", "--uncompressed", "--output"])
+                .arg(&oci)
+                .arg(image),
+            SAVE_TIMEOUT,
+        )
+        .map_err(|error| podman_failure(&error))?;
+        if !output.status.success() {
+            return Err(stderr_or(
+                &output.stderr,
+                "Podman could not export the image.",
+            ));
+        }
+        Export::read(oci)
+    })();
+    match export {
+        Ok(export) => Ok(SharedExport {
+            export: Arc::new(export),
+            size_bytes: size_bytes.unwrap_or(0),
+        }),
+        Err(message) => {
+            remove_dir(dir);
+            Err(message)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // image.serve.v1
 
-/// A served export. Its worker thread owns the listener and removes the
-/// export and the firewall element when it stops.
+/// A served export. Its worker thread owns the listener and the reference
+/// to the shared export, and removes the firewall element when it stops.
 struct Serve {
     generation: u64,
     root: PathBuf,
@@ -287,7 +410,6 @@ pub(crate) fn serve(
     validate_serve(request)?;
     if request.stop {
         let bytes_sent = stop_serve(&request.transfer_id);
-        remove_dir(&export_dir(root, &request.transfer_id));
         return Ok(ImageServeResult {
             bytes_sent,
             ..ImageServeResult::default()
@@ -335,42 +457,12 @@ fn start_serve(
     let Some(image_id) = crate::builder::image_id(podman, &request.image) else {
         return Err("The image is not on this Node anymore.".into());
     };
-    let directory = export_dir(root, &request.transfer_id);
-    remove_dir(&directory);
-    // The export is a full uncompressed copy of the image: check the disk
-    // first, so that a transfer never fills it.
-    let size_bytes = image_size(podman, &request.image);
-    if let (Some(size), Some(available)) = (size_bytes, available_bytes(&directory)) {
-        ensure_free_space(size, available)?;
-    }
-    create_private_dir(&directory)?;
-    let started = (|| {
-        let oci = directory.join("oci");
-        let output = output_with_timeout(
-            Command::new(podman)
-                .args(["save", "--format", "oci-dir", "--uncompressed", "--output"])
-                .arg(&oci)
-                .arg(&request.image),
-            SAVE_TIMEOUT,
-        )
-        .map_err(|error| podman_failure(&error))?;
-        if !output.status.success() {
-            return Err(stderr_or(
-                &output.stderr,
-                "Podman could not export the image.",
-            ));
-        }
-        let export = Export::read(oci, repository_of(&request.transfer_id))?;
-        let listener = bind(mesh.address)?;
-        Ok((export, listener))
-    })();
-    let (export, listener) = match started {
-        Ok(started) => started,
-        Err(message) => {
-            remove_dir(&directory);
-            return Err(message);
-        }
-    };
+    let directory = export_dir(root, &image_id).ok_or("Podman returned an invalid image ID.")?;
+    let (lease, shared) = acquire_export(&directory, |directory| {
+        save_export(podman, &image_id, directory)
+    })?;
+    let repository = repository_of(&request.transfer_id);
+    let listener = bind(mesh.address)?;
     let port = listener
         .local_addr()
         .map(|address| address.port())
@@ -378,16 +470,15 @@ fn start_serve(
     if root == Path::new("/")
         && let Err(message) = allow_peer(&mesh.interface, peer_ip, port)
     {
-        remove_dir(&directory);
         return Err(message);
     }
     let result = ImageServeResult {
         address: mesh.address.to_string(),
         port: u32::from(port),
-        repository: export.repository.clone(),
-        digest: export.manifest_digest.clone(),
+        repository: repository.clone(),
+        digest: shared.export.manifest_digest.clone(),
         image_id,
-        size_bytes: size_bytes.unwrap_or(0),
+        size_bytes: shared.size_bytes,
         bytes_sent: 0,
     };
 
@@ -400,7 +491,15 @@ fn start_serve(
         let transfer_id = request.transfer_id.clone();
         let root = root.to_path_buf();
         std::thread::spawn(move || {
-            run_server(listener, Arc::new(export), secret, &deadline, &stop, sent);
+            run_server(
+                listener,
+                shared.export.clone(),
+                &repository,
+                secret,
+                &deadline,
+                &stop,
+                sent,
+            );
             tracing::info!(transfer_id, "image transfer stopped");
             if root == Path::new("/") {
                 revoke_peer(peer_ip, port);
@@ -412,7 +511,7 @@ fn start_serve(
             {
                 serves.remove(&transfer_id);
             }
-            remove_dir(&export_dir(&root, &transfer_id));
+            drop(lease);
         })
     };
     SERVES
@@ -460,7 +559,6 @@ fn bind(address: Ipv4Addr) -> Result<TcpListener, String> {
 /// The OCI layout that `podman save --format oci-dir` wrote, with one image.
 struct Export {
     dir: PathBuf,
-    repository: String,
     manifest_digest: String,
     manifest_media_type: String,
     /// The config and the layers.
@@ -468,7 +566,7 @@ struct Export {
 }
 
 impl Export {
-    fn read(dir: PathBuf, repository: String) -> Result<Self, String> {
+    fn read(dir: PathBuf) -> Result<Self, String> {
         let invalid = || "Podman wrote an invalid image export.".to_string();
         let read_json = |path: PathBuf| -> Result<serde_json::Value, String> {
             std::fs::read(path)
@@ -518,7 +616,6 @@ impl Export {
         }
         Ok(Self {
             dir,
-            repository,
             manifest_digest,
             manifest_media_type,
             blobs,
@@ -541,11 +638,13 @@ struct Connections {
 fn run_server(
     listener: TcpListener,
     export: Arc<Export>,
+    repository: &str,
     secret: [u8; 32],
     deadline: &AtomicI64,
     stop: &AtomicBool,
     bytes_sent: Arc<AtomicU64>,
 ) {
+    let repository: Arc<str> = repository.into();
     let connections = Arc::new(Mutex::new(Connections::default()));
     let active = Arc::new(AtomicUsize::new(0));
     if listener.set_nonblocking(true).is_err() {
@@ -585,14 +684,15 @@ fn run_server(
             id
         };
         active.fetch_add(1, Ordering::SeqCst);
-        let (export, connections, active, sent) = (
+        let (export, repository, connections, active, sent) = (
             export.clone(),
+            repository.clone(),
             connections.clone(),
             active.clone(),
             bytes_sent.clone(),
         );
         std::thread::spawn(move || {
-            handle_connection(stream, &export, &secret, &sent);
+            handle_connection(stream, &export, &repository, &secret, &sent);
             if let Ok(mut connections) = connections.lock() {
                 connections.open.remove(&id);
             }
@@ -610,6 +710,7 @@ fn run_server(
 fn handle_connection(
     mut stream: TcpStream,
     export: &Export,
+    repository: &str,
     secret: &[u8; 32],
     bytes_sent: &AtomicU64,
 ) {
@@ -630,7 +731,7 @@ fn handle_connection(
             let authorized = request
                 .authorization
                 .is_some_and(|value| authorized(value, secret));
-            route(export, request.method, request.path, authorized)
+            route(export, repository, request.method, request.path, authorized)
         }
         None => Response::error(400, "UNSUPPORTED", "The request is invalid."),
     };
@@ -766,13 +867,25 @@ impl Response {
     }
 }
 
-fn route(export: &Export, method: &str, path: &str, authorized: bool) -> Response {
-    let mut response = route_get(export, method, path, authorized);
+fn route(
+    export: &Export,
+    repository: &str,
+    method: &str,
+    path: &str,
+    authorized: bool,
+) -> Response {
+    let mut response = route_get(export, repository, method, path, authorized);
     response.head_only = method == "HEAD";
     response
 }
 
-fn route_get(export: &Export, method: &str, path: &str, authorized: bool) -> Response {
+fn route_get(
+    export: &Export,
+    served: &str,
+    method: &str,
+    path: &str,
+    authorized: bool,
+) -> Response {
     if method != "GET" && method != "HEAD" {
         let mut response = Response::error(405, "UNSUPPORTED", "Only GET and HEAD are allowed.");
         response.headers.push(("Allow", "GET, HEAD".into()));
@@ -798,7 +911,7 @@ fn route_get(export: &Export, method: &str, path: &str, authorized: bool) -> Res
         return Response::error(404, "NOT_FOUND", "Not found.");
     };
     if let Some((repository, reference)) = rest.rsplit_once("/manifests/") {
-        if repository != export.repository {
+        if repository != served {
             return Response::error(404, "NAME_UNKNOWN", "The repository is unknown.");
         }
         if reference != export.manifest_digest && reference != "latest" {
@@ -812,7 +925,7 @@ fn route_get(export: &Export, method: &str, path: &str, authorized: bool) -> Res
         };
     }
     if let Some((repository, digest)) = rest.rsplit_once("/blobs/") {
-        if repository != export.repository {
+        if repository != served {
             return Response::error(404, "NAME_UNKNOWN", "The repository is unknown.");
         }
         return match blob_path(&export.dir, digest).filter(|_| export.blobs.contains(digest)) {
@@ -1406,7 +1519,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (manifest, layer) = write_export(dir.path());
         std::fs::write(dir.path().join("blobs/sha256").join("c".repeat(64)), b"x").unwrap();
-        let export = Export::read(dir.path().into(), repository_of("move-1")).unwrap();
+        let export = Export::read(dir.path().into()).unwrap();
         assert_eq!(export.manifest_digest, manifest);
         assert_eq!(export.blobs.len(), 2);
 
@@ -1421,6 +1534,7 @@ mod tests {
                 run_server(
                     listener,
                     Arc::new(export),
+                    &repository_of("move-1"),
                     digest(SECRET),
                     &deadline,
                     &stop,
@@ -1509,13 +1623,14 @@ mod tests {
     fn stops_serving_at_the_deadline() {
         let dir = tempfile::tempdir().unwrap();
         write_export(dir.path());
-        let export = Export::read(dir.path().into(), repository_of("move-1")).unwrap();
+        let export = Export::read(dir.path().into()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let deadline = AtomicI64::new(now_millis() + 200);
         let started = Instant::now();
         run_server(
             listener,
             Arc::new(export),
+            &repository_of("move-1"),
             digest(SECRET),
             &deadline,
             &AtomicBool::new(false),
@@ -1530,8 +1645,130 @@ mod tests {
         let (_, layer) = write_export(dir.path());
         std::fs::remove_file(dir.path().join("blobs/sha256").join(&layer[7..])).unwrap();
         assert_eq!(
-            Export::read(dir.path().into(), repository_of("move-1")).err(),
+            Export::read(dir.path().into()).err(),
             Some("Podman wrote an invalid image export.".into())
         );
+    }
+
+    /// An export like `save_export` writes, counted in `calls`.
+    fn fake_export(dir: &Path, calls: &AtomicUsize) -> Result<SharedExport, String> {
+        calls.fetch_add(1, Ordering::SeqCst);
+        create_private_dir(dir)?;
+        let oci = dir.join("oci");
+        write_export(&oci);
+        Ok(SharedExport {
+            export: Arc::new(Export::read(oci)?),
+            size_bytes: 42,
+        })
+    }
+
+    #[test]
+    fn names_the_shared_export_after_the_image_id() {
+        let root = Path::new("/");
+        assert_eq!(
+            export_dir(root, &sha('a')),
+            Some(PathBuf::from(format!(
+                "/var/lib/coolify/image-transfer/image-{}",
+                "a".repeat(64)
+            )))
+        );
+        assert_eq!(export_dir(root, "sha256:../../etc"), None);
+    }
+
+    #[test]
+    fn shares_one_export_until_the_last_serve_stops() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = export_dir(root.path(), &sha('a')).unwrap();
+        let calls = AtomicUsize::new(0);
+
+        let (first, first_export) = acquire_export(&dir, |dir| fake_export(dir, &calls)).unwrap();
+        let (second, second_export) = acquire_export(&dir, |dir| fake_export(dir, &calls)).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&first_export, &second_export));
+        assert_eq!(second_export.size_bytes, 42);
+
+        drop(first);
+        assert!(dir.join("oci/index.json").is_file());
+        drop(second);
+        assert!(!dir.exists());
+
+        // A later serve of the image exports it again.
+        let (third, _) = acquire_export(&dir, |dir| fake_export(dir, &calls)).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(third);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn exports_an_image_once_for_concurrent_serves() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = export_dir(root.path(), &sha('b')).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let serves: Vec<_> = (0..3)
+            .map(|_| {
+                let (dir, calls) = (dir.clone(), calls.clone());
+                std::thread::spawn(move || {
+                    acquire_export(&dir, |dir| {
+                        std::thread::sleep(Duration::from_millis(100));
+                        fake_export(dir, &calls)
+                    })
+                    .map(|(lease, _)| lease)
+                    .unwrap()
+                })
+            })
+            .collect();
+        let leases: Vec<_> = serves
+            .into_iter()
+            .map(|serve| serve.join().unwrap())
+            .collect();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(leases);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn a_waiting_serve_exports_again_after_a_failed_export() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = export_dir(root.path(), &sha('c')).unwrap();
+        let calls = AtomicUsize::new(0);
+        assert_eq!(
+            acquire_export(&dir, |_| Err::<SharedExport, _>("no disk".to_string())).err(),
+            Some("no disk".to_string())
+        );
+        let (lease, _) = acquire_export(&dir, |dir| fake_export(dir, &calls)).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(lease);
+        assert!(!dir.exists());
+        assert!(!EXPORTS.lock().unwrap().contains_key(&dir));
+    }
+
+    #[test]
+    fn exports_the_image_by_its_id() {
+        let root = tempfile::tempdir().unwrap();
+        let podman = root.path().join("podman");
+        let log = root.path().join("podman.log");
+        std::fs::write(
+            &podman,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\n[ \"$1\" = save ] && exit 125\necho 1\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&podman, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let dir = export_dir(root.path(), &sha('d')).unwrap();
+
+        assert!(save_export(&podman, &sha('d'), &dir).is_err());
+        let id = "d".repeat(64);
+        let oci = dir.join("oci");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!(
+                "image inspect --format {{{{.Size}}}} {id}\nsave --format oci-dir --uncompressed --output {} {id}\n",
+                oci.display()
+            )
+        );
+        assert!(!dir.exists());
     }
 }

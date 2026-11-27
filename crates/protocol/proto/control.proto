@@ -726,6 +726,12 @@ message ImageBuildRequest {
   // the push to `image` uses it. Needs `image.build.external_image.v1`.
   string image_username = 19;
   string image_password = 20;
+  // The source is not trusted, for example a pull request from a fork. The
+  // Git credential then opens only the repository of `repository_url`: an
+  // HTTPS token answers only for its path, and an SSH key fetches only the
+  // commit. Submodules and Git LFS objects from other repositories get no
+  // credential. Needs `image.build.untrusted_source.v1`.
+  bool untrusted_source = 21;
 }
 
 message ImageBuildResult {
