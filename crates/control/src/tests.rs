@@ -647,6 +647,8 @@ async fn sends_assignment_request_with_existing_identity_and_protocol_contract()
             "workload.container_socket.v1",
             "workload.user.v1",
             "workload.runtime_options.v1",
+            "workload.runtime_options.v2",
+            "workload.gpu.v1",
             "workload.exec.v1",
             "workload.terminal.v1"
         ])
@@ -1543,6 +1545,7 @@ fn builds_shell_free_podman_deploy_arguments() {
         stop_timeout_seconds: None,
         tty: false,
         stdin_open: false,
+        ..Default::default()
     };
 
     let deploy = crate::commands::podman_deploy_args(std::path::Path::new("/"), &request).unwrap();
@@ -1600,6 +1603,152 @@ fn builds_shell_free_podman_deploy_arguments() {
         &arguments[arguments.len() - 3..],
         ["docker.io/library/alpine:latest", "sleep", "3600"]
     );
+}
+
+#[test]
+fn gives_the_runtime_options_v2_in_a_fixed_order() {
+    use sentinel_protocol::control::v1::{WorkloadHost, WorkloadLabel, WorkloadSysctl};
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("etc/cdi")).unwrap();
+    std::fs::write(
+        root.path().join("etc/cdi/nvidia.yaml"),
+        "kind: nvidia.com/gpu\ndevices:\n- name: \"0\"\n- name: all\n",
+    )
+    .unwrap();
+    let label = |key: &str, value: &str| WorkloadLabel {
+        key: key.into(),
+        value: value.into(),
+    };
+    let request = sentinel_protocol::control::v1::WorkloadDeployRequest {
+        name: "coolify-test-web".into(),
+        image: "docker.io/library/alpine:latest".into(),
+        command: vec!["serve".into()],
+        restart_policy: "no".into(),
+        labels: vec![label("coolify.managed", "true")],
+        user_labels: vec![
+            label("traefik.enable", "true"),
+            label("com.example/team", "web"),
+        ],
+        stop_timeout_seconds: Some(30),
+        init: true,
+        read_only: true,
+        pids_limit: Some(-1),
+        hostname: "web-1".into(),
+        extra_hosts: vec![
+            WorkloadHost {
+                name: "db.example.com".into(),
+                ip: "10.0.0.5".into(),
+            },
+            WorkloadHost {
+                name: "v6.example.com".into(),
+                ip: "2001:db8:0:0::1".into(),
+            },
+        ],
+        entrypoint: vec!["/bin/sh".into(), "-c".into(), "echo \"a b\"".into()],
+        cap_drop: vec!["ALL".into()],
+        cap_add: vec!["NET_BIND_SERVICE".into()],
+        no_new_privileges: true,
+        sysctls: vec![WorkloadSysctl {
+            name: "net.core.somaxconn".into(),
+            value: "4096".into(),
+        }],
+        cdi_devices: vec!["nvidia.com/gpu=0".into()],
+        ..Default::default()
+    };
+    let arguments = crate::commands::podman_deploy_args(root.path(), &request)
+        .unwrap()
+        .arguments;
+    let start = arguments.iter().position(|v| v == "--label").unwrap();
+    assert_eq!(
+        &arguments[start..start + 6],
+        [
+            "--label",
+            "traefik.enable=true",
+            "--label",
+            "com.example/team=web",
+            "--label",
+            "coolify.managed=true",
+        ]
+    );
+    let start = arguments
+        .iter()
+        .position(|v| v == "--stop-timeout")
+        .unwrap();
+    assert_eq!(
+        &arguments[start..],
+        [
+            "--stop-timeout",
+            "30",
+            "--init",
+            "--read-only",
+            "--pids-limit",
+            "-1",
+            "--hostname",
+            "web-1",
+            "--add-host",
+            "db.example.com:10.0.0.5",
+            "--add-host",
+            "v6.example.com:2001:db8::1",
+            "--entrypoint",
+            r#"["/bin/sh","-c","echo \"a b\""]"#,
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "NET_BIND_SERVICE",
+            "--security-opt",
+            "no-new-privileges",
+            "--sysctl",
+            "net.core.somaxconn=4096",
+            "--device",
+            "nvidia.com/gpu=0",
+            "docker.io/library/alpine:latest",
+            "serve",
+        ]
+    );
+
+    let refused = |change: &dyn Fn(&mut sentinel_protocol::control::v1::WorkloadDeployRequest)| {
+        let mut request = request.clone();
+        change(&mut request);
+        crate::commands::podman_deploy_args(root.path(), &request).unwrap_err()
+    };
+    assert_eq!(
+        refused(&|request| request.cap_add = vec!["SYS_ADMIN".into()]),
+        "The capability SYS_ADMIN is not allowed."
+    );
+    assert_eq!(
+        refused(&|request| request.cdi_devices = vec!["nvidia.com/gpu=1".into()]),
+        "The GPU device nvidia.com/gpu=1 is not in the CDI specs of the Node."
+    );
+    assert_eq!(
+        refused(&|request| request.user_labels = vec![label("coolify.workload", "other")]),
+        "The label key coolify.workload is reserved."
+    );
+}
+
+#[test]
+fn refuses_podman_label_keys_in_the_labels() {
+    for key in [
+        "io.containers.autoupdate",
+        "IO.Containers.autoupdate",
+        "io.podman.annotations.label",
+        "PODMAN_SYSTEMD_UNIT",
+    ] {
+        let request = sentinel_protocol::control::v1::WorkloadDeployRequest {
+            name: "coolify-test-web".into(),
+            image: "alpine".into(),
+            restart_policy: "no".into(),
+            labels: vec![sentinel_protocol::control::v1::WorkloadLabel {
+                key: key.into(),
+                value: "x".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::commands::podman_deploy_args(std::path::Path::new("/"), &request).unwrap_err(),
+            format!("The label key {key} is reserved.")
+        );
+    }
 }
 
 #[test]

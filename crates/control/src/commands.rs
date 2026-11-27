@@ -1466,6 +1466,8 @@ pub(crate) fn podman_deploy_args(
             environment.push((key.clone(), value.clone()));
         }
     }
+    // The labels of the user come first, so they never hide a label below.
+    args.extend(crate::runtime_options::user_label_args(request)?);
     for label in &request.labels {
         let key = &label.key;
         let value = &label.value;
@@ -1477,6 +1479,10 @@ pub(crate) fn podman_deploy_args(
             || value.contains('\0')
         {
             return Err("A container label is invalid.".into());
+        }
+        // Podman reads these keys itself, for example for auto-update.
+        if crate::runtime_options::podman_label_key(key) {
+            return Err(format!("The label key {key} is reserved."));
         }
         args.extend(["--label".into(), format!("{key}={value}")]);
     }
@@ -1516,6 +1522,10 @@ pub(crate) fn podman_deploy_args(
     args.extend(crate::container_socket::mount_args(request)?);
     args.extend(crate::workload_user::user_args(request)?);
     args.extend(crate::runtime_options::runtime_args(request)?);
+    args.extend(crate::runtime_options::container_args(request)?);
+    args.extend(crate::isolation::isolation_args(request)?);
+    // Last: it reads the CDI specs of the Node.
+    args.extend(crate::cdi::device_args(root, &request.cdi_devices)?);
     args.push(request.image.clone());
     args.extend(request.command.clone());
     Ok(PodmanDeploy {
@@ -1716,6 +1726,7 @@ fn system_info(sentinel_version: &str, system: &mut System) -> SystemInfoResult 
         .find(|disk| disk.mount_point() == std::path::Path::new("/"));
     let (container_runtime, container_runtime_version) = container_runtime();
     let load = System::load_average();
+    let gpus = crate::cdi::inventory(std::path::Path::new("/"));
 
     SystemInfoResult {
         hostname: System::host_name(),
@@ -1741,6 +1752,8 @@ fn system_info(sentinel_version: &str, system: &mut System) -> SystemInfoResult 
         load_average_five: Some(load.five),
         load_average_fifteen: Some(load.fifteen),
         ingress_certificates: crate::ingress_tls::issuer_statuses(std::path::Path::new("/")),
+        gpu_cdi_devices: gpus.devices,
+        gpu_cdi_check: gpus.check,
     }
 }
 

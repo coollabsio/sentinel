@@ -3,6 +3,7 @@
 mod acme;
 mod assignment;
 mod builder;
+mod cdi;
 mod commands;
 mod connection;
 mod container_logs;
@@ -17,6 +18,7 @@ mod image_transfer;
 mod ingress;
 mod ingress_options;
 mod ingress_tls;
+mod isolation;
 mod logs;
 mod network;
 mod registry;

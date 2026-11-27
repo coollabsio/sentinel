@@ -224,6 +224,13 @@ message SystemInfoResult {
   // The certificate state of every host, reported only by the cluster's
   // certificate issuer.
   repeated IngressCertificateStatus ingress_certificates = 21;
+  // The CDI device names of the kind `nvidia.com/gpu` in the specs of
+  // `/etc/cdi` and `/var/run/cdi`, in the full form `nvidia.com/gpu=<name>`,
+  // sorted and unique (`workload.gpu.v1`).
+  repeated string gpu_cdi_devices = 22;
+  // One line about the CDI check, for example the number of GPUs found or
+  // why no spec was read.
+  string gpu_cdi_check = 23;
 }
 
 message IngressCertificateStatus {
@@ -352,6 +359,56 @@ message WorkloadDeployRequest {
   bool tty = 30;
   // `--interactive`, the Compose `stdin_open`. Needs `workload.runtime_options.v1`.
   bool stdin_open = 31;
+  // CDI devices, `--device <name>` (decision 0032 of Coolify). Each is a full
+  // CDI name of the kind `nvidia.com/gpu`, for example `nvidia.com/gpu=0`,
+  // that the current CDI specs of the Node list. At most 16, unique. Needs
+  // `workload.gpu.v1`.
+  repeated string cdi_devices = 32;
+  // Labels of the user, `--label key=value`, before the labels of `labels`.
+  // At most 64. A key is 1 to 255 characters of `[A-Za-z0-9._/-]` that start
+  // with a letter or a digit, not a key of `labels`, does not start with
+  // `coolify.`, `io.containers.`, or `io.podman.` (any case), and is not
+  // `PODMAN_SYSTEMD_UNIT`. A value is at most 4096 bytes without NUL. Unique.
+  // Fields 33 to 43 need `workload.runtime_options.v2`.
+  repeated WorkloadLabel user_labels = 33;
+  // `--init`.
+  bool init = 34;
+  // `--read-only`.
+  bool read_only = 35;
+  // `--pids-limit`: -1 (unlimited) or 1 to 4194304. Unset keeps the default.
+  optional int64 pids_limit = 36;
+  // `--hostname`: one DNS label of 1 to 63 characters of `[A-Za-z0-9-]`,
+  // without `-` at the start or the end. Empty keeps the default.
+  string hostname = 37;
+  // `--entrypoint` as a JSON array. At most 64 words, each at most 4096 bytes
+  // without NUL; the first word is not empty. Empty keeps the image entrypoint.
+  repeated string entrypoint = 38;
+  // `--add-host name:ip`. At most 32. `name` is a DNS name, `ip` an IPv4 or
+  // IPv6 literal; `host-gateway` is refused.
+  repeated WorkloadHost extra_hosts = 39;
+  // `--cap-add`: an upper-case capability name without `CAP_` from the allow
+  // list of tiers 1 and 2 of decision 0036. Unique, at most 32.
+  repeated string cap_add = 40;
+  // `--cap-drop`: a Linux capability name or `ALL`. Unique, at most 64.
+  repeated string cap_drop = 41;
+  // `--security-opt no-new-privileges`.
+  bool no_new_privileges = 42;
+  // `--sysctl name=value`, from the allow list of tiers 1 and 2 of decision
+  // 0036. Names unique, at most 16.
+  repeated WorkloadSysctl sysctls = 43;
+}
+
+// An entry of `/etc/hosts` in the container.
+message WorkloadHost {
+  string name = 1;
+  string ip = 2;
+}
+
+// A namespaced kernel parameter of the container. The value is one or two
+// numbers of at most 10 digits, separated by one space.
+message WorkloadSysctl {
+  string name = 1;
+  string value = 2;
 }
 
 // A ulimit, `--ulimit name=soft:hard`. `name` is one of `nofile`, `nproc`,

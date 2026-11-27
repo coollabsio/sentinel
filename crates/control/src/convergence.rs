@@ -901,6 +901,103 @@ mod tests {
     }
 
     #[test]
+    fn stores_the_runtime_options_v2_and_converges_a_change_again() {
+        use sentinel_protocol::control::v1::{WorkloadHost, WorkloadSysctl};
+
+        let now = now_millis() + 5_000;
+        let root = tempfile::tempdir().unwrap();
+        let set = WorkloadSet::open(root.path());
+        let with_options = |revision: &str, somaxconn: &str| {
+            let mut put = entry("w1", revision, "coolify-w1", "");
+            put.entry_hash = format!("hash-{revision}-{somaxconn}");
+            let deploy = put.deploy.as_mut().unwrap();
+            deploy.user_labels = vec![WorkloadLabel {
+                key: "com.example/app".into(),
+                value: "web".into(),
+            }];
+            deploy.init = true;
+            deploy.read_only = true;
+            deploy.pids_limit = Some(512);
+            deploy.hostname = "web".into();
+            deploy.entrypoint = vec!["tini".into(), "--".into()];
+            deploy.extra_hosts = vec![WorkloadHost {
+                name: "db".into(),
+                ip: "192.0.2.1".into(),
+            }];
+            deploy.cap_add = vec!["NET_ADMIN".into()];
+            deploy.cap_drop = vec!["ALL".into()];
+            deploy.no_new_privileges = true;
+            deploy.sysctls = vec![WorkloadSysctl {
+                name: "net.core.somaxconn".into(),
+                value: somaxconn.into(),
+            }];
+            put
+        };
+        let first = set
+            .apply(change(1, true, vec![with_options("r1", "1024")]))
+            .unwrap();
+        assert!(first.accepted);
+        let runtime = FakeRuntime::default();
+        runtime.now.set(now);
+        converge_once(&set, &runtime, now);
+        assert_eq!(*runtime.actions.borrow(), ["deploy coolify-w1"]);
+
+        // The stored entry keeps every field, also after a restart.
+        let reopened = WorkloadSet::open(root.path());
+        let stored = reopened.snapshot().entries[0]
+            .entry
+            .clone()
+            .unwrap()
+            .deploy
+            .unwrap();
+        let sent = with_options("r1", "1024").deploy.unwrap();
+        assert_eq!(stored.user_labels, sent.user_labels);
+        assert_eq!(stored.entrypoint, sent.entrypoint);
+        assert_eq!(stored.extra_hosts, sent.extra_hosts);
+        assert_eq!(stored.cap_add, sent.cap_add);
+        assert_eq!(stored.cap_drop, sent.cap_drop);
+        assert_eq!(stored.sysctls, sent.sysctls);
+        assert_eq!(
+            (stored.init, stored.read_only, stored.no_new_privileges),
+            (true, true, true)
+        );
+        assert_eq!(stored.pids_limit, Some(512));
+        assert_eq!(stored.hostname, "web");
+
+        // A changed option is a new revision with a new entry hash: the set
+        // hash changes and the container is deployed again.
+        let second = set
+            .apply(change(2, true, vec![with_options("r2", "4096")]))
+            .unwrap();
+        assert!(second.accepted);
+        assert_ne!(first.set_hash, second.set_hash);
+        converge_once(&set, &runtime, now + 1_000);
+        assert_eq!(
+            *runtime.actions.borrow(),
+            ["deploy coolify-w1", "deploy coolify-w1"]
+        );
+        let stored = set.snapshot().entries[0]
+            .entry
+            .clone()
+            .unwrap()
+            .deploy
+            .unwrap();
+        assert_eq!(stored.sysctls[0].value, "4096");
+    }
+
+    #[test]
+    fn an_older_stored_entry_without_the_new_fields_still_parses() {
+        use prost::Message;
+
+        let older = entry("w1", "r1", "coolify-w1", "");
+        let decoded = WorkloadSetEntry::decode(older.encode_to_vec().as_slice()).unwrap();
+        let deploy = decoded.deploy.unwrap();
+        assert!(deploy.cdi_devices.is_empty() && deploy.cap_add.is_empty());
+        assert_eq!(deploy.pids_limit, None);
+        assert!(!deploy.init);
+    }
+
+    #[test]
     fn deploys_only_after_coolify_confirmed_the_generation() {
         // Later than the entries that the test puts.
         let now = now_millis() + 5_000;

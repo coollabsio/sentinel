@@ -17,8 +17,8 @@ use sentinel_protocol::control::v1::{
     LogSource, LogsReadRequest, SystemInfoRequest, SystemPingRequest, TrustBundleUpdateRequest,
     WireguardInspectRequest, WireguardKeyEnsureRequest, WireguardPeer, WireguardReconcileRequest,
     WorkloadDeployRequest, WorkloadEnvironmentVariable, WorkloadFile, WorkloadHealthCheck,
-    WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadName, WorkloadSecret,
-    WorkloadTmpfs, WorkloadUlimit,
+    WorkloadHost, WorkloadLabel, WorkloadLifecycleAction, WorkloadLifecycleRequest, WorkloadName,
+    WorkloadSecret, WorkloadSysctl, WorkloadTmpfs, WorkloadUlimit,
 };
 use sentinel_protocol::{
     CAPABILITY_CLUSTER_LEAVE, CAPABILITY_CONTAINER_LIST, CAPABILITY_CONTAINER_LOGS,
@@ -28,8 +28,9 @@ use sentinel_protocol::{
     CAPABILITY_TRUST_BUNDLE_UPDATE, CAPABILITY_WIREGUARD_INSPECT, CAPABILITY_WIREGUARD_KEY_ENSURE,
     CAPABILITY_WIREGUARD_RECONCILE, CAPABILITY_WORKLOAD_CONTAINER_SOCKET,
     CAPABILITY_WORKLOAD_DEPLOY, CAPABILITY_WORKLOAD_DNS_SEARCH, CAPABILITY_WORKLOAD_FILES,
-    CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RUNTIME_OPTIONS,
-    CAPABILITY_WORKLOAD_SECRETS_OWNER, CAPABILITY_WORKLOAD_USER,
+    CAPABILITY_WORKLOAD_GPU, CAPABILITY_WORKLOAD_LIFECYCLE, CAPABILITY_WORKLOAD_RUNTIME_OPTIONS,
+    CAPABILITY_WORKLOAD_RUNTIME_OPTIONS_V2, CAPABILITY_WORKLOAD_SECRETS_OWNER,
+    CAPABILITY_WORKLOAD_USER,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -197,6 +198,56 @@ pub(crate) struct WorkloadDeploySpec {
     tty: bool,
     #[serde(default)]
     stdin_open: bool,
+    /// CDI names of `workload.gpu.v1` (decision 0032). Sentinel checks them
+    /// against its CDI inventory.
+    #[serde(default)]
+    cdi_devices: Vec<String>,
+    /// The options of `workload.runtime_options.v2` (decision 0032). Sentinel
+    /// validates them.
+    #[serde(default)]
+    user_labels: Vec<DeployUserLabel>,
+    #[serde(default)]
+    init: bool,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    pids_limit: Option<i64>,
+    #[serde(default)]
+    hostname: String,
+    #[serde(default)]
+    entrypoint: Vec<String>,
+    #[serde(default)]
+    extra_hosts: Vec<DeployHost>,
+    #[serde(default)]
+    cap_add: Vec<String>,
+    #[serde(default)]
+    cap_drop: Vec<String>,
+    #[serde(default)]
+    no_new_privileges: bool,
+    #[serde(default)]
+    sysctls: Vec<DeploySysctl>,
+}
+
+/// A user label of `workload.runtime_options.v2`, in the given order.
+#[derive(Deserialize)]
+struct DeployUserLabel {
+    key: String,
+    #[serde(default)]
+    value: String,
+}
+
+/// An extra host of `workload.runtime_options.v2`.
+#[derive(Deserialize)]
+struct DeployHost {
+    name: String,
+    ip: String,
+}
+
+/// A sysctl of `workload.runtime_options.v2`.
+#[derive(Deserialize)]
+struct DeploySysctl {
+    name: String,
+    value: String,
 }
 
 /// A ulimit of `workload.runtime_options.v1`; -1 is unlimited.
@@ -598,6 +649,8 @@ pub struct SystemInfoResponse {
     load_average_five: Option<f64>,
     load_average_fifteen: Option<f64>,
     ingress_certificates: Vec<IngressCertificateStatusResponse>,
+    gpu_cdi_devices: Vec<String>,
+    gpu_cdi_check: String,
 }
 
 #[derive(Serialize)]
@@ -1412,6 +1465,19 @@ pub(crate) fn deploy_request(
             || spec.tty
             || spec.stdin_open)
             .then_some(CAPABILITY_WORKLOAD_RUNTIME_OPTIONS),
+        (!spec.user_labels.is_empty()
+            || spec.init
+            || spec.read_only
+            || spec.pids_limit.is_some()
+            || !spec.hostname.is_empty()
+            || !spec.entrypoint.is_empty()
+            || !spec.extra_hosts.is_empty()
+            || !spec.cap_add.is_empty()
+            || !spec.cap_drop.is_empty()
+            || spec.no_new_privileges
+            || !spec.sysctls.is_empty())
+        .then_some(CAPABILITY_WORKLOAD_RUNTIME_OPTIONS_V2),
+        (!spec.cdi_devices.is_empty()).then_some(CAPABILITY_WORKLOAD_GPU),
         secrets
             .iter()
             .any(|secret| secret.uid.is_some() || secret.gid.is_some() || secret.mode.is_some())
@@ -1492,6 +1558,39 @@ pub(crate) fn deploy_request(
         stop_timeout_seconds: spec.stop_timeout_seconds,
         tty: spec.tty,
         stdin_open: spec.stdin_open,
+        cdi_devices: spec.cdi_devices,
+        user_labels: spec
+            .user_labels
+            .into_iter()
+            .map(|label| WorkloadLabel {
+                key: label.key,
+                value: label.value,
+            })
+            .collect(),
+        init: spec.init,
+        read_only: spec.read_only,
+        pids_limit: spec.pids_limit,
+        hostname: spec.hostname,
+        entrypoint: spec.entrypoint,
+        extra_hosts: spec
+            .extra_hosts
+            .into_iter()
+            .map(|host| WorkloadHost {
+                name: host.name,
+                ip: host.ip,
+            })
+            .collect(),
+        cap_add: spec.cap_add,
+        cap_drop: spec.cap_drop,
+        no_new_privileges: spec.no_new_privileges,
+        sysctls: spec
+            .sysctls
+            .into_iter()
+            .map(|sysctl| WorkloadSysctl {
+                name: sysctl.name,
+                value: sysctl.value,
+            })
+            .collect(),
     };
     Ok((deploy, needed))
 }
@@ -1644,6 +1743,8 @@ async fn system_info(
                 next_attempt_at: certificate.next_attempt_at,
             })
             .collect(),
+        gpu_cdi_devices: info.gpu_cdi_devices,
+        gpu_cdi_check: info.gpu_cdi_check,
     }))
 }
 

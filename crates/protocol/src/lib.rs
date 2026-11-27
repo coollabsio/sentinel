@@ -180,7 +180,16 @@ pub const CAPABILITY_WORKLOAD_USER: &str = "workload.user.v1";
 /// command: an older Sentinel ignores the fields and would start the container
 /// with the Podman defaults.
 pub const CAPABILITY_WORKLOAD_RUNTIME_OPTIONS: &str = "workload.runtime_options.v1";
-pub const STACK_CAPABILITIES: [&str; 8] = [
+/// `workload.deploy.v1` accepts `user_labels`, `init`, `read_only`,
+/// `pids_limit`, `hostname`, `entrypoint`, `extra_hosts`, `cap_add`,
+/// `cap_drop`, `no_new_privileges`, and `sysctls` (decision 0032). Not a
+/// command: an older Sentinel ignores the fields.
+pub const CAPABILITY_WORKLOAD_RUNTIME_OPTIONS_V2: &str = "workload.runtime_options.v2";
+/// `system.info.v1` reports the CDI devices of the kind `nvidia.com/gpu`, and
+/// `workload.deploy.v1` accepts `cdi_devices` from that inventory (decision
+/// 0032). Not a command.
+pub const CAPABILITY_WORKLOAD_GPU: &str = "workload.gpu.v1";
+pub const STACK_CAPABILITIES: [&str; 10] = [
     CAPABILITY_WORKLOAD_DNS_SEARCH,
     CAPABILITY_WORKLOAD_FILES,
     CAPABILITY_FIREWALL_STACK_RULES,
@@ -189,6 +198,8 @@ pub const STACK_CAPABILITIES: [&str; 8] = [
     CAPABILITY_WORKLOAD_CONTAINER_SOCKET,
     CAPABILITY_WORKLOAD_USER,
     CAPABILITY_WORKLOAD_RUNTIME_OPTIONS,
+    CAPABILITY_WORKLOAD_RUNTIME_OPTIONS_V2,
+    CAPABILITY_WORKLOAD_GPU,
 ];
 pub const VOLUME_CAPABILITIES: [&str; 9] = [
     CAPABILITY_VOLUME_MOUNTS,
@@ -277,6 +288,10 @@ pub mod control {
                     .field("container_ip", &self.container_ip)
                     .field("registry_username", &self.registry_username)
                     .field("registry_password", &redacted(&self.registry_password))
+                    .field("cdi_devices", &self.cdi_devices)
+                    .field("user_label_count", &self.user_labels.len())
+                    .field("cap_add", &self.cap_add)
+                    .field("cap_drop", &self.cap_drop)
                     .finish_non_exhaustive()
             }
         }

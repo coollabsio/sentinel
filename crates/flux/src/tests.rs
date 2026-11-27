@@ -2516,3 +2516,241 @@ async fn ingress_reconcile_route_sends_route_options_only_to_a_sentinel_with_the
     request.abort();
     server.abort();
 }
+
+#[tokio::test]
+async fn workload_deploy_route_needs_runtime_options_v2_and_gpu_for_the_new_fields() {
+    let registry = ConnectionRegistry::default();
+    let insert = |server: &'static str, capabilities: Vec<&'static str>| {
+        let registry = registry.clone();
+        async move {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            registry
+                .insert(
+                    server,
+                    &format!("connection-{server}"),
+                    sender,
+                    1,
+                    capabilities.into_iter().map(String::from).collect(),
+                )
+                .await;
+            receiver
+        }
+    };
+    let _v1 = insert(
+        "server-v1",
+        vec![
+            sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY,
+            sentinel_protocol::CAPABILITY_WORKLOAD_RUNTIME_OPTIONS,
+        ],
+    )
+    .await;
+    let _v2 = insert(
+        "server-v2",
+        vec![
+            sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY,
+            sentinel_protocol::CAPABILITY_WORKLOAD_RUNTIME_OPTIONS_V2,
+        ],
+    )
+    .await;
+    let mut gpu = insert(
+        "server-gpu",
+        vec![
+            sentinel_protocol::CAPABILITY_WORKLOAD_DEPLOY,
+            sentinel_protocol::CAPABILITY_WORKLOAD_RUNTIME_OPTIONS_V2,
+            sentinel_protocol::CAPABILITY_WORKLOAD_GPU,
+        ],
+    )
+    .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let request = |server_id: &str, key: &str, value: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "server_id": server_id,
+            "command_id": "deploy-1",
+            "name": "coolify-p1test-main",
+            "image": "docker.io/library/nginx:latest",
+            "restart_policy": "no",
+        });
+        body[key] = value;
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/workload.deploy"))
+            .bearer_auth("internal-secret")
+            .json(&body)
+            .send()
+    };
+    let fields = [
+        (
+            "user_labels",
+            serde_json::json!([{"key": "com.example/app", "value": "web"}]),
+        ),
+        ("init", serde_json::json!(true)),
+        ("read_only", serde_json::json!(true)),
+        ("pids_limit", serde_json::json!(-1)),
+        ("hostname", serde_json::json!("web")),
+        ("entrypoint", serde_json::json!(["tini", "--"])),
+        (
+            "extra_hosts",
+            serde_json::json!([{"name": "db", "ip": "2001:db8::1"}]),
+        ),
+        ("cap_add", serde_json::json!(["NET_ADMIN"])),
+        ("cap_drop", serde_json::json!(["ALL"])),
+        ("no_new_privileges", serde_json::json!(true)),
+        (
+            "sysctls",
+            serde_json::json!([{"name": "net.core.somaxconn", "value": "1024"}]),
+        ),
+    ];
+    for (key, value) in fields.clone() {
+        let response = request("server-v1", key, value).await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT, "{key}");
+    }
+    let response = request(
+        "server-v2",
+        "cdi_devices",
+        serde_json::json!(["nvidia.com/gpu=0"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+    let mut body = serde_json::json!({
+        "server_id": "server-gpu",
+        "command_id": "deploy-1",
+        "name": "coolify-p1test-main",
+        "image": "docker.io/library/nginx:latest",
+        "restart_policy": "no",
+        "cdi_devices": ["nvidia.com/gpu=0"],
+    });
+    for (key, value) in fields {
+        body[key] = value;
+    }
+    let mut pending = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/workload.deploy"))
+            .bearer_auth("internal-secret")
+            .json(&body)
+            .send(),
+    );
+    let message = tokio::select! {
+        message = gpu.recv() => message.unwrap(),
+        response = &mut pending => panic!("no dispatch: {:?}", response.unwrap().unwrap().text().await),
+    };
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    let Some(sentinel_protocol::control::v1::command::Payload::WorkloadDeploy(deploy)) =
+        command.payload
+    else {
+        panic!("expected a deploy");
+    };
+    assert_eq!(deploy.cdi_devices, ["nvidia.com/gpu=0"]);
+    assert_eq!(
+        deploy.user_labels,
+        [sentinel_protocol::control::v1::WorkloadLabel {
+            key: "com.example/app".into(),
+            value: "web".into(),
+        }]
+    );
+    assert!(deploy.init && deploy.read_only && deploy.no_new_privileges);
+    assert_eq!(deploy.pids_limit, Some(-1));
+    assert_eq!(deploy.hostname, "web");
+    assert_eq!(deploy.entrypoint, ["tini", "--"]);
+    assert_eq!(
+        deploy.extra_hosts,
+        [sentinel_protocol::control::v1::WorkloadHost {
+            name: "db".into(),
+            ip: "2001:db8::1".into(),
+        }]
+    );
+    assert_eq!(deploy.cap_add, ["NET_ADMIN"]);
+    assert_eq!(deploy.cap_drop, ["ALL"]);
+    assert_eq!(
+        deploy.sysctls,
+        [sentinel_protocol::control::v1::WorkloadSysctl {
+            name: "net.core.somaxconn".into(),
+            value: "1024".into(),
+        }]
+    );
+    pending.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn system_info_route_returns_the_gpu_inventory() {
+    let registry = ConnectionRegistry::default();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    registry
+        .insert(
+            "server-1",
+            "connection-1",
+            sender,
+            1,
+            vec![sentinel_protocol::CAPABILITY_SYSTEM_INFO.into()],
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_internal_api(
+        listener,
+        registry.clone(),
+        "internal-secret".into(),
+    ));
+    let request = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/commands/system.info"))
+            .bearer_auth("internal-secret")
+            .json(&serde_json::json!({"server_id": "server-1"}))
+            .send(),
+    );
+    let message = receiver.recv().await.unwrap();
+    let Some(sentinel_protocol::control::v1::control_message::Message::Command(command)) =
+        message.message
+    else {
+        panic!("expected a command");
+    };
+    registry
+        .complete(
+            "server-1",
+            sentinel_protocol::control::v1::CommandResult {
+                event_id: format!("{}:result", command.command_id),
+                command_id: command.command_id.clone(),
+                status: sentinel_protocol::control::v1::CommandStatus::Succeeded.into(),
+                observed_at_unix_ms: 1_700_000_000_500,
+                payload: Some(
+                    sentinel_protocol::control::v1::command_result::Payload::SystemInfo(
+                        sentinel_protocol::control::v1::SystemInfoResult {
+                            sentinel_version: "1.0.0".into(),
+                            gpu_cdi_devices: vec![
+                                "nvidia.com/gpu=0".into(),
+                                "nvidia.com/gpu=all".into(),
+                            ],
+                            gpu_cdi_check:
+                                "Found 1 NVIDIA GPU device (2 CDI names) in /etc/cdi/nvidia.yaml."
+                                    .into(),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["gpu_cdi_devices"],
+        serde_json::json!(["nvidia.com/gpu=0", "nvidia.com/gpu=all"])
+    );
+    assert_eq!(
+        body["gpu_cdi_check"],
+        "Found 1 NVIDIA GPU device (2 CDI names) in /etc/cdi/nvidia.yaml."
+    );
+    server.abort();
+}
