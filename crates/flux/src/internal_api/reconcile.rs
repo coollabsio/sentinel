@@ -5,12 +5,13 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use sentinel_protocol::CAPABILITY_WORKLOAD_RECONCILE;
 use sentinel_protocol::control::v1::command::Payload;
 use sentinel_protocol::control::v1::command_result;
 use sentinel_protocol::control::v1::{
-    WorkloadDesiredState, WorkloadReconcileRequest, WorkloadSetEntry, WorkloadStatus,
+    WorkloadDesiredState, WorkloadPublishedPort, WorkloadReconcileRequest, WorkloadSetEntry,
+    WorkloadStatus,
 };
+use sentinel_protocol::{CAPABILITY_PUBLISHED_PORTS_LOCAL, CAPABILITY_WORKLOAD_RECONCILE};
 use serde::Deserialize;
 
 use super::{
@@ -58,6 +59,19 @@ struct SetEntryApiRequest {
     entry_hash: String,
     #[serde(default)]
     redeploy: bool,
+    #[serde(default)]
+    published_ports: Vec<PublishedPortApiRequest>,
+    #[serde(default)]
+    replaces_container_ip: String,
+}
+
+#[derive(Deserialize)]
+struct PublishedPortApiRequest {
+    protocol: String,
+    host_port: u32,
+    container_port: u32,
+    #[serde(default)]
+    source_cidrs: Vec<String>,
 }
 
 fn valid_id(value: &str) -> bool {
@@ -111,6 +125,11 @@ pub(super) async fn workload_reconcile(
         }
         let (deploy, deploy_needs) = deploy_request(put.deploy)?;
         needed.extend(deploy_needs);
+        // An older Sentinel would ignore the ports, and the Node would not
+        // translate them (decision 0037 of Coolify).
+        if !put.published_ports.is_empty() || !put.replaces_container_ip.is_empty() {
+            needed.push(CAPABILITY_PUBLISHED_PORTS_LOCAL);
+        }
         puts.push(WorkloadSetEntry {
             workload_id: put.workload_id,
             revision_id: put.revision_id,
@@ -123,6 +142,17 @@ pub(super) async fn workload_reconcile(
             stop_timeout_seconds: put.stop_timeout_seconds,
             entry_hash: put.entry_hash,
             redeploy: put.redeploy,
+            published_ports: put
+                .published_ports
+                .into_iter()
+                .map(|port| WorkloadPublishedPort {
+                    protocol: port.protocol,
+                    host_port: port.host_port,
+                    container_port: port.container_port,
+                    source_cidrs: port.source_cidrs,
+                })
+                .collect(),
+            replaces_container_ip: put.replaces_container_ip,
         });
     }
     // An older Sentinel ignores unknown deploy fields, as for workload.deploy.

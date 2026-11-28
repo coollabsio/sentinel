@@ -26,6 +26,7 @@ use sentinel_protocol::control::v1::{
 use tokio::sync::watch;
 
 use crate::commands::CommandExecutor;
+use crate::network::LocalPort;
 use crate::workload_set::{Snapshot, WorkloadSet};
 
 /// A container without a health check must keep running this long after the
@@ -74,6 +75,9 @@ pub(crate) trait Runtime {
     fn lifecycle(&self, request: &WorkloadLifecycleRequest) -> Result<(), String>;
     /// The network revision that this Node applied (the firewall state).
     fn network_revision(&self) -> u64;
+    /// Sets the local rules of the published ports (decision 0037 of
+    /// Coolify) in one change. An unchanged list changes nothing.
+    fn local_ports(&self, ports: &[LocalPort]) -> Result<(), String>;
 }
 
 impl Runtime for CommandExecutor {
@@ -92,6 +96,10 @@ impl Runtime for CommandExecutor {
 
     fn network_revision(&self) -> u64 {
         self.applied_firewall_revision()
+    }
+
+    fn local_ports(&self, ports: &[LocalPort]) -> Result<(), String> {
+        self.apply_local_ports(ports)
     }
 }
 
@@ -149,6 +157,11 @@ fn is_running(container: &ContainerObservation) -> bool {
 pub(crate) fn converge_once(set: &WorkloadSet, runtime: &impl Runtime, now: i64) -> bool {
     let snapshot = set.snapshot();
     if snapshot.entries.is_empty() && snapshot.removing.is_empty() {
+        // The last workload with a published port can be gone.
+        if let Err(error) = runtime.local_ports(&[]) {
+            tracing::warn!(%error, "Sentinel could not remove the local rules of the published ports");
+            return true;
+        }
         return false;
     }
     let containers = match runtime.containers() {
@@ -180,6 +193,7 @@ pub(crate) fn converge_once(set: &WorkloadSet, runtime: &impl Runtime, now: i64)
             stored,
             entry,
             own: &own,
+            containers: &containers,
             now,
             network_revision,
         };
@@ -197,7 +211,79 @@ pub(crate) fn converge_once(set: &WorkloadSet, runtime: &impl Runtime, now: i64)
             _ => step.running(),
         };
     }
+    // After the passes of the entries: a new container that got healthy in
+    // this pass has its rule already (see `retire_replaced`).
+    if let Err(error) = runtime.local_ports(&local_ports(&set.snapshot(), &containers)) {
+        tracing::warn!(%error, "Sentinel could not set the local rules of the published ports");
+        busy = true;
+    }
     busy
+}
+
+/// The local rules of the published ports of the set (decision 0037 of
+/// Coolify). Coolify puts a port in the entry only on a Node whose container
+/// has the desired state running, so a stopped entry has none. The rule
+/// points to the container of the entry after it is healthy. Before that, in
+/// a rolling deploy, it points to the running container of `replaces`, so a
+/// new container that fails never gets traffic. A port that 2 entries use is
+/// kept for the first workload ID.
+pub(crate) fn local_ports(
+    snapshot: &Snapshot,
+    containers: &[ContainerObservation],
+) -> Vec<LocalPort> {
+    let mut ports: Vec<LocalPort> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for stored in &snapshot.entries {
+        let Some(entry) = &stored.entry else {
+            continue;
+        };
+        let Some(deploy) = &entry.deploy else {
+            continue;
+        };
+        if entry.published_ports.is_empty()
+            || WorkloadDesiredState::try_from(entry.desired_state)
+                != Ok(WorkloadDesiredState::Running)
+        {
+            continue;
+        }
+        let replaced_runs = !entry.replaces.is_empty()
+            && !entry.replaces_container_ip.is_empty()
+            && containers.iter().any(|container| {
+                container.name == entry.replaces
+                    && label(container, "coolify.workload") == Some(&entry.workload_id)
+                    && is_running(container)
+            });
+        let container_ip = if !stored.applied && replaced_runs {
+            &entry.replaces_container_ip
+        } else {
+            &deploy.container_ip
+        };
+        for port in &entry.published_ports {
+            if !seen.insert((port.protocol.clone(), port.host_port)) {
+                tracing::warn!(workload = %entry.workload_id, port = port.host_port, "Sentinel skips a published port that another workload of the set uses");
+                continue;
+            }
+            let mut source_cidrs = port
+                .source_cidrs
+                .iter()
+                .filter_map(|cidr| crate::network::ipv4_network(cidr))
+                .collect::<Vec<_>>();
+            source_cidrs.sort_unstable();
+            source_cidrs.dedup();
+            ports.push(LocalPort {
+                protocol: port.protocol.clone(),
+                host_port: port.host_port,
+                container_ip: container_ip.clone(),
+                container_port: port.container_port,
+                source_cidrs,
+                network_subnet: deploy.network_subnet.clone(),
+            });
+        }
+    }
+    ports.sort_by(|left, right| {
+        (&left.protocol, left.host_port).cmp(&(&right.protocol, right.host_port))
+    });
+    ports
 }
 
 fn remove_workload(
@@ -245,6 +331,8 @@ struct Step<'a, R: Runtime> {
     stored: &'a StoredWorkloadEntry,
     entry: &'a WorkloadSetEntry,
     own: &'a [&'a ContainerObservation],
+    /// Every container of the Node, for the local rules.
+    containers: &'a [ContainerObservation],
     now: i64,
     network_revision: u64,
 }
@@ -629,18 +717,28 @@ impl<R: Runtime> Step<'_, R> {
     }
 
     /// Removes the container that a rolling deploy replaced. A failure leaves
-    /// it: the next pass tries again.
+    /// it: the next pass tries again. A published port first points to the
+    /// new container, in one nftables change (decision 0037 of Coolify).
     fn retire_replaced(&self) {
         if self.entry.replaces.is_empty() {
             return;
         }
-        if let Some(replaced) = self.named(&self.entry.replaces)
-            && let Err(error) = self.runtime.lifecycle(&lifecycle(
-                &replaced.name,
-                WorkloadLifecycleAction::Remove,
-                self.entry.stop_timeout_seconds,
-            ))
+        let Some(replaced) = self.named(&self.entry.replaces) else {
+            return;
+        };
+        if !self.entry.published_ports.is_empty()
+            && let Err(error) = self
+                .runtime
+                .local_ports(&local_ports(&self.set.snapshot(), self.containers))
         {
+            tracing::warn!(%error, container = %replaced.name, "Sentinel keeps the replaced container, because the published ports could not switch to the new one");
+            return;
+        }
+        if let Err(error) = self.runtime.lifecycle(&lifecycle(
+            &replaced.name,
+            WorkloadLifecycleAction::Remove,
+            self.entry.stop_timeout_seconds,
+        )) {
             tracing::warn!(%error, container = %replaced.name, "Sentinel could not remove the replaced container");
         }
     }
@@ -790,6 +888,10 @@ mod tests {
         fn network_revision(&self) -> u64 {
             self.network_revision
         }
+
+        fn local_ports(&self, _ports: &[LocalPort]) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     fn entry(workload: &str, revision: &str, name: &str, replaces: &str) -> WorkloadSetEntry {
@@ -827,6 +929,8 @@ mod tests {
             stop_timeout_seconds: None,
             entry_hash: format!("hash-{revision}"),
             redeploy: false,
+            published_ports: vec![],
+            replaces_container_ip: String::new(),
         }
     }
 

@@ -1335,6 +1335,25 @@ message WorkloadSetEntry {
   // also when it already runs this revision, for example to pull a newer
   // image of the same tag.
   bool redeploy = 11;
+  // The published ports of the workload on this Node (decision 0037 of
+  // Coolify). Sentinel translates each host port to the active slot: the
+  // container of this entry after it is healthy, else the running container
+  // of `replaces` at `replaces_container_ip`. At most 100, unique by protocol
+  // and host port in the set. Needs `network.published_ports.local.v1`.
+  repeated WorkloadPublishedPort published_ports = 12;
+  // The address of the container of `replaces`. Empty without `replaces`.
+  string replaces_container_ip = 13;
+}
+
+message WorkloadPublishedPort {
+  // "tcp" or "udp".
+  string protocol = 1;
+  uint32 host_port = 2;
+  uint32 container_port = 3;
+  // IPv4 CIDRs that may connect. Empty allows every source. A connection
+  // that another Node of the cluster translated is accepted from its mesh
+  // address: that Node checked the CIDRs.
+  repeated string source_cidrs = 4;
 }
 
 message WorkloadReconcileResult {

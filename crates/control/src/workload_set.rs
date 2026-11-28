@@ -22,6 +22,7 @@ use tokio::sync::Notify;
 
 const SET_FILE: &str = "var/lib/coolify/workloads/desired-set.pb";
 const MAX_ENTRIES: usize = 1_000;
+const MAX_PUBLISHED_PORTS: usize = 100;
 
 /// The desired set, shared by the command lanes, the connection, and the
 /// converger.
@@ -119,7 +120,48 @@ fn validate_entry(entry: &WorkloadSetEntry) -> Result<(), String> {
             entry.workload_id
         ));
     }
+    validate_published_ports(entry, deploy)?;
     crate::commands::podman_deploy_args(Path::new("/"), deploy).map(|_| ())
+}
+
+/// The local rules of an entry (decision 0037 of Coolify). The container
+/// address of the deploy, and of `replaces`, must be in the workload network,
+/// because the rule translates to it.
+fn validate_published_ports(
+    entry: &WorkloadSetEntry,
+    deploy: &WorkloadDeployRequest,
+) -> Result<(), String> {
+    if entry.published_ports.is_empty() && entry.replaces_container_ip.is_empty() {
+        return Ok(());
+    }
+    let in_network = |ip: &str| {
+        ip.parse::<std::net::Ipv4Addr>().is_ok()
+            && crate::network::ipv4_in_cidr(ip, &deploy.network_subnet)
+    };
+    let mut seen = HashSet::new();
+    let valid = entry.published_ports.len() <= MAX_PUBLISHED_PORTS
+        && in_network(&deploy.container_ip)
+        && (entry.replaces_container_ip.is_empty()
+            || (!entry.replaces.is_empty() && in_network(&entry.replaces_container_ip)))
+        && entry.published_ports.iter().all(|port| {
+            matches!(port.protocol.as_str(), "tcp" | "udp")
+                && (1..=65_535).contains(&port.host_port)
+                && (1..=65_535).contains(&port.container_port)
+                && port.source_cidrs.len() <= 64
+                && port
+                    .source_cidrs
+                    .iter()
+                    .all(|cidr| crate::network::ipv4_network(cidr).is_some())
+                && seen.insert((port.protocol.as_str(), port.host_port))
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "The published ports of workload {} are invalid.",
+            entry.workload_id
+        ))
+    }
 }
 
 pub(crate) fn validate(request: &WorkloadReconcileRequest) -> Result<(), String> {

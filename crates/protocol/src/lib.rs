@@ -40,6 +40,12 @@ pub const CAPABILITY_INGRESS_ROUTE_OPTIONS: &str = "ingress.route_options.v1";
 /// `network.firewall.reconcile.v1` accepts `published_ports`, translated in
 /// `table ip coolify_cluster_nat` (decision 0016). Not a command.
 pub const CAPABILITY_FIREWALL_PUBLISHED_PORTS: &str = "network.firewall.published_ports.v1";
+/// The desired set entries accept `published_ports`: Sentinel owns the rule
+/// of a published port on the Node that runs the workload, and switches it in
+/// a rolling deploy. `published_ports` of `network.firewall.reconcile.v1`
+/// accepts the mesh address of another Node with the same port (decision
+/// 0037 of Coolify). Not a command.
+pub const CAPABILITY_PUBLISHED_PORTS_LOCAL: &str = "network.published_ports.local.v1";
 pub const CAPABILITY_IMAGE_BUILD: &str = "image.build.v1";
 pub const CAPABILITY_BUILDER_RECONCILE: &str = "builder.reconcile.v1";
 /// `image.build.v1` accepts `git_https_token` and `git_ssh_private_key`
@@ -228,7 +234,7 @@ pub const CAPABILITY_WORKLOAD_EXEC: &str = "workload.exec.v1";
 /// Opens an interactive shell in a managed container (decision 0018).
 pub const CAPABILITY_WORKLOAD_TERMINAL: &str = "workload.terminal.v1";
 pub const EXEC_CAPABILITIES: [&str; 2] = [CAPABILITY_WORKLOAD_EXEC, CAPABILITY_WORKLOAD_TERMINAL];
-pub const NETWORK_CAPABILITIES: [&str; 13] = [
+pub const NETWORK_CAPABILITIES: [&str; 14] = [
     CAPABILITY_CLUSTER_LEAVE,
     CAPABILITY_WIREGUARD_KEY_ENSURE,
     CAPABILITY_WIREGUARD_INSPECT,
@@ -242,6 +248,7 @@ pub const NETWORK_CAPABILITIES: [&str; 13] = [
     CAPABILITY_INGRESS_ROUTES_V2,
     CAPABILITY_INGRESS_ROUTE_OPTIONS,
     CAPABILITY_FIREWALL_PUBLISHED_PORTS,
+    CAPABILITY_PUBLISHED_PORTS_LOCAL,
 ];
 
 pub mod control {

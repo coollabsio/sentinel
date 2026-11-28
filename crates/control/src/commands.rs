@@ -144,6 +144,33 @@ impl CommandExecutor {
         .unwrap_or(0)
     }
 
+    /// Sets the local rules of the published ports (decision 0037 of
+    /// Coolify). The last applied table is kept in memory: a restart renders
+    /// and loads it again, also after a reboot.
+    pub(crate) fn apply_local_ports(
+        &self,
+        ports: &[crate::network::LocalPort],
+    ) -> Result<(), String> {
+        static APPLIED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let mesh = crate::network::local_ports_mesh(&self.network_root);
+        let rendered = crate::network::render_local_ports(
+            ports,
+            mesh.as_ref()
+                .map(|(interface, cidr)| (interface.as_str(), cidr.as_str())),
+        );
+        let mut applied = APPLIED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if applied.as_deref() == Some(rendered.as_str())
+            && (rendered.is_empty() || crate::network::local_ports_loaded(&self.network_root))
+        {
+            return Ok(());
+        }
+        crate::network::apply_local_ports(&self.network_root, &rendered)?;
+        *applied = Some(rendered);
+        Ok(())
+    }
+
     fn notify_workloads_changed(&self) {
         if let Some(trigger) = &self.discovery_trigger {
             trigger.notify_one();

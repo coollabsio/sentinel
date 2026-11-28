@@ -18,6 +18,17 @@ const MESH_NAT_CHAIN: &str = "mesh_nat";
 const COOLIFY_NFT_BRIDGE_TABLE: &str = "coolify_cluster_bridge";
 /// The published ports (decision 0016). It exists only while a port is published.
 const COOLIFY_NFT_NAT_TABLE: &str = "coolify_cluster_nat";
+/// The local rules of the published ports (decision 0037 of Coolify): the
+/// converger translates a port to the active slot of the container on this
+/// Node. It exists only while such a port exists.
+const COOLIFY_NFT_LOCAL_PORTS_TABLE: &str = "coolify_cluster_ports";
+/// The connection mark of a connection that a local rule translated. The
+/// firewall table accepts it, because the converger owns the destination.
+pub(crate) const LOCAL_PORT_MARK: &str = "0x01000000";
+/// The WireGuard interface and the cluster CIDR of the applied firewall, for
+/// the local rules: a connection that another Node translated comes from its
+/// mesh address.
+const LOCAL_PORTS_CONTEXT_FILE: &str = "local-ports.context";
 const BRIDGE_SYSCTL_FILE: &str = "etc/sysctl.d/90-coolify-workload-firewall.conf";
 pub(crate) const CORROSION_VERSION: &str = "v1.0.0";
 /// SHA-512 of the Corrosion v1.0.0 release archives. Change them together with `CORROSION_VERSION`.
@@ -98,6 +109,12 @@ pub(crate) fn leave_cluster(
             COOLIFY_NFT_BRIDGE_TABLE,
         ]));
         run_best_effort(Command::new("nft").args(["delete", "table", "ip", COOLIFY_NFT_NAT_TABLE]));
+        run_best_effort(Command::new("nft").args([
+            "delete",
+            "table",
+            "ip",
+            COOLIFY_NFT_LOCAL_PORTS_TABLE,
+        ]));
         remove_legacy_mesh_nat(&request.interface, &request.workload_cidrs);
     }
 
@@ -108,6 +125,7 @@ pub(crate) fn leave_cluster(
         state_path(root, &format!("{}.last-good.conf", request.interface)),
         state_path(root, &format!("{}.key", request.interface)),
         state_path(root, "firewall.state"),
+        state_path(root, LOCAL_PORTS_CONTEXT_FILE),
         state_path(root, "firewall.nft"),
         state_path(root, "firewall.last-good.nft"),
         state_path(root, "firewall.transaction.nft"),
@@ -294,10 +312,14 @@ struct PublishedPort<'a> {
     /// Network addresses with their prefix, sorted and unique. Empty allows
     /// every source.
     source_cidrs: Vec<String>,
+    /// A remote rule (decision 0037 of Coolify): the destination is the mesh
+    /// address of the Node that runs the workload, with the same port. Its
+    /// local rule translates the connection again.
+    remote: bool,
 }
 
 /// The CIDR with the host bits cleared.
-fn ipv4_network(cidr: &str) -> Option<String> {
+pub(crate) fn ipv4_network(cidr: &str) -> Option<String> {
     let (address, prefix) = cidr.split_once('/')?;
     let address = address.parse::<std::net::Ipv4Addr>().ok()?;
     let prefix = prefix.parse::<u32>().ok().filter(|prefix| *prefix <= 32)?;
@@ -314,15 +336,22 @@ fn published_ports(request: &FirewallReconcileRequest) -> Result<Vec<PublishedPo
     }
     let mut ports = Vec::with_capacity(request.published_ports.len());
     for port in &request.published_ports {
+        let workload_destination = request
+            .workload_cidrs
+            .iter()
+            .any(|cidr| ipv4_in_cidr(&port.destination_ip, cidr));
+        // Another Node of the mesh, never this Node: a rule to itself would
+        // translate in a loop.
+        let remote = !workload_destination
+            && ipv4_in_cidr(&port.destination_ip, &request.cluster_cidr)
+            && port.destination_ip != request.local_node_ip
+            && port.container_port == port.host_port;
         let valid = matches!(port.protocol.as_str(), "tcp" | "udp")
             && (1..=65_535).contains(&port.host_port)
             && (1..=65_535).contains(&port.container_port)
             && port.source_cidrs.len() <= MAX_PUBLISHED_PORT_SOURCES
             && port.destination_ip.parse::<std::net::Ipv4Addr>().is_ok()
-            && request
-                .workload_cidrs
-                .iter()
-                .any(|cidr| ipv4_in_cidr(&port.destination_ip, cidr));
+            && (workload_destination || remote);
         let source_cidrs = port
             .source_cidrs
             .iter()
@@ -343,6 +372,7 @@ fn published_ports(request: &FirewallReconcileRequest) -> Result<Vec<PublishedPo
             destination_ip: &port.destination_ip,
             container_port: port.container_port,
             source_cidrs: source_cidrs.into_iter().collect(),
+            remote,
         });
     }
     ports.sort_unstable_by_key(|port| (port.protocol, port.host_port));
@@ -385,8 +415,15 @@ fn render_published_ports(
             format!(" ip saddr {{ {} }}", port.source_cidrs.join(", "))
         };
         let translation = format!("dnat to {}:{}", port.destination_ip, port.container_port);
+        // A connection from the mesh is never sent on to a third Node, so 2
+        // Nodes cannot forward a port to each other.
+        let entry = if port.remote {
+            format!(" iifname != \"{wireguard_interface}\"")
+        } else {
+            String::new()
+        };
         prerouting.push_str(&format!(
-            " fib daddr type local {matches}{sources} {translation};"
+            " fib daddr type local{entry} {matches}{sources} {translation};"
         ));
         output.push_str(&format!(
             " ip daddr != 127.0.0.0/8 fib daddr type local {matches} {translation};"
@@ -401,6 +438,122 @@ fn render_published_ports(
 }}
 "
     )
+}
+
+/// A local rule of a published port (decision 0037 of Coolify): this Node
+/// translates the port to the active slot of its container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalPort {
+    pub(crate) protocol: String,
+    pub(crate) host_port: u32,
+    pub(crate) container_ip: String,
+    pub(crate) container_port: u32,
+    /// Network addresses with their prefix. Empty allows every source.
+    pub(crate) source_cidrs: Vec<String>,
+    /// The workload network of the container. A connection from it is
+    /// masqueraded, so that the reply on the same bridge comes back here.
+    pub(crate) network_subnet: String,
+}
+
+/// The table of the local rules, or nothing without one.
+///
+/// The entry Node checks the source CIDRs. A connection that another Node
+/// translated comes over WireGuard from its mesh address, so it is accepted
+/// from the cluster CIDR without a second check. The rules run before the
+/// NAT table of the firewall, so a local rule wins over a rule of an older
+/// network revision. The connection mark lets the firewall table accept the
+/// translated connection.
+pub(crate) fn render_local_ports(ports: &[LocalPort], mesh: Option<(&str, &str)>) -> String {
+    if ports.is_empty() {
+        return String::new();
+    }
+    let mut prerouting = String::new();
+    let mut output = String::new();
+    let mut subnets = std::collections::BTreeSet::new();
+    let mark = format!("ct mark set ct mark | {LOCAL_PORT_MARK}");
+    for port in ports {
+        let matches = format!("{} dport {}", port.protocol, port.host_port);
+        let translation = format!(
+            "{mark} dnat to {}:{}",
+            port.container_ip, port.container_port
+        );
+        if port.source_cidrs.is_empty() {
+            prerouting.push_str(&format!(" fib daddr type local {matches} {translation};"));
+        } else {
+            prerouting.push_str(&format!(
+                " fib daddr type local {matches} ip saddr {{ {} }} {translation};",
+                port.source_cidrs.join(", ")
+            ));
+            if let Some((interface, cluster_cidr)) = mesh {
+                prerouting.push_str(&format!(
+                    " fib daddr type local iifname \"{interface}\" ip saddr {cluster_cidr} {matches} {translation};"
+                ));
+            }
+        }
+        output.push_str(&format!(
+            " ip daddr != 127.0.0.0/8 fib daddr type local {matches} {translation};"
+        ));
+        if !port.network_subnet.is_empty() {
+            subnets.insert(port.network_subnet.as_str());
+        }
+    }
+    let masquerade = if subnets.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ct mark & {LOCAL_PORT_MARK} == {LOCAL_PORT_MARK} ip saddr {{ {} }} masquerade;",
+            subnets.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    };
+    format!(
+        "table ip {COOLIFY_NFT_LOCAL_PORTS_TABLE} {{
+ chain prerouting {{ type nat hook prerouting priority dstnat - 1; policy accept;{prerouting} }}
+ chain output {{ type nat hook output priority dstnat - 1; policy accept;{output} }}
+ chain postrouting {{ type nat hook postrouting priority srcnat - 11; policy accept;{masquerade} }}
+}}
+"
+    )
+}
+
+/// The WireGuard interface and the cluster CIDR of the applied firewall.
+pub(crate) fn local_ports_mesh(root: &Path) -> Option<(String, String)> {
+    let contents = fs::read_to_string(state_path(root, LOCAL_PORTS_CONTEXT_FILE)).ok()?;
+    let mut words = contents.split_whitespace();
+    let interface = words.next()?.to_string();
+    let cluster_cidr = words.next()?.to_string();
+    (validate_interface(&interface).is_ok() && valid_ipv4_cidr(&cluster_cidr))
+        .then_some((interface, cluster_cidr))
+}
+
+/// Replaces the table of the local rules in one nftables transaction, so a
+/// rule never points to no container while it switches to another slot. An
+/// empty table text removes the table. The rules are not stored: the
+/// converger renders them again after a restart or a reboot.
+pub(crate) fn apply_local_ports(root: &Path, rendered: &str) -> Result<(), String> {
+    let transaction = format!(
+        "table ip {COOLIFY_NFT_LOCAL_PORTS_TABLE}\ndelete table ip {COOLIFY_NFT_LOCAL_PORTS_TABLE}\n{rendered}"
+    );
+    let path = state_path(root, "local-ports.transaction.nft");
+    atomic_write(&path, transaction.as_bytes(), 0o600)?;
+    if root != Path::new("/") {
+        return Ok(());
+    }
+    run(
+        Command::new("nft").arg("--file").arg(&path),
+        "The local rules of the published ports could not be activated.",
+    )
+}
+
+/// Whether the table of the local rules is loaded. An `nft flush ruleset`
+/// removes it without Sentinel.
+pub(crate) fn local_ports_loaded(root: &Path) -> bool {
+    root != Path::new("/")
+        || Command::new("nft")
+            .args(["list", "table", "ip", COOLIFY_NFT_LOCAL_PORTS_TABLE])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
 }
 
 pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<String, String> {
@@ -614,9 +767,9 @@ pub(crate) fn render_firewall(request: &FirewallReconcileRequest) -> Result<Stri
         "table inet {COOLIFY_NFT_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
  chain input {{ type filter hook input priority -5; policy accept; ct state established,related accept; udp dport {} accept; ip saddr @workload_networks udp dport 53 accept; ip saddr @workload_networks tcp dport 53 accept; ip saddr {} udp dport 8787 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} udp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 53 accept; ip saddr {local_node_ip} ip daddr {local_node_ip} tcp dport 8080 accept; ip saddr {} drop; iifname \"{}\" ip saddr != {} ip saddr != @workload_networks drop; ip saddr @workload_networks drop; }}
- chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} {stack_allow_rules}{forward_ingress_rules} {forward_published_rules}ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; ip saddr != @workload_networks ip daddr @workload_networks drop; }}
+ chain forward {{ type filter hook forward priority -5; policy accept; ct state established,related accept; {allow_rules} {stack_allow_rules}{forward_ingress_rules} {forward_published_rules}ct mark & {LOCAL_PORT_MARK} == {LOCAL_PORT_MARK} accept; ip saddr @workload_networks ip daddr @workload_networks drop; ip saddr @workload_networks ip daddr {} drop; ip saddr != @workload_networks ip daddr @workload_networks drop; }}
  chain {MESH_NAT_CHAIN} {{ type nat hook postrouting priority srcnat - 5; policy accept; oifname \"{}\" ip saddr @workload_networks ip daddr @workload_networks snat ip to ip saddr; }}
- chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; ip daddr {local_node_ip} udp dport 53 accept; ip daddr {local_node_ip} tcp dport 53 accept; ip daddr {local_node_ip} tcp dport 8080 accept; {output_allow_rules} {output_ingress_rules} {output_published_rules}ip daddr {} drop; ip daddr @workload_networks drop; }}
+ chain output {{ type filter hook output priority -5; policy accept; ct state established,related accept; ip daddr {} udp dport 8787 accept; ip daddr {local_node_ip} udp dport 53 accept; ip daddr {local_node_ip} tcp dport 53 accept; ip daddr {local_node_ip} tcp dport 8080 accept; {output_allow_rules} {output_ingress_rules} {output_published_rules}ct mark & {LOCAL_PORT_MARK} == {LOCAL_PORT_MARK} accept; ip daddr {} drop; ip daddr @workload_networks drop; }}
 }}
 table bridge {COOLIFY_NFT_BRIDGE_TABLE} {{
  set workload_networks {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}
@@ -1183,6 +1336,11 @@ pub(crate) fn reconcile_firewall(
         crate::image_transfer::restore_firewall();
         refresh_discovery_resolver(root)?;
     }
+    atomic_write(
+        &state_path(root, LOCAL_PORTS_CONTEXT_FILE),
+        format!("{} {}\n", request.wireguard_interface, request.cluster_cidr).as_bytes(),
+        0o600,
+    )?;
     atomic_write(
         &state_file,
         format!("{} {}\n", request.revision, configuration_hash).as_bytes(),
@@ -3593,10 +3751,10 @@ mod tests {
 "
         );
         assert!(node_a.contains(
-            "ct status dnat ip daddr 100.64.0.5 tcp dport 22 accept; iifname \"coolify0\" ip saddr 10.240.0.0/24 ip daddr 100.64.0.5 tcp dport 22 accept; ct status dnat ip daddr 100.64.1.7 udp dport 53 accept; iifname \"coolify0\" ip saddr 10.240.0.0/24 ip daddr 100.64.1.7 udp dport 53 accept; ip saddr @workload_networks ip daddr @workload_networks drop;"
+            "ct status dnat ip daddr 100.64.0.5 tcp dport 22 accept; iifname \"coolify0\" ip saddr 10.240.0.0/24 ip daddr 100.64.0.5 tcp dport 22 accept; ct status dnat ip daddr 100.64.1.7 udp dport 53 accept; iifname \"coolify0\" ip saddr 10.240.0.0/24 ip daddr 100.64.1.7 udp dport 53 accept; ct mark & 0x01000000 == 0x01000000 accept; ip saddr @workload_networks ip daddr @workload_networks drop;"
         ));
         assert!(node_a.contains(
-            "ct status dnat ip daddr 100.64.0.5 tcp dport 22 accept; ct status dnat ip daddr 100.64.1.7 udp dport 53 accept; ip daddr 10.240.0.0/24 drop;"
+            "ct status dnat ip daddr 100.64.0.5 tcp dport 22 accept; ct status dnat ip daddr 100.64.1.7 udp dport 53 accept; ct mark & 0x01000000 == 0x01000000 accept; ip daddr 10.240.0.0/24 drop;"
         ));
 
         let to_node_a = |saddr, protocol, dport| Packet {
