@@ -7,7 +7,12 @@ use super::*;
 #[test]
 fn network_capabilities_are_typed_and_versioned() {
     let capabilities = NETWORK_CAPABILITIES;
-    assert_eq!(capabilities.len(), 13);
+    assert_eq!(capabilities.len(), 14);
+    assert!(capabilities.contains(&CAPABILITY_PUBLISHED_PORTS_LOCAL));
+    assert_eq!(
+        CAPABILITY_PUBLISHED_PORTS_LOCAL,
+        "network.published_ports.local.v1"
+    );
     assert!(capabilities.contains(&CAPABILITY_FIREWALL_PUBLISHED_PORTS));
     assert_eq!(
         CAPABILITY_FIREWALL_PUBLISHED_PORTS,
