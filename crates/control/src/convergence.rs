@@ -564,6 +564,15 @@ impl<R: Runtime> Step<'_, R> {
         let backoff = (START_BACKOFF_INITIAL_MILLIS << self.stored.start_attempts.min(16))
             .min(START_BACKOFF_MAX_MILLIS);
         if self.stored.start_attempts > 0 && self.now - self.stored.last_start_unix_ms < backoff {
+            // Coolify then lets the other Nodes forward the published ports
+            // of the workload to a Node that runs it (decision 0037 of
+            // Coolify).
+            self.status(
+                WorkloadStatusValue::Stopped,
+                "The container stopped again. Sentinel starts it again after a backoff.",
+                &container.runtime_id,
+                true,
+            );
             return true;
         }
         let now = self.now;
@@ -1230,6 +1239,9 @@ mod tests {
         runtime.containers.borrow_mut()[0].state = "exited".into();
         converge_once(&set, &runtime, now + 2_000);
         assert_eq!(runtime.actions.borrow().len(), 1, "the backoff waits");
+        let status = status_of(&set, "w1");
+        assert_eq!(value(&status), WorkloadStatusValue::Stopped);
+        assert!(status.autonomous);
         converge_once(
             &set,
             &runtime,
