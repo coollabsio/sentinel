@@ -1068,6 +1068,15 @@ pub(crate) fn build_arguments(root: &Path, request: &ImageBuildRequest) -> Vec<S
     if request.untrusted_source {
         arguments.push("--untrusted-source".into());
     }
+    if request.skip_submodules {
+        arguments.push("--skip-submodules".into());
+    }
+    if request.skip_lfs {
+        arguments.push("--skip-lfs".into());
+    }
+    if request.full_history {
+        arguments.push("--full-history".into());
+    }
     arguments
 }
 
@@ -1388,13 +1397,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn passes_the_git_options_to_the_builder() {
+        let flags = ["--skip-submodules", "--skip-lfs", "--full-history"];
+        let defaults = build_arguments(Path::new("/"), &dockerfile_build(""));
+        assert!(
+            !defaults
+                .iter()
+                .any(|argument| flags.contains(&argument.as_str()))
+        );
+        let options = ImageBuildRequest {
+            skip_submodules: true,
+            skip_lfs: true,
+            full_history: true,
+            ..dockerfile_build("")
+        };
+        assert_eq!(
+            build_arguments(Path::new("/"), &options)[defaults.len()..],
+            flags
+        );
+    }
+
     /// Runs the Git steps of the builder entrypoint with a fake `git` that
     /// only records its calls, except `git config`, which the real Git writes
-    /// to a temporary home. Returns the log and the home.
+    /// to a temporary home. Its checkout writes a `.gitmodules`, and the
+    /// source lists one Git LFS file. Returns the log, the output, and the
+    /// home.
     fn run_entrypoint_git_steps(
         credential: (&str, &str),
-        untrusted: bool,
-    ) -> (String, tempfile::TempDir) {
+        flags: &[&str],
+    ) -> (String, String, tempfile::TempDir) {
         let home = tempfile::tempdir().unwrap();
         let credentials = home.path().join("git-credential");
         std::fs::create_dir(&credentials).unwrap();
@@ -1410,12 +1442,15 @@ mod tests {
         let bin = home.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let log = home.path().join("git.log");
+        let source = home.path().join("source");
+        std::fs::create_dir(&source).unwrap();
         std::fs::write(
             bin.join("git"),
             format!(
-                "#!/bin/sh\nprintf '%s | %s\\n' \"${{GIT_SSH_COMMAND:-}}\" \"$*\" >> '{}'\n[ \"$1\" = config ] && exec '{}' \"$@\"\nexit 0\n",
+                "#!/bin/sh\nprintf '%s | %s\\n' \"${{GIT_SSH_COMMAND:-}}\" \"$*\" >> '{}'\n[ \"$1\" = config ] && exec '{}' \"$@\"\ncase \"$*\" in *' checkout '*) : > '{}/.gitmodules' ;; *' lfs ls-files '*) echo big.bin ;; esac\nexit 0\n",
                 log.display(),
-                real_git.trim()
+                real_git.trim(),
+                source.display()
             ),
         )
         .unwrap();
@@ -1443,19 +1478,22 @@ mod tests {
             "--image".into(),
             "localhost/api:1".into(),
         ];
-        if untrusted {
-            arguments.push("--untrusted-source".into());
-        }
-        // The script stops at the missing build context, after the Git steps.
-        let _ = Command::new("sh")
+        arguments.extend(flags.iter().map(|flag| flag.to_string()));
+        // The script stops later at the missing BuildKit, after the Git steps.
+        let output = Command::new("sh")
             .args(&arguments)
             .env_clear()
             .env("HOME", home.path())
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("COOLIFY_GIT_CREDENTIALS", &credentials)
+            .env("COOLIFY_BUILD_SOURCE", &source)
             .output()
             .unwrap();
-        (std::fs::read_to_string(&log).unwrap_or_default(), home)
+        (
+            std::fs::read_to_string(&log).unwrap_or_default(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            home,
+        )
     }
 
     /// Whether `git credential fill` gives the token of the home for a URL.
@@ -1483,11 +1521,12 @@ mod tests {
     fn an_untrusted_source_gets_the_token_only_for_its_repository() {
         let parent = "https://git.example.com/acme/api.git";
         let other = "https://git.example.com/acme/private.git";
-        let (_, trusted) = run_entrypoint_git_steps(("token", "t0ken"), false);
+        let (_, _, trusted) = run_entrypoint_git_steps(("token", "t0ken"), &[]);
         assert!(token_for(trusted.path(), parent));
         assert!(token_for(trusted.path(), other));
 
-        let (_, untrusted) = run_entrypoint_git_steps(("token", "t0ken"), true);
+        let (_, _, untrusted) =
+            run_entrypoint_git_steps(("token", "t0ken"), &["--untrusted-source"]);
         for url in [
             parent,
             "https://git.example.com/acme/api",
@@ -1507,16 +1546,65 @@ mod tests {
 
     #[test]
     fn an_untrusted_source_uses_the_ssh_key_only_for_the_commit() {
-        let calls = |untrusted| {
-            let (log, home) = run_entrypoint_git_steps(("ssh-key", "key"), untrusted);
+        let calls = |flags: &[&str]| {
+            let (log, output, home) = run_entrypoint_git_steps(("ssh-key", "key"), flags);
             let key = format!("-i {}/git-credential/ssh-key", home.path().display());
-            log.lines()
+            let calls = log
+                .lines()
                 .filter(|line| line.contains(" fetch ") || line.contains(" lfs pull"))
                 .map(|line| (line.contains(" fetch "), line.contains(&key)))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (calls, output)
         };
-        assert_eq!(calls(false), [(true, true), (false, true)]);
-        assert_eq!(calls(true), [(true, true), (false, false)]);
+        assert_eq!(calls(&[]).0, [(true, true), (false, true)]);
+        // The LFS objects need the key, so the builder does not pull them.
+        let (untrusted, output) = calls(&["--untrusted-source"]);
+        assert_eq!(untrusted, [(true, true)]);
+        assert!(output.contains("Skipping Git LFS objects (the source is not trusted"));
+    }
+
+    #[test]
+    fn the_git_options_change_the_git_steps() {
+        let git_steps = |flags: &[&str]| {
+            let (log, output, _home) = run_entrypoint_git_steps(("token", "t0ken"), flags);
+            let calls = log
+                .lines()
+                .filter(|line| !line.contains(" | config "))
+                .map(|line| line.split(" | ").nth(1).unwrap().to_string())
+                .collect::<Vec<_>>();
+            (calls, output)
+        };
+        let allow =
+            "-c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always";
+        let (calls, output) = git_steps(&[]);
+        assert!(calls.iter().any(|call| call.ends_with(&format!(
+            "{allow} fetch --quiet --depth=1 origin {}",
+            "a".repeat(40)
+        ))));
+        assert!(calls.iter().any(|call| call.ends_with(&format!(
+            "{allow} submodule update --quiet --init --recursive --depth=1"
+        ))));
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.ends_with(&format!("{allow} lfs pull")))
+        );
+        assert!(output.contains("(depth 1)"));
+
+        let (calls, output) = git_steps(&["--skip-submodules", "--skip-lfs", "--full-history"]);
+        assert!(calls.iter().any(|call| {
+            call.ends_with(&format!("{allow} fetch --quiet origin {}", "a".repeat(40)))
+        }));
+        assert!(!calls.iter().any(|call| call.contains(" submodule ")));
+        assert!(!calls.iter().any(|call| call.contains(" lfs pull")));
+        assert!(output.contains("(full history)"));
+        assert!(output.contains("Skipping submodules (turned off)"));
+        assert!(output.contains("Skipping Git LFS objects (turned off)"));
+
+        let (calls, _) = git_steps(&["--full-history"]);
+        assert!(calls.iter().any(|call| call.ends_with(&format!(
+            "{allow} submodule update --quiet --init --recursive"
+        ))));
     }
 
     #[test]

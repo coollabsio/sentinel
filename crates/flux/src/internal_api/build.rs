@@ -69,6 +69,12 @@ pub(super) struct ImageBuildApiRequest {
     untrusted_source: bool,
     #[serde(default)]
     max_concurrent_builds: u32,
+    #[serde(default)]
+    skip_submodules: bool,
+    #[serde(default)]
+    skip_lfs: bool,
+    #[serde(default)]
+    full_history: bool,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +145,9 @@ pub(super) async fn image_build(
             image_password: request.image_password,
             untrusted_source: request.untrusted_source,
             max_concurrent_builds: request.max_concurrent_builds,
+            skip_submodules: request.skip_submodules,
+            skip_lfs: request.skip_lfs,
+            full_history: request.full_history,
         }),
         DEPLOY_TIMEOUT,
     )

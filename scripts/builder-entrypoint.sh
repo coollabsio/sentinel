@@ -10,7 +10,8 @@
 # Arguments: --repository URL --commit SHA --type dockerfile|railpack
 #            --base-directory DIR --dockerfile PATH --image REF
 #            [--push-image REF] [--target STAGE] [--static-root DIR]
-#            [--untrusted-source]
+#            [--untrusted-source] [--skip-submodules] [--skip-lfs]
+#            [--full-history]
 # Without --repository, the build uses /run/coolify-build/dockerfile/Dockerfile
 # with an empty context. Build-time variables are read-only files from
 # Sentinel: /run/coolify-build/args/<KEY> become build args, and
@@ -26,18 +27,26 @@
 # With --untrusted-source (a pull request from a fork), the Git credential
 # opens only the repository of --repository: an HTTPS token answers only for
 # its path, and an SSH key fetches only the commit. Submodules and Git LFS
-# objects of other repositories get no credential.
+# objects of other repositories get no credential. The Git LFS objects of an
+# untrusted SSH repository are not pulled, because the key fetches only the
+# commit.
+# Git options (decision 0033 of Coolify): --skip-submodules skips the
+# submodules, --skip-lfs keeps the Git LFS pointer files, and --full-history
+# fetches the commit and the submodules without --depth=1. Submodules accept
+# only https and ssh URLs. A failed Git LFS pull fails the build.
 # The last line of a successful build is:
 #   COOLIFY_BUILD_RESULT {"digest":"sha256:..."}
 set -eu
 
 repository='' commit='' type='' base_directory='' dockerfile='' image='' push_image='' target='' static_root='' untrusted=''
+skip_submodules='' skip_lfs='' full_history=''
 while [ $# -gt 0 ]; do
-  if [ "$1" = --untrusted-source ]; then
-    untrusted=1
-    shift
-    continue
-  fi
+  case "$1" in
+    --untrusted-source) untrusted=1; shift; continue ;;
+    --skip-submodules) skip_submodules=1; shift; continue ;;
+    --skip-lfs) skip_lfs=1; shift; continue ;;
+    --full-history) full_history=1; shift; continue ;;
+  esac
   [ $# -ge 2 ] || { echo "error: $1 needs a value" >&2; exit 2; }
   case "$1" in
     --repository) repository=$2 ;;
@@ -94,22 +103,48 @@ elif [ -f "$git_credentials/ssh-key" ]; then
   fi
 fi
 
-source_dir=/home/build/source
+# The unit tests set another source directory.
+source_dir=${COOLIFY_BUILD_SOURCE:-/home/build/source}
 if [ -n "$repository" ]; then
-  step "Fetching commit $commit"
+  # Only https and ssh: no local paths, git://, http://, or ext:: URLs, also
+  # not in a .gitmodules of the source.
+  set -- -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always
+  if [ -n "$full_history" ]; then
+    depth='' depth_text='full history'
+  else
+    depth=--depth=1 depth_text='depth 1'
+  fi
+  # The checkout keeps the Git LFS pointer files. The LFS step below pulls
+  # the objects, so that its error shows in the build log.
+  export GIT_LFS_SKIP_SMUDGE=1
+  step "Fetching commit $commit ($depth_text)"
   git init --quiet "$source_dir"
   git -C "$source_dir" remote add origin "$repository"
   if [ -f "$git_credentials/ssh-key" ]; then
-    GIT_SSH_COMMAND="$key_ssh" git -C "$source_dir" -c protocol.file.allow=never fetch --quiet --depth=1 origin "$commit"
+    GIT_SSH_COMMAND="$key_ssh" git -C "$source_dir" "$@" fetch --quiet ${depth:+"$depth"} origin "$commit"
   else
-    git -C "$source_dir" -c protocol.file.allow=never fetch --quiet --depth=1 origin "$commit"
+    git -C "$source_dir" "$@" fetch --quiet ${depth:+"$depth"} origin "$commit"
   fi
   git -C "$source_dir" checkout --quiet FETCH_HEAD
   if [ -f "$source_dir/.gitmodules" ]; then
-    step "Fetching submodules"
-    git -C "$source_dir" -c protocol.file.allow=never submodule update --quiet --init --recursive --depth=1
+    if [ -n "$skip_submodules" ]; then
+      step "Skipping submodules (turned off)"
+    else
+      step "Fetching submodules ($depth_text)"
+      git -C "$source_dir" "$@" submodule update --quiet --init --recursive ${depth:+"$depth"}
+    fi
   fi
-  git -C "$source_dir" lfs pull 2>/dev/null || true
+  if [ -n "$(git -C "$source_dir" lfs ls-files -n)" ]; then
+    if [ -n "$skip_lfs" ]; then
+      step "Skipping Git LFS objects (turned off)"
+    elif [ -n "$untrusted" ] && [ -f "$git_credentials/ssh-key" ]; then
+      step "Skipping Git LFS objects (the source is not trusted, and the SSH key fetches only the commit)"
+    else
+      step "Fetching Git LFS objects"
+      unset GIT_LFS_SKIP_SMUDGE
+      git -C "$source_dir" "$@" lfs pull
+    fi
+  fi
 else
   mkdir -p "$source_dir"
 fi

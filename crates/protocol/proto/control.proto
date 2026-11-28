@@ -822,6 +822,14 @@ message ImageBuildRequest {
   // limit, Sentinel refuses the build with "The builder is busy." 0 does not
   // check. Needs `image.build.concurrent.v1`.
   uint32 max_concurrent_builds = 22;
+  // Git options (decision 0033 of Coolify). Each field names the change from
+  // the default: no submodule step, Git LFS pointer files instead of the
+  // objects, and a fetch of the commit and the submodules without
+  // `--depth=1`. Only for a build with `repository_url`. Needs
+  // `image.build.git_options.v1`.
+  bool skip_submodules = 23;
+  bool skip_lfs = 24;
+  bool full_history = 25;
 }
 
 message ImageBuildResult {

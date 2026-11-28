@@ -90,6 +90,10 @@ pub const CAPABILITY_IMAGE_BUILD_UNTRUSTED_SOURCE: &str = "image.build.untrusted
 /// BuildKit (decision 0035 of Coolify). Not a command: an older Sentinel
 /// ignores the fields.
 pub const CAPABILITY_IMAGE_BUILD_CONCURRENT: &str = "image.build.concurrent.v1";
+/// `image.build.v1` accepts `skip_submodules`, `skip_lfs`, and
+/// `full_history`, and a failed Git LFS pull fails the build (decision 0033
+/// of Coolify). Not a command: an older Sentinel ignores the fields.
+pub const CAPABILITY_IMAGE_BUILD_GIT_OPTIONS: &str = "image.build.git_options.v1";
 /// Removes unused images and ended build containers, except a keep list
 /// (decision 0027 of Coolify).
 pub const CAPABILITY_IMAGE_PRUNE: &str = "image.prune.v1";
@@ -98,7 +102,7 @@ pub const CAPABILITY_IMAGE_PRUNE: &str = "image.prune.v1";
 /// carry the generation and the hash of the set, and Sentinel sends
 /// `WorkloadStatus` events.
 pub const CAPABILITY_WORKLOAD_RECONCILE: &str = "workload.reconcile.v1";
-pub const BUILD_CAPABILITIES: [&str; 16] = [
+pub const BUILD_CAPABILITIES: [&str; 17] = [
     CAPABILITY_IMAGE_BUILD,
     CAPABILITY_IMAGE_BUILD_PRIVATE_GIT,
     CAPABILITY_IMAGE_LOAD,
@@ -112,6 +116,7 @@ pub const BUILD_CAPABILITIES: [&str; 16] = [
     CAPABILITY_IMAGE_BUILD_STATIC,
     CAPABILITY_IMAGE_BUILD_UNTRUSTED_SOURCE,
     CAPABILITY_IMAGE_BUILD_CONCURRENT,
+    CAPABILITY_IMAGE_BUILD_GIT_OPTIONS,
     CAPABILITY_WORKLOAD_REGISTRY_AUTH,
     CAPABILITY_BUILDER_RECONCILE,
     CAPABILITY_IMAGE_PRUNE,
@@ -274,6 +279,11 @@ pub mod control {
                     .field("dockerfile_content_bytes", &self.dockerfile_content.len())
                     .field("target", &self.target)
                     .field("static_root", &self.static_root)
+                    .field("untrusted_source", &self.untrusted_source)
+                    .field("max_concurrent_builds", &self.max_concurrent_builds)
+                    .field("skip_submodules", &self.skip_submodules)
+                    .field("skip_lfs", &self.skip_lfs)
+                    .field("full_history", &self.full_history)
                     .finish()
             }
         }
